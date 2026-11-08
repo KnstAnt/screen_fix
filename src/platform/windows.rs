@@ -243,6 +243,8 @@ fn record_session(
 ) -> Result<(usize, Option<mp4::Recording>, Option<mp4::FrameIndex>), ProbeError> {
     let session = stage(pool.CreateCaptureSession(item), "Create the WGC session")?;
     let result = (|| {
+        stage(session.SetIsCursorCaptureEnabled(false),
+            "Disable cursor capture (requires Windows 10 version 2004 or later)")?;
         let mut frame_index = mp4::FrameIndex::create(&options.folder, geometry)?;
         let folder = frame_index.folder().to_path_buf();
         let ((count, recording), event_count) = input::with_journal(&folder, stop, options.clipboard, || {
@@ -254,13 +256,13 @@ fn record_session(
             stage(session.StartCapture(), "Start WGC capture")?;
             let mut stop_offset = None;
             let mut observation_id = 0_u64;
-            let mut previous: Option<(Arc<ID3D11Texture2D>, i64, u64)> = None;
+            let mut previous: Option<(Arc<ID3D11Texture2D>, i64, u64, [u8; 32])> = None;
             let mut recording = None;
             let mut pending = None;
             let mut origin = None;
             let mut stopped = false;
             let mut scheduled = start;
-            let mut next_texture = |scheduled: Instant| -> Result<Result<(Arc<ID3D11Texture2D>, i64, u64, bool, Instant), Instant>, ProbeError> {
+            let mut next_texture = |scheduled: Instant| -> Result<Result<(Arc<ID3D11Texture2D>, i64, u64, [u8; 32], bool, Instant), Instant>, ProbeError> {
                 if let Some(at) = stop.wait_until(scheduled) {
                     return Ok(Err(at));
                 }
@@ -296,12 +298,12 @@ fn record_session(
                                 }
                             };
                             match inspect_frame(&frame, converter) {
-                                Ok(texture) => {
+                                Ok((texture, fingerprint)) => {
                                     stage(frame.Close(), "Return the frame to the WGC pool")?;
                                     observation_id = observation_id.checked_add(1)
                                         .ok_or_else(|| unavailable("The WGC observation counter overflowed"))?;
-                                    previous = Some((texture.clone(), wgc_time, observation_id));
-                                    return Ok(Ok((texture, wgc_time, observation_id, false, at)));
+                                    previous = Some((texture.clone(), wgc_time, observation_id, fingerprint));
+                                    return Ok(Ok((texture, wgc_time, observation_id, fingerprint, false, at)));
                                 }
                                 Err(error) => {
                                     let _ = session.Close();
@@ -312,8 +314,8 @@ fn record_session(
                             }
                         }
                         Ok(None) => {
-                            if let Some((texture, wgc_time, id)) = &previous {
-                                return Ok(stop.admit().map(|at| (texture.clone(), *wgc_time, *id, true, at)));
+                            if let Some((texture, wgc_time, id, fingerprint)) = &previous {
+                                return Ok(stop.admit().map(|at| (texture.clone(), *wgc_time, *id, *fingerprint, true, at)));
                             }
                             if start.elapsed() >= Duration::from_secs(3) {
                                 return Err(unavailable("No WGC frame arrived within 3 seconds"));
@@ -332,11 +334,11 @@ fn record_session(
                 }
                 loop {
                     let boundary = match next_texture(scheduled)? {
-                        Ok((texture, wgc_time, observation_id, repeated, observed_at)) => {
+                        Ok((texture, wgc_time, observation_id, fingerprint, repeated, observed_at)) => {
                             scheduled = observed_at + Duration::from_nanos(1_000_000_000 / 30);
-                            let prior = pending.replace((texture, wgc_time, observation_id, repeated, observed_at));
-                            if let Some((texture, wgc_time, observation_id, repeated, at)) = prior {
-                                (texture, wgc_time, observation_id, repeated, at, observed_at)
+                            let prior = pending.replace((texture, wgc_time, observation_id, fingerprint, repeated, observed_at));
+                            if let Some((texture, wgc_time, observation_id, fingerprint, repeated, at)) = prior {
+                                (texture, wgc_time, observation_id, fingerprint, repeated, at, observed_at)
                             } else {
                                 origin = Some(observed_at);
                                 continue;
@@ -345,13 +347,13 @@ fn record_session(
                         Err(stop_at) => {
                             stopped = true;
                             stop_offset = Some(video_ticks(stop_at.saturating_duration_since(start))?);
-                            let Some((texture, wgc_time, observation_id, repeated, at)) = pending.take() else {
+                            let Some((texture, wgc_time, observation_id, fingerprint, repeated, at)) = pending.take() else {
                                 return Ok(None);
                             };
-                            (texture, wgc_time, observation_id, repeated, at, stop_at)
+                            (texture, wgc_time, observation_id, fingerprint, repeated, at, stop_at)
                         }
                     };
-                    let (texture, wgc_time_100ns, observation_id, repeated, at, end) = boundary;
+                    let (texture, wgc_time_100ns, observation_id, fingerprint, repeated, at, end) = boundary;
                     let origin = origin.ok_or_else(|| unavailable("The video time origin is missing"))?;
                     let pts = video_ticks(at.saturating_duration_since(origin))?;
                     let end = video_ticks(end.saturating_duration_since(origin))?;
@@ -362,7 +364,7 @@ fn record_session(
                         return Err(unavailable("Video frame timestamps are not strictly increasing"));
                     }
                     index.push(&mp4::FrameTiming {
-                            wgc_time_100ns, observation_id, repeated, pts_100ns: pts, duration_100ns: end - pts,
+                            wgc_time_100ns, observation_id, fingerprint, repeated, pts_100ns: pts, duration_100ns: end - pts,
                             admitted_100ns: video_ticks(at.saturating_duration_since(start))?,
                         })?;
                     return Ok(Some((texture, pts, end - pts)));
@@ -429,7 +431,7 @@ fn try_next_frame(
 fn inspect_frame(
     frame: &windows::Graphics::Capture::Direct3D11CaptureFrame,
     converter: &mut gpu::Converter<'_>,
-) -> Result<Arc<ID3D11Texture2D>, ProbeError> {
+) -> Result<(Arc<ID3D11Texture2D>, [u8; 32]), ProbeError> {
     let size = stage(frame.ContentSize(), "Read the WGC frame bounds")?;
     let surface = stage(frame.Surface(), "Get the WGC frame surface")?;
     let access: IDirect3DDxgiInterfaceAccess =

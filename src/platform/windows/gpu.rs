@@ -28,6 +28,7 @@ pub(super) struct Converter<'device> {
     fence: ID3D11Fence,
     next_fence: u64,
     textures: Vec<Arc<ID3D11Texture2D>>,
+    comparison_surface: ID3D11Texture2D,
     enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
     width: i32,
@@ -85,8 +86,9 @@ impl<'device> Converter<'device> {
             video_context.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&source_rect));
             video_context.VideoProcessorSetStreamDestRect(&processor, 0, true, Some(&dest_rect));
         }
+        let comparison_surface = create_nv12_texture(device, true)?;
         Ok(Self {
-            device, video, context, video_context, fence_context, fence, next_fence: 0, textures: Vec::new(),
+            device, video, context, video_context, fence_context, fence, next_fence: 0, textures: Vec::new(), comparison_surface,
             enumerator, processor, width, height,
         })
     }
@@ -96,7 +98,7 @@ impl<'device> Converter<'device> {
         source: &ID3D11Texture2D,
         width: i32,
         height: i32,
-    ) -> Result<Arc<ID3D11Texture2D>, ProbeError> {
+    ) -> Result<(Arc<ID3D11Texture2D>, [u8; 32]), ProbeError> {
         if (width, height) != (self.width, self.height) {
             return Err(unavailable("The WGC frame size changed during recording"));
         }
@@ -138,6 +140,9 @@ impl<'device> Converter<'device> {
             result
         };
         stage(blit, "Convert BGRA to NV12 on the GPU")?;
+        // Read the exact encoder input, before H.264 can change pixel values.
+        unsafe { self.context.CopyResource(&self.comparison_surface, texture.as_ref()) };
+
         stage(unsafe { self.fence_context.Signal(&self.fence, fence_value) }, "Signal GPU conversion completion")?;
         unsafe { self.context.Flush() };
 
@@ -149,7 +154,7 @@ impl<'device> Converter<'device> {
                 return Err(unavailable("The GPU device became unavailable after conversion"));
             }
             if value >= fence_value {
-                return Ok(texture);
+                return Ok((texture, self.fingerprint()?));
             }
             if Instant::now() >= deadline {
                 return Err(unavailable("GPU conversion did not finish within 3 seconds"));
@@ -167,25 +172,66 @@ impl<'device> Converter<'device> {
         if self.textures.len() >= 16 {
             return Err(unavailable("The hardware encoder is holding all 16 NV12 textures"));
         }
-        let texture_desc = D3D11_TEXTURE2D_DESC {
-            Width: WIDTH,
-            Height: HEIGHT,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_NV12,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
-            ..Default::default()
-        };
-        let mut texture = None;
-        stage(
-            unsafe { self.device.CreateTexture2D(&texture_desc, None, Some(&mut texture)) },
-            "Create an NV12 GPU texture",
-        )?;
-        let texture = Arc::new(texture.ok_or_else(|| unavailable("D3D11 did not return an NV12 texture"))?);
+        let texture = Arc::new(create_nv12_texture(self.device, false)?);
         self.textures.push(Arc::clone(&texture));
         Ok(texture)
     }
 
+
+    fn fingerprint(&self) -> Result<[u8; 32], ProbeError> {
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        stage(unsafe {
+            self.context.Map(&self.comparison_surface, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+        }, "Map the NV12 comparison surface")?;
+        let result = (|| {
+            let width = WIDTH as usize;
+            let rows = HEIGHT as usize * 3 / 2;
+            let pitch = mapped.RowPitch as usize;
+            let extent = pitch.checked_mul(rows - 1)
+                .and_then(|offset| offset.checked_add(width))
+                .filter(|length| *length <= isize::MAX as usize)
+                .ok_or_else(|| unavailable("Invalid NV12 comparison surface extent"))?;
+            if mapped.DepthPitch != 0 && extent > mapped.DepthPitch as usize {
+                return Err(unavailable("Incomplete NV12 comparison surface"));
+            }
+            if mapped.pData.is_null() || pitch < width {
+                return Err(unavailable("Invalid NV12 comparison surface layout"));
+            }
+            // NV12 stores HEIGHT luma rows followed by HEIGHT / 2 chroma rows.
+            let mut hasher = blake3::Hasher::new();
+            for row in 0..rows {
+                // Only active pixels are initialized by the GPU copy.
+                let pixels = unsafe {
+                    std::slice::from_raw_parts(mapped.pData.cast::<u8>().add(row * pitch), width)
+                };
+                hasher.update(pixels);
+            }
+            Ok(*hasher.finalize().as_bytes())
+        })();
+        unsafe { self.context.Unmap(&self.comparison_surface, 0) };
+        result
+    }
+
+}
+
+
+fn create_nv12_texture(device: &ID3D11Device, readback: bool) -> Result<ID3D11Texture2D, ProbeError> {
+    let texture_desc = D3D11_TEXTURE2D_DESC {
+        Width: WIDTH,
+        Height: HEIGHT,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_NV12,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: if readback { D3D11_USAGE_STAGING } else { D3D11_USAGE_DEFAULT },
+        BindFlags: if readback { 0 } else { D3D11_BIND_RENDER_TARGET.0 as u32 },
+        CPUAccessFlags: if readback { D3D11_CPU_ACCESS_READ.0 as u32 } else { 0 },
+        ..Default::default()
+    };
+    let mut texture = None;
+    stage(
+        unsafe { device.CreateTexture2D(&texture_desc, None, Some(&mut texture)) },
+        "Create an NV12 texture",
+    )?;
+    texture.ok_or_else(|| unavailable("D3D11 did not return an NV12 texture"))
 }

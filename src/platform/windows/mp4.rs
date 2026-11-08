@@ -15,6 +15,7 @@ pub(super) struct FrameTiming {
     pub(super) wgc_time_100ns: i64,
     pub(super) repeated: bool,
     pub(super) observation_id: u64,
+    pub(super) fingerprint: [u8; 32],
     pub(super) admitted_100ns: i64,
     pub(super) pts_100ns: i64,
     pub(super) duration_100ns: i64,
@@ -149,7 +150,7 @@ impl Recording {
         })?;
         let timeline = index.timeline.ok_or_else(|| unavailable("The session timeline is missing"))?;
         let manifest = Manifest {
-            version: 2, frame_count: count, video: "video.mp4".into(), frames: "frames.jsonl".into(),
+            version: 3, frame_count: count, video: "video.mp4".into(), frames: "frames.jsonl".into(),
             events: "events.jsonl".into(), event_count: index.event_count, timeline, geometry: Some(index.geometry),
         };
         let pending_manifest = index.folder.join("manifest.pending.json");

@@ -1,7 +1,7 @@
 # screen_fix
 
 Record a Windows display and its input events for an AI training dataset.
-Windows recording requires Windows 10 version 1903 or later and compatible
+Windows recording requires Windows 10 version 2004 or later and compatible
 D3D11 hardware H.264 encoding. The Linux and macOS builds provide the UI shell.
 
 ## Build and record
@@ -35,7 +35,7 @@ For the UI shell, build with `x86_64-unknown-linux-gnu` or
 | `events.jsonl` | Raw input and foreground context, plus clipboard changes when enabled |
 | `manifest.json` | Completion marker, package index, display geometry, counts, and timeline |
 | `export/events.jsonl` | Before, after, and presented frame references, or reasons for missing frames |
-| `export/drags.jsonl` | Drag boundaries, input references, and boundary frame links |
+| `export/clicks.jsonl`, `export/drags.jsonl` | Button intervals, input references, baseline, and changed frame links |
 | `export/*.png` | Images shared by events that reference the same observation |
 
 Times ending in `_100ns` use 100 ns units. Admission is relative to session
@@ -43,7 +43,14 @@ Start. PTS is relative to video start. The manifest relates the two origins
 and records Stop. Physical cursor position is observed at read time.
 An unfinished session may contain files without a final manifest.
 
-To export a completed version 2 session again on Windows:
+The cursor is excluded from video. Its observed position is kept in the input
+log. Identical pre-encode NV12 pixels share an image, regardless of timestamps.
+Each button interval keeps the real frame just before the press when available.
+During the hold and at the first frame after release, only images that differ
+from that baseline are selected. Older version 2 sessions lack the required
+fingerprints.
+
+To export a completed version 3 session again on Windows:
 
 ```powershell
 .\target\x86_64-pc-windows-msvc\release\screen-fix.exe --export "<session-directory>"
@@ -58,7 +65,5 @@ exports are preserved. A directory ending in `.pending` is unpublished.
 - [MVP specification and acceptance criteria](doc/SCREEN_FIX_SPEC.md)
 - [Architecture, implementation status, and known gaps](doc/SCREEN_FIX_ARCHITECTURE.md)
 - [Historical video pipeline review](doc/SCREEN_FIX_VIDEO_STATIC_REVIEW.md)
-- [Project working prompt](doc/SCREEN_FIX_PROJECT_CONTEXT.md) and
-  [critic prompt](doc/SCREEN_FIX_CRITIC_PROMPT.md)
 
 The current source package has not been built or exercised on Windows.

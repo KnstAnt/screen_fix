@@ -16,7 +16,7 @@ pub(super) struct MouseEvent {
 #[derive(Clone, Copy, Serialize)]
 pub(super) struct Boundary {
     pub(super) time_100ns: i64,
-    event_index: Option<u64>,
+    pub(super) event_index: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -24,7 +24,7 @@ pub(super) struct Gesture {
     device_id: Option<u64>,
     button: usize,
     status: &'static str,
-    movement_confirmed: bool,
+    pub(super) movement_confirmed: bool,
     pub(super) start: Boundary,
     pub(super) end: Boundary,
 }
@@ -69,14 +69,13 @@ impl Tracker {
                 *held = Some(Held { start: point, moved: false });
             }
             if up {
-                let (start, status) = match held.take() {
-                    Some(held) if held.moved => (held.start, "complete"),
-                    Some(_) => continue,
-                    None => (Boundary { time_100ns: 0, event_index: None }, "missing_start"),
+                let (start, status, movement_confirmed) = match held.take() {
+                    Some(held) => (held.start, "complete", held.moved),
+                    None => (Boundary { time_100ns: 0, event_index: None }, "missing_start", false),
                 };
                 gestures.push(Gesture {
                     device_id: event.device_id, button: index + 1, status,
-                    movement_confirmed: status == "complete", start, end: point,
+                    movement_confirmed, start, end: point,
                 });
             }
         }
@@ -86,9 +85,9 @@ impl Tracker {
     pub(super) fn finish(self, stop: i64) -> impl Iterator<Item = Gesture> {
         self.0.into_iter().flat_map(move |(device_id, mouse)| {
             mouse.buttons.into_iter().enumerate().filter_map(move |(index, held)| {
-                let held = held.filter(|held| held.moved)?;
+                let held = held?;
                 Some(Gesture {
-                    device_id, button: index + 1, status: "missing_end", movement_confirmed: true,
+                    device_id, button: index + 1, status: "missing_end", movement_confirmed: held.moved,
                     start: held.start,
                     end: Boundary { time_100ns: stop, event_index: None },
                 })

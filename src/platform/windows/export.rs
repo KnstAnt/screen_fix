@@ -15,8 +15,8 @@ pub(super) fn run(folder: &Path, repeat: bool) -> Result<PathBuf, ProbeError> {
     let video = folder.join("video.mp4");
     let manifest: Manifest = serde_json::from_reader(BufReader::new(open(&folder.join("manifest.json"))?))
         .map_err(|error| io_error("Read the manifest for export", error.into()))?;
-    if manifest.version != 2 {
-        return Err(unavailable("The manifest version is not supported for export"));
+    if manifest.version != 3 {
+        return Err(unavailable("Content-aware export requires a version 3 session recorded without the cursor"));
     }
     if !video.is_file() {
         return Err(unavailable("The completed session does not contain video.mp4"));
@@ -30,10 +30,14 @@ pub(super) fn run(folder: &Path, repeat: bool) -> Result<PathBuf, ProbeError> {
     let mut frames = Vec::new();
     let mut presented = Vec::new();
     let mut original_pts = BTreeMap::new();
+    let mut images = BTreeMap::new();
+    let mut fingerprints = BTreeMap::new();
     for line in BufReader::new(open(&folder.join("frames.jsonl"))?).lines() {
         let frame: FrameTiming = parse(&line.map_err(|error| io_error("Read the frame index", error))?)?;
         if !frame.repeated {
             original_pts.insert(frame.observation_id, frame.pts_100ns);
+            let image_pts = *fingerprints.entry(frame.fingerprint).or_insert(frame.pts_100ns);
+            images.insert(frame.pts_100ns, image_pts);
             frames.push((i128::from(frame.wgc_time_100ns) - start, frame.pts_100ns, frame.observation_id));
         }
         let begin = i128::from(clock.video_origin_100ns) + i128::from(frame.pts_100ns);
@@ -58,30 +62,41 @@ pub(super) fn run(folder: &Path, repeat: bool) -> Result<PathBuf, ProbeError> {
     fs::create_dir(&pending).map_err(|error| io_error("Create the export directory", error))?;
     let mut selected = BTreeSet::new();
     let mut gestures = BufWriter::new(create(&pending.join("drags.jsonl"))?);
+    let mut clicks = BufWriter::new(create(&pending.join("clicks.jsonl"))?);
     let mut tracker = super::drag::Tracker::default();
     let mut mappings = BufWriter::new(create(&pending.join("events.jsonl"))?);
     for line in BufReader::new(open(&folder.join("events.jsonl"))?).lines() {
         let event: serde_json::Value = parse(&line.map_err(|error| io_error("Read an event for export", error))?)?;
+        if event["kind"] == "foreground_window" {
+            continue;
+        }
         if event["kind"] == "mouse" {
             let mouse: super::drag::MouseEvent = serde_json::from_value(event.clone())
                 .map_err(|error| io_error("Parse the mouse event", error.into()))?;
             for gesture in tracker.observe(&mouse) {
-                write_gesture(&mut gestures, gesture, &frames, &mut selected)?;
+                let writer = if gesture.movement_confirmed || gesture.start.event_index.is_none() {
+                    &mut gestures
+                } else {
+                    &mut clicks
+                };
+                write_gesture(writer, gesture, &frames, &images, &mut selected)?;
             }
-            if mouse.button_flags == 0 {
+            // Button edges are exported as one interval. Wheel events remain discrete.
+            if mouse.button_flags & 0x0c00 == 0 {
                 continue;
             }
         }
         let at = event["admitted_100ns"].as_i64()
             .ok_or_else(|| unavailable("The event is missing its admission timestamp"))?;
         let at = i128::from(at);
-        let (before, after) = frame_links(&frames, at, at, &mut selected);
+        let (before, after) = frame_links(&frames, at, at, &images, &mut selected);
         let shown = presented.partition_point(|sample| sample.0 <= at)
             .checked_sub(1).and_then(|index| presented.get(index))
             .filter(|sample| at < sample.1);
         let shown = if let Some((begin, end, sample)) = shown {
-            let image_pts = *original_pts.get(&sample.observation_id)
+            let observation_pts = *original_pts.get(&sample.observation_id)
                 .ok_or_else(|| unavailable("The MP4 sample has no source observation"))?;
+            let image_pts = images[&observation_pts];
             selected.insert(image_pts);
             serde_json::json!({
                 "image": image_name(image_pts),
@@ -106,8 +121,11 @@ pub(super) fn run(folder: &Path, repeat: bool) -> Result<PathBuf, ProbeError> {
         mappings.write_all(b"\n").map_err(|error| io_error("Write the export frame mappings", error))?;
     }
     for gesture in tracker.finish(clock.stop_100ns) {
-        write_gesture(&mut gestures, gesture, &frames, &mut selected)?;
+        let writer = if gesture.movement_confirmed { &mut gestures } else { &mut clicks };
+        write_gesture(writer, gesture, &frames, &images, &mut selected)?;
     }
+    clicks.flush().map_err(|error| io_error("Close the click interval log", error))?;
+    drop(clicks);
     gestures.flush().map_err(|error| io_error("Close the drag interval log", error))?;
     drop(gestures);
     mappings.flush().map_err(|error| io_error("Close the export index", error))?;
@@ -136,36 +154,95 @@ fn cursor_video(event: &serde_json::Value, geometry: Option<&Geometry>) -> serde
     serde_json::json!({"x": x, "y": y, "source": "cursor_at_read"})
 }
 
+type Observation = (i128, i64, u64);
+
+fn frame_link(
+    frame: &Observation, images: &BTreeMap<i64, i64>, selected: &mut BTreeSet<i64>,
+) -> serde_json::Value {
+    let &(_, pts, id) = frame;
+    let image_pts = images[&pts];
+    selected.insert(image_pts);
+    serde_json::json!({
+        "image": image_name(image_pts), "image_pts_100ns": image_pts,
+        "observation_id": id, "pts_100ns": pts,
+    })
+}
+
+fn before(frames: &[Observation], at: i128) -> Option<&Observation> {
+    frames.partition_point(|frame| frame.0 < at)
+        .checked_sub(1).and_then(|index| frames.get(index))
+}
+
+fn after(frames: &[Observation], at: i128) -> Option<&Observation> {
+    frames.get(frames.partition_point(|frame| frame.0 <= at))
+}
+
 fn frame_links(
-    frames: &[(i128, i64, u64)], start: i128, end: i128, selected: &mut BTreeSet<i64>,
+    frames: &[Observation], start: i128, end: i128,
+    images: &BTreeMap<i64, i64>, selected: &mut BTreeSet<i64>,
 ) -> (serde_json::Value, serde_json::Value) {
-    let before = frames.partition_point(|frame| frame.0 < start)
-        .checked_sub(1).and_then(|index| frames.get(index));
-    let after = frames.get(frames.partition_point(|frame| frame.0 <= end));
-    let mut link = |frame: Option<&(i128, i64, u64)>, missing: &'static str| {
-        if let Some(&(_, pts, id)) = frame {
-            selected.insert(pts);
-            serde_json::json!({"image": image_name(pts), "observation_id": id, "pts_100ns": pts})
-        } else {
-            serde_json::json!({"missing": missing})
-        }
-    };
-    (link(before, "no_earlier_observation"), link(after, "no_later_observation"))
+    let before = before(frames, start).map_or_else(
+        || serde_json::json!({"missing": "no_earlier_observation"}),
+        |frame| frame_link(frame, images, selected),
+    );
+    let after = after(frames, end).map_or_else(
+        || serde_json::json!({"missing": "no_later_observation"}),
+        |frame| frame_link(frame, images, selected),
+    );
+    (before, after)
 }
 
 fn write_gesture(
     writer: &mut impl Write,
     gesture: super::drag::Gesture,
-    frames: &[(i128, i64, u64)],
+    frames: &[Observation],
+    images: &BTreeMap<i64, i64>,
     selected: &mut BTreeSet<i64>,
 ) -> Result<(), ProbeError> {
-    let (before, after) = frame_links(
-        frames, i128::from(gesture.start.time_100ns), i128::from(gesture.end.time_100ns), selected,
-    );
-    let row = serde_json::json!({"gesture": gesture, "before": before, "after": after});
+    let start = i128::from(gesture.start.time_100ns);
+    let end = i128::from(gesture.end.time_100ns);
+    let baseline = gesture.start.event_index.and_then(|_| before(frames, start));
+    let mut during = Vec::new();
+    let (before_link, after_link) = if !gesture.movement_confirmed && gesture.end.event_index.is_none() {
+        (
+            serde_json::json!({"missing": "incomplete_click"}),
+            serde_json::json!({"missing": "no_release_observation"}),
+        )
+    } else if let Some(baseline) = baseline {
+        let baseline_image = images[&baseline.1];
+        let mut seen = BTreeSet::from([baseline_image]);
+        let first = frames.partition_point(|frame| frame.0 < start);
+        let last = frames.partition_point(|frame| frame.0 < end);
+        for frame in frames.get(first..last).unwrap_or_default() {
+            if seen.insert(images[&frame.1]) {
+                during.push(frame_link(frame, images, selected));
+                if !gesture.movement_confirmed {
+                    break;
+                }
+            }
+        }
+        let after_link = if gesture.end.event_index.is_none() {
+            serde_json::json!({"missing": "no_release_observation"})
+        } else {
+            match after(frames, end) {
+                Some(frame) if images[&frame.1] != baseline_image => frame_link(frame, images, selected),
+                Some(_) => serde_json::json!({"missing": "unchanged_from_before"}),
+                None => serde_json::json!({"missing": "no_later_observation"}),
+            }
+        };
+        (frame_link(baseline, images, selected), after_link)
+    } else {
+        (
+            serde_json::json!({"missing": "no_earlier_observation"}),
+            serde_json::json!({"missing": "no_baseline_for_comparison"}),
+        )
+    };
+    let row = serde_json::json!({
+        "gesture": gesture, "before": before_link, "during": during, "after": after_link,
+    });
     serde_json::to_writer(&mut *writer, &row)
-        .map_err(|error| io_error("Write the drag interval", error.into()))?;
-    writer.write_all(b"\n").map_err(|error| io_error("Write the drag interval", error))
+        .map_err(|error| io_error("Write the button interval", error.into()))?;
+    writer.write_all(b"\n").map_err(|error| io_error("Write the button interval", error))
 }
 
 fn image_name(pts: i64) -> String {
