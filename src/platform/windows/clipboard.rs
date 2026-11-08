@@ -17,7 +17,7 @@ pub(super) struct Listener(HWND);
 
 impl Listener {
     pub(super) fn register(window: HWND) -> Result<Self, ProbeError> {
-        stage(unsafe { AddClipboardFormatListener(window) }, "Подписка на буфер обмена")?;
+        stage(unsafe { AddClipboardFormatListener(window) }, "Subscribe to clipboard changes")?;
         Ok(Self(window))
     }
 }

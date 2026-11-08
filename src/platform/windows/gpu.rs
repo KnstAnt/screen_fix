@@ -41,20 +41,20 @@ impl<'device> Converter<'device> {
         height: i32,
     ) -> Result<Self, ProbeError> {
         if width <= 0 || height <= 0 {
-            return Err(unavailable("Недопустимый размер источника WGC"));
+            return Err(unavailable("Invalid WGC source size"));
         }
-        let video: ID3D11VideoDevice = stage(device.cast(), "Получение видеоустройства D3D11")?;
-        let context = stage(unsafe { device.GetImmediateContext() }, "Получение контекста D3D11")?;
+        let video: ID3D11VideoDevice = stage(device.cast(), "Get the D3D11 video device")?;
+        let context = stage(unsafe { device.GetImmediateContext() }, "Get the D3D11 context")?;
         let video_context: ID3D11VideoContext1 =
-            stage(context.cast(), "Получение контекста преобразования D3D11")?;
-        let fence_device: ID3D11Device5 = stage(device.cast(), "Получение интерфейса GPU fence")?;
-        let fence_context: ID3D11DeviceContext4 = stage(context.cast(), "Получение контекста GPU fence")?;
+            stage(context.cast(), "Get the D3D11 conversion context")?;
+        let fence_device: ID3D11Device5 = stage(device.cast(), "Get the GPU fence interface")?;
+        let fence_context: ID3D11DeviceContext4 = stage(context.cast(), "Get the GPU fence context")?;
         let mut fence: Option<ID3D11Fence> = None;
         stage(
             unsafe { fence_device.CreateFence(0, D3D11_FENCE_FLAG_NONE, &mut fence) },
-            "Создание GPU fence",
+            "Create the GPU fence",
         )?;
-        let fence = fence.ok_or_else(|| unavailable("D3D11 не вернул GPU fence"))?;
+        let fence = fence.ok_or_else(|| unavailable("D3D11 did not return a GPU fence"))?;
 
         let rate = DXGI_RATIONAL { Numerator: 30, Denominator: 1 };
         let content = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
@@ -69,11 +69,11 @@ impl<'device> Converter<'device> {
         };
         let enumerator = stage(
             unsafe { video.CreateVideoProcessorEnumerator(&content) },
-            "Проверка видеопроцессора D3D11",
+            "Check D3D11 video processor support",
         )?;
         let processor = stage(
             unsafe { video.CreateVideoProcessor(&enumerator, 0) },
-            "Создание видеопроцессора D3D11",
+            "Create the D3D11 video processor",
         )?;
         let source_rect = RECT { left: 0, top: 0, right: width, bottom: height };
         let dest_rect = RECT { left: 0, top: 0, right: WIDTH as i32, bottom: HEIGHT as i32 };
@@ -98,11 +98,11 @@ impl<'device> Converter<'device> {
         height: i32,
     ) -> Result<Arc<ID3D11Texture2D>, ProbeError> {
         if (width, height) != (self.width, self.height) {
-            return Err(unavailable("Размер области WGC изменился во время записи"));
+            return Err(unavailable("The WGC frame size changed during recording"));
         }
         let fence_value = self.next_fence.checked_add(1)
             .filter(|value| *value < u64::MAX)
-            .ok_or_else(|| unavailable("Исчерпаны значения GPU fence"))?;
+            .ok_or_else(|| unavailable("The GPU fence counter overflowed"))?;
         self.next_fence = fence_value;
         let texture = self.acquire_texture()?;
 
@@ -117,15 +117,15 @@ impl<'device> Converter<'device> {
         let mut input_view = None;
         stage(
             unsafe { self.video.CreateVideoProcessorInputView(source, &self.enumerator, &input_desc, Some(&mut input_view)) },
-            "Подготовка BGRA-кадра для видеопроцессора",
+            "Prepare the BGRA input for the video processor",
         )?;
         let mut output_view = None;
         stage(
             unsafe { self.video.CreateVideoProcessorOutputView(texture.as_ref(), &self.enumerator, &output_desc, Some(&mut output_view)) },
-            "Подготовка NV12-выхода видеопроцессора",
+            "Prepare the NV12 output for the video processor",
         )?;
-        let output_view = output_view.ok_or_else(|| unavailable("Не получен NV12-выход видеопроцессора"))?;
-        let input_view = input_view.ok_or_else(|| unavailable("Не получен BGRA-вход видеопроцессора"))?;
+        let output_view = output_view.ok_or_else(|| unavailable("The video processor did not return an NV12 output view"))?;
+        let input_view = input_view.ok_or_else(|| unavailable("The video processor did not return a BGRA input view"))?;
         let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
             Enable: true.into(),
             pInputSurface: ManuallyDrop::new(Some(input_view)),
@@ -137,8 +137,8 @@ impl<'device> Converter<'device> {
             ManuallyDrop::drop(&mut stream.pInputSurface);
             result
         };
-        stage(blit, "Преобразование BGRA → NV12 на GPU")?;
-        stage(unsafe { self.fence_context.Signal(&self.fence, fence_value) }, "Сигнал завершения преобразования GPU")?;
+        stage(blit, "Convert BGRA to NV12 on the GPU")?;
+        stage(unsafe { self.fence_context.Signal(&self.fence, fence_value) }, "Signal GPU conversion completion")?;
         unsafe { self.context.Flush() };
 
         // The converter waits for GPU completion before returning the capture lease.
@@ -146,13 +146,13 @@ impl<'device> Converter<'device> {
         loop {
             let value = unsafe { self.fence.GetCompletedValue() };
             if value == u64::MAX {
-                return Err(unavailable("Устройство GPU недоступно после преобразования"));
+                return Err(unavailable("The GPU device became unavailable after conversion"));
             }
             if value >= fence_value {
                 return Ok(texture);
             }
             if Instant::now() >= deadline {
-                return Err(unavailable("GPU не завершил преобразование за 3 секунды"));
+                return Err(unavailable("GPU conversion did not finish within 3 seconds"));
             }
             thread::sleep(Duration::from_millis(1));
         }
@@ -165,7 +165,7 @@ impl<'device> Converter<'device> {
             return Ok(Arc::clone(texture));
         }
         if self.textures.len() >= 16 {
-            return Err(unavailable("Аппаратный кодировщик удерживает все 16 текстур NV12"));
+            return Err(unavailable("The hardware encoder is holding all 16 NV12 textures"));
         }
         let texture_desc = D3D11_TEXTURE2D_DESC {
             Width: WIDTH,
@@ -181,9 +181,9 @@ impl<'device> Converter<'device> {
         let mut texture = None;
         stage(
             unsafe { self.device.CreateTexture2D(&texture_desc, None, Some(&mut texture)) },
-            "Создание GPU-текстуры NV12",
+            "Create an NV12 GPU texture",
         )?;
-        let texture = Arc::new(texture.ok_or_else(|| unavailable("D3D11 не вернул текстуру NV12"))?);
+        let texture = Arc::new(texture.ok_or_else(|| unavailable("D3D11 did not return an NV12 texture"))?);
         self.textures.push(Arc::clone(&texture));
         Ok(texture)
     }

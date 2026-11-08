@@ -33,14 +33,14 @@ pub(super) fn with_journal<T>(
                 gate.stop();
             }
             result
-        }).map_err(|error| io_error("Запуск потока ввода", error))?;
+        }).map_err(|error| io_error("Start the input worker", error))?;
         let video = if initialized.recv().is_ok() { Some(record()) } else { None };
         gate.stop();
-        let input = worker.join().map_err(|_| unavailable("Поток ввода аварийно завершился"))?;
+        let input = worker.join().map_err(|_| unavailable("The input worker terminated unexpectedly"))?;
         match video {
             Some(Err(error)) => Err(error),
             Some(Ok(video)) => input.map(|count| (video, count)),
-            None => Err(input.err().unwrap_or_else(|| unavailable("Поток ввода не готов"))),
+            None => Err(input.err().unwrap_or_else(|| unavailable("The input worker is not ready"))),
         }
     })
 }
@@ -71,7 +71,7 @@ fn collect(
     ready: mpsc::SyncSender<()>,
 ) -> Result<u64, ProbeError> {
     let file = File::create(folder.join("events.jsonl"))
-        .map_err(|error| io_error("Создание журнала ввода", error))?;
+        .map_err(|error| io_error("Create the input log", error))?;
     thread::scope(|scope| {
         let (events, pending) = mpsc::sync_channel(4096);
         let writer = thread::Builder::new().name("input-journal".into()).spawn_scoped(scope, move || {
@@ -80,13 +80,13 @@ fn collect(
                 gate.stop();
             }
             result
-        }).map_err(|error| io_error("Запуск записи журнала ввода", error))?;
+        }).map_err(|error| io_error("Start the input log writer", error))?;
         let collected = pump(gate, record_clipboard, ready, events);
-        let written = writer.join().map_err(|_| unavailable("Поток журнала аварийно завершился"))?;
+        let written = writer.join().map_err(|_| unavailable("The input log writer terminated unexpectedly"))?;
         let written = written?;
         let collected = collected?;
         if written != collected {
-            return Err(unavailable("Число записанных событий не совпадает с числом принятых"));
+            return Err(unavailable("The number of written events does not match the number admitted"));
         }
         Ok(written)
     })
@@ -98,11 +98,11 @@ fn write_events(file: File, pending: mpsc::Receiver<serde_json::Value>) -> Resul
     for mut event in pending {
         clipboard::enrich(&mut event);
         serde_json::to_writer(&mut writer, &event)
-            .map_err(|error| io_error("Запись события ввода", error.into()))?;
-        writer.write_all(b"\n").map_err(|error| io_error("Запись события ввода", error))?;
+            .map_err(|error| io_error("Write the input event", error.into()))?;
+        writer.write_all(b"\n").map_err(|error| io_error("Write the input event", error))?;
         count += 1;
     }
-    writer.flush().map_err(|error| io_error("Закрытие журнала ввода", error))?;
+    writer.flush().map_err(|error| io_error("Close the input log", error))?;
     Ok(count)
 }
 
@@ -118,13 +118,13 @@ fn pump(
             WINDOW_STYLE(0), 0, 0, 0, 0, Some(HWND_MESSAGE), None,
             None::<HINSTANCE>, None,
         )
-    }, "Создание окна Raw Input")?);
+    }, "Create the Raw Input window")?);
     stage(unsafe {
         RegisterRawInputDevices(&devices(window.0, RIDEV_INPUTSINK), size_of::<RAWINPUTDEVICE>() as u32)
-    }, "Регистрация клавиатуры и мыши")?;
+    }, "Register the keyboard and mouse")?;
     let foreground = ForegroundHook::install()?;
     let _clipboard = record_clipboard.then(|| clipboard::Listener::register(window.0)).transpose()?;
-    ready.send(()).map_err(|_| unavailable("Координатор записи недоступен"))?;
+    ready.send(()).map_err(|_| unavailable("The recording coordinator is unavailable"))?;
     let Some(start) = gate.wait_for_start() else { return Ok(0) };
     let mut count = 0;
     if let Ok(at) = gate.admit() {
@@ -152,7 +152,7 @@ fn pump(
             count += 1;
         } else if has_message {
             if message.message == WM_QUIT {
-                return Err(unavailable("Поток событий Windows получил WM_QUIT"));
+                return Err(unavailable("The Windows event thread received WM_QUIT"));
             }
             unsafe { DispatchMessageW(&message) };
         }
@@ -171,8 +171,8 @@ fn pump(
 
 fn send_event(events: &mpsc::SyncSender<serde_json::Value>, event: serde_json::Value) -> Result<(), ProbeError> {
     events.try_send(event).map_err(|error| match error {
-        mpsc::TrySendError::Full(_) => unavailable("Очередь журнала ввода переполнена"),
-        mpsc::TrySendError::Disconnected(_) => unavailable("Запись журнала ввода остановлена"),
+        mpsc::TrySendError::Full(_) => unavailable("The input log queue is full"),
+        mpsc::TrySendError::Disconnected(_) => unavailable("The input log writer has stopped"),
     })
 }
 
@@ -188,15 +188,15 @@ fn read_input(message: &MSG, index: u64, time: i64) -> Result<serde_json::Value,
         )
     };
     if copied == u32::MAX {
-        return stage(Err(core::Error::from_thread()), "Чтение пакета Raw Input");
+        return stage(Err(core::Error::from_thread()), "Read the Raw Input packet");
     }
     if copied < size_of::<RAWINPUTHEADER>() as u32 {
-        return Err(unavailable("Неполный пакет Raw Input"));
+        return Err(unavailable("Incomplete Raw Input packet"));
     }
     match raw.header.dwType {
         value if value == RIM_TYPEKEYBOARD.0 => {
             if (copied as usize) < offset_of!(RAWINPUT, data) + size_of::<RAWKEYBOARD>() {
-                return Err(unavailable("Неполный пакет клавиатуры Raw Input"));
+                return Err(unavailable("Incomplete Raw Input keyboard packet"));
             }
             let key = unsafe { raw.data.keyboard };
             Ok(serde_json::json!({
@@ -207,7 +207,7 @@ fn read_input(message: &MSG, index: u64, time: i64) -> Result<serde_json::Value,
         }
         value if value == RIM_TYPEMOUSE.0 => {
             if (copied as usize) < offset_of!(RAWINPUT, data) + size_of::<RAWMOUSE>() {
-                return Err(unavailable("Неполный пакет мыши Raw Input"));
+                return Err(unavailable("Incomplete Raw Input mouse packet"));
             }
             let mut position = POINT::default();
             let cursor = unsafe { GetPhysicalCursorPos(&mut position) }.ok()
@@ -222,6 +222,6 @@ fn read_input(message: &MSG, index: u64, time: i64) -> Result<serde_json::Value,
                 "cursor_at_read": cursor
             }))
         }
-        _ => Err(unavailable("Получен неподдерживаемый пакет Raw Input")),
+        _ => Err(unavailable("Unsupported Raw Input packet")),
     }
 }

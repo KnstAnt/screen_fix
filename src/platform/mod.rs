@@ -35,7 +35,7 @@ pub(crate) fn record_video(
     }
     #[cfg(not(target_os = "windows"))]
     {
-        Err("Запись экрана для этой ОС пока недоступна.".into())
+        Err("Screen recording is unavailable on this platform.".into())
     }
 }
 
@@ -46,6 +46,6 @@ pub(crate) fn export_session(_folder: &std::path::Path) -> Result<std::path::Pat
     }
     #[cfg(not(target_os = "windows"))]
     {
-        Err("Экспорт сессии для этой ОС пока недоступен.".into())
+        Err("Session export is unavailable on this platform.".into())
     }
 }

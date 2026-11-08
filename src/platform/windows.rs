@@ -64,7 +64,7 @@ struct Apartment;
 
 impl Apartment {
     fn initialize() -> Result<Self, ProbeError> {
-        stage(unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }, "Инициализация COM")?;
+        stage(unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }, "Initialize COM")?;
         Ok(Self)
     }
 }
@@ -80,7 +80,7 @@ struct MediaFoundation;
 
 impl MediaFoundation {
     fn initialize() -> Result<Self, ProbeError> {
-        stage(unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }, "Запуск Media Foundation")?;
+        stage(unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }, "Start Media Foundation")?;
         Ok(Self)
     }
 }
@@ -94,22 +94,22 @@ impl Drop for MediaFoundation {
 
 pub(crate) fn record(stop: &crate::session_gate::SessionGate, options: &crate::platform::RecordingOptions) -> Result<String, ProbeError> {
     let _apartment = Apartment::initialize()?;
-    let supported = stage(GraphicsCaptureSession::IsSupported(), "Проверка захвата экрана")?;
+    let supported = stage(GraphicsCaptureSession::IsSupported(), "Check screen capture support")?;
     if !supported {
-        return Err(unavailable("Захват экрана Windows недоступен"));
+        return Err(unavailable("Windows screen capture is unavailable"));
     }
 
     let (adapter, display) = outputs()?.into_iter()
         .find(|(_, display)| display_id(display) == options.display_id)
-        .ok_or_else(|| unavailable("Выбранный монитор больше не доступен"))?;
+        .ok_or_else(|| unavailable("The selected display is no longer available"))?;
     let monitor = display.Monitor;
     let interop = stage(core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>(),
-        "Открытие API выбора монитора")?;
+        "Get the display capture API")?;
     let item: GraphicsCaptureItem = stage(unsafe { interop.CreateForMonitor(monitor) },
-        "Выбор монитора для захвата")?;
-    let size = stage(item.Size(), "Чтение размера монитора")?;
+        "Select the display to capture")?;
+    let size = stage(item.Size(), "Read the display size")?;
 
-    let description = stage(unsafe { adapter.GetDesc1() }, "Чтение адаптера монитора")?;
+    let description = stage(unsafe { adapter.GetDesc1() }, "Read the display adapter")?;
     let mut device: Option<ID3D11Device> = None;
     // With an explicit adapter D3D11 requires DRIVER_TYPE_UNKNOWN.
     stage(unsafe {
@@ -118,25 +118,25 @@ pub(crate) fn record(stop: &crate::session_gate::SessionGate, options: &crate::p
             D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
             None, D3D11_SDK_VERSION, Some(&mut device), None, None,
         )
-    }, "Создание видеоустройства D3D11")?;
-    let device = device.ok_or_else(|| unavailable("D3D11 не вернул устройство"))?;
-    let context = stage(unsafe { device.GetImmediateContext() }, "Получение контекста D3D11")?;
-    let multithread: ID3D11Multithread = stage(context.cast(), "Защита общего контекста D3D11")?;
+    }, "Create the D3D11 video device")?;
+    let device = device.ok_or_else(|| unavailable("D3D11 did not return a device"))?;
+    let context = stage(unsafe { device.GetImmediateContext() }, "Get the D3D11 context")?;
+    let multithread: ID3D11Multithread = stage(context.cast(), "Protect the shared D3D11 context")?;
     // The async MFT and the converter can use the same immediate context.
     unsafe { multithread.SetMultithreadProtected(true) };
 
 
     let _media_foundation = MediaFoundation::initialize()?;
     let mut attributes = None;
-    stage(unsafe { MFCreateAttributes(&mut attributes, 1) }, "Создание фильтра кодировщика")?;
-    let attributes = attributes.ok_or_else(|| unavailable("Не получен фильтр кодировщика"))?;
+    stage(unsafe { MFCreateAttributes(&mut attributes, 1) }, "Create the encoder filter")?;
+    let attributes = attributes.ok_or_else(|| unavailable("Media Foundation did not return the encoder filter"))?;
     let luid = description.AdapterLuid;
     // Serialize the two 32-bit fields of the Windows LUID in ABI order.
     let mut luid_bytes = [0; 8];
     luid_bytes[..4].copy_from_slice(&luid.LowPart.to_le_bytes());
     luid_bytes[4..].copy_from_slice(&luid.HighPart.to_le_bytes());
     stage(unsafe { attributes.SetBlob(&MFT_ENUM_ADAPTER_LUID, &luid_bytes) },
-        "Привязка поиска кодировщика к адаптеру")?;
+        "Restrict encoder discovery to the display adapter")?;
     let input = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_NV12,
@@ -150,7 +150,7 @@ pub(crate) fn record(stop: &crate::session_gate::SessionGate, options: &crate::p
     stage(unsafe {
         MFTEnum2(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
             Some(&input), Some(&output), &attributes, &mut entries, &mut count)
-    }, "Поиск аппаратного кодировщика H.264")?;
+    }, "Find a hardware H.264 encoder")?;
     // On success Media Foundation transfers the array and each COM reference.
     let mut candidates = Vec::new();
     if !entries.is_null() {
@@ -160,7 +160,7 @@ pub(crate) fn record(stop: &crate::session_gate::SessionGate, options: &crate::p
         }
         unsafe { CoTaskMemFree(Some(entries.cast())) };
     }
-    let mut last_error = unavailable("На адаптере монитора не найден аппаратный NV12 → H.264");
+    let mut last_error = unavailable("No hardware NV12-to-H.264 encoder was found on the display adapter");
     let mut configured = None;
     for candidate in candidates {
         match configure_encoder(&candidate, &device) {
@@ -174,7 +174,7 @@ pub(crate) fn record(stop: &crate::session_gate::SessionGate, options: &crate::p
     let encoder = configured.ok_or(last_error)?;
     let rect = display.DesktopCoordinates;
     if (rect.right - rect.left, rect.bottom - rect.top) != (size.Width, size.Height) {
-        return Err(unavailable("Геометрия рабочего стола не совпадает с размером источника WGC"));
+        return Err(unavailable("Desktop geometry does not match the WGC source size"));
     }
     let geometry = mp4::Geometry {
         display_id: options.display_id.clone(),
@@ -187,16 +187,16 @@ pub(crate) fn record(stop: &crate::session_gate::SessionGate, options: &crate::p
     )?;
     encoder.finish()?;
     if count == 0 {
-        return Ok("Запись завершена до первого кадра.".into());
+        return Ok("Recording stopped before the first frame.".into());
     }
-    let recording = recording.ok_or_else(|| unavailable("Кодировщик не вернул образцы для MP4"))?;
-    let output = recording.finish(count, index.ok_or_else(|| unavailable("Индекс кадров отсутствует"))?)?;
-    let folder = output.parent().ok_or_else(|| unavailable("Каталог записи отсутствует"))?;
+    let recording = recording.ok_or_else(|| unavailable("The encoder did not produce samples for the MP4"))?;
+    let output = recording.finish(count, index.ok_or_else(|| unavailable("The frame index is missing"))?)?;
+    let folder = output.parent().ok_or_else(|| unavailable("The recording directory is missing"))?;
     export::run(folder, false).map_err(|error| mp4::io_error(
-        "Экспорт PNG",
-        std::io::Error::other(format!("{error}. Исходная запись сохранена: {}", output.display())),
+        "Export PNG images",
+        std::io::Error::other(format!("{error}. The original recording was saved to {}", output.display())),
     ))?;
-    Ok(format!("MP4, индекс и экспорт записаны. Кадров: {count}.\n{}", output.display()))
+    Ok(format!("MP4, index, and export saved. Frames: {count}.\n{}", output.display()))
 }
 
 pub(crate) fn export_session(folder: &std::path::Path) -> Result<std::path::PathBuf, ProbeError> {
@@ -214,21 +214,21 @@ fn capture_recording(
     options: &crate::platform::RecordingOptions,
     geometry: mp4::Geometry,
 ) -> Result<(usize, Option<mp4::Recording>, Option<mp4::FrameIndex>), ProbeError> {
-    let dxgi: IDXGIDevice = stage(device.cast(), "Получение устройства DXGI")?;
+    let dxgi: IDXGIDevice = stage(device.cast(), "Get the DXGI device")?;
     let winrt = stage(
         unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) },
-        "Создание устройства WinRT для захвата",
+        "Create the WinRT capture device",
     )?;
-    let winrt: IDirect3DDevice = stage(winrt.cast(), "Получение интерфейса WinRT D3D11")?;
+    let winrt: IDirect3DDevice = stage(winrt.cast(), "Get the WinRT D3D11 interface")?;
     let pool = stage(
         Direct3D11CaptureFramePool::CreateFreeThreaded(
             &winrt, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size,
         ),
-        "Создание пула кадров WGC",
+        "Create the WGC frame pool",
     )?;
     let result = gpu::Converter::new(device, size.Width, size.Height)
         .and_then(|mut converter| record_session(&pool, item, &mut converter, encoder, stop, options, geometry));
-    let close = stage(pool.Close(), "Закрытие пула кадров WGC");
+    let close = stage(pool.Close(), "Close the WGC frame pool");
     result.and_then(|frame| close.map(|()| frame))
 }
 
@@ -241,7 +241,7 @@ fn record_session(
     options: &crate::platform::RecordingOptions,
     geometry: mp4::Geometry,
 ) -> Result<(usize, Option<mp4::Recording>, Option<mp4::FrameIndex>), ProbeError> {
-    let session = stage(pool.CreateCaptureSession(item), "Создание сессии WGC")?;
+    let session = stage(pool.CreateCaptureSession(item), "Create the WGC session")?;
     let result = (|| {
         let mut frame_index = mp4::FrameIndex::create(&options.folder, geometry)?;
         let folder = frame_index.folder().to_path_buf();
@@ -251,7 +251,7 @@ fn record_session(
                 return Ok((0, None));
             }
             let wgc_start = i128::from(qpc) * 10_000_000 / i128::from(qpc_frequency);
-            stage(session.StartCapture(), "Запуск захвата WGC")?;
+            stage(session.StartCapture(), "Start WGC capture")?;
             let mut stop_offset = None;
             let mut observation_id = 0_u64;
             let mut previous: Option<(Arc<ID3D11Texture2D>, i64, u64)> = None;
@@ -271,18 +271,18 @@ fn record_session(
                             // observation and release the older lease before conversion.
                             match try_next_frame(pool) {
                                 Ok(Some(newer)) => {
-                                    stage(frame.Close(), "Возврат устаревшего кадра WGC")?;
+                                    stage(frame.Close(), "Release the older WGC frame")?;
                                     frame = newer;
                                 }
                                 Ok(None) => {}
                                 Err(error) => {
                                     let _ = frame.Close();
-                                    return stage(Err(error), "Получение следующего кадра WGC");
+                                    return stage(Err(error), "Get the next WGC frame");
                                 }
                             }
-                            let wgc_time = stage(frame.SystemRelativeTime(), "Чтение времени кадра WGC")?.Duration;
+                            let wgc_time = stage(frame.SystemRelativeTime(), "Read the WGC frame timestamp")?.Duration;
                             if i128::from(wgc_time) < wgc_start {
-                                stage(frame.Close(), "Возврат кадра WGC до Start")?;
+                                stage(frame.Close(), "Release the WGC frame captured before Start")?;
                                 if let Some(at) = stop.wait_until(Instant::now()) {
                                     return Ok(Err(at));
                                 }
@@ -291,15 +291,15 @@ fn record_session(
                             let at = match stop.admit() {
                                 Ok(at) => at,
                                 Err(at) => {
-                                    stage(frame.Close(), "Возврат кадра WGC после Stop")?;
+                                    stage(frame.Close(), "Release the WGC frame received after Stop")?;
                                     return Ok(Err(at));
                                 }
                             };
                             match inspect_frame(&frame, converter) {
                                 Ok(texture) => {
-                                    stage(frame.Close(), "Возврат кадра в пул WGC")?;
+                                    stage(frame.Close(), "Return the frame to the WGC pool")?;
                                     observation_id = observation_id.checked_add(1)
-                                        .ok_or_else(|| unavailable("Исчерпан счётчик наблюдений WGC"))?;
+                                        .ok_or_else(|| unavailable("The WGC observation counter overflowed"))?;
                                     previous = Some((texture.clone(), wgc_time, observation_id));
                                     return Ok(Ok((texture, wgc_time, observation_id, false, at)));
                                 }
@@ -316,13 +316,13 @@ fn record_session(
                                 return Ok(stop.admit().map(|at| (texture.clone(), *wgc_time, *id, true, at)));
                             }
                             if start.elapsed() >= Duration::from_secs(3) {
-                                return Err(unavailable("Первый кадр WGC не получен за 3 секунды"));
+                                return Err(unavailable("No WGC frame arrived within 3 seconds"));
                             }
                             if let Some(at) = stop.wait_until(Instant::now() + Duration::from_millis(10)) {
                                 return Ok(Err(at));
                             }
                         }
-                        Err(error) => return stage(Err(error), "Получение кадра WGC"),
+                        Err(error) => return stage(Err(error), "Get a WGC frame"),
                     }
                 }
             };
@@ -352,14 +352,14 @@ fn record_session(
                         }
                     };
                     let (texture, wgc_time_100ns, observation_id, repeated, at, end) = boundary;
-                    let origin = origin.ok_or_else(|| unavailable("Не задано начало шкалы видео"))?;
+                    let origin = origin.ok_or_else(|| unavailable("The video time origin is missing"))?;
                     let pts = video_ticks(at.saturating_duration_since(origin))?;
                     let end = video_ticks(end.saturating_duration_since(origin))?;
                     if end <= pts {
                         if stopped {
                             return Ok(None);
                         }
-                        return Err(unavailable("Временные метки видеокадров не возрастают"));
+                        return Err(unavailable("Video frame timestamps are not strictly increasing"));
                     }
                     index.push(&mp4::FrameTiming {
                             wgc_time_100ns, observation_id, repeated, pts_100ns: pts, duration_100ns: end - pts,
@@ -369,20 +369,20 @@ fn record_session(
                 }
             }, |index, encoder, sample| {
                 if recording.is_none() {
-                    let media_type = stage(unsafe { encoder.GetOutputCurrentType(0) }, "Чтение выходного формата H.264")?;
+                    let media_type = stage(unsafe { encoder.GetOutputCurrentType(0) }, "Read the H.264 output format")?;
                     let folder = index.folder();
                     recording = Some(mp4::Recording::open(&media_type, folder)?);
                 }
-                recording.as_ref().ok_or_else(|| unavailable("Не открыт MP4 writer"))?.write(sample)
+                recording.as_ref().ok_or_else(|| unavailable("The MP4 writer is not open"))?.write(sample)
             })?;
             if count != 0 {
-                let origin = origin.ok_or_else(|| unavailable("Не задано начало шкалы видео"))?;
+                let origin = origin.ok_or_else(|| unavailable("The video time origin is missing"))?;
                 frame_index.set_timeline(mp4::Timeline {
                     qpc_at_start: qpc,
                     qpc_frequency,
                     qpc_uncertainty_100ns,
                     video_origin_100ns: video_ticks(origin.saturating_duration_since(start))?,
-                    stop_100ns: stop_offset.ok_or_else(|| unavailable("Не зафиксирована граница Stop"))?,
+                    stop_100ns: stop_offset.ok_or_else(|| unavailable("The Stop boundary was not recorded"))?,
                 });
             }
             Ok((count, recording))
@@ -390,19 +390,19 @@ fn record_session(
         frame_index.set_event_count(event_count);
         Ok((count, recording, Some(frame_index)))
     })();
-    let stopped = stage(session.Close(), "Остановка сессии WGC");
+    let stopped = stage(session.Close(), "Stop the WGC session");
     result.and_then(|recording| stopped.map(|()| recording))
 }
 
 fn session_clock() -> Result<(Instant, i64, i64, i64), ProbeError> {
     let mut frequency = 0;
-    stage(unsafe { QueryPerformanceFrequency(&mut frequency) }, "Чтение частоты QPC")?;
+    stage(unsafe { QueryPerformanceFrequency(&mut frequency) }, "Read the QPC frequency")?;
     if frequency <= 0 {
-        return Err(unavailable("Недопустимая частота QPC"));
+        return Err(unavailable("Invalid QPC frequency"));
     }
     let mut counter = 0;
     let before = Instant::now();
-    stage(unsafe { QueryPerformanceCounter(&mut counter) }, "Чтение начала шкалы QPC")?;
+    stage(unsafe { QueryPerformanceCounter(&mut counter) }, "Read the QPC time origin")?;
     let after = Instant::now();
     let bracket = after.saturating_duration_since(before);
     let uncertainty = video_ticks(bracket)?.saturating_add(1);
@@ -411,7 +411,7 @@ fn session_clock() -> Result<(Instant, i64, i64, i64), ProbeError> {
 
 fn video_ticks(duration: Duration) -> Result<i64, ProbeError> {
     i64::try_from(duration.as_nanos() / 100)
-        .map_err(|_| unavailable("Длительность записи выходит за пределы шкалы MP4"))
+        .map_err(|_| unavailable("The recording duration exceeds the MP4 time range"))
 }
 
 fn try_next_frame(
@@ -430,19 +430,19 @@ fn inspect_frame(
     frame: &windows::Graphics::Capture::Direct3D11CaptureFrame,
     converter: &mut gpu::Converter<'_>,
 ) -> Result<Arc<ID3D11Texture2D>, ProbeError> {
-    let size = stage(frame.ContentSize(), "Чтение области кадра WGC")?;
-    let surface = stage(frame.Surface(), "Получение поверхности кадра WGC")?;
+    let size = stage(frame.ContentSize(), "Read the WGC frame bounds")?;
+    let surface = stage(frame.Surface(), "Get the WGC frame surface")?;
     let access: IDirect3DDxgiInterfaceAccess =
-        stage(surface.cast(), "Получение доступа DXGI к поверхности WGC")?;
+        stage(surface.cast(), "Get DXGI access to the WGC surface")?;
     let texture: ID3D11Texture2D =
-        stage(unsafe { access.GetInterface() }, "Получение текстуры D3D11")?;
+        stage(unsafe { access.GetInterface() }, "Get the D3D11 texture")?;
     let mut description = D3D11_TEXTURE2D_DESC::default();
     // The texture stays inside the lifetime of the WGC frame lease.
     unsafe { texture.GetDesc(&mut description) };
     if size.Width <= 0 || size.Height <= 0
         || size.Width as u32 > description.Width || size.Height as u32 > description.Height
     {
-        return Err(unavailable("Область кадра WGC выходит за пределы текстуры"));
+        return Err(unavailable("The WGC frame bounds exceed the texture dimensions"));
     }
     converter.convert(&texture, size.Width, size.Height)
 }
@@ -457,7 +457,7 @@ struct Encoder {
 impl Encoder {
     fn finish(mut self) -> Result<(), ProbeError> {
         self.shutdown_attempted = true;
-        stage(unsafe { self.activation.ShutdownObject() }, "Освобождение кодировщика")
+        stage(unsafe { self.activation.ShutdownObject() }, "Release the encoder")
     }
 }
 
@@ -474,14 +474,14 @@ fn configure_encoder(candidate: &IMFActivate, device: &ID3D11Device) -> Result<E
     let mut manager = None;
     stage(
         unsafe { MFCreateDXGIDeviceManager(&mut token, &mut manager) },
-        "Создание диспетчера DXGI",
+        "Create the DXGI device manager",
     )?;
-    let manager = manager.ok_or_else(|| unavailable("Не получен диспетчер DXGI"))?;
-    stage(unsafe { manager.ResetDevice(device, token) }, "Подключение устройства D3D11")?;
+    let manager = manager.ok_or_else(|| unavailable("Media Foundation did not return a DXGI device manager"))?;
+    stage(unsafe { manager.ResetDevice(device, token) }, "Attach the D3D11 device")?;
 
     let encoder: IMFTransform = stage(
         unsafe { candidate.ActivateObject() },
-        "Активация аппаратного H.264",
+        "Activate the hardware H.264 encoder",
     )?;
     let encoder = Encoder {
         transform: encoder,
@@ -497,41 +497,41 @@ fn negotiate_encoder(
     encoder: &IMFTransform,
     manager: &IMFDXGIDeviceManager,
 ) -> Result<(), ProbeError> {
-    let attributes = stage(unsafe { encoder.GetAttributes() }, "Чтение свойств кодировщика")?;
+    let attributes = stage(unsafe { encoder.GetAttributes() }, "Read encoder properties")?;
     let async_enabled = stage(
         unsafe { attributes.GetUINT32(&MF_TRANSFORM_ASYNC) },
-        "Проверка асинхронного аппаратного кодировщика",
+        "Check for asynchronous hardware encoding",
     )?;
     if async_enabled == 0 {
-        return Err(unavailable("Кодировщик не поддерживает асинхронный режим"));
+        return Err(unavailable("The encoder does not support asynchronous operation"));
     }
     stage(
         unsafe { attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) },
-        "Разблокировка асинхронного кодировщика",
+        "Unlock the asynchronous encoder",
     )?;
     let d3d11_aware = stage(
         unsafe { attributes.GetUINT32(&MF_SA_D3D11_AWARE) },
-        "Проверка поддержки D3D11 кодировщиком",
+        "Check encoder support for D3D11",
     )?;
     if d3d11_aware == 0 {
-        return Err(unavailable("Кодировщик не принимает устройство D3D11"));
+        return Err(unavailable("The encoder does not accept a D3D11 device"));
     }
     // The manager remains alive through negotiation and encoder shutdown.
     stage(
         unsafe { encoder.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize) },
-        "Передача устройства D3D11 кодировщику",
+        "Pass the D3D11 device to the encoder",
     )?;
 
     let output = video_type(&MFVideoFormat_H264)?;
-    stage(unsafe { output.SetUINT32(&MF_MT_AVG_BITRATE, 8_000_000) }, "Настройка битрейта H.264")?;
-    stage(unsafe { output.SetUINT32(&MF_MT_MPEG2_PROFILE, 77) }, "Настройка профиля H.264 Main")?;
-    stage(unsafe { encoder.SetOutputType(0, &output, 0) }, "Согласование выхода H.264")?;
+    stage(unsafe { output.SetUINT32(&MF_MT_AVG_BITRATE, 8_000_000) }, "Set the H.264 bitrate")?;
+    stage(unsafe { output.SetUINT32(&MF_MT_MPEG2_PROFILE, 77) }, "Set the H.264 Main profile")?;
+    stage(unsafe { encoder.SetOutputType(0, &output, 0) }, "Negotiate H.264 output")?;
     let input = video_type(&MFVideoFormat_NV12)?;
-    stage(unsafe { encoder.SetInputType(0, &input, 0) }, "Согласование входа NV12")
+    stage(unsafe { encoder.SetInputType(0, &input, 0) }, "Negotiate NV12 input")
 }
 
 fn video_type(subtype: &core::GUID) -> Result<IMFMediaType, ProbeError> {
-    let media_type = stage(unsafe { MFCreateMediaType() }, "Создание формата видео")?;
+    let media_type = stage(unsafe { MFCreateMediaType() }, "Create the video media type")?;
     // Media Foundation packs the first UINT32 into the high half.
     stage((|| unsafe {
         media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -540,7 +540,7 @@ fn video_type(subtype: &core::GUID) -> Result<IMFMediaType, ProbeError> {
         media_type.SetUINT64(&MF_MT_FRAME_RATE, (30_u64 << 32) | 1)?;
         media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1_u64 << 32) | 1)?;
         media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
-    })(), "Настройка формата 1080p30")?;
+    })(), "Configure the 1080p30 format")?;
     Ok(media_type)
 }
 
@@ -560,18 +560,18 @@ fn display_id(display: &DXGI_OUTPUT_DESC) -> String {
 
 fn outputs() -> Result<Vec<(IDXGIAdapter1, DXGI_OUTPUT_DESC)>, ProbeError> {
     let mut outputs = Vec::new();
-    let factory: IDXGIFactory1 = stage(unsafe { CreateDXGIFactory1() }, "Открытие DXGI")?;
+    let factory: IDXGIFactory1 = stage(unsafe { CreateDXGIFactory1() }, "Open DXGI")?;
     for adapter_index in 0.. {
         let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
             Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
-            result => stage(result, "Перечисление адаптеров DXGI")?,
+            result => stage(result, "Enumerate DXGI adapters")?,
         };
         for output_index in 0.. {
             let output = match unsafe { adapter.EnumOutputs(output_index) } {
                 Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
-                result => stage(result, "Перечисление мониторов DXGI")?,
+                result => stage(result, "Enumerate DXGI displays")?,
             };
-            let description = stage(unsafe { output.GetDesc() }, "Чтение монитора DXGI")?;
+            let description = stage(unsafe { output.GetDesc() }, "Read the DXGI display description")?;
             if description.AttachedToDesktop.as_bool() && !description.Monitor.0.is_null() {
                 outputs.push((adapter.clone(), description));
             }

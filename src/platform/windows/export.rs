@@ -14,24 +14,24 @@ use super::{ProbeError, mp4::{FrameTiming, Geometry, Manifest, io_error}, stage,
 pub(super) fn run(folder: &Path, repeat: bool) -> Result<PathBuf, ProbeError> {
     let video = folder.join("video.mp4");
     let manifest: Manifest = serde_json::from_reader(BufReader::new(open(&folder.join("manifest.json"))?))
-        .map_err(|error| io_error("Чтение манифеста для экспорта", error.into()))?;
+        .map_err(|error| io_error("Read the manifest for export", error.into()))?;
     if manifest.version != 2 {
-        return Err(unavailable("Версия манифеста не поддерживается экспортом"));
+        return Err(unavailable("The manifest version is not supported for export"));
     }
     if !video.is_file() {
-        return Err(unavailable("В закрытой сессии отсутствует video.mp4"));
+        return Err(unavailable("The completed session does not contain video.mp4"));
     }
     let clock = manifest.timeline;
     let geometry = manifest.geometry;
     if clock.qpc_frequency <= 0 {
-        return Err(unavailable("Недопустимая частота QPC в манифесте"));
+        return Err(unavailable("The manifest contains an invalid QPC frequency"));
     }
     let start = i128::from(clock.qpc_at_start) * 10_000_000 / i128::from(clock.qpc_frequency);
     let mut frames = Vec::new();
     let mut presented = Vec::new();
     let mut original_pts = BTreeMap::new();
     for line in BufReader::new(open(&folder.join("frames.jsonl"))?).lines() {
-        let frame: FrameTiming = parse(&line.map_err(|error| io_error("Чтение индекса кадров", error))?)?;
+        let frame: FrameTiming = parse(&line.map_err(|error| io_error("Read the frame index", error))?)?;
         if !frame.repeated {
             original_pts.insert(frame.observation_id, frame.pts_100ns);
             frames.push((i128::from(frame.wgc_time_100ns) - start, frame.pts_100ns, frame.observation_id));
@@ -51,20 +51,20 @@ pub(super) fn run(folder: &Path, repeat: bool) -> Result<PathBuf, ProbeError> {
     }
 
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)
-        .map_err(|_| unavailable("Системные часы не позволяют назвать каталог экспорта"))?;
+        .map_err(|_| unavailable("The system clock could not supply an export directory timestamp"))?;
     let suffix = format!("{}-{}", std::process::id(), timestamp.as_nanos());
     let pending = folder.join(format!("export-{suffix}.pending"));
     let destination = if repeat { folder.join(format!("export-{suffix}")) } else { folder.join("export") };
-    fs::create_dir(&pending).map_err(|error| io_error("Создание каталога экспорта", error))?;
+    fs::create_dir(&pending).map_err(|error| io_error("Create the export directory", error))?;
     let mut selected = BTreeSet::new();
     let mut gestures = BufWriter::new(create(&pending.join("drags.jsonl"))?);
     let mut tracker = super::drag::Tracker::default();
     let mut mappings = BufWriter::new(create(&pending.join("events.jsonl"))?);
     for line in BufReader::new(open(&folder.join("events.jsonl"))?).lines() {
-        let event: serde_json::Value = parse(&line.map_err(|error| io_error("Чтение события экспорта", error))?)?;
+        let event: serde_json::Value = parse(&line.map_err(|error| io_error("Read an event for export", error))?)?;
         if event["kind"] == "mouse" {
             let mouse: super::drag::MouseEvent = serde_json::from_value(event.clone())
-                .map_err(|error| io_error("Разбор события мыши", error.into()))?;
+                .map_err(|error| io_error("Parse the mouse event", error.into()))?;
             for gesture in tracker.observe(&mouse) {
                 write_gesture(&mut gestures, gesture, &frames, &mut selected)?;
             }
@@ -73,7 +73,7 @@ pub(super) fn run(folder: &Path, repeat: bool) -> Result<PathBuf, ProbeError> {
             }
         }
         let at = event["admitted_100ns"].as_i64()
-            .ok_or_else(|| unavailable("В событии отсутствует метка допуска"))?;
+            .ok_or_else(|| unavailable("The event is missing its admission timestamp"))?;
         let at = i128::from(at);
         let (before, after) = frame_links(&frames, at, at, &mut selected);
         let shown = presented.partition_point(|sample| sample.0 <= at)
@@ -81,7 +81,7 @@ pub(super) fn run(folder: &Path, repeat: bool) -> Result<PathBuf, ProbeError> {
             .filter(|sample| at < sample.1);
         let shown = if let Some((begin, end, sample)) = shown {
             let image_pts = *original_pts.get(&sample.observation_id)
-                .ok_or_else(|| unavailable("У образца MP4 нет исходного наблюдения"))?;
+                .ok_or_else(|| unavailable("The MP4 sample has no source observation"))?;
             selected.insert(image_pts);
             serde_json::json!({
                 "image": image_name(image_pts),
@@ -102,20 +102,20 @@ pub(super) fn run(folder: &Path, repeat: bool) -> Result<PathBuf, ProbeError> {
             row["cursor_video"] = cursor_video(&event, geometry.as_ref());
         }
         serde_json::to_writer(&mut mappings, &row)
-            .map_err(|error| io_error("Запись соответствий экспорта", error.into()))?;
-        mappings.write_all(b"\n").map_err(|error| io_error("Запись соответствий экспорта", error))?;
+            .map_err(|error| io_error("Write the export frame mappings", error.into()))?;
+        mappings.write_all(b"\n").map_err(|error| io_error("Write the export frame mappings", error))?;
     }
     for gesture in tracker.finish(clock.stop_100ns) {
         write_gesture(&mut gestures, gesture, &frames, &mut selected)?;
     }
-    gestures.flush().map_err(|error| io_error("Закрытие журнала перетаскиваний", error))?;
+    gestures.flush().map_err(|error| io_error("Close the drag interval log", error))?;
     drop(gestures);
-    mappings.flush().map_err(|error| io_error("Закрытие индекса экспорта", error))?;
+    mappings.flush().map_err(|error| io_error("Close the export index", error))?;
     drop(mappings);
     if !selected.is_empty() {
         decode(&video, &pending, selected)?;
     }
-    fs::rename(pending, &destination).map_err(|error| io_error("Публикация экспорта", error))?;
+    fs::rename(pending, &destination).map_err(|error| io_error("Publish the export", error))?;
     Ok(destination)
 }
 
@@ -164,8 +164,8 @@ fn write_gesture(
     );
     let row = serde_json::json!({"gesture": gesture, "before": before, "after": after});
     serde_json::to_writer(&mut *writer, &row)
-        .map_err(|error| io_error("Запись интервала перетаскивания", error.into()))?;
-    writer.write_all(b"\n").map_err(|error| io_error("Запись интервала перетаскивания", error))
+        .map_err(|error| io_error("Write the drag interval", error.into()))?;
+    writer.write_all(b"\n").map_err(|error| io_error("Write the drag interval", error))
 }
 
 fn image_name(pts: i64) -> String {
@@ -173,52 +173,52 @@ fn image_name(pts: i64) -> String {
 }
 
 fn open(path: &Path) -> Result<File, ProbeError> {
-    File::open(path).map_err(|error| io_error("Открытие файла экспорта", error))
+    File::open(path).map_err(|error| io_error("Open an export file", error))
 }
 
 fn create(path: &Path) -> Result<File, ProbeError> {
-    File::create(path).map_err(|error| io_error("Создание файла экспорта", error))
+    File::create(path).map_err(|error| io_error("Create an export file", error))
 }
 
 fn parse<T: serde::de::DeserializeOwned>(line: &str) -> Result<T, ProbeError> {
-    serde_json::from_str(line).map_err(|error| io_error("Разбор JSONL для экспорта", error.into()))
+    serde_json::from_str(line).map_err(|error| io_error("Parse JSONL for export", error.into()))
 }
 
 fn decode(video: &Path, folder: &Path, mut selected: BTreeSet<i64>) -> Result<(), ProbeError> {
     let mut attributes = None;
-    stage(unsafe { MFCreateAttributes(&mut attributes, 1) }, "Создание настроек экспорта")?;
-    let attributes = attributes.ok_or_else(|| unavailable("Не получены настройки экспорта"))?;
-    stage(unsafe { attributes.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1) }, "Включение RGB для экспорта")?;
+    stage(unsafe { MFCreateAttributes(&mut attributes, 1) }, "Create the export settings")?;
+    let attributes = attributes.ok_or_else(|| unavailable("Media Foundation did not return export settings"))?;
+    stage(unsafe { attributes.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1) }, "Enable RGB processing for export")?;
     let filename: Vec<u16> = video.as_os_str().encode_wide().chain([0]).collect();
     let reader = stage(
         unsafe { MFCreateSourceReaderFromURL(PCWSTR(filename.as_ptr()), &attributes) },
-        "Открытие MP4 для экспорта",
+        "Open the MP4 for export",
     )?;
-    let output = stage(unsafe { MFCreateMediaType() }, "Создание формата RGB32")?;
-    stage(unsafe { output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video) }, "Выбор видео для экспорта")?;
-    stage(unsafe { output.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32) }, "Выбор RGB32 для экспорта")?;
-    stage(unsafe { reader.SetCurrentMediaType(0, None, &output) }, "Настройка декодирования RGB32")?;
-    let media_type = stage(unsafe { reader.GetCurrentMediaType(0) }, "Чтение формата кадров экспорта")?;
-    let size = stage(unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE) }, "Чтение размера кадров экспорта")?;
+    let output = stage(unsafe { MFCreateMediaType() }, "Create the RGB32 media type")?;
+    stage(unsafe { output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video) }, "Select video for export")?;
+    stage(unsafe { output.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32) }, "Select RGB32 for export")?;
+    stage(unsafe { reader.SetCurrentMediaType(0, None, &output) }, "Configure RGB32 decoding")?;
+    let media_type = stage(unsafe { reader.GetCurrentMediaType(0) }, "Read the export frame format")?;
+    let size = stage(unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE) }, "Read the export frame dimensions")?;
     let width = (size >> 32) as u32;
     let height = size as u32;
     if (width, height) != (super::gpu::WIDTH, super::gpu::HEIGHT) {
-        return Err(unavailable("Размер декодированного кадра не соответствует профилю"));
+        return Err(unavailable("The decoded frame size does not match the recording profile"));
     }
     let stride = match unsafe { media_type.GetUINT32(&MF_MT_DEFAULT_STRIDE) } {
         Ok(stride) => stride as i32,
         Err(_) => stage(
             unsafe { MFGetStrideForBitmapInfoHeader(MFVideoFormat_RGB32.data1, width) },
-            "Определение шага строк RGB32",
+            "Determine the RGB32 row stride",
         )?,
     };
     while !selected.is_empty() {
         let (mut pts, mut flags, mut sample) = (0, 0, None);
         stage(unsafe {
             reader.ReadSample(0, 0, None, Some(&mut flags), Some(&mut pts), Some(&mut sample))
-        }, "Декодирование кадра для PNG")?;
+        }, "Decode a frame for PNG export")?;
         if flags & MF_SOURCE_READERF_ERROR.0 as u32 != 0 {
-            return Err(unavailable("Ошибка декодирования при экспорте PNG"));
+            return Err(unavailable("Decoding failed during PNG export"));
         }
         if let Some(sample) = sample {
             if selected.remove(&pts) {
@@ -227,30 +227,30 @@ fn decode(video: &Path, folder: &Path, mut selected: BTreeSet<i64>) -> Result<()
             }
         }
         if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 && !selected.is_empty() {
-            return Err(unavailable("В MP4 отсутствуют выбранные для экспорта кадры"));
+            return Err(unavailable("The MP4 is missing frames selected for export"));
         }
     }
     Ok(())
 }
 
 fn save_png(path: &Path, sample: &IMFSample, width: u32, height: u32, stride: i32) -> Result<(), ProbeError> {
-    let buffer = stage(unsafe { sample.ConvertToContiguousBuffer() }, "Получение буфера RGB32")?;
+    let buffer = stage(unsafe { sample.ConvertToContiguousBuffer() }, "Get the RGB32 buffer")?;
     let rgb = if let Ok(layout) = buffer.cast::<IMF2DBuffer2>() {
         let (mut scanline, mut pitch, mut base, mut length) =
             (std::ptr::null_mut(), 0, std::ptr::null_mut(), 0);
         stage(unsafe {
             layout.Lock2DSize(MF2DBuffer_LockFlags_Read, &mut scanline, &mut pitch, &mut base, &mut length)
-        }, "Чтение двумерного буфера RGB32")?;
+        }, "Read the two-dimensional RGB32 buffer")?;
         let first_row = scanline.addr().checked_sub(base.addr());
         let rgb = first_row.and_then(|first_row| {
             // The locked allocation and actual pitch are supplied by Media Foundation.
             unsafe { copy_rgb(base, length as usize, first_row, pitch, width, height) }
         });
-        stage(unsafe { layout.Unlock2D() }, "Освобождение двумерного буфера RGB32")?;
+        stage(unsafe { layout.Unlock2D() }, "Unlock the two-dimensional RGB32 buffer")?;
         rgb
     } else {
         let (mut data, mut length) = (std::ptr::null_mut(), 0);
-        stage(unsafe { buffer.Lock(&mut data, None, Some(&mut length)) }, "Чтение линейного буфера RGB32")?;
+        stage(unsafe { buffer.Lock(&mut data, None, Some(&mut length)) }, "Read the linear RGB32 buffer")?;
         let first_row = if stride < 0 {
             (stride.unsigned_abs() as usize).checked_mul(height as usize - 1)
         } else {
@@ -260,17 +260,17 @@ fn save_png(path: &Path, sample: &IMFSample, width: u32, height: u32, stride: i3
             // Lock provides a contiguous allocation and its valid byte count.
             unsafe { copy_rgb(data, length as usize, first_row, stride, width, height) }
         });
-        stage(unsafe { buffer.Unlock() }, "Освобождение линейного буфера RGB32")?;
+        stage(unsafe { buffer.Unlock() }, "Unlock the linear RGB32 buffer")?;
         rgb
     };
-    let rgb = rgb.ok_or_else(|| unavailable("Неполный или некорректный буфер RGB32"))?;
+    let rgb = rgb.ok_or_else(|| unavailable("Incomplete or invalid RGB32 buffer"))?;
     let mut encoder = png::Encoder::new(BufWriter::new(create(path)?), width, height);
     encoder.set_color(png::ColorType::Rgb);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header()
-        .map_err(|error| io_error("Создание PNG", std::io::Error::other(error)))?;
+        .map_err(|error| io_error("Create the PNG", std::io::Error::other(error)))?;
     writer.write_image_data(&rgb).and_then(|()| writer.finish())
-        .map_err(|error| io_error("Запись PNG", std::io::Error::other(error)))
+        .map_err(|error| io_error("Write the PNG", std::io::Error::other(error)))
 }
 
 

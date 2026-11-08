@@ -35,7 +35,7 @@ impl ForegroundHook {
             )
         };
         if hook.0.is_null() {
-            return Err(unavailable("Не удалось подписаться на смену активного окна"));
+            return Err(unavailable("Could not subscribe to foreground window changes"));
         }
         Ok(Self(hook))
     }
@@ -47,7 +47,7 @@ impl ForegroundHook {
     pub(super) fn next(&self) -> Result<Option<Observation>, ProbeError> {
         PENDING.with(|pending| {
             pending.borrow_mut().as_mut().map(VecDeque::pop_front)
-                .ok_or_else(|| unavailable("Очередь смены активных окон переполнена"))
+                .ok_or_else(|| unavailable("The foreground window event queue is full"))
         })
     }
 }

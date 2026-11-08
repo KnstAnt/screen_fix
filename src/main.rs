@@ -21,7 +21,7 @@ fn main() -> std::process::ExitCode {
                 }
             }
         }
-        eprintln!("Использование: screen-fix --export <каталог завершённой сессии>");
+        eprintln!("Usage: screen-fix --export <completed-session-directory>");
         return std::process::ExitCode::FAILURE;
     }
 
@@ -37,7 +37,7 @@ fn main() -> std::process::ExitCode {
     ) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{}", app::report_error(format!("Не удалось открыть интерфейс: {error}")));
+            eprintln!("{}", app::report_error(format!("Could not open the interface: {error}")));
             std::process::ExitCode::FAILURE
         }
     }

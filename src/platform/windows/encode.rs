@@ -14,7 +14,7 @@ pub(super) fn record<S>(
     mut output: impl FnMut(&mut S, &IMFTransform, &IMFSample) -> Result<(), ProbeError>,
 ) -> Result<usize, ProbeError> {
     let events: IMFMediaEventGenerator =
-        stage(encoder.cast(), "Получение событий аппаратного кодировщика")?;
+        stage(encoder.cast(), "Get hardware encoder events")?;
     message(encoder, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING)?;
     message(encoder, MFT_MESSAGE_NOTIFY_START_OF_STREAM)?;
     let mut deadline = Instant::now() + Duration::from_secs(5);
@@ -22,23 +22,23 @@ pub(super) fn record<S>(
     let mut draining = false;
     loop {
         if Instant::now() >= deadline {
-            return Err(unavailable("Кодировщик не завершил обработку кадра за 5 секунд"));
+            return Err(unavailable("The encoder did not finish processing a frame within 5 seconds"));
         }
         let event = match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
             Err(error) if error.code() == MF_E_NO_EVENTS_AVAILABLE => {
                 thread::sleep(Duration::from_millis(1));
                 continue;
             }
-            result => stage(result, "Получение события кодировщика")?,
+            result => stage(result, "Get an encoder event")?,
         };
-        let status = stage(unsafe { event.GetStatus() }, "Чтение статуса события кодировщика")?;
-        stage(status.ok(), "Ошибка обработки в аппаратном кодировщике")?;
-        let kind = stage(unsafe { event.GetType() }, "Чтение типа события кодировщика")?;
+        let status = stage(unsafe { event.GetStatus() }, "Read the encoder event status")?;
+        stage(status.ok(), "Hardware encoder processing failed")?;
+        let kind = stage(unsafe { event.GetType() }, "Read the encoder event type")?;
         deadline = Instant::now() + Duration::from_secs(5);
         if kind == METransformNeedInput.0 as u32 && !draining {
             if let Some((texture, pts, duration)) = next_frame(state)? {
                 let sample = input_sample(texture, pts, duration)?;
-                stage(unsafe { encoder.ProcessInput(0, &sample, 0) }, "Подача GPU-кадра кодировщику")?;
+                stage(unsafe { encoder.ProcessInput(0, &sample, 0) }, "Submit a GPU frame to the encoder")?;
                 submitted += 1;
             } else {
                 draining = true;
@@ -48,7 +48,7 @@ pub(super) fn record<S>(
             deadline = Instant::now() + Duration::from_secs(5);
         } else if kind == METransformHaveOutput.0 as u32 {
             if let Some(sample) = read_output(encoder)? {
-                if stage(unsafe { sample.GetTotalLength() }, "Чтение размера образца H.264")? != 0 {
+                if stage(unsafe { sample.GetTotalLength() }, "Read the H.264 sample size")? != 0 {
                     output(state, encoder, &sample)?;
                 }
             }
@@ -64,18 +64,18 @@ fn input_sample(texture: Arc<ID3D11Texture2D>, pts: i64, duration: i64) -> Resul
     // The sample owns a reference to the GPU texture. No texture is overwritten.
     let buffer = stage(
         unsafe { MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, texture.as_ref(), 0, false) },
-        "Создание буфера Media Foundation для NV12",
+        "Create the Media Foundation NV12 buffer",
     )?;
-    let layout: IMF2DBuffer = stage(buffer.cast(), "Получение раскладки NV12-буфера")?;
-    let length = stage(unsafe { layout.GetContiguousLength() }, "Чтение размера NV12-буфера")?;
-    stage(unsafe { buffer.SetCurrentLength(length) }, "Установка размера NV12-буфера")?;
-    let tracked = stage(unsafe { MFCreateTrackedSample() }, "Создание отслеживаемого образца NV12")?;
-    let sample: IMFSample = stage(tracked.cast(), "Получение образца NV12")?;
-    stage(unsafe { sample.AddBuffer(&buffer) }, "Подключение NV12 к образцу")?;
-    stage(unsafe { sample.SetSampleTime(pts) }, "Установка метки образца")?;
-    stage(unsafe { sample.SetSampleDuration(duration) }, "Установка длительности образца")?;
+    let layout: IMF2DBuffer = stage(buffer.cast(), "Get the NV12 buffer layout")?;
+    let length = stage(unsafe { layout.GetContiguousLength() }, "Read the NV12 buffer size")?;
+    stage(unsafe { buffer.SetCurrentLength(length) }, "Set the NV12 buffer size")?;
+    let tracked = stage(unsafe { MFCreateTrackedSample() }, "Create a tracked NV12 sample")?;
+    let sample: IMFSample = stage(tracked.cast(), "Get the NV12 sample")?;
+    stage(unsafe { sample.AddBuffer(&buffer) }, "Attach the NV12 buffer to the sample")?;
+    stage(unsafe { sample.SetSampleTime(pts) }, "Set the sample timestamp")?;
+    stage(unsafe { sample.SetSampleDuration(duration) }, "Set the sample duration")?;
     let release: IMFAsyncCallback = ReleaseTexture { texture: Mutex::new(Some(texture)) }.into();
-    stage(unsafe { tracked.SetAllocator(&release, None) }, "Регистрация возврата текстуры NV12")?;
+    stage(unsafe { tracked.SetAllocator(&release, None) }, "Register the NV12 texture release callback")?;
     Ok(sample)
 }
 
@@ -97,7 +97,7 @@ impl IMFAsyncCallback_Impl for ReleaseTexture_Impl {
 }
 
 fn message(encoder: &IMFTransform, message: MFT_MESSAGE_TYPE) -> Result<(), ProbeError> {
-    stage(unsafe { encoder.ProcessMessage(message, 0) }, "Управление потоком аппаратного кодировщика")
+    stage(unsafe { encoder.ProcessMessage(message, 0) }, "Control the hardware encoder stream")
 }
 
 fn read_output(encoder: &IMFTransform) -> Result<Option<IMFSample>, ProbeError> {
@@ -108,6 +108,6 @@ fn read_output(encoder: &IMFTransform) -> Result<Option<IMFSample>, ProbeError> 
     let result = unsafe { encoder.ProcessOutput(0, std::slice::from_mut(&mut output), &mut status) };
     let sample = ManuallyDrop::into_inner(output.pSample);
     drop(ManuallyDrop::into_inner(output.pEvents));
-    stage(result, "Чтение закодированного H.264")?;
+    stage(result, "Read encoded H.264 output")?;
     Ok(sample)
 }

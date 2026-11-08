@@ -1,90 +1,64 @@
 # screen_fix
 
-На Windows кнопки «Начать запись» и «Остановить запись» управляют
-записью выбранного монитора. Перед Start выберите дисплей и укажите путь
-к существующему каталогу. Видео кодируется аппаратным
-H.264 и пишется в MP4 по мере поступления закодированных образцов.
+Record a Windows display and its input events for an AI training dataset.
+Windows recording requires Windows 10 version 1903 or later and compatible
+D3D11 hardware H.264 encoding. The Linux and macOS builds provide the UI shell.
 
-## Цели сборки
+## Build and record
 
-- Windows x64 — `cargo build --release --target x86_64-pc-windows-msvc`
-- Linux x64 — `cargo build --release --target x86_64-unknown-linux-gnu`
-- macOS Apple Silicon — `cargo build --release --target aarch64-apple-darwin`
+On Windows x64, with the Rust MSVC toolchain and Windows build tools installed:
 
-Выбирайте цель Cargo и соответствующий toolchain, SDK и системные библиотеки.
-Модуль платформы выбирается через `cfg(target_os)`; Cargo features eframe
-включают Glow и шрифты, а X11 и Wayland подключаются только для Linux.
-Общий интерфейс и диагностика не импортируют Win32.
-
-Linux и macOS пока имеют интерфейс без реализации видеозахвата.
-Используется фиксированный профиль 1920×1080, 30 кадр/с, с повтором
-последней текстуры при отсутствии нового наблюдения WGC. PTS отражают монотонное время допуска кадров перед GPU-конвертацией, относительно
-первого принятого кадра. Код удерживает один кадр для расчёта длительности
-до следующего кадра или Stop. Допуск готового кадра и метка Stop
-упорядочены одним шлюзом. Пропущенные слоты не догоняются. frames.jsonl хранит исходное время WGC, отметку повтора, PTS и длительность
-из закрытого MP4 в единицах 100 нс. Проверка сопоставляет каждый кадр
-с поданным образцом с допуском 1 мс. Видеопроцессор D3D11 и fence создаются на сессию. Пул вмещает до 16
-NV12-текстур. Текстура возвращается в оборот после освобождения
-кодировщиком и владельцами наблюдения. Исчерпание пула завершает запись
-с диагностикой. Изменение размеров источника
-завершает запись с диагностикой. После Stop приложение дренирует кодировщик,
-финализирует MP4 и проверяет количество и возрастание PTS декодированных кадров перед публикацией
-пути к файлу в выбранном каталоге. Эта проверка может занять время.
-Манифест содержит геометрию рабочего стола и размеры видео. Координаты
-внутри desktop_rect переводятся в видео вычитанием левой и верхней границ
-и масштабированием на video_size по каждой оси. Экспорт записывает
-результат в cursor_video или причину отсутствия координат. Start открывает допуск
-после подготовки источников и регистрации Raw Input.
-Сборку и запуск этого инкремента не проводили.
-
-Закрытая сессия публикует manifest.json после MP4 и frames.jsonl.
-Манифест хранит смещение начала видео и границу Stop относительно начала
-сессии в единицах 100 нс. Для сопоставления с исходным временем WGC
-сохранены QPC-якорь начала, частота и консервативная погрешность замера.
-В индексе admitted_100ns измеряется от начала сессии, а pts_100ns —
-от начала видео. Технический повтор сохраняет observation_id и время
-WGC исходного наблюдения. При экспорте конец покрытия ограничивается
-stop_100ns даже при округлении меток в контейнере.
-
-
-events.jsonl содержит исходные коды клавиатуры, пакеты мыши и физические
-координаты курсора, наблюдённые при чтении. Шкала admitted_100ns совпадает
-со шкалой допуска видео. Ввод и запись журнала работают в разных потоках,
-очередь ограничена 4096 событиями. Переполнение завершает сессию с ошибкой.
-Манифест публикуется после закрытия журнала и содержит число событий.
-
-
-События foreground_window включают начальный фокус и уведомления WinEvent
-о переключениях. Имя процесса и заголовок наблюдаются при чтении и могут
-отсутствовать. Полный путь к исполняемому файлу не сохраняется.
-
-
-Текст буфера обмена записывается только при включении флажка перед Start.
-Флажок сбрасывается после запуска сессии. Уведомление хранится отдельно
-от результата чтения текста. При изменении версии или недоступности
-данных сохраняется причина. Для текста действует лимит 128 КиБ на блок.
-Уведомление об изменении буфера само по себе не означает вставку.
-
-
-После Stop каталог export содержит events.jsonl со ссылками на ближайшие
-сохранённые реальные наблюдения WGC строго до и после события либо причинами
-их отсутствия. PNG кодируются крейтом png после завершения записи. События
-мыши без кнопок или прокрутки остаются только в исходном журнале. Поле presented указывает на реально показанный образец MP4, включая
-технические повторы. Интервал показанного состояния полуоткрытый и
-обрезан по Stop. Файл export/drags.jsonl хранит границы перетаскиваний на шкале сессии,
-ссылки на исходные события и крайние PNG. Полный жест требует движения
-при удерживаемой кнопке. Отпускание без зафиксированного нажатия
-помечается missing_start с movement_confirmed=false, а жест с движением без отпускания — missing_end.
-Интервал ограничен Start/Stop при отсутствующей границе.
-
-
-Повторный экспорт на Windows:
-
-```text
-screen-fix --export "<каталог завершённой сессии>"
+```powershell
+cargo build --release --target x86_64-pc-windows-msvc
+.\target\x86_64-pc-windows-msvc\release\screen-fix.exe
 ```
 
-Команда читает исходный пакет с manifest.json версии 2 и печатает путь
-к новому каталогу export-<идентификатор>. Исходный пакет и предыдущие
-выгрузки не меняются. Каталог с суффиксом .pending не считается готовой
-выгрузкой и не мешает следующему запуску.
+Select a display and use **Browse…** to choose an existing output directory,
+or paste the path. Click **Start recording**, then **Stop recording** to close
+the session. The recorder creates a new subdirectory for each session and
+displays the saved video path when export completes.
+
+Keyboard and mouse data are recorded locally. Enable **Save clipboard text**
+before Start if needed. The option resets when a session starts. Clipboard
+text is limited to 128 KiB per block. Delayed clipboard reads may extend Stop.
+On failure, the app shows diagnostics and attempts to write a local report.
+
+For the UI shell, build with `x86_64-unknown-linux-gnu` or
+`aarch64-apple-darwin` and the corresponding SDK and system libraries.
+
+## Session output
+
+| File | Contents |
+|---|---|
+| `video.mp4` | Finalized H.264 recording |
+| `frames.jsonl` | WGC observation time, admission time, and verified video PTS and duration |
+| `events.jsonl` | Raw input and foreground context, plus clipboard changes when enabled |
+| `manifest.json` | Completion marker, package index, display geometry, counts, and timeline |
+| `export/events.jsonl` | Before, after, and presented frame references, or reasons for missing frames |
+| `export/drags.jsonl` | Drag boundaries, input references, and boundary frame links |
+| `export/*.png` | Images shared by events that reference the same observation |
+
+Times ending in `_100ns` use 100 ns units. Admission is relative to session
+Start. PTS is relative to video start. The manifest relates the two origins
+and records Stop. Physical cursor position is observed at read time.
+An unfinished session may contain files without a final manifest.
+
+To export a completed version 2 session again on Windows:
+
+```powershell
+.\target\x86_64-pc-windows-msvc\release\screen-fix.exe --export "<session-directory>"
+```
+
+The command prints the new `export-<id>` directory. Source files and earlier
+exports are preserved. A directory ending in `.pending` is unpublished.
+
+## Project documentation
+
+- [Project goal](doc/target.txt)
+- [MVP specification and acceptance criteria](doc/SCREEN_FIX_SPEC.md)
+- [Architecture, implementation status, and known gaps](doc/SCREEN_FIX_ARCHITECTURE.md)
+- [Historical video pipeline review](doc/SCREEN_FIX_VIDEO_STATIC_REVIEW.md)
+- [Project working prompt](doc/SCREEN_FIX_PROJECT_CONTEXT.md) and
+  [critic prompt](doc/SCREEN_FIX_CRITIC_PROMPT.md)
+
+The current source package has not been built or exercised on Windows.
