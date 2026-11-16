@@ -1,0 +1,69 @@
+[package]
+name = "screen-fix-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+screen-fix-protocol = { path = "../protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+png = "0.18"
+blake3 = { version = "1", features = ["pure"] }
+windows-core = "0.62.2"
+windows = { version = "0.62.2", features = [
+    "Foundation",
+    "Foundation_Metadata",
+    "Security_Authorization_AppCapabilityAccess",
+    "Graphics_Capture",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_Foundation",
+    "Win32_Devices_Display",
+    "Win32_UI_HiDpi",
+    "Win32_Storage_FileSystem",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Variant",
+    "Win32_System_Ole",
+    "Win32_UI_Input",
+    "Win32_UI_Accessibility",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Performance",
+    "Win32_System_SystemInformation",
+    "Win32_System_WinRT_Graphics_Capture",
+] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Globalization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Performance",
+    "Win32_UI_Accessibility",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Ime",
+    "Win32_System_JobObjects",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Threading",
+] }

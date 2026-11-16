@@ -1,41 +1,4 @@
-[package]
-name = "screen-fix"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-eframe = { version = "0.33", default-features = false, features = ["x11", "wayland"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-png = "0.18"
-blake3 = { version = "1", features = ["pure"] }
-rfd = { version = "0.17.2", default-features = false }
-windows-core = "0.62.2"
-windows = { version = "0.62.2", features = [
-    "Foundation",
-    "Graphics_Capture",
-    "Graphics_DirectX_Direct3D11",
-    "Win32_System_WinRT_Direct3D11",
-    "Win32_Foundation",
-    "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D11",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
-    "Win32_Graphics_Gdi",
-    "Win32_Media_MediaFoundation",
-    "Win32_System_Com",
-    "Win32_System_DataExchange",
-    "Win32_System_Memory",
-    "Win32_System_Ole",
-    "Win32_UI_Input",
-    "Win32_UI_Accessibility",
-    "Win32_System_Threading",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_System_Performance",
-    "Win32_System_WinRT_Graphics_Capture",
-] }
+[workspace]
+resolver = "3"
+members = ["protocol", "core", "core/capture/input", "ui"]
+default-members = ["ui"]
