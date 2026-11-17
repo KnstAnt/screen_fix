@@ -12,7 +12,7 @@ use windows_sys::Win32::System::Performance::QueryPerformanceFrequency;
 use crate::{
     deadline::Deadline,
     pipe::{Name, Pipe},
-    secret::{Secret, hmac},
+    secret::{Secret, erase, hmac, random},
     win::{Failure, Result},
 };
 
@@ -28,9 +28,14 @@ pub(crate) struct Bootstrap {
 }
 
 impl Bootstrap {
-    pub(crate) fn new(scope: Scope) -> Result<Self> {
-        let connection = ConnectionId::new(Secret::<16>::random()?.0).map_err(|_| Failure::Cryptography)?;
-        Ok(Self { connection, scope, secret: Secret::random()? })
+    /// The secret is generated in its final heap location (E4).
+    pub(crate) fn new(scope: Scope) -> Result<Box<Self>> {
+        let mut connection = [0u8; 16];
+        random(&mut connection)?;
+        let connection = ConnectionId::new(connection).map_err(|_| Failure::Cryptography)?;
+        let mut bootstrap = Box::new(Self { connection, scope, secret: Secret::zeroed() });
+        bootstrap.secret.randomize()?;
+        Ok(bootstrap)
     }
 
     pub(crate) fn send(&self, pipe: &mut Pipe, deadline: Deadline<'_>) -> Result<()> {
@@ -43,7 +48,9 @@ impl Bootstrap {
         pipe.write(&record.0, deadline)
     }
 
-    pub(crate) fn receive(pipe: &mut Pipe, deadline: Deadline<'_>) -> Result<Self> {
+    /// The received secret is copied straight into its final heap location;
+    /// the record buffer is erased on drop (E4).
+    pub(crate) fn receive(pipe: &mut Pipe, deadline: Deadline<'_>) -> Result<Box<Self>> {
         let mut record = Secret([0u8; BOOTSTRAP_BYTES]);
         pipe.read_exact(&mut record.0, deadline)?;
         pipe.expect_eof(deadline)?;
@@ -57,10 +64,10 @@ impl Bootstrap {
         connection.copy_from_slice(&record.0[8..24]);
         let connection = ConnectionId::new(connection).map_err(|_| Failure::Protocol)?;
         let scope = Scope::decode(&record.0[24..24 + SCOPE_BYTES]).map_err(|_| Failure::Protocol)?;
-        let mut secret = Secret([0; 32]);
-        secret.0.copy_from_slice(&record.0[24 + SCOPE_BYTES..]);
-        if secret.0 == [0; 32] { return Err(Failure::Protocol) }
-        Ok(Self { connection, scope, secret })
+        let mut bootstrap = Box::new(Self { connection, scope, secret: Secret::zeroed() });
+        bootstrap.secret.0.copy_from_slice(&record.0[24 + SCOPE_BYTES..]);
+        if bootstrap.secret.0 == [0; 32] { return Err(Failure::Protocol) }
+        Ok(bootstrap)
     }
 
     pub(crate) fn name(&self, role: Role) -> Result<Name> {
@@ -69,30 +76,35 @@ impl Bootstrap {
         let domain = DOMAIN;
         input[..domain.len()].copy_from_slice(domain);
         input[domain.len()] = role as u8;
-        let digest = hmac(&self.secret, &input[..=domain.len()])?;
+        let mut digest = Secret::zeroed();
+        hmac(&self.secret, &input[..=domain.len()], &mut digest)?;
         Ok(Name::hex("lane.", &digest.0, role.suffix()))
     }
 
     pub(crate) fn bind_client(&self, pipe: &mut Pipe, role: Role, deadline: Deadline<'_>) -> Result<()> {
         let mut request = Secret([0; MAX_PAYLOAD]);
         request.0[..SCOPE_BYTES].copy_from_slice(&self.scope.encode());
-        request.0[SCOPE_BYTES..].copy_from_slice(&Secret::<32>::random()?.0);
+        random(&mut request.0[SCOPE_BYTES..])?;
         self.send_frame(pipe, role, Transition::Challenge, &request.0, deadline)?;
-        let reply = self.receive_frame(pipe, role, Transition::Proof, deadline)?;
+        let mut reply = Secret::zeroed();
+        self.receive_frame(pipe, role, Transition::Proof, deadline, &mut reply)?;
         let actual = (&reply.0[..32]).try_into().map_err(|_| Failure::Protocol)?;
-        let expected = self.proof(role, &request.0)?;
+        let mut expected = Secret::zeroed();
+        self.proof(role, &request.0, &mut expected)?;
         if !crate::secret::matches(&expected.0, actual) { return Err(Failure::Protocol) }
         Ok(())
     }
 
     pub(crate) fn bind_server(&self, pipe: &mut Pipe, role: Role, deadline: Deadline<'_>) -> Result<()> {
-        let request = self.receive_frame(pipe, role, Transition::Challenge, deadline)?;
+        let mut request = Secret::zeroed();
+        self.receive_frame(pipe, role, Transition::Challenge, deadline, &mut request)?;
         if Scope::decode(&request.0[..SCOPE_BYTES]).map_err(|_| Failure::Protocol)? != self.scope
             || request.0[SCOPE_BYTES..].iter().all(|&byte| byte == 0)
         {
             return Err(Failure::Protocol);
         }
-        let proof = self.proof(role, &request.0[..MAX_PAYLOAD])?;
+        let mut proof = Secret::zeroed();
+        self.proof(role, &request.0[..MAX_PAYLOAD], &mut proof)?;
         self.send_frame(pipe, role, Transition::Proof, &proof.0, deadline)
     }
 
@@ -101,13 +113,14 @@ impl Bootstrap {
     }
 
     pub(crate) fn receive_seal(&self, control: &mut Pipe, transition: Transition, deadline: Deadline<'_>) -> Result<()> {
-        let frame = self.receive_frame(control, Role::Control, transition, deadline)?;
+        let mut frame = Secret::zeroed();
+        self.receive_frame(control, Role::Control, transition, deadline, &mut frame)?;
         let scope = Scope::decode(&frame.0[..SCOPE_BYTES]).map_err(|_| Failure::Protocol)?;
         if scope != self.scope { return Err(Failure::Protocol) }
         Ok(())
     }
 
-    fn proof(&self, role: Role, request: &[u8]) -> Result<Secret<32>> {
+    fn proof(&self, role: Role, request: &[u8], digest: &mut Secret<32>) -> Result<()> {
         const DOMAIN: &[u8] = b"ScreenFix/elevation/proof/v1\0";
         let domain = DOMAIN;
         let mut transcript = Secret([0u8; DOMAIN.len() + 1 + MAX_FRAME]);
@@ -117,7 +130,7 @@ impl Bootstrap {
         let header = attachment::header(role, Transition::Challenge, self.connection).map_err(|_| Failure::Protocol)?;
         body[..HEADER_BYTES].copy_from_slice(&header);
         body[HEADER_BYTES..].copy_from_slice(request);
-        hmac(&self.secret, &transcript.0)
+        hmac(&self.secret, &transcript.0, digest)
     }
 
     fn send_frame(
@@ -134,7 +147,8 @@ impl Bootstrap {
 
     fn receive_frame(
         &self, pipe: &mut Pipe, role: Role, transition: Transition, deadline: Deadline<'_>,
-    ) -> Result<Secret<MAX_PAYLOAD>> {
+        payload: &mut Secret<MAX_PAYLOAD>,
+    ) -> Result<()> {
         let mut frame = Secret([0u8; MAX_FRAME]);
         let expected = HEADER_BYTES + transition.payload_len();
         if pipe.is_server() {
@@ -149,9 +163,8 @@ impl Bootstrap {
         if !pipe.is_server() {
             pipe.read_exact(&mut frame.0[HEADER_BYTES..expected], deadline)?;
         }
-        let mut payload = Secret([0; MAX_PAYLOAD]);
         payload.0[..transition.payload_len()].copy_from_slice(&frame.0[HEADER_BYTES..expected]);
-        Ok(payload)
+        Ok(())
     }
 }
 
@@ -180,7 +193,9 @@ impl LaunchArguments {
         command
     }
 
-    pub(crate) fn parse(mut arguments: impl Iterator<Item = OsString>) -> Result<Self> {
+    /// The rendezvous ID is decoded into its final heap location, and the
+    /// argument text is erased (E4).
+    pub(crate) fn parse(mut arguments: impl Iterator<Item = OsString>) -> Result<Box<Self>> {
         fn next(arguments: &mut impl Iterator<Item = OsString>) -> Result<String> {
             arguments.next().and_then(|value| value.into_string().ok()).ok_or(Failure::Arguments)
         }
@@ -195,19 +210,25 @@ impl LaunchArguments {
         let pid = canonical(&next(&mut arguments)?)?;
         let pid = u32::try_from(pid).ok().and_then(NonZeroU32::new).ok_or(Failure::Arguments)?;
         let birth = canonical(&next(&mut arguments)?)?;
-        let token = next(&mut arguments)?;
-        if token.len() != 32 || arguments.next().is_some() { return Err(Failure::Arguments) }
-        let hex = |c| match c {
-            b'0'..=b'9' => Ok(c - b'0'),
-            b'a'..=b'f' => Ok(c - b'a' + 10),
-            _ => Err(Failure::Arguments),
-        };
-        let mut rendezvous = Secret([0u8; 16]);
-        for (byte, pair) in rendezvous.0.iter_mut().zip(token.as_bytes().chunks_exact(2)) {
-            *byte = (hex(pair[0])? << 4) | hex(pair[1])?;
-        }
-        if rendezvous.0 == [0; 16] { return Err(Failure::Arguments) }
-        Ok(Self { parent: ProcessInstance { pid, creation_filetime: birth }, rendezvous })
+        let mut token = next(&mut arguments)?.into_bytes();
+        let parsed = (|| {
+            if token.len() != 32 || arguments.next().is_some() { return Err(Failure::Arguments) }
+            let hex = |c: u8| match c {
+                b'0'..=b'9' => Ok(c - b'0'),
+                b'a'..=b'f' => Ok(c - b'a' + 10),
+                _ => Err(Failure::Arguments),
+            };
+            let mut parsed = Box::new(Self {
+                parent: ProcessInstance { pid, creation_filetime: birth }, rendezvous: Secret::zeroed(),
+            });
+            for (byte, pair) in parsed.rendezvous.0.iter_mut().zip(token.chunks_exact(2)) {
+                *byte = (hex(pair[0])? << 4) | hex(pair[1])?;
+            }
+            if parsed.rendezvous.0 == [0; 16] { return Err(Failure::Arguments) }
+            Ok(parsed)
+        })();
+        erase(&mut token);
+        parsed
     }
 
     pub(crate) fn bootstrap(&self) -> Name { Name::hex("boot.", &self.rendezvous.0, ".bootstrap") }

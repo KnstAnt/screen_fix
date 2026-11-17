@@ -124,7 +124,7 @@ fn wide(text: &str) -> Vec<u16> {
 }
 
 fn unknown(message: &'static str) -> CaptureError {
-    CaptureError::backend("Verify Windows capability", None, message.into())
+    CaptureError::owned(crate::package::diagnostics::FailureComponent::Capture, "Verify Windows capability", None, message.into())
 }
 
 fn unsupported(message: &'static str) -> CaptureError {

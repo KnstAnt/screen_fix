@@ -102,6 +102,7 @@ fn functions() -> Result<&'static Functions, ProbeError> {
             source: Some(error.code.into()),
             journal: None,
             raw_input_registration: None,
+            owner: Some(crate::package::diagnostics::FailureComponent::Video),
         })
 }
 
@@ -192,9 +193,17 @@ pub(super) fn enum_on_adapter(
     Ok(result)
 }
 
-pub(super) fn mp4_part_reader(url: PCWSTR) -> Result<IMFSourceReader, ProbeError> {
+/// A reader of a finalized part. With a device manager the reader may use a
+/// hardware decoder; without one it decodes in software.
+pub(super) fn mp4_part_reader(url: PCWSTR, decoder: Option<&IMFDXGIDeviceManager>) -> Result<IMFSourceReader, ProbeError> {
     use windows::core::Interface;
     let api = functions()?;
+    let settings = decoder.map(|manager| {
+        let settings = attributes(1)?;
+        stage(unsafe { settings.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, manager) },
+            "Attach the decoder device to the MP4 reader")?;
+        Ok::<_, ProbeError>(settings)
+    }).transpose()?;
     let bytes: IMFByteStream = create("Open the finalized MP4 byte stream", |out| unsafe {
         (api.open_file)(MF_ACCESSMODE_READ.0, MF_OPENMODE_FAIL_IF_NOT_EXIST.0, MF_FILEFLAGS_NONE.0, url, out)
     })?;
@@ -206,7 +215,7 @@ pub(super) fn mp4_part_reader(url: PCWSTR) -> Result<IMFSourceReader, ProbeError
         hints.SetString(&MF_BYTESTREAM_ORIGIN_NAME, w!("segment.mp4"))
     }, "Identify the finalized part as MP4")?;
     create("Open the finalized MP4 reader", |out| unsafe {
-        (api.stream_reader)(bytes.as_raw(), std::ptr::null_mut(), out)
+        (api.stream_reader)(bytes.as_raw(), settings.as_ref().map_or(std::ptr::null_mut(), Interface::as_raw), out)
     })
 }
 

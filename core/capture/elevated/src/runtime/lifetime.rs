@@ -10,6 +10,7 @@ use crate::win::{Failure, Result};
 
 pub const HEARTBEAT: Duration = Duration::from_millis(250);
 pub(crate) const LEASE: Duration = Duration::from_secs(1);
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 pub(crate) fn qpc() -> Result<QpcTick> {
     let mut tick = 0;
@@ -34,7 +35,7 @@ impl Lifetime {
     pub(crate) fn new(frequency: QpcFrequency, startup: Instant) -> Result<Self> {
         let ticks_per_second = i64::try_from(frequency.0.get()).map_err(|_| Failure::Supervisor)?;
         let remaining = startup.saturating_duration_since(Instant::now());
-        let ticks = (remaining.as_nanos() * ticks_per_second as u128) / LEASE.as_nanos();
+        let ticks = (remaining.as_nanos() * ticks_per_second as u128) / NANOS_PER_SECOND;
         let ticks = i64::try_from(ticks).map_err(|_| Failure::Supervisor)?;
         let expiry = qpc()?.0.checked_add(ticks).ok_or(Failure::Supervisor)?;
         Ok(Self {
@@ -96,7 +97,7 @@ impl Lifetime {
 
     pub(super) fn ticks(&self, duration: Duration) -> Result<i64> {
         let ticks = duration.as_nanos().checked_mul(self.ticks_per_second as u128)
-            .ok_or(Failure::Supervisor)? / LEASE.as_nanos();
+            .ok_or(Failure::Supervisor)? / NANOS_PER_SECOND;
         i64::try_from(ticks).map_err(|_| Failure::Supervisor)
     }
 

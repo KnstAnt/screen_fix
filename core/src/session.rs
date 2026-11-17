@@ -11,6 +11,8 @@ use crate::{
 };
 
 #[cfg(target_os = "windows")]
+pub(crate) mod fault;
+#[cfg(target_os = "windows")]
 pub(crate) mod windows;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +38,7 @@ pub struct SessionResult {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PauseReason {
     User,
@@ -68,6 +70,24 @@ pub struct AdmissionBoundary {
     pub epoch: AdmissionEpoch,
     pub qpc: QpcTick,
     pub time: SessionTimeUs,
+}
+
+/// An activity that stopped for the rest of the attempt while recording continues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DegradedActivity {
+    pub component: crate::package::diagnostics::FailureComponent,
+    pub monitor: Option<MonitorId>,
+    /// Input or one monitor's video; its loss makes the attempt incomplete.
+    pub required: bool,
+}
+
+impl DegradedActivity {
+    pub fn label(&self) -> String {
+        match self.monitor {
+            Some(monitor) => format!("{} (monitor {})", self.component.label(), monitor.0),
+            None => self.component.label().to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -322,6 +342,8 @@ pub struct SessionStatus {
     pub input_report: Option<ReportOutcome>,
     pub hotkeys_unavailable: bool,
     pub last_hotkey: Option<hotkey::ControlOutcome>,
+    /// Activities lost while the attempt continues (§6.2 class L), in report order.
+    pub degraded: Vec<DegradedActivity>,
 }
 
 impl Default for SessionStatus {
@@ -350,6 +372,7 @@ impl Default for SessionStatus {
             input_report: None,
             hotkeys_unavailable: false,
             last_hotkey: None,
+            degraded: Vec::new(),
         }
     }
 }

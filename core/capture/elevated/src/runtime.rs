@@ -13,11 +13,11 @@ pub use witness::normal_capture_desktop;
 
 use std::{marker::PhantomData, sync::Arc, time::Instant};
 
-use screen_fix_protocol::ipc::elevated::{
+use screen_fix_protocol::ipc::{PacketError, elevated::{
     GrantedInput, VisitBinding,
     attachment::{ConnectionId, HEADER_BYTES, Scope},
     runtime::{self, ContextCommand, Control, Observation, Record, Status},
-};
+}};
 
 use crate::{
     deadline::{Cancellation, Deadline},
@@ -171,6 +171,17 @@ impl<T: Record> Receiver<T> {
     }
 
     pub fn receive(&mut self, until: Instant) -> Result<T> {
+        let record = self.receive_lossy(until)?;
+        record.ok_or_else(|| {
+            self.0.connection.stop.cancel();
+            Failure::Protocol
+        })
+    }
+
+    /// Like `receive`, but a frame with valid framing whose payload does not
+    /// decode is consumed and reported as `None` (E3, §6.2). Corrupt framing
+    /// remains a transport failure.
+    pub fn receive_lossy(&mut self, until: Instant) -> Result<Option<T>> {
         let lane = &mut self.0;
         let connection = &lane.connection;
         let deadline = Deadline { at: until, cancellation: &connection.stop, grant: None, scope_current: None, peer: Some(&connection.peer) };
@@ -185,8 +196,16 @@ impl<T: Record> Receiver<T> {
                 lane.pipe.read_exact(&mut lane.frame[HEADER_BYTES..end], deadline)?;
                 end
             };
-            runtime::decode(&lane.frame[..len], &connection.scope, connection.id, lane.next)
-                .map_err(|_| Failure::Protocol)
+            let framed = len >= HEADER_BYTES && runtime::payload_len::<T>(&lane.frame[..HEADER_BYTES], connection.id, lane.next)
+                .is_ok_and(|payload| HEADER_BYTES + payload == len);
+            if !framed { return Err(Failure::Protocol); }
+            // Only an undecodable or invalid payload is skippable; a foreign
+            // scope or contradicting kind remains a protocol failure.
+            match runtime::decode(&lane.frame[..len], &connection.scope, connection.id, lane.next) {
+                Ok(record) => Ok(Some(record)),
+                Err(PacketError::InvalidPayload) => Ok(None),
+                Err(_) => Err(Failure::Protocol),
+            }
         })();
         lane.complete(result)
     }

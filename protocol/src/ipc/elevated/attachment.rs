@@ -4,7 +4,12 @@ use std::num::NonZeroU64;
 
 use crate::{AttemptId, QpcFrequency, SessionId};
 
-pub const VERSION: u16 = 1;
+/// The elevated wire version, checked at attachment so an incompatible
+/// collector is rejected before admission. Version 2: five input producers
+/// with `OptionalHid` (stage I5), `HeldSnapshot.keys` (stage I4),
+/// `CommitEvidence.valid` (stage I7), `InputEvidence::OptionalUnavailable`
+/// and `ContextGap.cause` (stage E3).
+pub const VERSION: u16 = 2;
 pub const HEADER_BYTES: usize = 40;
 pub const MAX_FRAME_BYTES: usize = 65_536;
 const MAGIC: [u8; 4] = *b"SFEL";

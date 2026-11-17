@@ -52,7 +52,10 @@ impl Native {
             });
             let owner = unsafe { BorrowedHandle::borrow_raw(grant.parent.raw()) };
             let wake = unsafe { BorrowedHandle::borrow_raw(grant.stop.handle().raw()) };
-            let mut output = Output { grant: Arc::clone(&grant), send, ready, losses: Losses::default(), environment: None, visit: None };
+            let mut output = Output {
+                grant: Arc::clone(&grant), send, ready, losses: Losses::default(), environment: None, visit: None, raw_source: None,
+                notices: Vec::new(),
+            };
             input::run_scoped(Settings { qpc_frequency: frequency, pen_hid }, owner, wake, &mut output, Some(scope))
         }).map_err(|_| Failure::Supervisor)?;
         Ok(Self { ready: registered, worker })
@@ -83,6 +86,13 @@ struct Output {
     losses: Losses,
     environment: Option<EnvironmentState>,
     visit: Option<VisitBinding>,
+    /// Source lower bound of the latest Raw Input record with a message time.
+    /// Records drained from the Raw Input buffer after it have no message
+    /// time and were queued after it, so it bounds their source time too.
+    raw_source: Option<QpcTick>,
+    /// Optional-collection notices waiting for queue room (E3); at most one
+    /// per collection.
+    notices: Vec<InputEvidence>,
 }
 
 fn transport() -> NativeError { NativeError::without_code(HelperFailureStage::Transport) }
@@ -111,14 +121,26 @@ impl Collector for Output {
 
     fn offer(&mut self, record: HelperToCore) -> std::result::Result<(), NativeError> {
         let visit = self.grant.visit();
-        let Ok(floor) = self.grant.read_floor(false) else { return Ok(()) };
-        if self.grant.visit() != visit { return Ok(()); }
+        let floor = self.grant.read_floor(false).ok().filter(|_| self.grant.visit() == visit);
         if self.visit != Some(visit) {
-            self.losses = Losses::default();
+            // The old binding's evidence is closed. Its pending gaps are kept
+            // and delivered first in the new binding, where gaps before the
+            // resync sample only count (E3).
             self.environment = None;
+            self.raw_source = None;
+            self.notices.clear();
             self.visit = Some(visit);
         }
-        if !self.eligible(&record, visit, floor) { return Ok(()) }
+        // A native gap is never dropped: outside the open scope it waits as a
+        // pending loss (E3).
+        let Some(floor) = floor else {
+            if matches!(record, HelperToCore::Gap(_)) { self.losses.drop_record(&record); }
+            return Ok(());
+        };
+        if !self.eligible(&record, visit, floor) {
+            if matches!(record, HelperToCore::Gap(_)) { self.losses.drop_record(&record); }
+            return Ok(());
+        }
         if let Some(producer) = loss::producer(&record) && !self.flush_loss(producer)? {
             self.losses.drop_record(&record);
             return Ok(());
@@ -128,6 +150,10 @@ impl Collector for Output {
             if let Some(pending) = self.environment.take() { state.changes |= pending.changes; }
             if !self.enqueue(InputEvidence::Environment(state))? { self.environment = Some(state); }
             return Ok(());
+        }
+        if let HelperToCore::OptionalUnavailable { collection, observed_qpc } = record {
+            self.notices.push(InputEvidence::OptionalUnavailable { collection, observed_qpc });
+            return self.flush_notices();
         }
         let value = match &record {
             HelperToCore::Input(input) => InputEvidence::Input(input.clone()),
@@ -143,7 +169,7 @@ impl Collector for Output {
 
     fn flush(&mut self) -> std::result::Result<(), NativeError> {
         if self.grant.read_floor(false).is_err() || self.visit != Some(self.grant.visit()) { return Ok(()) }
-        for producer in [Producer::RawInput, Producer::DeviceNotifications, Producer::KeyboardHook, Producer::PointerHook] {
+        for producer in Producer::ALL {
             if !self.flush_loss(producer)? { return Ok(()) }
         }
         if let Some(state) = self.environment
@@ -151,22 +177,31 @@ impl Collector for Output {
         {
             self.environment = None;
         }
-        Ok(())
+        self.flush_notices()
     }
 
     fn finish(&mut self, _: BorrowedHandle<'_>) -> std::result::Result<(), NativeError> { Ok(()) }
 }
 
 impl Output {
-    fn eligible(&self, record: &HelperToCore, visit: VisitBinding, floor: QpcTick) -> bool {
+    fn eligible(&mut self, record: &HelperToCore, visit: VisitBinding, floor: QpcTick) -> bool {
         match record {
             HelperToCore::Input(input) => {
                 let horizon = floor.0.saturating_add(self.grant.lifetime.ticks(INPUT_HOLDBACK).unwrap_or(0));
                 if input.receipt.qpc.0 <= horizon { return false; }
-                let source = input.receipt.message_tick_ms.and_then(|tick| coarse_lower(tick.0, &self.grant.lifetime));
+                let raw = input.sample.producer().raw_input();
+                let source = match input.receipt.message_tick_ms {
+                    Some(tick) => {
+                        let source = coarse_lower(tick.0, &self.grant.lifetime);
+                        if raw { self.raw_source = source; }
+                        source
+                    }
+                    None if raw => self.raw_source,
+                    None => None,
+                };
                 let in_scope = source.is_some_and(|source| source > floor && source <= input.receipt.qpc)
                     && match input.sample.producer() {
-                        Producer::RawInput => input.foreground_at_receipt.is_some_and(|foreground| {
+                        producer if producer.raw_input() => input.foreground_at_receipt.is_some_and(|foreground| {
                             let target = visit.foreground;
                             foreground.window == target.window && foreground.process == target.process
                                 && foreground.focus == self.grant.expected_focus(visit)
@@ -187,15 +222,25 @@ impl Output {
             HelperToCore::Gap(gap) => gap.first_qpc > floor,
             HelperToCore::Progress(progress) => progress.before_qpc > floor,
             HelperToCore::Environment(state) => state.observed_qpc > floor,
+            HelperToCore::OptionalUnavailable { observed_qpc, .. } => *observed_qpc > floor,
             _ => false,
         }
     }
 
+    fn flush_notices(&mut self) -> std::result::Result<(), NativeError> {
+        while let Some(notice) = self.notices.first() {
+            if !self.enqueue(notice.clone())? { break; }
+            self.notices.remove(0);
+        }
+        Ok(())
+    }
+
     fn flush_loss(&mut self, producer: Producer) -> std::result::Result<bool, NativeError> {
-        let Some(gap) = self.losses.pending(producer) else { return Ok(true) };
-        let sent = self.enqueue(InputEvidence::Gap(gap))?;
-        if sent { self.losses.clear(producer); }
-        Ok(sent)
+        while let Some(gap) = self.losses.front(producer) {
+            if !self.enqueue(InputEvidence::Gap(gap))? { return Ok(false); }
+            self.losses.delivered(producer);
+        }
+        Ok(true)
     }
 
     fn enqueue(&self, evidence: InputEvidence) -> std::result::Result<bool, NativeError> {

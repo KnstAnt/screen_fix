@@ -37,6 +37,9 @@ impl Probe {
         let user32 = unsafe { GetModuleHandleW(w!("user32.dll")) }.ok();
         let lookup = |name: &'static [u8]| {
             unsafe { GetProcAddress(user32?, PCSTR(name.as_ptr())) }
+                // SAFETY: both user32 exports have the signature `HWND -> HWND`
+                // with the stdcall ("system") ABI, which `GhostLookup` declares,
+                // and user32 stays loaded for the process lifetime.
                 .map(|address| unsafe { std::mem::transmute::<_, GhostLookup>(address) })
         };
         Self {

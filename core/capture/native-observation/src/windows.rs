@@ -33,6 +33,9 @@ pub struct FocusSnapshot {
     pub caret_window: Option<WindowId>,
     pub gui_flags: u32,
     pub hung: bool,
+    /// The snapshot comes from the active window because no window has focus.
+    /// Consumers use it for layout and focus identity only.
+    pub active_fallback: bool,
 }
 
 impl FocusSnapshot {
@@ -43,11 +46,12 @@ impl FocusSnapshot {
 
     pub fn read(foreground: WindowProcess) -> Option<Self> {
         let mut gui = GUITHREADINFO { cbSize: size_of::<GUITHREADINFO>() as u32, ..Default::default() };
-        if unsafe { GetGUIThreadInfo(foreground.thread.get(), &mut gui) } == 0 || gui.hwndFocus.is_null() {
+        if unsafe { GetGUIThreadInfo(foreground.thread.get(), &mut gui) } == 0 {
             return None;
         }
+        let crate::focus::FocusWindow { hwnd: focused, active_fallback } = crate::focus::focus_window(&gui)?;
         let mut pid = 0;
-        let thread = NonZeroU32::new(unsafe { GetWindowThreadProcessId(gui.hwndFocus, &mut pid) })?;
+        let thread = NonZeroU32::new(unsafe { GetWindowThreadProcessId(focused, &mut pid) })?;
         if pid != foreground.process.pid.get() {
             return None;
         }
@@ -55,7 +59,7 @@ impl FocusSnapshot {
         if layout.is_null() || WindowProcess::foreground() != Some(foreground) {
             return None;
         }
-        let hwnd = HWND(gui.hwndFocus);
+        let hwnd = HWND(focused);
         let caret = (!gui.hwndCaret.is_null()).then(|| {
             let window = HWND(gui.hwndCaret);
             let start = physical_client_point(window, gui.rcCaret.left, gui.rcCaret.top)?;
@@ -64,11 +68,12 @@ impl FocusSnapshot {
         }).flatten();
         Some(Self {
             focus: FocusAtReceipt {
-                window: WindowId(gui.hwndFocus as usize as u64), thread, keyboard_layout: layout as usize as u64,
-                password_style: password_style(hwnd),
+                window: WindowId(focused as usize as u64), thread, keyboard_layout: layout as usize as u64,
+                // The active window's style says nothing about the field that receives keys.
+                password_style: if active_fallback { None } else { password_style(hwnd) },
             },
             caret, caret_window: (!gui.hwndCaret.is_null()).then_some(WindowId(gui.hwndCaret as usize as u64)),
-            gui_flags: gui.flags, hung: unsafe { IsHungAppWindow(gui.hwndFocus) != 0 },
+            gui_flags: gui.flags, hung: unsafe { IsHungAppWindow(focused) != 0 }, active_fallback,
         })
     }
 }
@@ -95,15 +100,7 @@ fn physical_client_point(window: HWND, x: i32, y: i32) -> Option<POINT> {
 }
 
 pub fn password_style(hwnd: HWND) -> Option<bool> {
-    use windows_sys::Win32::{
-        Foundation::{GetLastError, SetLastError},
-        UI::WindowsAndMessaging::{ES_PASSWORD, GWL_STYLE, GetWindowLongW},
-    };
-    unsafe {
-        SetLastError(0);
-        let style = GetWindowLongW(hwnd.0, GWL_STYLE);
-        (style != 0 || GetLastError() == 0).then_some((style as u32) & (ES_PASSWORD as u32) != 0)
-    }
+    crate::focus::password_style(hwnd.0)
 }
 
 #[derive(serde::Serialize)]

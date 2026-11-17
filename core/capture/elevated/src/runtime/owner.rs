@@ -19,7 +19,7 @@ use screen_fix_protocol::{
 use crate::{deadline::{Cancellation, Deadline}, win::{Failure, Result}};
 use super::{
     Connection, Links, Receiver, Sender, context, notices, outbox::Outbox,
-    grant::{Grant, InputLoss, INPUT_HOLDBACK, await_witness},
+    grant::{ESSENTIAL_PROGRESS, Grant, InputLoss, INPUT_HOLDBACK, await_witness},
     input::{self, Native},
     lifetime::{LEASE, Lifetime, qpc},
     witness::{View, Witness},
@@ -27,7 +27,8 @@ use super::{
 
 const COMMANDS: usize = 8;
 const POLL: Duration = Duration::from_millis(4);
-const WRITE: Duration = Duration::from_millis(100);
+/// Budget of the provider-backed egress gate of one context record.
+const GATE: Duration = Duration::from_millis(100);
 
 struct Configuration {
     approved: Arc<[ApprovalKey]>,
@@ -157,15 +158,27 @@ fn run_with_witness(links: Links, lifetime: &Arc<Lifetime>, startup: Instant, wi
     let mut writer = Sender::<GrantedInput>::new(&links.input, &links.connection);
     workers.spawn("elevated-input-out", move |cancel| {
         while cancel.check().is_ok() {
-            let Ok(item) = outbound.recv_timeout(POLL) else { continue };
-            if item.grant.qualify_egress(item.record.visit, false) && writer.send_scoped(&item.record, Instant::now() + WRITE, &item.grant, item.record.visit)?
-            {
-                match item.record.evidence {
-                    InputEvidence::Progress(progress) => item.grant.input_progress(item.record.visit, progress),
-                    InputEvidence::Gap(gap) => item.grant.input_loss(item.record.visit, InputLoss {
-                        before: gap.first_qpc, reason: CoverageReason::NativeGap, gap: Some(gap),
-                    }),
-                    _ => {}
+            let mut verified = None;
+            for item in batch(&outbound) {
+                verify_once(&mut verified, &item.grant);
+                // One outstanding write; later records wait in the bounded
+                // queue, whose producers drop newest with loss accounting.
+                // Only a write stalled past the essential coverage budget
+                // fails the lane (E3).
+                if item.grant.qualify_egress(item.record.visit, false)
+                    && writer.send_scoped(&item.record, Instant::now() + ESSENTIAL_PROGRESS, &item.grant, item.record.visit)?
+                {
+                    match item.record.evidence {
+                        InputEvidence::Progress(progress) => item.grant.input_progress(item.record.visit, progress),
+                        // A gap carried from the previous binding only counts;
+                        // a gap reaching past the floor needs a resync (E3).
+                        InputEvidence::Gap(gap) => if let Ok(floor) = item.grant.read_floor(false) && gap.last_qpc > floor {
+                            item.grant.input_loss(item.record.visit, InputLoss {
+                                before: gap.first_qpc.max(floor), reason: CoverageReason::NativeGap, gap: Some(gap),
+                            });
+                        },
+                        _ => {}
+                    }
                 }
             }
         }
@@ -178,28 +191,31 @@ fn run_with_witness(links: Links, lifetime: &Arc<Lifetime>, startup: Instant, wi
     workers.spawn("elevated-context-out", move |cancel| {
         while cancel.check().is_ok() {
             drain_losses.flush_losses()?;
-            let Ok(mut item) = pending.recv_timeout(POLL) else { continue };
-            if let Some(delivery) = &item.delivery
-                && item.visit == item.grant.visit() && item.grant.read_floor(false).is_ok()
-            {
-                let deadline = qpc()?.0.checked_add(item.grant.lifetime.ticks(WRITE)?).ok_or(Failure::Supervisor)?;
-                if let Some(_provider) = item.grant.lifetime.provider(super::lifetime::ProviderKind::Egress, QpcTick(deadline)) {
-                    delivery.gate(&item.grant, &mut item.evidence)?;
-                } else {
-                    return Err(Failure::Supervisor);
-                }
-            }
-            if item.grant.qualify_egress(item.visit, item.allow_opening)
-                && context_writer.send_scoped(&item.evidence, Instant::now() + WRITE, &item.grant, item.visit)?
-            {
-                match item.evidence {
-                    Observation::Progress { before_qpc, .. } => item.grant.context_progress(item.visit, before_qpc),
-                    Observation::Item { evidence: ContextEvidence::Held(read), .. } => {
-                        if let Some(end) = read.completed_qpc {
-                            item.grant.deliver_held(item.visit, read.binding.request, end);
-                        }
+            let mut verified = None;
+            for mut item in batch(&pending) {
+                verify_once(&mut verified, &item.grant);
+                if let Some(delivery) = &item.delivery
+                    && item.visit == item.grant.visit() && item.grant.read_floor(false).is_ok()
+                {
+                    let deadline = qpc()?.0.checked_add(item.grant.lifetime.ticks(GATE)?).ok_or(Failure::Supervisor)?;
+                    if let Some(_provider) = item.grant.lifetime.provider(super::lifetime::ProviderKind::Egress, QpcTick(deadline)) {
+                        delivery.gate(&item.grant, &mut item.evidence)?;
+                    } else {
+                        return Err(Failure::Supervisor);
                     }
-                    _ => {}
+                }
+                if item.grant.qualify_egress(item.visit, item.allow_opening)
+                    && context_writer.send_scoped(&item.evidence, Instant::now() + ESSENTIAL_PROGRESS, &item.grant, item.visit)?
+                {
+                    match item.evidence {
+                        Observation::Progress { before_qpc, .. } => item.grant.context_progress(item.visit, before_qpc),
+                        Observation::Item { evidence: ContextEvidence::Held(read), .. } => {
+                            if let Some(end) = read.completed_qpc {
+                                item.grant.deliver_held(item.visit, read.binding.request, end);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -223,8 +239,9 @@ fn run_with_witness(links: Links, lifetime: &Arc<Lifetime>, startup: Instant, wi
 }
 
 impl Owner<'_> {
+    /// A control write fails the lane only past the lease bound (E3).
     fn send(&mut self, status: &Status) -> Result<()> {
-        self.status.send(status, Instant::now() + WRITE)
+        self.status.send(status, Instant::now() + LEASE)
     }
 
     fn run(&mut self, commands: Queue<Control>, queries: Queue<ContextCommand>) -> Result<()> {
@@ -249,6 +266,7 @@ impl Owner<'_> {
                     Err(TryRecvError::Disconnected) => return Err(Failure::Transport),
                 }
             }
+            self.expire_reads()?;
             thread::park_timeout(POLL);
         }
     }
@@ -272,7 +290,9 @@ impl Owner<'_> {
             Control::Prepare(request) => {
                 let visit = request.visit;
                 if self.urgent.stopping.load(Acquire) || self.current.is_some() || visit.grant.get() <= self.grant_sequence
-                    || visit.epoch.0 <= self.epoch || visit.source_generation.get() <= self.source_generation
+                    // The same epoch may prepare again before admission (D-8 A);
+                    // grant and source generation still strictly increase.
+                    || visit.epoch.0 < self.epoch || visit.source_generation.get() <= self.source_generation
                     || request.expires_qpc <= now
                 {
                     self.transition_rejected(visit, Transition::Prepare,
@@ -289,6 +309,12 @@ impl Owner<'_> {
                     Ok(grant) => grant,
                     Err(Failure::TargetChanged | Failure::ScopeClosed | Failure::ProcessIdentity | Failure::TokenIdentity(_) | Failure::PeerExited) => {
                         self.send(&Status::Invalidated { visit, reason: Revocation::Foreground, before_qpc: now })?;
+                        self.send(&Status::Closed { visit, before_qpc: now })?;
+                        return Ok(false);
+                    }
+                    // The collector's canonical approval proof failed (E6).
+                    Err(Failure::TargetAccess) => {
+                        self.send(&Status::Invalidated { visit, reason: Revocation::RequiredAccess, before_qpc: now })?;
                         self.send(&Status::Closed { visit, before_qpc: now })?;
                         return Ok(false);
                     }
@@ -461,6 +487,9 @@ impl Owner<'_> {
         if !visit.notices.ready() { return Err(Failure::ReadinessDeadline); }
         match visit.native.ready.try_recv() {
             Ok(registration) => {
+                // The Arm QPC follows hook and Raw Input registration and
+                // precedes the held probe (E4).
+                let arm_qpc = qpc()?;
                 let focus = visit.grant.observe_readiness_focus()?;
                 let (_, _, held) = match input::held(&visit.grant) {
                     Ok(result) => result,
@@ -473,7 +502,7 @@ impl Owner<'_> {
                 visit.grant.arm()?;
                 visit.registered = true;
                 let status = Status::Armed {
-                    visit: visit.grant.visit(), arm_qpc: visit.grant.arm, registration, focus,
+                    visit: visit.grant.visit(), arm_qpc, registration, focus,
                     held: if held.is_some() { HeldReadiness::Known } else { HeldReadiness::Unknown },
                 };
                 self.send(&status)
@@ -563,6 +592,20 @@ impl Owner<'_> {
             }
         } else {
             return self.read_rejected(read, ReadUnavailable::Unavailable);
+        }
+        Ok(())
+    }
+
+    /// A provider call still running at its request deadline gets its typed
+    /// timeout now; the grant stays valid (E2).
+    fn expire_reads(&mut self) -> Result<()> {
+        let Some(visit) = &self.current else { return Ok(()) };
+        let now = qpc()?;
+        for read in visit.context.expire(now)? {
+            self.observation.publish(&visit.grant, read.visit, ContextEvidence::Rejected(ReadEvidence {
+                binding: read, started_qpc: None, completed_qpc: Some(now),
+                outcome: ReadOutcome::Unavailable(ReadUnavailable::TimedOut),
+            }), false)?;
         }
         Ok(())
     }
@@ -687,6 +730,22 @@ fn configure(control: &mut Receiver<Control>, until: Instant) -> Result<Configur
 }
 
 fn long_wait() -> Instant { Instant::now() + Duration::from_secs(86_400) }
+
+/// The records of one egress pass: the first waits up to a poll interval, the
+/// rest are already queued.
+fn batch<T>(queue: &Queue<T>) -> impl Iterator<Item = T> + '_ {
+    queue.recv_timeout(POLL).ok().into_iter().chain(std::iter::from_fn(move || queue.try_recv().ok())).take(input::SLOTS)
+}
+
+/// Token facts are queried once per egress batch and grant; per-record checks
+/// read the result latched in the grant (E3).
+fn verify_once(verified: &mut Option<Arc<Grant>>, grant: &Arc<Grant>) {
+    if verified.as_ref().is_none_or(|last| !Arc::ptr_eq(last, grant)) {
+        // A failure is latched; `qualify_egress` then refuses the records.
+        let _ = grant.verify_token();
+        *verified = Some(Arc::clone(grant));
+    }
+}
 
 struct Workers {
     stop: Arc<Cancellation>,

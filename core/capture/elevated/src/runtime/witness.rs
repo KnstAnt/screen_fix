@@ -494,6 +494,11 @@ impl Target {
 
     pub(super) fn recheck(&self, parent: &Process) -> Result<()> {
         crate::process::verify_capture_target(parent, &self.process)?;
+        self.bound()
+    }
+
+    /// The window, thread and desktop binding, without the token facts.
+    pub(super) fn bound(&self) -> Result<()> {
         let hwnd = self.window.window.0 as usize as HWND;
         if Foreground::of(hwnd) != Some(self.window) || !normal_desktop(Some(self.window.thread)) {
             return Err(Failure::TargetChanged);

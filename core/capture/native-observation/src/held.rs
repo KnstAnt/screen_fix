@@ -36,12 +36,18 @@ pub fn read() -> Option<HeldSnapshot> {
     let modifiers = [VK_LSHIFT, VK_RSHIFT, VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU,
         VK_LWIN, VK_RWIN].map(pressed);
     let physical_buttons = [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2].map(pressed);
+    let mut keys = [0_u64; 4];
+    for vk in 1..=0xfe_u16 {
+        if pressed(vk) {
+            keys[usize::from(vk >> 6)] |= 1 << (vk & 63);
+        }
+    }
     let caps_lock = (unsafe { GetKeyState(i32::from(VK_CAPITAL)) } & 1) != 0;
     let swapped = unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0;
     if unsafe { GetForegroundWindow() } != foreground || process_id(foreground) != Some(pid) || !on_input_desktop() {
         return None;
     }
-    Some(HeldSnapshot { modifiers, physical_buttons, swapped, caps_lock })
+    Some(HeldSnapshot { modifiers, physical_buttons, swapped, caps_lock, keys })
 }
 
 fn pressed(vk: u16) -> bool {

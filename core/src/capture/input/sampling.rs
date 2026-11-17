@@ -42,9 +42,7 @@ pub(crate) struct MotionSampler {
 }
 
 impl MotionSampler {
-    pub fn push(
-        &mut self, input: HeldInput, pointer_hook_lost: bool, mut resolve: impl FnMut(Sampled),
-    ) {
+    pub fn push(&mut self, input: HeldInput, mut resolve: impl FnMut(Sampled)) {
         let first = &input.normalized.correlated.first;
         let t = first.time.recv_t_us;
         self.expire(t);
@@ -70,7 +68,7 @@ impl MotionSampler {
             _ if matches!(first.action, Action::Motion(_)) => {
                 // Hardware delta evidence alone does not open/close a burst
                 // while the pointer hook is healthy.
-                (input.normalized.cursor_motion || pointer_hook_lost).then_some((Lane::Pointer, 0))
+                input.normalized.cursor_motion.then_some((Lane::Pointer, 0))
             }
             _ => {
                 self.close_lanes();

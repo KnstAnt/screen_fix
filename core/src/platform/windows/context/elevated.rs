@@ -1,7 +1,7 @@
 use screen_fix_elevated::{Failure, Result};
 use screen_fix_protocol::ipc::elevated::{
     CommitEvidence, ContextEvidence, Query, ReadBinding, ReadEvidence, ReadOutcome, WindowEvidence, WindowInstance,
-    runtime::{IdentityClaim, Observation},
+    runtime::{ContextGapCause, ContextProducer, IdentityClaim, Observation},
 };
 
 use super::*;
@@ -70,7 +70,7 @@ impl Context<'_> {
         let Some(visit) = self.current else { return Ok(Vec::new()); };
         let Some((binding, focus)) = visit.elevated else { return Ok(Vec::new()); };
         let mut rows = Vec::new();
-        self.approvals.poll().map_err(|_| Failure::Witness)?;
+        self.poll_health(at);
         let now = Instant::now();
         let display_changed = now >= self.next_displays;
         if display_changed { self.next_displays = now + DISPLAY_REFRESH; }
@@ -84,7 +84,7 @@ impl Context<'_> {
                 if notice.object == OBJID_WINDOW && matches!(notice.event, EVENT_OBJECT_DESTROY | EVENT_OBJECT_HIDE) {
                     self.elevated.owned_windows.retain(|window| *window != notice.window);
                 }
-                if window_notice_kind(notice).is_some() { self.queue_window_notice(notice, &mut rows); }
+                if window_notice_kind(notice).is_some() { self.queue_window_notice(notice); }
             }
         }
         let mut notices = Vec::new();
@@ -192,6 +192,8 @@ impl Context<'_> {
                 rows.push(change.row(receipt.clock));
             } else if self.cursor_completions.len() < 16 {
                 self.cursor_completions.push(change);
+            } else {
+                self.losses.note(LossReason::StagingPressure, 1, change.received(), change.received());
             }
         }
         Ok(rows)
@@ -205,7 +207,18 @@ impl Context<'_> {
         let evidence = match delivery {
             ContextDelivery::Observation(Observation::Item { evidence, .. }) => evidence,
             ContextDelivery::Observation(Observation::Gap(gap)) if gap.visit == binding => {
-                rows.push(json!({ "kind": "context_source_gap", "source": "elevated", "gap": gap }));
+                // A collector gap is a typed context loss per cause (E3).
+                let reason = match (gap.producer, gap.cause) {
+                    (ContextProducer::TextEdit, ContextGapCause::Overflow) => LossReason::CommitCapacity,
+                    (ContextProducer::Notices, ContextGapCause::Overflow) => LossReason::NotificationOverflow,
+                    (_, ContextGapCause::Overflow) => LossReason::QueueOverflow,
+                    (_, ContextGapCause::Stale) => LossReason::LateCommit,
+                    (_, ContextGapCause::CommitTooLong) => LossReason::CommitTooLong,
+                    (_, ContextGapCause::CommitParts) => LossReason::CommitParts,
+                    (_, ContextGapCause::CommitRejected) => LossReason::CommitRejected,
+                };
+                let count = gap.last_position.get().saturating_sub(gap.first_position.get()).saturating_add(1);
+                self.losses.note(reason, count, gap.first_qpc, gap.last_qpc);
                 return Ok(());
             }
             ContextDelivery::Rejected(read, reason) => ContextEvidence::Rejected(ReadEvidence {
@@ -228,7 +241,7 @@ impl Context<'_> {
                     self.visit_geometry = None;
                 }
                 if window_notice_kind(notice).is_some() {
-                    self.queue_window_notice(notice, rows);
+                    self.queue_window_notice(notice);
                 }
                 if notice.object == OBJID_CARET as i32
                     && matches!(notice.event, EVENT_OBJECT_SHOW | EVENT_OBJECT_HIDE | EVENT_OBJECT_LOCATIONCHANGE)
@@ -243,9 +256,12 @@ impl Context<'_> {
                     && let Some(current) = self.current.as_mut()
                 {
                     self.elevated.focus_observed = Some(observed);
+                    // Collector evidence carries no fallback marker. A fallback focus
+                    // has no password evidence, and the collector itself withholds
+                    // focus reads and IME state for it.
                     current.native = Some(FocusSnapshot {
                         focus: snapshot.focus, caret: snapshot.caret, caret_window: snapshot.caret_window,
-                        gui_flags: snapshot.gui_flags, hung: snapshot.hung,
+                        gui_flags: snapshot.gui_flags, hung: snapshot.hung, active_fallback: false,
                     });
                 }
             }
@@ -280,7 +296,7 @@ impl Context<'_> {
                 self.elevated.ime_result = Some((key, fresh_read(&read, arrived).map_or(ImeState::Unknown, |(_, state)| *state)));
             }
             ContextEvidence::Commit(commit) if commit.binding.visit == binding => {
-                self.elevated_commit(commit, visit, arrived, at, receipt.clock, rows);
+                self.elevated_commit(commit, visit, arrived, at, receipt.clock);
             }
             ContextEvidence::ClipboardFence(read) if read.binding.visit == binding => {
                 self.clipboard_fence(read, visit, arrived, at, receipt.clock, admission);
@@ -353,8 +369,15 @@ impl Context<'_> {
     ) -> Result<()> {
         let Some(worker) = &self.clipboard else { return Ok(()); };
         let Some((binding, _)) = visit.elevated else { return Ok(()); };
+        if let Some((count, first, last)) = worker.take_loss() {
+            self.losses.note(LossReason::ClipboardQueue, count, first, last);
+        }
         for notice in worker.notices() {
-            if self.clipboard_notices.len() < 8 { self.clipboard_notices.push_back(notice); }
+            if self.clipboard_notices.len() < 8 {
+                self.clipboard_notices.push_back(notice);
+            } else {
+                self.losses.note(LossReason::ClipboardQueue, 1, notice.received, notice.received);
+            }
         }
         self.clipboard_notices.retain(|notice| notice.observed.elapsed() < clipboard::MAX_AGE
             && notice.foreground == visit.foreground && notice.received >= visit.started_at
@@ -364,7 +387,11 @@ impl Context<'_> {
         results.extend(worker.results());
         for read in results {
             if read.completed > at {
-                if self.future_clipboard.len() < 8 { self.future_clipboard.push(read); }
+                if self.future_clipboard.len() < 8 {
+                    self.future_clipboard.push(read);
+                } else {
+                    self.losses.note(LossReason::ClipboardQueue, 1, read.completed, read.completed);
+                }
                 continue;
             }
             let Some(ClipboardStage::Read { notice, pre, permit }) = self.elevated.clipboard.as_ref() else { continue; };
@@ -454,22 +481,33 @@ impl Context<'_> {
         }
     }
 
-    fn elevated_commit(&mut self, commit: CommitEvidence, visit: Visit, arrived: QpcTick, at: QpcTick, clock: ClockOrigin, rows: &mut Vec<Value>) {
-        if !self.queries.remote_commit(&commit, at, clock) || !self.confirm_focus(visit) { return; }
+    fn elevated_commit(&mut self, commit: CommitEvidence, visit: Visit, arrived: QpcTick, at: QpcTick, clock: ClockOrigin) {
+        if !self.queries.remote_commit(&commit, at, clock) || !self.confirm_focus(visit) {
+            self.losses.note(LossReason::LateCommit, 1, commit.receipt_qpc, commit.receipt_qpc);
+            return;
+        }
         if self.elevated.commits.len() == COMMIT_CAPACITY {
-            rows.push(json!({ "kind": "context_source_gap", "source": "elevated", "producer": "text_edit",
-                "first_qpc": commit.receipt_qpc, "last_qpc": commit.receipt_qpc, "count": 1 }));
+            self.losses.note(LossReason::CommitCapacity, 1, commit.receipt_qpc, commit.receipt_qpc);
             return;
         }
         self.elevated.commits.push_back(ConfirmedText {
             visit, revision: commit.binding.visit.focus_revision, source_read: Some(commit.binding),
-            callback_at: commit.receipt_qpc, observed_at: arrived, text: commit.text.as_str().to_owned(),
+            callback_at: commit.receipt_qpc, observed_at: arrived, text: commit.text.as_str().to_owned(), valid: commit.valid,
         });
     }
 
     pub(super) fn take_elevated_text(&mut self, now: QpcTick) -> Vec<ConfirmedText> {
         let pending = std::mem::take(&mut self.elevated.commits);
-        pending.into_iter().filter(|commit| commit.observed_at <= now && self.confirm_text(commit)).collect()
+        let mut confirmed = Vec::new();
+        for commit in pending {
+            if commit.observed_at <= now && self.confirm_text(&commit) {
+                confirmed.push(commit);
+            } else {
+                // A commit that cannot be confirmed is counted (E3).
+                self.losses.note(LossReason::LateCommit, 1, commit.callback_at, commit.callback_at);
+            }
+        }
+        confirmed
     }
 
     fn elevated_window_row(
@@ -508,9 +546,9 @@ impl Context<'_> {
         row
     }
 
-    fn queue_window_notice(&mut self, notice: Notice, rows: &mut Vec<Value>) {
+    fn queue_window_notice(&mut self, notice: Notice) {
         if self.elevated.windows.len() == WINDOW_NOTICES {
-            rows.push(json!({ "kind": "context_notifications_gap", "source": "elevated", "count": 1 }));
+            self.losses.note(LossReason::NotificationOverflow, 1, notice.receipt, notice.receipt);
         } else {
             self.elevated.windows.push_back(notice);
         }

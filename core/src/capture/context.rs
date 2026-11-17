@@ -1,34 +1,4 @@
-use std::num::NonZeroU32;
-
-use crate::{
-    config::ExecutableIdentity,
-    protocol::{
-        BoundedText, Evidence, FocusGeneration, GeometryId, PhysicalRect, RecordTime, RequestId,
-        SessionTimeUs, WindowId,
-    },
-};
-
-pub const MAX_WINDOW_TITLE_BYTES: usize = 4096;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalStatus {
-    Approved,
-    OutsideApprovedSelection,
-    Unknown,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForegroundObservation {
-    pub time: RecordTime,
-    pub focus: FocusGeneration,
-    pub window: Evidence<WindowId>,
-    pub executable: Evidence<ExecutableIdentity>,
-    pub approval: ApprovalStatus,
-    pub title: Evidence<BoundedText<MAX_WINDOW_TITLE_BYTES>>,
-    pub bounds: Evidence<PhysicalRect>,
-    pub geometry: Evidence<GeometryId>,
-    pub dpi: Evidence<NonZeroU32>,
-}
+use crate::protocol::{FocusGeneration, WindowId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,16 +7,9 @@ pub enum TextTarget {
     Editable,
     Password,
     PossiblySensitive,
-}
-
-/// A completion has its own receipt time and refers to the original focus generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FocusClassification {
-    pub request: RequestId,
-    pub focus: FocusGeneration,
-    pub requested_t_us: SessionTimeUs,
-    pub completed_t_us: SessionTimeUs,
-    pub target: Evidence<TextTarget>,
+    /// A non-password field with a mixed read-only attribute: keys are
+    /// published with `typing:"unknown"` and no text is inferred (D-4c).
+    TypingUnknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]

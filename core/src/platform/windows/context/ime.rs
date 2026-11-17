@@ -59,14 +59,16 @@ impl Reader {
         self.focus_result = None;
         self.key_result = None;
         let Some(visit) = visit else { return };
-        if !has_ime(visit.native) {
-            self.focus_result = Some((visit.generation, State::NotIme));
-        } else {
-            let request = Request { kind: Kind::Focus(visit.generation), visit, expires: Instant::now() + BUDGET };
-            if self.requests.try_send(request).is_ok() {
-                self.pending_focus = Some(request);
-            } else {
-                self.focus_result = Some((visit.generation, State::Unknown));
+        match has_ime(visit.native) {
+            Some(false) => self.focus_result = Some((visit.generation, State::NotIme)),
+            None => self.focus_result = Some((visit.generation, State::Unknown)),
+            Some(true) => {
+                let request = Request { kind: Kind::Focus(visit.generation), visit, expires: Instant::now() + BUDGET };
+                if self.requests.try_send(request).is_ok() {
+                    self.pending_focus = Some(request);
+                } else {
+                    self.focus_result = Some((visit.generation, State::Unknown));
+                }
             }
         }
     }
@@ -102,8 +104,10 @@ impl Reader {
 
     pub fn key_state(&mut self, visit: Visit, key: RequestId) -> Option<State> {
         self.poll();
-        if !has_ime(visit.native) {
-            return Some(State::NotIme);
+        match has_ime(visit.native) {
+            Some(false) => return Some(State::NotIme),
+            None => return Some(State::Unknown),
+            Some(true) => {}
         }
         if let Some((id, state)) = self.key_result.take() && id == key {
             return Some(state);

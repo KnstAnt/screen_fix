@@ -3,6 +3,7 @@
 
 pub(crate) mod disk;
 mod environment;
+pub(crate) use environment::{AwakeElapsed, SuspendMarks};
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -22,8 +23,8 @@ use crate::{
     CaptureError,
     capture::save::{FixtureSave, FixtureSaveError, FixtureSaveResult},
     config::ResolvedCaptureConfig,
-    package::{diagnostics::{DiagnosticContext, Failure, ReportOutcome}, metadata::{
-        ElevatedSourceEvidence, InputBlindReason, SelectedSourceInterval, SelectedSourceKind, SourceBlindInterval, SourceBlindReason,
+    package::{diagnostics::{DiagnosticContext, Failure, FailureComponent, ReportOutcome}, metadata::{
+        ElevatedSourceEvidence, InputBlindReason, LostActivity, SelectedSourceInterval, SelectedSourceKind, SourceBlindInterval, SourceBlindReason,
         SourceEvidence, SourceRegistration, SourceTail, StandardSourceEvidence, UncertifiedInputTail,
     }},
     platform::windows::{ProbeError, clock, hotkeys::ActiveHotkeys, preflight::ForegroundApproval, unavailable},
@@ -32,6 +33,7 @@ use crate::{
 use screen_fix_protocol::ipc::{FocusAtReceipt, InputRegistration, elevated::{VisitBinding, runtime::IdentityClaim}};
 
 use super::{
+    fault::{FaultClass, FaultLog, FaultOutcome, FaultReport},
     AdmissionBoundary, CommandError, PauseReason, SessionCommand, SessionHandle, SessionPhase,
     ReadyVideo, SessionResult, SessionStatus, SourceFailure, SourceFailureReason, SourceStage, SourceStatus,
     StartupStep, VideoReport, WindowCoverage,
@@ -47,6 +49,17 @@ const MAX_CONTROL_NOTICES: usize = 32;
 pub(crate) const MAX_FIXTURE_SAVES: usize = 8;
 const MAX_SOURCE_TRACE: usize = 4096;
 pub(crate) const MAX_INPUT_FAILURES: usize = 4;
+const MAX_HEALTH_REPORTS: usize = 256;
+/// The hotkey progress gap that records a control loss (S1).
+const HOTKEY_PROGRESS_GAP: Duration = Duration::from_millis(250);
+/// The frames merge owner acknowledges an opening between two merge steps,
+/// which never wait for IO; a missing acknowledgement is its failure (§6.5).
+const FRAMES_OPENING_ACK: Duration = Duration::from_secs(1);
+
+/// The frames merge owner's opening endpoint (§6.5). The controller sends
+/// each opening boundary with an acknowledgement sender and publishes the
+/// boundary to the workers only after the acknowledgement.
+pub(crate) type FramesOpening = SyncSender<(AdmissionBoundary, SyncSender<()>)>;
 
 // The recording worker and all nested owners retain this lease until their
 // actual exit, even when the controller has stopped waiting for a result.
@@ -164,6 +177,36 @@ enum CompletePublication {
     Authorized,
 }
 
+/// The controller's lifecycle state machine. `status.phase` is the state; the
+/// latches below are its associated data. Only the controller thread changes
+/// the phase.
+///
+/// States and transitions (`SessionPhase`):
+/// - `Starting` → `Recording` in `start`: the clock origin is set, `opened`
+///   holds the first admission boundary and the source is selected.
+/// - `Recording` → `Paused` in `pause`, when `pause_reasons` becomes non-empty:
+///   `closed` holds the pause cutoff; `pause_started`, `pause_prefix`,
+///   `paused_video` and `pause_interval_reasons` track the boundary.
+/// - `Paused` → `Recording` in `resume`, once every producer finished the
+///   pause at `closed`: `opened` holds the new admission epoch; `closed`,
+///   `suspend_wait` and `suspend_cleanup` are cleared.
+/// - `Starting | Recording | Paused` → `Stopping` in `stop`: `status.stop` holds
+///   the stop boundary (and `closed` when stopping while recording);
+///   `stop_deadline` and `segment_deadline` are bounded by the Stop budget.
+/// - `Stopping` → `Finished` or `Failed` when the controller returns.
+///
+/// Latches:
+/// - `Lifecycle::stop`: Stop was requested; one-way. Set by `request_stop`,
+///   including by an attempt failure (`report_fault`).
+/// - `clock_failed`: the clock or a boundary sample failed; one-way. It ends
+///   source activity and refuses Complete publication.
+/// - `source_change`: the admitted source must change at the next boundary;
+///   set by `require_source_change`, cleared by `select_source` on reopening.
+/// - `complete_publication`: `Awaiting` → `Authorized` or `Expired`; one-way.
+/// - `status.closed` / `status.opened`: the current closing and opening boundaries.
+/// - `suspend_wait`, `segment_deadline`: suspend and Stop bounds on video
+///   finalization (D-5 A); suspend data is read only through `suspend_marks`.
+/// - `faults`: the fault log; its first attempt failure decides the outcome (§6.2).
 #[derive(Default)]
 struct Facts {
     status: SessionStatus,
@@ -171,6 +214,12 @@ struct Facts {
     utc_anchors: Vec<ClockAnchor>,
     tick_anchor: Option<MessageTickAnchor>,
     video_failures: Vec<VideoFailure>,
+    /// Capture and video health conditions for the context stream, in report order.
+    health: Vec<crate::package::journal::HealthRecord>,
+    /// Conditions beyond `MAX_HEALTH_REPORTS`, counted in the manifest health block.
+    omitted_health: u64,
+    /// The suspend sequence read at the previous hotkey drain.
+    hotkey_suspends: u64,
     input_failures: Vec<InputFailure>,
     hotkeys: ControlPrefix,
     fixture_saves: VecDeque<FixtureNotice>,
@@ -179,10 +228,19 @@ struct Facts {
     stop_deadline: Option<Instant>,
     complete_publication: CompletePublication,
     completed_prefix: Option<AdmissionBoundary>,
+    /// The Stop and session-end bound on segment finalization and
+    /// verification. Suspend never sets it (D-5 A).
     segment_deadline: Option<Instant>,
-    pause_deadline: Option<Instant>,
+    /// The suspend sequence whose pause still waits for its video producers.
+    suspend_wait: Option<u64>,
+    /// The suspend budget offered to the elevated collector's cleanup only.
+    suspend_cleanup: Option<Instant>,
+    /// The pause start QPC and the suspend sequence read after it. The pause
+    /// bound is measured with sleep excluded and never across an unknown suspend.
+    pause_started: Option<(QpcTick, u64)>,
     clock_failed: bool,
-    controller_failure: Option<&'static str>,
+    /// Attempt failures and activity losses in report order (§6.2).
+    faults: FaultLog,
     pause_prefix: BTreeSet<PauseProducer>,
     paused_video: BTreeMap<MonitorId, PausedVideo>,
     pause_interval_reasons: BTreeSet<PauseReason>,
@@ -221,9 +279,12 @@ struct Lifecycle {
     input_environment: Arc<AtomicU32>,
     elevated_environment: Arc<AtomicU32>,
     display_revision: Arc<AtomicU32>,
+    /// Written only by the power callback; read through `suspend_marks`.
+    power: Arc<environment::PowerMarks>,
     journal_flush_revision: AtomicU64,
     controller_qpc: AtomicI64,
     hotkey_keys: [u16; 4],
+    frames_opening: OnceLock<FramesOpening>,
 }
 
 #[derive(Default)]
@@ -373,7 +434,10 @@ pub(crate) struct VideoFailure {
 #[derive(Clone, Copy)]
 pub(crate) struct InputFailure {
     pub operation: &'static str,
+    /// The detection receipt.
     pub at: SessionTimeUs,
+    /// The earliest missing receipt: the start of the blind interval.
+    pub first_missing: SessionTimeUs,
     pub failure: Failure,
     pub reason: InputBlindReason,
 }
@@ -504,9 +568,12 @@ impl WorkerSession {
         update(self.lifecycle.lock().source_evidence.elevated.get_or_insert_with(ElevatedSourceEvidence::default));
     }
 
-    pub(crate) fn elevated_registration(&self, epoch: AdmissionEpoch, observed_qpc: QpcTick, registration: InputRegistration) {
+    pub(crate) fn elevated_registration(
+        &self, epoch: AdmissionEpoch, observed_qpc: QpcTick, registration: InputRegistration,
+        held: screen_fix_protocol::ipc::elevated::runtime::HeldReadiness,
+    ) {
         let mut facts = self.lifecycle.lock();
-        let registration = SourceRegistration { epoch, observed_qpc, registration };
+        let registration = SourceRegistration { epoch, observed_qpc, registration, held: Some(held) };
         let evidence = facts.source_evidence.elevated.get_or_insert_with(ElevatedSourceEvidence::default);
         if evidence.registrations.len() < MAX_SOURCE_TRACE {
             evidence.registrations.push(registration);
@@ -646,16 +713,41 @@ impl WorkerSession {
         self.lifecycle.lock().status.clock.is_some()
     }
 
-    pub(crate) fn controller_failure(&self) -> Option<&'static str> {
-        self.lifecycle.lock().controller_failure
+    /// Report an attempt failure or an activity loss. An attempt failure runs the Stop path.
+    pub(crate) fn report_fault(&self, report: FaultReport) {
+        let attempt = report.class() == FaultClass::Attempt;
+        record_fault(&mut self.lifecycle.lock(), report);
+        if attempt {
+            self.request_stop();
+        }
+    }
+
+    pub(crate) fn attempt_failed(&self) -> bool {
+        self.lifecycle.lock().faults.attempt_failure().is_some()
+    }
+
+    pub(crate) fn fault_outcome(&self) -> FaultOutcome {
+        self.lifecycle.lock().faults.outcome()
     }
 
     pub(crate) fn stop_deadline(&self) -> Option<Instant> {
         self.lifecycle.lock().stop_deadline
     }
 
+    /// The latest suspend and resume QPC marks, for excluding sleep from QPC intervals.
+    pub(crate) fn suspend_marks(&self) -> environment::SuspendMarks {
+        self.lifecycle.power.snapshot()
+    }
+
     pub(crate) fn segment_deadline(&self) -> Option<Instant> {
         self.lifecycle.lock().segment_deadline
+    }
+
+    /// The bound on the elevated collector's environment cleanup: the Stop or
+    /// session-end deadline, or the suspend budget.
+    pub(crate) fn cleanup_deadline(&self) -> Option<Instant> {
+        let facts = self.lifecycle.lock();
+        facts.segment_deadline.into_iter().chain(facts.suspend_cleanup).min()
     }
 
     pub(crate) fn pause_interval_reasons(&self, cutoff: AdmissionBoundary) -> Vec<PauseReason> {
@@ -826,8 +918,8 @@ impl WorkerSession {
         if facts.clock_failed {
             return Err(io::Error::other("The session clock or lifecycle controller failed"));
         }
-        if let Some(operation) = facts.controller_failure {
-            return Err(io::Error::other(operation));
+        if let Some(fault) = facts.faults.attempt_failure() {
+            return Err(io::Error::other(fault.operation()));
         }
         if facts.status.phase != SessionPhase::Stopping || facts.status.stop.is_none()
             || facts.status.closed.is_none() || facts.completed_prefix != facts.status.closed
@@ -929,6 +1021,7 @@ impl WorkerSession {
         let entry = VideoFailure { monitor, at, failure };
         facts.video_failures.push(entry);
         facts.status.video_unavailable.push(monitor);
+        record_fault(&mut facts, FaultReport::activity(LostActivity::Required, failure, Some(monitor), at));
         Some(entry)
     }
 
@@ -945,6 +1038,23 @@ impl WorkerSession {
         self.lifecycle.lock().status.video_reports.clone()
     }
 
+    /// A capture or video health condition written to the context stream when
+    /// it occurs (CTX-7). Before the session clock exists it stays only in the
+    /// manifest. Conditions beyond the bound are counted as `omitted_health`.
+    pub(crate) fn report_health(
+        &self, kind: crate::package::outcome::HealthKind, failure: Failure, monitor: Option<MonitorId>, ongoing: bool,
+    ) {
+        push_health(&mut self.lifecycle.lock(), kind, failure, monitor, ongoing);
+    }
+
+    pub(crate) fn omitted_health(&self) -> u64 {
+        self.lifecycle.lock().omitted_health
+    }
+
+    pub(crate) fn health_after(&self, prefix: usize) -> Vec<crate::package::journal::HealthRecord> {
+        self.lifecycle.lock().health.get(prefix..).unwrap_or_default().to_vec()
+    }
+
     pub(crate) fn video_failures_after(&self, prefix: usize) -> Vec<VideoFailure> {
         self.lifecycle.lock().video_failures.get(prefix..).unwrap_or_default().to_vec()
     }
@@ -957,6 +1067,7 @@ impl WorkerSession {
             return false;
         }
         facts.input_failures.push(failure);
+        record_fault(&mut facts, FaultReport::activity(LostActivity::Required, failure.failure, None, Some(failure.first_missing)));
         facts.status.input_unavailable = Some(failure.operation);
         facts.status.input_report = None;
         true
@@ -996,6 +1107,12 @@ impl WorkerSession {
         }
     }
 
+    /// Register the frames merge owner before the controller can start.
+    pub(crate) fn register_frames(&self, opening: FramesOpening) -> Result<(), ProbeError> {
+        self.lifecycle.frames_opening.set(opening)
+            .map_err(|_| unavailable("The frames merge owner was already registered"))
+    }
+
     pub(crate) fn request_journal_flush(&self) {
         self.lifecycle.journal_flush_revision.fetch_add(1, Ordering::Release);
     }
@@ -1006,6 +1123,12 @@ impl WorkerSession {
 
     pub(crate) fn display_revision(&self) -> u32 {
         self.lifecycle.display_revision.load(Ordering::Acquire)
+    }
+
+    /// Ask the standard helper for a fresh registration check; its next
+    /// environment record attests the result (E4).
+    pub(crate) fn request_input_check(&self) {
+        self.lifecycle.input_environment.fetch_or(crate::protocol::ipc::EnvironmentChange::Settings.bit(), Ordering::AcqRel);
     }
 
     pub(crate) fn take_input_environment(&self) -> u32 {
@@ -1077,7 +1200,7 @@ pub(crate) fn spawn(
         drop(facts);
         controller_lifecycle.changed.notify_all();
         let _ = complete.try_send(result);
-    }).map_err(|error| CaptureError::backend("Start the session controller", None, error.to_string()))?;
+    }).map_err(|error| CaptureError::owned(FailureComponent::Controller, "Start the session controller", None, error.to_string()))?;
     Ok(SessionHandle { result, control: Control { lifecycle, commands, wake } })
 }
 
@@ -1091,22 +1214,24 @@ fn run(
     record: fn(&WorkerSession) -> Result<SessionResult, CaptureError>,
     lease: RecordingLease,
 ) -> Result<SessionResult, CaptureError> {
-    let frequency = clock::frequency()?;
+    let frequency = clock::frequency().map_err(controller_error)?;
     let (environment, notifications_ready) = environment::Notifications::spawn(
         Arc::clone(&lifecycle.input_environment), Arc::clone(&lifecycle.elevated_environment), Arc::clone(&lifecycle.display_revision),
-        Arc::clone(&lifecycle.session_end_started), endpoint.wake.clone(),
+        Arc::clone(&lifecycle.session_end_started), Arc::clone(&lifecycle.power), endpoint.wake.clone(),
     )?;
     let pause_producer_count = endpoint.config().monitors().len() * 2 + 2;
+    // The controller reads the suspend marks through the same accessor as the owners.
+    let session = endpoint.clone();
     let worker = thread::Builder::new().name("video-recording".into())
         .spawn(move || {
             let _lease = lease;
             let result = record(&endpoint);
             (Instant::now(), result)
         })
-        .map_err(|error| CaptureError::backend("Start the recording worker", None, error.to_string()))?;
-    let result = coordinate(lifecycle, &commands, &wake, &ready, frequency, &worker, &environment, notifications_ready, &hotkeys, pause_producer_count);
+        .map_err(|error| CaptureError::owned(FailureComponent::Controller, "Start the recording worker", None, error.to_string()))?;
+    let result = coordinate(lifecycle, &session, &commands, &wake, &ready, frequency, &worker, &environment, notifications_ready, &hotkeys, pause_producer_count);
     if let Err(error) = &result {
-        lifecycle.lock().controller_failure = Some(error.operation);
+        record_fault(&mut lifecycle.lock(), FaultReport::attempt(error));
         // A failed controller still closes admission and releases startup
         // waiters. A failed QPC sample may prevent a certified prefix.
         let _ = stop(lifecycle);
@@ -1122,9 +1247,11 @@ fn run(
                     break;
                 }
                 facts.complete_publication = CompletePublication::Expired;
-                return Err(facts.status.source.failure().map(CaptureError::elevated)
-                    .or_else(|| result.err()).unwrap_or_else(|| failure("Finish recording",
-                        "The recording could not finish before its deadline. An active owner may still hold capture or output resources.")));
+                // The retained primary cause is never replaced by the deadline (§6.2 rule 2).
+                let timeout = failure("Finish recording",
+                    "The recording could not finish before its deadline. An active owner may still hold capture or output resources.");
+                record_fault(&mut facts, FaultReport::attempt(&timeout));
+                return Err(retained_cause(facts.faults.primary_outcome(), timeout));
             }
             (remaining, remaining.is_zero() && lifecycle.session_end_started.get().is_some())
         };
@@ -1145,26 +1272,17 @@ fn run(
     let (completed, worker_result) = worker_result?;
     let acknowledged = match result {
         Ok(acknowledged) => acknowledged,
-        Err(error) => {
-            if let Err(worker_error) = worker_result
-                && let Some(source) = worker_error.source_failure()
-            {
-                if error.source_failure() == Some(source) {
-                    return Err(worker_error);
-                }
-                if error.source_failure().is_none() {
-                    return Err(worker_error.with_additional_failure(error.failure()));
-                }
-            }
-            return Err(error);
-        }
+        // The worker composes its error from the same fault log, which already
+        // holds this controller failure, so its first attempt failure is retained.
+        Err(error) => return Err(worker_result.err().unwrap_or(error)),
     };
     if facts.stop_deadline.is_some_and(|deadline| completed >= deadline) {
-        if let Some(source) = facts.status.source.failure() {
-            let error = worker_result.err().filter(|error| error.source_failure() == Some(source));
-            return Err(error.unwrap_or_else(|| CaptureError::elevated(source)));
-        }
-        return Err(failure("Finish recording", "The recording owners finished after the finalization deadline."));
+        let late = failure("Finish recording", "The recording owners finished after the finalization deadline.");
+        record_fault(&mut facts, FaultReport::attempt(&late));
+        return Err(match worker_result {
+            Err(error) => error.with_additional_failure(late.failure()),
+            Ok(_) => retained_cause(facts.faults.primary_outcome(), late),
+        });
     }
     let message = worker_result?;
     if let Some(cutoff) = facts.status.closed
@@ -1175,12 +1293,19 @@ fn run(
     Ok(message)
 }
 
+/// The primary cause with every other retained cause attached for diagnostics.
+fn retained_cause(outcome: FaultOutcome, fallback: CaptureError) -> CaptureError {
+    let FaultOutcome { error, additional, .. } = outcome;
+    additional.into_iter().fold(error.unwrap_or(fallback), CaptureError::with_additional_failure)
+}
+
 fn publication_timeout() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "The recording deadline expired before Complete publication")
 }
 
 fn coordinate(
     lifecycle: &Lifecycle,
+    session: &WorkerSession,
     commands: &Receiver<SessionCommand>,
     wake: &Receiver<()>,
     ready: &Receiver<()>,
@@ -1208,7 +1333,7 @@ fn coordinate(
             }
             return Ok(pause_finished);
         }
-        lifecycle.controller_qpc.store(clock::qpc()?.0, Ordering::Release);
+        lifecycle.controller_qpc.store(clock::qpc().map_err(controller_error)?.0, Ordering::Release);
         if !subscribed {
             match notifications_ready.try_recv() {
                 Ok(result) => { result?; subscribed = true; }
@@ -1228,8 +1353,10 @@ fn coordinate(
                 if reason == PauseReason::Sleep && !reasons.contains(&reason) {
                     let mut facts = lifecycle.lock();
                     if matches!(facts.status.phase, SessionPhase::Recording | SessionPhase::Paused) {
-                        let deadline = environment.suspend_started().unwrap_or_else(Instant::now) + environment::SUSPEND_BUDGET;
-                        shorten(&mut facts.segment_deadline, deadline);
+                        // Video finalization may continue after wake; a miss is
+                        // a health row, never a fault (D-5 A).
+                        facts.suspend_wait = Some(session.suspend_marks().sequence);
+                        shorten(&mut facts.suspend_cleanup, Instant::now() + environment::SUSPEND_BUDGET);
                     }
                 }
                 pause_command(lifecycle, &mut reasons, SessionCommand::Pause(reason))?;
@@ -1247,7 +1374,7 @@ fn coordinate(
         }
         if subscribed && countdown.is_none() && ready.try_recv().is_ok() {
             lifecycle.lock().status.startup = StartupStep::Ready;
-            countdown = Some(clock::qpc()?);
+            countdown = Some(clock::qpc().map_err(controller_error)?);
         }
         // Bound processing per wake and revisit the independent Stop latch first.
         for command in commands.try_iter().take(8) {
@@ -1273,18 +1400,37 @@ fn coordinate(
                 if facts.pause_prefix.iter().filter(|producer| matches!(producer, PauseProducer::Video(_))).count()
                     == (pause_producer_count - 2) / 2
                 {
-                    facts.segment_deadline = None;
+                    facts.suspend_wait = None;
+                    facts.suspend_cleanup = None;
+                } else if let Some(sequence) = facts.suspend_wait {
+                    // The suspend window cannot be measured while the suspend is
+                    // open. A video prefix still open when the system has
+                    // resumed missed it: one G row per late monitor.
+                    let marks = session.suspend_marks();
+                    if marks.sequence != sequence || marks.resume.is_some() {
+                        facts.suspend_wait = None;
+                        let late: Vec<_> = session.config().monitors().iter().map(|monitor| monitor.id)
+                            .filter(|id| !facts.pause_prefix.contains(&PauseProducer::Video(*id))).collect();
+                        for monitor in late {
+                            push_health(&mut facts, crate::package::outcome::HealthKind::SuspendFinalizeLate,
+                                Failure::new(FailureComponent::Video, "Finish the suspended video segment", None), Some(monitor), false);
+                        }
+                    }
                 }
                 if facts.pause_prefix.len() == pause_producer_count {
                     pause_finished = facts.status.closed;
-                    facts.pause_deadline = None;
+                    facts.pause_started = None;
                 }
             }
         }
-        if pause_finished.is_none() && lifecycle.lock().segment_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Err(failure("Finish the suspended video segment", "Video did not finish within the suspend budget."));
-        }
-        if lifecycle.lock().pause_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        let pause_overdue = {
+            let facts = lifecycle.lock();
+            let now = clock::qpc().map_err(controller_error)?;
+            facts.pause_started.is_some_and(|(started, since)| matches!(
+                session.suspend_marks().awake_elapsed(started, now, since, frequency),
+                AwakeElapsed::Known(elapsed) if elapsed >= STOP_BUDGET))
+        };
+        if pause_overdue {
             return Err(failure("Finish the paused recording prefix", "A recording owner did not finish its pause prefix."));
         }
         if let Some(finished) = pause_finished {
@@ -1305,9 +1451,16 @@ fn coordinate(
             }
         }
         let mut wait = CONTROL_WAIT;
-        if let Some(begin) = countdown {
+        // A lock, secure desktop or suspend holds the countdown at its full
+        // length: the approved application must be in front when it ends.
+        if countdown.is_some() && reasons.iter().any(|reason| matches!(reason,
+            PauseReason::LockScreen | PauseReason::SecureDesktop | PauseReason::Sleep))
+        {
+            countdown = Some(clock::qpc().map_err(controller_error)?);
+            lifecycle.lock().status.countdown_seconds = None;
+        } else if let Some(begin) = countdown {
             let ticks_per_second = i128::from(frequency.0.get());
-            let elapsed = i128::from(clock::qpc()?.0) - i128::from(begin.0);
+            let elapsed = i128::from(clock::qpc().map_err(controller_error)?.0) - i128::from(begin.0);
             if elapsed < 0 {
                 return Err(failure("Count down to recording", "QPC moved backward during the countdown."));
             }
@@ -1473,13 +1626,18 @@ fn route_hotkeys(
     let batch = hotkeys.drain();
     let before = batch.before;
     let loss = batch.loss;
-    let detected_at = clock::qpc()?;
-    let overdue = before.is_some_and(|last| {
-        i128::from(detected_at.0).saturating_sub(i128::from(last.0)) * 4 > i128::from(frequency.0.get())
-    });
-    let failed = batch.failed || overdue;
-    let already_failed = lifecycle.lock().hotkeys.failed;
-    for activation in batch.into_events().take_while(|_| !already_failed) {
+    let detected_at = clock::qpc().map_err(controller_error)?;
+    // A progress gap over 250 ms, sleep excluded, is a recorded control loss;
+    // later activations are processed normally. The suspend sequence was read
+    // at the previous drain, before the progress mark, so a missed suspend
+    // makes the gap unknown rather than overdue.
+    let marks = lifecycle.power.snapshot();
+    let since = std::mem::replace(&mut lifecycle.lock().hotkey_suspends, marks.sequence);
+    let overdue = before.is_some_and(|last| matches!(marks.awake_elapsed(last, detected_at, since, frequency),
+        AwakeElapsed::Known(gap) if gap > HOTKEY_PROGRESS_GAP));
+    // Only a stopped hotkey thread makes the hotkeys unavailable.
+    let failed = batch.failed;
+    for activation in batch.into_events() {
         let outcome = if lifecycle.stop.load(Ordering::Acquire) {
             ControlOutcome::AlreadyStopping
         } else {
@@ -1515,18 +1673,18 @@ fn route_hotkeys(
         facts.status.last_hotkey = Some(outcome);
     }
     let mut facts = lifecycle.lock();
-    if !already_failed {
-        facts.hotkeys.before = before;
-        if let Some(loss) = loss {
-            ControlLoss::merge(&mut facts.hotkeys.loss, loss);
-        }
-        if failed {
-            ControlLoss::merge(&mut facts.hotkeys.loss, ControlLoss {
-                first: before.unwrap_or(detected_at), last: detected_at, count: None,
-            });
-            facts.hotkeys.failed = true;
-            facts.status.hotkeys_unavailable = true;
-        }
+    facts.hotkeys.before = before;
+    if let Some(loss) = loss {
+        ControlLoss::merge(&mut facts.hotkeys.loss, loss);
+    }
+    if failed || overdue {
+        ControlLoss::merge(&mut facts.hotkeys.loss, ControlLoss {
+            first: before.unwrap_or(detected_at), last: detected_at, count: None,
+        });
+    }
+    if failed {
+        facts.hotkeys.failed = true;
+        facts.status.hotkeys_unavailable = true;
     }
     Ok(())
 }
@@ -1534,6 +1692,13 @@ fn route_hotkeys(
 fn restrict_interval(interval: &mut SelectedInterval, before: SessionTimeUs) {
     interval.cutoff = Some(interval.cutoff.map_or(before, |cutoff| cutoff.min(before)));
     interval.evidence.before_t_us = interval.evidence.before_t_us.min(before);
+}
+
+/// The label of a source-transition pause: its actual pause reason, and
+/// `elevation_transition` only when the transition latch alone paused.
+fn pause_blind_reason(reasons: &BTreeSet<PauseReason>) -> SourceBlindReason {
+    reasons.iter().copied().find(|reason| *reason != PauseReason::ElevationTransition)
+        .map_or(SourceBlindReason::ElevationTransition, SourceBlindReason::Pause)
 }
 
 fn push_source_blind(facts: &mut Facts, interval: SourceBlindInterval) {
@@ -1562,9 +1727,19 @@ fn clear_source_status(facts: &mut Facts) {
     }
 }
 
+/// Record a fault in the controller's log. A lost activity becomes visible in the status at once.
+fn record_fault(facts: &mut Facts, report: FaultReport) {
+    let now = facts.status.clock.and_then(|origin| origin.time(clock::qpc().ok()?).ok());
+    if let Some(degraded) = facts.faults.record(report, now)
+        && !facts.status.degraded.contains(&degraded)
+    {
+        facts.status.degraded.push(degraded);
+    }
+}
+
 fn set_source_failure(facts: &mut Facts, failure: SourceFailure) {
     if facts.status.source.failure().is_none() {
-        facts.controller_failure = Some(CaptureError::elevated(failure).operation);
+        record_fault(facts, FaultReport::attempt(&CaptureError::elevated(failure)));
         facts.status.source = if failure.admitted {
             SourceStatus::FailedPrefix(failure)
         } else {
@@ -1599,15 +1774,16 @@ fn select_source(facts: &mut Facts, epoch: AdmissionEpoch, selected: Option<Sele
 }
 
 fn start(lifecycle: &Lifecycle, frequency: QpcFrequency, selected: Option<SelectedSource>) -> Result<(), CaptureError> {
-    let mut facts = lifecycle.lock();
     if lifecycle.stop.load(Ordering::Acquire) {
         return Ok(());
     }
-    let anchor = clock::utc_anchor()?;
+    let anchor = clock::utc_anchor().map_err(controller_error)?;
     let origin = ClockOrigin { origin_qpc: anchor.qpc, qpc_frequency: frequency };
     let epoch = selected.as_ref().map_or(AdmissionEpoch(1), |source| source.epoch);
     let boundary = boundary(origin, anchor.qpc, epoch)?;
-    let tick_anchor = clock::message_tick_anchor()?;
+    let tick_anchor = clock::message_tick_anchor().map_err(controller_error)?;
+    open_frames(lifecycle, boundary)?;
+    let mut facts = lifecycle.lock();
     if lifecycle.stop.load(Ordering::Acquire) || lifecycle.session_end_started.get().is_some() {
         return Ok(());
     }
@@ -1620,6 +1796,31 @@ fn start(lifecycle: &Lifecycle, frequency: QpcFrequency, selected: Option<Select
     facts.status.countdown_seconds = None;
     lifecycle.changed.notify_all();
     Ok(())
+}
+
+/// Opening(e, R) (§6.5): the frames merge owner sets every monitor's floor at
+/// R before any video worker can observe epoch e. The controller does not
+/// hold the lifecycle lock while it waits.
+fn open_frames(lifecycle: &Lifecycle, opening: AdmissionBoundary) -> Result<(), CaptureError> {
+    let lost = || CaptureError::owned(FailureComponent::Journal, "Open the frames journal epoch", None,
+        "The frames merge owner did not acknowledge the opening boundary.".into());
+    let owner = lifecycle.frames_opening.get().ok_or_else(lost)?;
+    let (ack, acknowledged) = mpsc::sync_channel(1);
+    owner.try_send((opening, ack)).map_err(|_| lost())?;
+    acknowledged.recv_timeout(FRAMES_OPENING_ACK).map_err(|_| lost())
+}
+
+fn push_health(
+    facts: &mut Facts, kind: crate::package::outcome::HealthKind, failure: Failure, monitor: Option<MonitorId>, ongoing: bool,
+) {
+    let Some(at) = facts.status.clock.and_then(|origin| origin.time(clock::qpc().ok()?).ok()) else { return };
+    if facts.health.len() < MAX_HEALTH_REPORTS {
+        facts.health.push(crate::package::journal::HealthRecord {
+            kind, failure, detected: at, first_affected: Some(at), ongoing, monitor, count: None,
+        });
+    } else {
+        facts.omitted_health = facts.omitted_health.saturating_add(1);
+    }
 }
 
 fn shorten(deadline: &mut Option<Instant>, candidate: Instant) {
@@ -1643,7 +1844,7 @@ fn stop(lifecycle: &Lifecycle) -> Result<(), CaptureError> {
     facts.status.countdown_seconds = None;
     let sampled = (|| {
         if let (Some(origin), Some(opened)) = (facts.status.clock, facts.status.opened) {
-            let stopped = boundary(origin, clock::qpc()?, opened.epoch)?;
+            let stopped = boundary(origin, clock::qpc().map_err(controller_error)?, opened.epoch)?;
             facts.status.stop = Some(stopped);
             if was_recording {
                 facts.status.closed = Some(stopped);
@@ -1651,17 +1852,18 @@ fn stop(lifecycle: &Lifecycle) -> Result<(), CaptureError> {
             } else if let Some(closed) = facts.status.closed
                 && facts.pause_interval_reasons.contains(&PauseReason::ElevationTransition)
             {
+                let reason = pause_blind_reason(&facts.pause_interval_reasons);
                 push_source_blind(&mut facts, SourceBlindInterval {
-                    epoch: closed.epoch, start_t_us: closed.time, before_t_us: stopped.time,
-                    reason: SourceBlindReason::ElevationTransition,
+                    epoch: closed.epoch, start_t_us: closed.time, before_t_us: stopped.time, reason,
                 });
             }
-            facts.utc_anchors.push(ClockAnchor { admission_epoch: stopped.epoch, sample: clock::utc_anchor()? });
+            facts.utc_anchors.push(ClockAnchor { admission_epoch: stopped.epoch, sample: clock::utc_anchor().map_err(controller_error)? });
         }
         Ok::<(), CaptureError>(())
     })();
-    if sampled.is_err() {
+    if let Err(error) = &sampled {
         facts.clock_failed = true;
+        record_fault(&mut facts, FaultReport::attempt(error));
     }
     lifecycle.changed.notify_all();
     sampled
@@ -1692,8 +1894,8 @@ fn pause_command(
     } else if facts.status.phase == SessionPhase::Recording && !reasons.is_empty()
         && let (Some(origin), Some(opened)) = (facts.status.clock, facts.status.opened)
     {
-        let closed = boundary(origin, clock::qpc()?, opened.epoch)?;
-        let anchor = clock::utc_anchor()?;
+        let closed = boundary(origin, clock::qpc().map_err(controller_error)?, opened.epoch)?;
+        let anchor = clock::utc_anchor().map_err(controller_error)?;
         facts.status.closed = Some(closed);
         facts.utc_anchors.push(ClockAnchor { admission_epoch: closed.epoch, sample: anchor });
         facts.status.phase = SessionPhase::Paused;
@@ -1702,14 +1904,15 @@ fn pause_command(
         facts.paused_video.clear();
         facts.input_prefix = None;
         facts.pause_interval_reasons.clone_from(reasons);
-        facts.pause_deadline = Some(Instant::now() + STOP_BUDGET);
+        let started = clock::qpc().map_err(controller_error)?;
+        facts.pause_started = Some((started, lifecycle.power.snapshot().sequence));
         lifecycle.changed.notify_all();
     }
     Ok(())
 }
 
 fn resume(lifecycle: &Lifecycle, finished: AdmissionBoundary, selected: Option<SelectedSource>) -> Result<(), CaptureError> {
-    let mut facts = lifecycle.lock();
+    let facts = lifecycle.lock();
     if lifecycle.stop.load(Ordering::Acquire) || facts.status.phase != SessionPhase::Paused || facts.status.closed != Some(finished) {
         return Ok(());
     }
@@ -1720,20 +1923,27 @@ fn resume(lifecycle: &Lifecycle, finished: AdmissionBoundary, selected: Option<S
         None => facts.source_epoch.checked_add(1).map(AdmissionEpoch)
             .ok_or_else(|| failure("Resume recording", "The admission epoch overflowed."))?,
     };
-    let resume_anchor = clock::utc_anchor()?;
-    let tick_anchor = clock::message_tick_anchor()?;
+    let resume_anchor = clock::utc_anchor().map_err(controller_error)?;
+    let tick_anchor = clock::message_tick_anchor().map_err(controller_error)?;
     let reopened = boundary(origin, resume_anchor.qpc, epoch)?;
+    drop(facts);
+    open_frames(lifecycle, reopened)?;
+    let mut facts = lifecycle.lock();
+    if lifecycle.stop.load(Ordering::Acquire) || facts.status.phase != SessionPhase::Paused || facts.status.closed != Some(finished) {
+        return Ok(());
+    }
     if facts.pause_interval_reasons.contains(&PauseReason::ElevationTransition) {
+        let reason = pause_blind_reason(&facts.pause_interval_reasons);
         push_source_blind(&mut facts, SourceBlindInterval {
-            epoch: finished.epoch, start_t_us: finished.time, before_t_us: reopened.time,
-            reason: SourceBlindReason::ElevationTransition,
+            epoch: finished.epoch, start_t_us: finished.time, before_t_us: reopened.time, reason,
         });
     }
     facts.status.opened = Some(reopened);
     select_source(&mut facts, epoch, selected);
     facts.status.closed = None;
     facts.status.phase = SessionPhase::Recording;
-    facts.segment_deadline = None;
+    facts.suspend_wait = None;
+    facts.suspend_cleanup = None;
     facts.last_pause = Some((finished, facts.pause_interval_reasons.iter().copied().collect()));
     facts.utc_anchors.push(ClockAnchor { admission_epoch: epoch, sample: resume_anchor });
     facts.tick_anchor = Some(tick_anchor);
@@ -1749,17 +1959,17 @@ fn sample_anchors(lifecycle: &Lifecycle) -> Result<(), CaptureError> {
     let (Some(origin), Some(opened)) = (facts.status.clock, facts.status.opened) else {
         return Ok(());
     };
-    let now = clock::qpc()?;
+    let now = clock::qpc().map_err(controller_error)?;
     let ticks_per_second = i128::from(origin.qpc_frequency.0.get());
     if facts.tick_anchor.is_none_or(|anchor| {
         i128::from(now.0) - i128::from(anchor.qpc.0) >= ticks_per_second
     }) {
-        facts.tick_anchor = Some(clock::message_tick_anchor()?);
+        facts.tick_anchor = Some(clock::message_tick_anchor().map_err(controller_error)?);
     }
     if facts.utc_anchors.last().is_none_or(|anchor| {
         i128::from(now.0) - i128::from(anchor.sample.qpc.0) >= ticks_per_second * i128::from(UTC_INTERVAL_SECONDS)
     }) {
-        facts.utc_anchors.push(ClockAnchor { admission_epoch: opened.epoch, sample: clock::utc_anchor()? });
+        facts.utc_anchors.push(ClockAnchor { admission_epoch: opened.epoch, sample: clock::utc_anchor().map_err(controller_error)? });
     }
     Ok(())
 }
@@ -1769,9 +1979,14 @@ fn boundary(origin: ClockOrigin, qpc: QpcTick, epoch: AdmissionEpoch) -> Result<
 }
 
 fn timing_error(error: crate::protocol::ClockRangeError) -> CaptureError {
-    CaptureError::backend("Convert the session timestamp", None, error.to_string())
+    CaptureError::owned(FailureComponent::Controller, "Convert the session timestamp", None, error.to_string())
+}
+
+/// Clock and lifecycle errors on the controller path belong to the controller.
+fn controller_error(error: ProbeError) -> CaptureError {
+    error.into_error(FailureComponent::Controller)
 }
 
 fn failure(operation: &'static str, message: &'static str) -> CaptureError {
-    CaptureError::backend(operation, None, message.into())
+    CaptureError::owned(FailureComponent::Controller, operation, None, message.into())
 }

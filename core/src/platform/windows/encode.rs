@@ -59,7 +59,8 @@ pub(super) fn record<S>(
     encoder: &IMFTransform,
     device: Option<&ID3D11Device>,
     state: &mut S,
-    mut observe_admission: impl FnMut(&mut S) -> Result<(), ProbeError>,
+    /// Returns true after a system suspend: time asleep is not encoder time.
+    mut observe_admission: impl FnMut(&mut S) -> Result<bool, ProbeError>,
     mut next_frame: impl FnMut(&mut S) -> Result<Next, ProbeError>,
     mut prefix_drained: impl FnMut(&mut S) -> Result<(), ProbeError>,
     mut output: impl FnMut(&mut S, &IMFTransform, &IMFSample) -> Result<usize, ProbeError>,
@@ -95,7 +96,10 @@ pub(super) fn record<S>(
         let active = Arc::new(AtomicUsize::new(0));
         let mut pending: Option<(Input, i64, i64, bool, Instant)> = None;
         loop {
-            observe_admission(state)?;
+            if observe_admission(state)? {
+                activity = Instant::now();
+                if let Some(pending) = &mut pending { pending.4 = activity; }
+            }
             if ((draining || outstanding != 0) && activity.elapsed() >= Duration::from_secs(5))
                 || pending.as_ref().is_some_and(|pending| pending.4.elapsed() >= Duration::from_secs(5))
             {
@@ -119,6 +123,9 @@ pub(super) fn record<S>(
                                 outstanding = outstanding.checked_sub(retired)
                                     .ok_or_else(|| unavailable("The H.264 encoder returned an unsolicited picture"))?;
                                 activity = Instant::now();
+                                // Time in the owner's output step (rotation, a
+                                // wait for a verifier slot) is not encoder time.
+                                if let Some(pending) = &mut pending { pending.4 = activity; }
                             }
                             // Work in output order before taking another input request.
                             continue;
@@ -144,6 +151,7 @@ pub(super) fn record<S>(
                         outstanding = outstanding.checked_sub(retired)
                             .ok_or_else(|| unavailable("The H.264 encoder returned an unsolicited picture"))?;
                         activity = Instant::now();
+                        if let Some(pending) = &mut pending { pending.4 = activity; }
                         continue;
                     }
                     Output::NeedInput if draining => {

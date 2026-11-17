@@ -54,6 +54,9 @@ pub(crate) struct HeldSynchronization {
     pub physical_buttons: u8,
     pub swapped: bool,
     pub caps_lock: bool,
+    /// Every virtual key physically down at the resync, as a 256-bit set.
+    /// Private state only; ordinary keys get no synthetic edges (stage I4).
+    pub keys: [u64; 4],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -86,6 +89,9 @@ pub(crate) struct PhysicalHeld {
     modifiers_known: u8,
     buttons_known: u8,
     known_released: BTreeSet<HeldIdentity>,
+    /// Ordinary keys known up since the last resync (stage I4). A key outside
+    /// it, and not released since, is down or unknown across the boundary.
+    keys_up: [u64; 4],
     caps_lock: Option<bool>,
     companion_at: Option<SessionTimeUs>,
     right_alt_at: Option<SessionTimeUs>,
@@ -185,6 +191,7 @@ impl PhysicalHeld {
         self.modifiers_known = 0;
         self.buttons_known = 0;
         self.known_released.clear();
+        self.keys_up = [0; 4];
         self.caps_lock = None;
         self.companion_at = None;
         self.right_alt_at = None;
@@ -204,6 +211,7 @@ impl PhysicalHeld {
         self.known_released.retain(|hold| hold.device != Some(id));
         self.modifiers_known = 0;
         self.buttons_known = 0;
+        self.keys_up = [0; 4];
     }
 
     /// Called only with a desktop/integrity-verified modifier/button snapshot.
@@ -211,8 +219,9 @@ impl PhysicalHeld {
     pub fn synchronize(
         &mut self, synchronization: HeldSynchronization, t_us: SessionTimeUs,
     ) -> Vec<SyntheticHeldEdge> {
-        let HeldSynchronization { modifiers, physical_buttons, swapped, caps_lock } = synchronization;
+        let HeldSynchronization { modifiers, physical_buttons, swapped, caps_lock, keys } = synchronization;
         let prior = self.snapshot();
+        self.keys_up = keys.map(|down| !down);
         self.caps_lock = Some(caps_lock);
         self.companion_at = None;
         self.right_alt_at = None;
@@ -254,6 +263,15 @@ impl PhysicalHeld {
         }
     }
 
+    /// Whether an ordinary key was known up since the resync. It is down from now on.
+    fn take_key_up(&mut self, vk: u16) -> bool {
+        let Some(word) = self.keys_up.get_mut(usize::from(vk >> 6)) else { return false };
+        let bit = 1_u64 << (vk & 63);
+        let up = *word & bit != 0;
+        *word &= !bit;
+        up
+    }
+
     fn apply(&mut self, edge: HeldEdge) -> Evidence<bool> {
         let own = edge.identity;
         let mut matching = self.held.iter().filter(|old| compatible(**old, own)).copied();
@@ -278,6 +296,7 @@ impl PhysicalHeld {
             let released = self.known_released.iter().find(|old| compatible(**old, own)).copied();
             let known_up = match own.holding {
                 Holding::Key { modifier: Some(modifier), .. } => self.modifiers_known & modifier_bit(modifier) != 0,
+                Holding::Key { vk, modifier: None, .. } => self.take_key_up(vk),
                 Holding::Button { logical, .. } => self.buttons_known & button_bit(logical) != 0,
                 _ => false,
             };

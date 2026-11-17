@@ -27,6 +27,17 @@ pub(super) struct HidPublication {
 }
 
 impl HidPublication {
+    /// Forget the touchpad and multi-axis state, including the scan clocks of
+    /// those devices, without touching pen state.
+    pub fn reset_optional(&mut self) {
+        let devices: Vec<DeviceId> = self.frames.keys().chain(self.latest_contacts.keys()).chain(self.ndof_masks.keys())
+            .chain(self.ndof_buttons.iter().map(|button| &button.device)).copied().collect();
+        for device in devices {
+            self.reset(Some(device));
+        }
+        self.ndof_overflow_at = None;
+    }
+
     pub fn reset(&mut self, device: Option<DeviceId>) {
         if let Some(device) = device {
             self.clocks.remove(&device);
@@ -191,9 +202,10 @@ impl HidPublication {
         if let Some(clock) = self.clocks.get_mut(&device) && clock.spec == spec {
             return clock.map(raw, at);
         }
-        let (clock, source) = ScanClock::start(raw, spec, at)?;
-        self.clocks.insert(device, clock);
-        Some(source)
+        // The first report of a new Scan Time base only starts the fit; its
+        // receipt is never copied into source time (CLK-2).
+        self.clocks.insert(device, ScanClock::start(raw, spec, at)?);
+        None
     }
 }
 
@@ -246,11 +258,11 @@ struct ScanClock {
 }
 
 impl ScanClock {
-    fn start(raw: i64, spec: HidValueSpec, at: SessionTimeUs) -> Option<(Self, SessionTimeUs)> {
+    fn start(raw: i64, spec: HidValueSpec, at: SessionTimeUs) -> Option<Self> {
         scan_extent(raw, spec)?;
         let mut offsets = VecDeque::with_capacity(FIT_SAMPLES);
         offsets.push_back(i128::from(at.0));
-        Some((Self { spec, raw, unwrapped: 0, at, period_us: None, offsets }, at))
+        Some(Self { spec, raw, unwrapped: 0, at, period_us: None, offsets })
     }
 
     fn map(&mut self, raw: i64, at: SessionTimeUs) -> Option<SessionTimeUs> {
@@ -262,9 +274,8 @@ impl ScanClock {
         // A large forward modular delta may be a device reset. Once an
         // interval is observed, either clock can force a new base.
         if dt < 0 || dt > gap || elapsed > i128::from(gap) {
-            let (clock, source) = Self::start(raw, self.spec, at)?;
-            *self = clock;
-            return Some(source);
+            *self = Self::start(raw, self.spec, at)?;
+            return None;
         }
         if elapsed != 0 {
             let elapsed = i64::try_from(elapsed).ok()?;

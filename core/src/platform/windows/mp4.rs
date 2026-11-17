@@ -3,9 +3,12 @@ use std::{
     fs,
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
+    sync::{Arc, atomic::{AtomicU8, Ordering}, mpsc::{Receiver, SyncSender}},
 };
 
-use windows::{Win32::Media::MediaFoundation::*, core::PCWSTR};
+use windows::{Win32::{Graphics::Dxgi::IDXGIAdapter1, Media::MediaFoundation::*}, core::PCWSTR};
+
+use crate::protocol::SegmentId;
 
 use super::{ProbeError, mf, stage, unavailable};
 
@@ -16,6 +19,7 @@ pub(super) fn io_error(stage: &'static str, error: std::io::Error) -> ProbeError
         stage,
         journal: None,
         raw_input_registration: None,
+        owner: None,
         source: Some(windows::core::Error::new(
             windows::core::HRESULT::from_win32(error.raw_os_error().unwrap_or(1) as u32),
             error.to_string(),
@@ -28,6 +32,42 @@ pub(super) struct Recording {
     stream: u32,
     pending: PathBuf,
     path: PathBuf,
+}
+
+/// The claim on a handed-off part: the verifier publishes it only if the
+/// video worker has not abandoned it, and the worker abandons it only if its
+/// publication has not begun.
+pub(super) const CLAIM_OPEN: u8 = 0;
+const CLAIM_PUBLISHING: u8 = 1;
+pub(super) const CLAIM_ABANDONED: u8 = 2;
+
+pub(super) const DEADLINE: &str = "The MP4 publication deadline expired";
+const ABANDONED: &str = "The video owner abandoned the overdue segment verification";
+
+/// A finalized and flushed `.part` handed to the segment verifier.
+pub(super) struct SegmentToVerify {
+    pub segment: SegmentId,
+    pending: PathBuf,
+    path: PathBuf,
+    /// The planned (PTS, duration) of each indexed picture, in 100 ns.
+    expected: Vec<(i64, i64)>,
+    size: [u32; 2],
+    /// Whether the media, with the decoded end once known, is still authorized.
+    authorized: Box<dyn Fn(Option<i64>) -> bool + Send>,
+    pub claim: Arc<AtomicU8>,
+}
+
+/// A verified and published segment: its decoded timing and extent.
+pub(super) struct Published {
+    pub local_end_100ns: i64,
+    pub bytes: u64,
+    pub timing: Vec<(i64, i64)>,
+}
+
+pub(super) struct Verdict {
+    pub segment: SegmentId,
+    /// `Ok(None)`: the media was revoked and its part removed.
+    pub outcome: Result<Option<Published>, ProbeError>,
 }
 
 impl Recording {
@@ -66,62 +106,122 @@ impl Recording {
         remove_part(&self.pending)
     }
 
-    pub(super) fn finish(
-        self, expected: &mut [super::slots::Row], size: [u32; 2],
-        deadline: impl Fn() -> Option<std::time::Instant>, authorized: impl Fn(Option<i64>) -> bool,
-    ) -> Result<Option<(i64, u64)>, ProbeError> {
+    /// Finalize, release and flush the part on the video worker (the ALG
+    /// rotation steps). The returned part still needs verification before
+    /// publication. `None`: the media was revoked and its part removed.
+    pub(super) fn close(
+        self, segment: SegmentId, expected: Vec<(i64, i64)>, size: [u32; 2],
+        deadline: impl Fn() -> Option<std::time::Instant>, authorized: Box<dyn Fn(Option<i64>) -> bool + Send>,
+    ) -> Result<Option<SegmentToVerify>, ProbeError> {
         let pending = self.pending.clone();
-        match self.finish_verified(expected, size, deadline, &authorized) {
-            Ok(published) => Ok(Some(published)),
+        let check = || {
+            if !authorized(None) {
+                return Err(unavailable(REVOKED));
+            }
+            check_deadline(&deadline)
+        };
+        let closed = (|| {
+            check()?;
+            stage(unsafe { self.writer.Finalize() }, "Finalize the MP4")?;
+            drop(self.writer);
+            check()?;
+            fs::OpenOptions::new().write(true).open(&pending).and_then(|file| file.sync_all())
+                .map_err(|error| io_error("Flush the finalized MP4", error))?;
+            check()
+        })();
+        match closed {
+            Ok(()) => Ok(Some(SegmentToVerify {
+                segment, pending, path: self.path, expected, size, authorized, claim: Arc::new(AtomicU8::new(CLAIM_OPEN)),
+            })),
             Err(error) if error.stage == REVOKED => { remove_part(&pending)?; Ok(None) }
             Err(error) => Err(error),
         }
     }
+}
 
-    fn finish_verified(
-        self, expected: &mut [super::slots::Row], size: [u32; 2],
-        deadline: impl Fn() -> Option<std::time::Instant>, authorized: &impl Fn(Option<i64>) -> bool,
-    ) -> Result<(i64, u64), ProbeError> {
+fn check_deadline(deadline: &impl Fn() -> Option<std::time::Instant>) -> Result<(), ProbeError> {
+    if deadline().is_some_and(|limit| std::time::Instant::now() >= limit) {
+        return Err(unavailable(DEADLINE));
+    }
+    Ok(())
+}
+
+/// The per-monitor segment verifier. It decodes each handed-off part, with a
+/// hardware decoder on its own D3D11 device when available, and publishes it
+/// by renaming it to `.mp4` only after verification. The video worker keeps
+/// at most two parts in flight.
+pub(super) fn verify_segments(
+    adapter: IDXGIAdapter1, parts: Receiver<SegmentToVerify>, verdicts: SyncSender<Verdict>,
+    deadline: impl Fn() -> Option<std::time::Instant>,
+) {
+    // Without COM the verifier exits; the worker sees it as disconnected.
+    let Ok(_apartment) = super::Apartment::initialize() else { return };
+    let decoder = super::capture_device(&adapter).and_then(|device| {
+        let (token, manager) = mf::device_manager()?;
+        stage(unsafe { manager.ResetDevice(&device, token) }, "Attach the segment decoder D3D11 device")?;
+        Ok(manager)
+    }).ok();
+    for part in parts {
+        let segment = part.segment;
+        let outcome = part.publish(decoder.as_ref(), &deadline);
+        if verdicts.send(Verdict { segment, outcome }).is_err() {
+            return;
+        }
+    }
+}
+
+impl SegmentToVerify {
+    fn publish(
+        self, decoder: Option<&IMFDXGIDeviceManager>, deadline: &impl Fn() -> Option<std::time::Instant>,
+    ) -> Result<Option<Published>, ProbeError> {
+        match self.verify_and_rename(decoder, deadline) {
+            Err(error) if error.stage == REVOKED => { remove_part(&self.pending)?; Ok(None) }
+            // A rejected or abandoned part stays `.part`.
+            result => result.map(Some),
+        }
+    }
+
+    fn verify_and_rename(
+        &self, decoder: Option<&IMFDXGIDeviceManager>, deadline: &impl Fn() -> Option<std::time::Instant>,
+    ) -> Result<Published, ProbeError> {
         let decoded_end = Cell::new(None);
         let check = || {
-            if !authorized(decoded_end.get()) {
+            if self.claim.load(Ordering::Acquire) == CLAIM_ABANDONED {
+                return Err(unavailable(ABANDONED));
+            }
+            if !(self.authorized)(decoded_end.get()) {
                 return Err(unavailable(REVOKED));
             }
-            if deadline().is_some_and(|limit| std::time::Instant::now() >= limit) {
-                return Err(unavailable("The MP4 publication deadline expired"));
-            }
-            Ok(())
+            check_deadline(deadline)
         };
-        check()?;
-        stage(unsafe { self.writer.Finalize() }, "Finalize the MP4")?;
-        drop(self.writer);
-        check()?;
-        fs::OpenOptions::new().write(true).open(&self.pending).and_then(|file| file.sync_all())
-            .map_err(|error| io_error("Flush the finalized MP4", error))?;
-        check()?;
-        let end = verify_decoded_frames(&self.pending, expected, size, &check)?;
+        let mut timing = self.expected.clone();
+        let hardware = decoder.map(|decoder| verify_decoded_frames(&self.pending, &mut timing, self.size, &check, Some(decoder)));
+        let end = match hardware {
+            Some(Ok(end)) => end,
+            _ => {
+                // The software decoder decides when hardware decoding is
+                // unavailable or failed for a reason other than this check.
+                check()?;
+                timing.clone_from(&self.expected);
+                verify_decoded_frames(&self.pending, &mut timing, self.size, &check, None)?
+            }
+        };
         decoded_end.set(Some(end));
         let bytes = fs::metadata(&self.pending).map_err(|error| io_error("Inspect the verified MP4 extent", error))?.len();
         if bytes == 0 {
             return Err(unavailable("The verified MP4 file is empty"));
         }
+        check()?;
+        // Publication is the commit point: once claimed, the worker waits for
+        // this verdict, and a published file is never returned to `.part`.
+        if self.claim.compare_exchange(CLAIM_OPEN, CLAIM_PUBLISHING, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return Err(unavailable(ABANDONED));
+        }
         for retry in 0..6 {
-            check()?;
             match fs::rename(&self.pending, &self.path) {
-                Ok(()) => {
-                    if let Err(error) = check() {
-                        if error.stage == REVOKED {
-                            remove_part(&self.path)?;
-                        } else {
-                            // This owner can still withdraw a late publication.
-                            fs::rename(&self.path, &self.pending)
-                                .map_err(|error| io_error("Return the late published MP4 to its part path", error))?;
-                        }
-                        return Err(error);
-                    }
-                    return Ok((end, bytes));
-                }
+                Ok(()) => return Ok(Published { local_end_100ns: end, bytes, timing }),
                 Err(error) if retry < 5 && matches!(error.raw_os_error(), Some(32 | 33)) => {
+                    check_deadline(deadline)?;
                     let delay = std::time::Duration::from_millis(25);
                     let delay = deadline().map_or(delay, |limit| delay.min(limit.saturating_duration_since(std::time::Instant::now())));
                     std::thread::sleep(delay);
@@ -142,11 +242,11 @@ fn remove_part(path: &Path) -> Result<(), ProbeError> {
 }
 
 fn verify_decoded_frames(
-    path: &Path, expected: &mut [super::slots::Row], size: [u32; 2],
-    check: &impl Fn() -> Result<(), ProbeError>,
+    path: &Path, expected: &mut [(i64, i64)], size: [u32; 2],
+    check: &impl Fn() -> Result<(), ProbeError>, decoder: Option<&IMFDXGIDeviceManager>,
 ) -> Result<i64, ProbeError> {
     let filename: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-    let reader = mf::mp4_part_reader(PCWSTR(filename.as_ptr()))?;
+    let reader = mf::mp4_part_reader(PCWSTR(filename.as_ptr()), decoder)?;
     let output = mf::media_type()?;
     stage(unsafe { output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video) }, "Select video for verification")?;
     stage(unsafe { output.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12) }, "Select NV12 for verification")?;
@@ -170,10 +270,11 @@ fn verify_decoded_frames(
             return Err(unavailable("The decoder reported an error reading the MP4"));
         }
         if let Some(sample) = sample {
-            if stage(unsafe { sample.GetTotalLength() }, "Check the decoded frame size")? != 0 {
+            // A hardware decoder returns surfaces whose buffer length is not a
+            // picture size; every sample it returns is a decoded picture.
+            if decoder.is_some() || stage(unsafe { sample.GetTotalLength() }, "Check the decoded frame size")? != 0 {
                 let timing = expected.get_mut(decoded).ok_or_else(|| unavailable("The MP4 contains an unindexed frame"))?;
-                let pts = timing.pts_100ns.ok_or_else(|| unavailable("The segment frame has no planned PTS"))?;
-                let expected_duration = timing.duration_100ns.ok_or_else(|| unavailable("The segment frame has no planned duration"))?;
+                let (pts, expected_duration) = *timing;
                 let duration = stage(unsafe { sample.GetSampleDuration() }, "Read the MP4 frame duration")?;
                 let end = timestamp.checked_add(duration).ok_or_else(|| unavailable("The decoded MP4 duration overflowed"))?;
                 if duration <= 0 || previous_pts.is_some_and(|previous| timestamp <= previous)
@@ -182,8 +283,7 @@ fn verify_decoded_frames(
                 {
                     return Err(unavailable("The decoded segment timing does not match the frame index"));
                 }
-                timing.pts_100ns = Some(timestamp);
-                timing.duration_100ns = Some(duration);
+                *timing = (timestamp, duration);
                 previous_pts = Some(timestamp);
                 previous_end = end;
                 decoded += 1;

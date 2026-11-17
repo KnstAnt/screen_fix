@@ -135,14 +135,14 @@ impl RecorderHotkeys {
                 }
                 Err(error) => { let _ = ready.try_send(Err(error)); }
             }
-        }).map_err(|error| CaptureError::backend("Start recorder hotkeys", error.raw_os_error(), error.to_string()))?;
+        }).map_err(|error| CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, "Start recorder hotkeys", error.raw_os_error(), error.to_string()))?;
         match initialized.recv_timeout(STARTUP_WAIT) {
             Ok(Ok(())) => Ok(Self(Arc::new(Owner { shared, thread: Some(owner), keys: bindings.virtual_keys() }))),
             Ok(Err(error)) => Err(error),
             Err(_) => {
                 shared.stop.store(true, Ordering::Release);
                 owner.thread().unpark();
-                Err(CaptureError::backend("Register recorder hotkeys", None, "Hotkey preflight did not complete.".into()))
+                Err(CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, "Register recorder hotkeys", None, "Hotkey preflight did not complete.".into()))
             }
         }
     }
@@ -179,10 +179,10 @@ impl RecorderHotkeys {
     pub(crate) fn claim(&self) -> Result<ActiveHotkeys, CaptureError> {
         let mut inbox = self.0.shared.inbox.lock().unwrap_or_else(PoisonError::into_inner);
         if inbox.active {
-            return Err(CaptureError::backend("Use recorder hotkeys", None, "An attempt already owns the hotkey input.".into()));
+            return Err(CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, "Use recorder hotkeys", None, "An attempt already owns the hotkey input.".into()));
         }
         if !inbox.ready_for_start() {
-            return Err(CaptureError::backend("Use recorder hotkeys", None, "The previous hotkey commands are still clearing. Try Start again.".into()));
+            return Err(CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, "Use recorder hotkeys", None, "The previous hotkey commands are still clearing. Try Start again.".into()));
         }
         inbox.active = true;
         Ok(ActiveHotkeys(self.clone()))
@@ -236,7 +236,7 @@ impl Registration {
         if count <= 0 || count as usize > MAX_LAYOUTS
             || unsafe { GetKeyboardLayoutList(MAX_LAYOUTS as i32, layouts.as_mut_ptr()) } != count
         {
-            return Err(CaptureError::backend("Read installed keyboard layouts", None, "The hotkey layout inventory is unavailable.".into()));
+            return Err(CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, "Read installed keyboard layouts", None, "The hotkey layout inventory is unavailable.".into()));
         }
         for (index, action) in RecorderAction::ALL.into_iter().enumerate() {
             let vk = 0x6f + u16::from(bindings.function(action));
@@ -288,7 +288,7 @@ fn yields_character(vk: u16, layout: HKL) -> bool {
 }
 
 fn chord_failure(action: RecorderAction, vk: u16, code: Option<i32>, message: &str) -> CaptureError {
-    CaptureError::backend("Validate recorder hotkeys", code, format!(
+    CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, "Validate recorder hotkeys", code, format!(
         "{} (Ctrl+Alt+F{}). {message}", action.name(), vk - 0x6f,
     ))
 }

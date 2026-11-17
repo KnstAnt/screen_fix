@@ -20,7 +20,8 @@ impl Notifications {
 
     pub fn drain(&self) -> impl Iterator<Item = Notice> + '_ { self.0.drain() }
 
-    pub fn take_loss(&self) -> u64 { self.0.take_loss() }
+    /// Lost notices since the last drain: count and first and last receipt.
+    pub fn take_loss(&self) -> Option<(u64, crate::protocol::QpcTick, crate::protocol::QpcTick)> { self.0.take_loss() }
 
     pub fn running(&self) -> bool { self.0.running() }
 }

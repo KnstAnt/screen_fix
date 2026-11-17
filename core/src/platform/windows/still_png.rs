@@ -5,10 +5,11 @@ use std::{
     fs::{self, OpenOptions},
     io,
     os::windows::ffi::OsStrExt,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Condvar, Mutex, PoisonError,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{Receiver, SyncSender, TryRecvError, sync_channel},
     },
     time::{Duration, Instant},
@@ -18,9 +19,15 @@ use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileEx
 
 use crate::{
     capture::frame::CaptureColor,
-    package::{ArtifactKind, ArtifactRef, ImageDigest, journal::{Flush, JournalIngress}, metadata::{AttemptLayout, PngCounters}},
+    package::{
+        ArtifactKind, ArtifactRef, ImageDigest,
+        diagnostics::{Failure, FailureComponent},
+        journal::{Flush, JournalIngress},
+        metadata::{AttemptLayout, ImageFile, LostActivity, PngCounters},
+        outcome::HealthKind,
+    },
     protocol::MonitorId,
-    session::windows::{PauseProducer, WorkerSession},
+    session::{fault::FaultReport, windows::{PauseProducer, WorkerSession}},
 };
 
 use super::{ProbeError, package_journal_error, readback::Pixels, still_rows::{Merge, Rows, StillCoverage}};
@@ -49,6 +56,8 @@ pub(super) enum Dropped {
     WorkerClosed,
     Deadline,
     ApprovalSuppressed,
+    /// The PNG encoder stopped for the rest of the attempt (§6.2 row 16).
+    PngWorkerUnavailable,
 }
 
 #[derive(Debug)]
@@ -65,6 +74,9 @@ struct Job {
     priority: Priority,
     exempt: bool,
     reply: SyncSender<Outcome>,
+    /// Set when the requesting slot gave up the job; checked before the image
+    /// is written and before it is published.
+    cancelled: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -99,10 +111,9 @@ impl Inbox {
         let offered_at = Instant::now();
         self.0.offered.fetch_add(1, Ordering::Relaxed);
         let (reply, result) = sync_channel(1);
-        let mut jobs = self.0.jobs.try_lock().map_err(|_| {
-            self.0.rejected.fetch_add(1, Ordering::Relaxed);
-            Dropped::Capacity
-        })?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        // The worker holds the lock only to pop a job, so this wait is short.
+        let mut jobs = self.0.jobs.lock().unwrap_or_else(PoisonError::into_inner);
         if jobs.len() >= JOBS {
             let lowest = jobs.iter().map(|job| job.priority).min().expect("the PNG queue is full");
             if lowest >= priority {
@@ -115,19 +126,23 @@ impl Inbox {
                 let _ = evicted.reply.try_send(Outcome::Dropped(Dropped::LowerPriority));
             }
         }
-        jobs.push_back(Job { offered_at, pixels, coverage, priority, exempt, reply });
+        jobs.push_back(Job { offered_at, pixels, coverage, priority, exempt, reply, cancelled: Arc::clone(&cancelled) });
         self.0.peak.fetch_max(jobs.len(), Ordering::Relaxed);
         drop(jobs);
         self.0.wake.notify_one();
-        Ok(Ticket(result))
+        Ok(Ticket { result, cancelled })
     }
 }
 
-pub(super) struct Ticket(Receiver<Outcome>);
+/// Dropping an unfinished ticket cancels its job.
+pub(super) struct Ticket {
+    result: Receiver<Outcome>,
+    cancelled: Arc<AtomicBool>,
+}
 
 impl Ticket {
     pub fn poll(&self) -> Option<Outcome> {
-        match self.0.try_recv() {
+        match self.result.try_recv() {
             Ok(outcome) => Some(outcome),
             Err(TryRecvError::Disconnected) => Some(Outcome::Dropped(Dropped::WorkerClosed)),
             Err(TryRecvError::Empty) => None,
@@ -135,10 +150,22 @@ impl Ticket {
     }
 }
 
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
 pub(super) struct Worker {
     input: Arc<Queue>,
     rows: Merge,
     rate: HashMap<MonitorId, VecDeque<Instant>>,
+    /// The operation of the current PNG write failure episode, reported once.
+    failing: Option<&'static str>,
+    /// The encoder stopped after an unexpected exit; jobs are dropped (§6.2 row 16).
+    encoder_lost: bool,
+    /// Every image this worker published (M1-09 output inventory).
+    images: Vec<ImageFile>,
 }
 
 impl Worker {
@@ -146,11 +173,11 @@ impl Worker {
         let input = Arc::new(Queue::default());
         input.senders.store(1, Ordering::Relaxed);
         let (rows, merge) = Merge::new(lanes);
-        (Inbox(Arc::clone(&input)), rows, Self { input, rows: merge, rate: HashMap::new() })
+        (Inbox(Arc::clone(&input)), rows, Self { input, rows: merge, rate: HashMap::new(), failing: None, encoder_lost: false, images: Vec::new() })
     }
 
     pub fn run(mut self, layout: &AttemptLayout, journal: JournalIngress, session: &WorkerSession)
-        -> (PngCounters, Result<(), ProbeError>)
+        -> (PngCounters, Vec<ImageFile>, Result<(), ProbeError>)
     {
         let mut counters = PngCounters::default();
         let result = self.drain(layout, journal, session, &mut counters);
@@ -158,7 +185,7 @@ impl Worker {
         counters.jobs_rejected = self.input.rejected.load(Ordering::Relaxed);
         counters.jobs_evicted = self.input.evicted.load(Ordering::Relaxed);
         counters.queue_peak = self.input.peak.load(Ordering::Relaxed);
-        (counters, result)
+        (counters, self.images, result)
     }
 
     fn drain(&mut self, layout: &AttemptLayout, mut journal: JournalIngress, session: &WorkerSession,
@@ -184,7 +211,7 @@ impl Worker {
                 let started = Instant::now();
                 let waited = u64::try_from(started.duration_since(job.offered_at).as_micros()).unwrap_or(u64::MAX);
                 counters.queue_wait_max_us = counters.queue_wait_max_us.max(waited);
-                let outcome = self.save(layout, &mut job, session);
+                let outcome = self.encode(layout, &mut job, session);
                 let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
                 counters.processing_max_us = counters.processing_max_us.max(elapsed);
                 match &outcome {
@@ -193,7 +220,23 @@ impl Worker {
                     Outcome::Dropped(_) => counters.dropped_at_processing += 1,
                     Outcome::Failed { .. } => counters.failed_jobs += 1,
                 }
-                let _ = job.reply.try_send(outcome);
+                match &outcome {
+                    Outcome::Saved { .. } => self.failing = None,
+                    Outcome::Failed { operation, native_code } if self.failing != Some(*operation) => {
+                        // One context health row per failure kind episode; each
+                        // still row keeps its own operation and native code.
+                        self.failing = Some(*operation);
+                        session.report_health(HealthKind::StillWriteFailure,
+                            Failure::new(FailureComponent::Stills, *operation, *native_code), None, false);
+                    }
+                    _ => {}
+                }
+                let published = matches!(outcome, Outcome::Saved { reused: false, .. });
+                // A slot that gave up the job after its image was published
+                // leaves the file without a row; it is kept and counted.
+                if job.reply.try_send(outcome).is_err() && published {
+                    counters.unreferenced_images += 1;
+                }
             } else if self.input.senders.load(Ordering::Acquire) == 0 {
                 break;
             }
@@ -213,8 +256,29 @@ impl Worker {
         jobs.remove(index)
     }
 
+    /// Encode one job. An unexpected exit of the encoder is an auxiliary
+    /// activity loss (§6.2 row 16): it is reported once, this and every later
+    /// job resolves as `png_worker_unavailable`, and the still journal and the
+    /// recording continue. Journal failures stay attempt failures (row 1).
+    fn encode(&mut self, layout: &AttemptLayout, job: &mut Job, session: &WorkerSession) -> Outcome {
+        if !self.encoder_lost {
+            match catch_unwind(AssertUnwindSafe(|| self.save(layout, job, session))) {
+                Ok(outcome) => return outcome,
+                Err(_) => {
+                    self.encoder_lost = true;
+                    let failure = Failure::new(FailureComponent::Stills, "Encode and publish a still image", None);
+                    session.report_health(HealthKind::AuxiliaryActivityLoss, failure, None, true);
+                    session.report_fault(FaultReport::activity(LostActivity::Auxiliary, failure, None, session.session_time()));
+                }
+            }
+        }
+        Outcome::Dropped(Dropped::PngWorkerUnavailable)
+    }
+
     fn save(&mut self, layout: &AttemptLayout, job: &mut Job, session: &WorkerSession) -> Outcome {
-        let expired = || session.stop_deadline().is_some_and(|deadline| Instant::now() >= deadline);
+        let cancelled = Arc::clone(&job.cancelled);
+        let expired = || cancelled.load(Ordering::Acquire)
+            || session.stop_deadline().is_some_and(|deadline| Instant::now() >= deadline);
         if expired() { return Outcome::Dropped(Dropped::Deadline); }
         let pixels = &mut job.pixels;
         let metadata = pixels.metadata.clone();
@@ -264,7 +328,7 @@ impl Worker {
         for pixel in pixels.bgra_mut().chunks_exact_mut(4) {
             pixel.swap(0, 2);
         }
-        let result = (|| -> Result<(), Outcome> {
+        let result = (|| -> Result<u64, Outcome> {
             let mut encoder = png::Encoder::new(&mut file, metadata.extent.width.get(), metadata.extent.height.get());
             encoder.set_color(png::ColorType::Rgba);
             encoder.set_depth(png::BitDepth::Eight);
@@ -272,10 +336,11 @@ impl Worker {
             let mut writer = encoder.write_header().map_err(|_| png_failure())?;
             writer.write_image_data(pixels.bgra()).map_err(|_| png_failure())?;
             writer.finish().map_err(|_| png_failure())?;
-            file.sync_all().map_err(|error| failed("flush_image", error))
+            file.sync_all().map_err(|error| failed("flush_image", error))?;
+            file.metadata().map(|meta| meta.len()).map_err(|error| failed("inspect_image", error))
         })();
         drop(file);
-        let result = result.and_then(|()| {
+        let result = result.and_then(|bytes| {
             if expired() { return Err(Outcome::Dropped(Dropped::Deadline)); }
             if !authorized() { return Err(Outcome::Dropped(Dropped::ApprovalSuppressed)); }
             move_new(&temporary, &image).map_err(|error| failed("publish_image", error))?;
@@ -283,15 +348,20 @@ impl Worker {
                 fs::remove_file(&image).map_err(|error| failed("remove_revoked_image", error))?;
                 return Err(Outcome::Dropped(Dropped::ApprovalSuppressed));
             }
-            Ok(())
+            Ok(bytes)
         });
-        if let Err(outcome) = result {
-            let _ = fs::remove_file(&temporary);
-            return outcome;
-        }
+        let bytes = match result {
+            Ok(bytes) => bytes,
+            Err(outcome) => {
+                let _ = fs::remove_file(&temporary);
+                return outcome;
+            }
+        };
         if !job.exempt {
             rate.push_back(Instant::now());
         }
+        self.images.push(ImageFile { file: reference.relative_uri(), bytes,
+            width: metadata.extent.width.get(), height: metadata.extent.height.get() });
         Outcome::Saved { reference, reused: false }
     }
 }

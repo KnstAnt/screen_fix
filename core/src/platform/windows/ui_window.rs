@@ -20,7 +20,7 @@ impl RecorderWindow {
         let mut process = 0;
         let thread = unsafe { GetWindowThreadProcessId(window, &mut process) };
         if thread == 0 || thread != unsafe { GetCurrentThreadId() } || process != std::process::id() {
-            return Err(CaptureError::backend("Track the recorder window", None,
+            return Err(CaptureError::owned(crate::package::diagnostics::FailureComponent::Interface, "Track the recorder window", None,
                 "The native recorder window does not belong to the current UI thread.".into()));
         }
         Ok(Self { id, indicator: indicator::Indicator::new(window)? })

@@ -27,6 +27,6 @@ pub(super) fn from_snapshot(snapshot: held::HeldSnapshot) -> HeldSynchronization
         }
     }
     HeldSynchronization {
-        modifiers, physical_buttons, swapped: snapshot.swapped, caps_lock: snapshot.caps_lock,
+        modifiers, physical_buttons, swapped: snapshot.swapped, caps_lock: snapshot.caps_lock, keys: snapshot.keys,
     }
 }

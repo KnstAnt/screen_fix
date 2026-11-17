@@ -5,6 +5,7 @@ use std::{
     fs::{self, OpenOptions},
     io,
     mem::size_of,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     ptr::null_mut,
     sync::{
@@ -25,7 +26,7 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::{package::{ArtifactKind, ArtifactRef, ImageDigest, metadata::AttemptLayout},
+use crate::{package::{ArtifactKind, ArtifactRef, ImageDigest, metadata::{AttemptLayout, ImageFile}},
     protocol::{ClockOrigin, PhysicalPoint, QpcTick}};
 use super::super::{ProbeError, clock, mp4::io_error};
 
@@ -46,10 +47,15 @@ pub(super) struct Tracker {
     standards: Vec<(usize, &'static str)>,
     next_poll: Instant,
     sender: Option<SyncSender<Job>>,
-    owner: Option<thread::JoinHandle<()>>,
+    owner: Option<thread::JoinHandle<Vec<ImageFile>>>,
     returned: Receiver<Completion>,
     pending: Vec<Observed>,
     cancelled: Arc<AtomicBool>,
+    /// Set once by the asset owner when it stopped after an unexpected exit.
+    owner_lost: Arc<AtomicBool>,
+    /// A custom cursor whose asset could not be queued; it is retried on the
+    /// next observation of the same handle (C3).
+    unqueued: Option<usize>,
 }
 
 impl Tracker {
@@ -59,12 +65,29 @@ impl Tracker {
         let (returning, returned) = sync_channel(QUEUE);
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
+        let owner_lost = Arc::new(AtomicBool::new(false));
+        let worker_lost = Arc::clone(&owner_lost);
         let owner = thread::Builder::new().name("context-cursor-assets".into()).spawn(move || {
+            let mut inventory = Vec::new();
+            let mut lost = false;
             while let Ok(job) = jobs.recv() {
                 if worker_cancelled.load(Acquire) { break; }
-                let resolved = write_assets(&layout, job.image, &worker_cancelled).ok();
+                // An unexpected exit of the asset owner is an auxiliary activity
+                // loss (§6.2): later assets are unavailable, and the assets it
+                // already published stay in the inventory.
+                let resolved = if lost { None } else {
+                    match catch_unwind(AssertUnwindSafe(|| write_assets(&layout, job.image, &worker_cancelled, &mut inventory))) {
+                        Ok(result) => result.ok(),
+                        Err(_) => {
+                            lost = true;
+                            worker_lost.store(true, Release);
+                            None
+                        }
+                    }
+                };
                 let _ = returning.try_send(Completion { observed: job.observed, resolved, kind: ResultKind::Asset });
             }
+            inventory
         }).map_err(|error| io_error("Start cursor asset owner", error))?;
         let standards = [
             (IDC_ARROW, "arrow"), (IDC_IBEAM, "ibeam"), (IDC_WAIT, "wait"), (IDC_CROSS, "crosshair"),
@@ -75,7 +98,10 @@ impl Tracker {
             let cursor = unsafe { LoadCursorW(null_mut(), id) };
             (!cursor.is_null()).then_some((cursor as usize, name))
         }).collect();
-        Ok(Self { previous: None, standards, next_poll: Instant::now(), sender: Some(sender), owner: Some(owner), returned, pending: Vec::with_capacity(QUEUE), cancelled })
+        Ok(Self {
+            previous: None, standards, next_poll: Instant::now(), sender: Some(sender), owner: Some(owner), returned,
+            pending: Vec::with_capacity(QUEUE), cancelled, owner_lost, unqueued: None,
+        })
     }
 
     pub fn reset_observation(&mut self) {
@@ -108,7 +134,8 @@ impl Tracker {
             handle: if approved { info.hCursor as usize } else { 0 },
             visible: info.flags & CURSOR_SHOWING != 0, suppressed: info.flags & CURSOR_SUPPRESSED != 0, approved,
         };
-        if self.previous == Some(state) {
+        let retry = self.previous == Some(state);
+        if retry && self.unqueued != Some(state.handle) {
             return None;
         }
         self.previous = Some(state);
@@ -116,15 +143,25 @@ impl Tracker {
         let standard = self.standards.iter().find(|(handle, _)| *handle == state.handle).map(|(_, name)| *name);
         let observed = Observed { at, state, standard };
         if !approved || standard.is_some() || state.handle == 0 || !state.visible {
-            return Some(Completion { observed, resolved: None, kind: ResultKind::State { asset_pending: false } });
+            self.unqueued = None;
+            return Some(Completion { observed, resolved: None, kind: ResultKind::State { asset: CustomAsset::NotNeeded } });
         }
-        if self.pending.len() < QUEUE && let Some(image) = Pixels::read(info.hCursor)
+        let Some(image) = Pixels::read(info.hCursor) else {
+            self.unqueued = None;
+            return (!retry).then_some(Completion { observed, resolved: None,
+                kind: ResultKind::State { asset: CustomAsset::Unavailable("pixels_unavailable") } });
+        };
+        if self.pending.len() < QUEUE
             && self.sender.as_ref().is_some_and(|sender| sender.try_send(Job { observed, image }).is_ok())
         {
+            self.unqueued = None;
             self.pending.push(observed);
-            return Some(Completion { observed, resolved: None, kind: ResultKind::State { asset_pending: true } });
+            return Some(Completion { observed, resolved: None, kind: ResultKind::State { asset: CustomAsset::Pending } });
         }
-        Some(Completion { observed, resolved: None, kind: ResultKind::State { asset_pending: false } })
+        // A retry that fails again adds no row.
+        self.unqueued = Some(state.handle);
+        (!retry).then_some(Completion { observed, resolved: None,
+            kind: ResultKind::State { asset: CustomAsset::Unavailable("cursor_asset_queue") } })
     }
 
     pub fn results(&mut self) -> Vec<Completion> {
@@ -160,6 +197,20 @@ impl Tracker {
     }
 }
 
+impl Tracker {
+    /// Whether the asset owner stopped after an unexpected exit; reported once.
+    pub fn take_owner_lost(&self) -> bool {
+        self.owner_lost.swap(false, Acquire)
+    }
+
+    /// Stop the asset owner and return every asset it published.
+    pub fn finish(&mut self) -> Option<Vec<ImageFile>> {
+        self.cancelled.store(true, Release);
+        drop(self.sender.take());
+        self.owner.take()?.join().ok()
+    }
+}
+
 impl Drop for Tracker {
     fn drop(&mut self) {
         self.cancelled.store(true, Release);
@@ -182,8 +233,16 @@ struct Job {
     image: Pixels,
 }
 
+#[derive(Clone, Copy)]
+enum CustomAsset {
+    NotNeeded,
+    Pending,
+    /// The asset could not be produced, with its reason; distinct from not needed.
+    Unavailable(&'static str),
+}
+
 enum ResultKind {
-    State { asset_pending: bool },
+    State { asset: CustomAsset },
     Asset,
 }
 
@@ -213,10 +272,16 @@ impl Completion {
                     "hotspot": assets.hotspot,
                 })),
             }),
-            ResultKind::State { asset_pending } => json!({
+            ResultKind::State { asset } => json!({
                 "kind": "cursor", "approved": true, "shape": observation.standard,
                 "visible": observation.state.visible, "suppressed": observation.state.suppressed,
-                "cursor_observed_t_us": at, "custom_asset_pending": asset_pending,
+                "cursor_observed_t_us": at, "custom_asset_pending": matches!(asset, CustomAsset::Pending),
+                "custom_asset": match asset {
+                    CustomAsset::NotNeeded => "not_needed",
+                    CustomAsset::Pending => "pending",
+                    CustomAsset::Unavailable(_) => "unavailable",
+                },
+                "custom_asset_reason": match asset { CustomAsset::Unavailable(reason) => Some(reason), _ => None },
             }),
         }
     }
@@ -353,13 +418,15 @@ impl Drop for DesktopDc {
     }
 }
 
-fn write_assets(layout: &AttemptLayout, image: Pixels, cancelled: &AtomicBool) -> io::Result<Assets> {
-    let png = write_asset(layout, image.width, image.height, &image.rgba, cancelled)?;
-    let xor_mask = image.invert.map(|mask| write_asset(layout, image.width, image.height, &mask, cancelled)).transpose()?;
+fn write_assets(layout: &AttemptLayout, image: Pixels, cancelled: &AtomicBool, inventory: &mut Vec<ImageFile>) -> io::Result<Assets> {
+    let png = write_asset(layout, image.width, image.height, &image.rgba, cancelled, inventory)?;
+    let xor_mask = image.invert.map(|mask| write_asset(layout, image.width, image.height, &mask, cancelled, inventory)).transpose()?;
     Ok(Assets { png, xor_mask, hotspot: image.hotspot })
 }
 
-fn write_asset(layout: &AttemptLayout, width: u32, height: u32, rgba: &[u8], cancelled: &AtomicBool) -> io::Result<ArtifactRef> {
+fn write_asset(layout: &AttemptLayout, width: u32, height: u32, rgba: &[u8], cancelled: &AtomicBool,
+    inventory: &mut Vec<ImageFile>,
+) -> io::Result<ArtifactRef> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"screen_fix/cursor/rgba8");
     hasher.update(&width.to_le_bytes());
@@ -373,24 +440,26 @@ fn write_asset(layout: &AttemptLayout, width: u32, height: u32, rgba: &[u8], can
         Err(error) if error.kind() == io::ErrorKind::NotFound => true,
         Err(error) => return Err(error),
     };
+    let artifact = ArtifactRef { attempt: layout.id().clone(), kind };
     if publish {
         let pending = destination.with_extension("pending");
-        let encoded = encode(&pending, width, height, rgba).and_then(|()| {
+        let encoded = encode(&pending, width, height, rgba).and_then(|bytes| {
             if cancelled.load(Acquire) {
                 Err(io::Error::from(io::ErrorKind::Interrupted))
             } else {
-                fs::rename(&pending, &destination)
+                fs::rename(&pending, &destination).map(|()| bytes)
             }
         });
         if encoded.is_err() {
             let _ = fs::remove_file(pending);
         }
-        encoded?;
+        inventory.push(ImageFile { file: artifact.relative_uri(), bytes: encoded?, width, height });
     }
-    Ok(ArtifactRef { attempt: layout.id().clone(), kind })
+    Ok(artifact)
 }
 
-fn encode(path: &Path, width: u32, height: u32, rgba: &[u8]) -> io::Result<()> {
+/// Write the PNG and return its length.
+fn encode(path: &Path, width: u32, height: u32, rgba: &[u8]) -> io::Result<u64> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     let mut encoder = png::Encoder::new(&mut file, width, height);
     encoder.set_color(png::ColorType::Rgba);
@@ -398,5 +467,6 @@ fn encode(path: &Path, width: u32, height: u32, rgba: &[u8]) -> io::Result<()> {
     let mut writer = encoder.write_header().map_err(io::Error::other)?;
     writer.write_image_data(rgba).map_err(io::Error::other)?;
     writer.finish().map_err(io::Error::other)?;
-    file.sync_all()
+    file.sync_all()?;
+    Ok(file.metadata()?.len())
 }

@@ -44,7 +44,7 @@ pub struct Display {
 pub fn displays() -> Result<Vec<Display>, CaptureError> {
     #[cfg(target_os = "windows")]
     {
-        windows::displays().map_err(Into::into)
+        windows::displays().map_err(|error| error.into_error(crate::package::diagnostics::FailureComponent::Capture))
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -95,7 +95,7 @@ pub fn start_recording_with_hotkeys(
         ));
     }
     if !hotkeys.available() {
-        return Err(CaptureError::backend("Register recorder hotkeys", None, "The recorder hotkey owner is unavailable.".into()));
+        return Err(CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, "Register recorder hotkeys", None, "The recorder hotkey owner is unavailable.".into()));
     }
     controller::spawn(config, hotkeys.claim()?, trigger, windows::record_attempt)
 }

@@ -179,10 +179,28 @@ pub enum ContextProducer {
 pub struct ContextGap {
     pub visit: VisitBinding,
     pub producer: ContextProducer,
+    pub cause: ContextGapCause,
     pub first_position: NonZeroU64,
     pub last_position: NonZeroU64,
     pub first_qpc: QpcTick,
     pub last_qpc: QpcTick,
+}
+
+/// Why context positions were not delivered (E3). TextEdit commits are
+/// counted per reason; a sender or foreground mismatch carries no detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextGapCause {
+    /// A bounded queue (the outbound lane or the commit slots) had no room.
+    Overflow,
+    /// The item's visit, focus or edit revision was no longer current.
+    Stale,
+    /// A finalized commit exceeded the bounded UTF-16 length.
+    CommitTooLong,
+    /// A finalized commit had too many parts or an unreadable part array.
+    CommitParts,
+    /// The commit sender, foreground or callback deadline check failed.
+    CommitRejected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,6 +381,7 @@ fn input_valid(input: &GrantedInput) -> bool {
             && state.changes != 0 && state.changes & !EnvironmentChange::ALL_BITS == 0,
         InputEvidence::Progress(progress) => tick(progress.before_qpc),
         InputEvidence::Gap(gap) => gap_valid(*gap),
+        InputEvidence::OptionalUnavailable { observed_qpc, .. } => tick(*observed_qpc),
     }
 }
 
@@ -489,9 +508,12 @@ pub fn decode<T: Record>(
     let payload = &frame[HEADER_BYTES..];
     let mut records = serde_json::Deserializer::from_slice(payload).into_iter::<Scoped<T>>();
     let scoped = records.next().ok_or(PacketError::InvalidPayload)?.map_err(|_| PacketError::InvalidPayload)?;
-    if records.byte_offset() != payload.len() || scoped.attempt != scope.attempt || scoped.session != scope.session
-        || scoped.record.kind() != header[7] || !scoped.record.valid()
-    {
+    // A foreign scope or a kind that contradicts the header is a protocol
+    // violation, never a skippable record.
+    if scoped.attempt != scope.attempt || scoped.session != scope.session || scoped.record.kind() != header[7] {
+        return Err(PacketError::InvalidRecord("The record scope or kind contradicts its frame"));
+    }
+    if records.byte_offset() != payload.len() || !scoped.record.valid() {
         return Err(PacketError::InvalidPayload);
     }
     Ok(scoped.record)

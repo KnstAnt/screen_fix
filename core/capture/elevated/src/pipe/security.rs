@@ -34,7 +34,8 @@ impl Owner<'_> {
             Self::Bootstrap { user, server_logon } => {
                 let user = sid_string(user)?;
                 let server_logon = sid_string(server_logon)?;
-                format!("O:{user}D:P(A;;FA;;;SY)(A;;FA;;;{server_logon})(A;;0x{CLIENT_ACCESS:08x};;;{user})")
+                // The bootstrap server only reads, writes and waits (E4).
+                format!("O:{user}D:P(A;;FA;;;SY)(A;;0x{CLIENT_ACCESS:08x};;;{server_logon})(A;;0x{CLIENT_ACCESS:08x};;;{user})")
             }
             Self::Collector(user) => {
                 let user = sid_string(user)?;
@@ -87,7 +88,7 @@ impl Owner<'_> {
         let mut expected = vec![(&system, FILE_ALL_ACCESS)];
         let owner_matches = match self {
             Self::Bootstrap { user, server_logon } => {
-                expected.push((server_logon, FILE_ALL_ACCESS));
+                expected.push((server_logon, CLIENT_ACCESS));
                 expected.push((user, CLIENT_ACCESS));
                 user.matches(owner)
             }

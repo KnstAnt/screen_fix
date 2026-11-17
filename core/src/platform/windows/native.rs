@@ -13,6 +13,9 @@ const HISTORY: usize = 4;
 // Four circulating frames, one copy destination and three distinct
 // out-of-history holds. Lease capacity must leave the copy destination free.
 const EXTRA_HOLDS: usize = 3;
+/// Pending private selections hold at most this many distinct frames, so one
+/// extra hold stays available to public requests.
+pub(super) const PRIVATE_HOLDS: usize = EXTRA_HOLDS - 1;
 const BASE_SLOTS: usize = HISTORY + 1;
 
 #[derive(Clone)]
@@ -195,8 +198,8 @@ impl Holds {
         Some(held)
     }
 
-    pub fn fits_readback(&self, frame: &NativeFrame) -> bool {
-        image_bytes(frame.metadata.extent).and_then(|bytes| bytes.checked_mul(2))
-            .is_some_and(|bytes| self.budget.fits(bytes))
+    /// Whether the frame already has a live hold, which a new holder shares.
+    pub fn holds(&self, id: FrameId) -> bool {
+        self.live.iter().any(|(held, frame)| *held == id && frame.strong_count() != 0)
     }
 }

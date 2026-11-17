@@ -1,6 +1,6 @@
-use crate::protocol::{
-    DeviceId, Evidence, PhysicalPoint, UnavailableReason,
-    ipc::InputSample,
+use crate::{
+    capture::context::ControllerHint,
+    protocol::{DeviceId, Evidence, PhysicalPoint, UnavailableReason, ipc::InputSample},
 };
 
 use super::{
@@ -9,16 +9,12 @@ use super::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InjectorHint {
-    AutoHotkey,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OriginEvidence {
     pub origin: InputOrigin,
     pub device: Evidence<DeviceId>,
     pub cursor_id: Evidence<u8>,
-    pub injector_hint: Option<InjectorHint>,
+    /// INP-7: an AutoHotkey extra-information value is a hint, never proof.
+    pub injector_hint: Option<ControllerHint>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +22,8 @@ pub(crate) struct PointerDetails {
     pub points: PointerEvidence,
     pub raw_relative: Evidence<(i64, i64)>,
     pub raw_absolute: Evidence<PhysicalPoint>,
+    /// The absolute packet's raw x/y (0..65535) and move flags (INP-5).
+    pub raw_absolute_packet: Option<([i32; 2], u16)>,
     pub raw_packets: u16,
     pub raw_wheel: Evidence<i16>,
     pub hook_wheel: Evidence<i16>,
@@ -38,7 +36,9 @@ pub(crate) struct NormalizedInput {
     pub origin: OriginEvidence,
     pub key_name: Option<String>,
     pub pointer: Option<PointerDetails>,
-    /// Raw-only motion is evidence of device deltas, never a cursor position.
+    /// A cursor sample: hook motion, or raw motion while the pointer hook is
+    /// lost (INP-6). Other raw-only motion is device-delta evidence, never a
+    /// cursor position (stage I2).
     pub cursor_motion: bool,
 }
 
@@ -63,7 +63,8 @@ impl NormalizedInput {
             Action::Key(key) => layout_name(key, raw.and_then(|slot| slot.packet.foreground_at_receipt?.focus.map(|focus| focus.keyboard_layout))),
             _ => None,
         };
-        let cursor_motion = matches!(hook.map(|slot| slot.action), Some(Action::Motion(_)));
+        let cursor_motion = matches!(hook.map(|slot| slot.action), Some(Action::Motion(_)))
+            || pointer_hook_lost && matches!(correlated.first.action, Action::Motion(_));
         let pointer = matches!(correlated.first.action,
             Action::Button { .. } | Action::Wheel { .. } | Action::Motion(_))
             .then(|| {
@@ -83,6 +84,7 @@ impl NormalizedInput {
                 let mut delta = None;
                 let mut raw_count = 0;
                 let mut raw_absolute = Evidence::Unavailable(reason);
+                let mut raw_absolute_packet = None;
                 for slot in all().filter(|slot| matches!(slot.packet.sample, InputSample::RawPointer(_))) {
                     raw_count += 1;
                     match slot.action {
@@ -90,7 +92,12 @@ impl NormalizedInput {
                             let (sum_x, sum_y) = delta.unwrap_or((0_i64, 0_i64));
                             delta = Some((sum_x + i64::from(x), sum_y + i64::from(y)));
                         }
-                        Action::Motion(Motion::Absolute { desktop_point, .. }) => raw_absolute = desktop_point,
+                        Action::Motion(Motion::Absolute { x, y, desktop_point }) => {
+                            raw_absolute = desktop_point;
+                            if let InputSample::RawPointer(pointer) = slot.packet.sample {
+                                raw_absolute_packet = Some(([x, y], pointer.move_flags));
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -124,6 +131,7 @@ impl NormalizedInput {
                     },
                     raw_relative: delta.map_or(Evidence::Unavailable(reason), Evidence::Observed),
                     raw_absolute,
+                    raw_absolute_packet,
                     raw_packets: raw_count,
                     raw_wheel: raw.and_then(wheel).map_or(Evidence::Unavailable(reason), Evidence::Observed),
                     hook_wheel: hook.and_then(wheel).map_or(Evidence::Unavailable(reason), Evidence::Observed),
@@ -177,6 +185,14 @@ fn origin(
             device, cursor_id: Evidence::Observed(signature & 0x7f), injector_hint: None,
         };
     }
+    // An ambiguous cluster row carries no hook of its own. Its component is
+    // injected when every hook is flagged and every raw record has a NULL handle.
+    if correlated.cluster.is_some_and(|cluster| cluster.injected) {
+        return OriginEvidence {
+            origin: InputOrigin::Injected, device, cursor_id: Evidence::Unavailable(UnavailableReason::NoDevice),
+            injector_hint: None,
+        };
+    }
     let injected = hook.and_then(|slot| match slot.packet.sample {
         InputSample::HookKey(key) if key.flags & 0x12 != 0 => Some(key.extra_information),
         InputSample::HookPointer(pointer) if pointer.flags & 3 != 0 => Some(pointer.extra_information),
@@ -185,7 +201,7 @@ fn origin(
     if let Some(extra) = injected {
         return OriginEvidence {
             origin: InputOrigin::Injected, device, cursor_id: Evidence::Unavailable(UnavailableReason::NoDevice),
-            injector_hint: (0xffc3_d3e9..=0xffc3_d450).contains(&extra).then_some(InjectorHint::AutoHotkey),
+            injector_hint: (0xffc3_d3e9..=0xffc3_d450).contains(&extra).then_some(ControllerHint::AutoHotkey),
         };
     }
     if raw.is_some_and(|slot| matches!(&slot.packet.sample,

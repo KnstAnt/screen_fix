@@ -56,7 +56,10 @@ pub(super) fn inventory() -> Result<Vec<RAWINPUTDEVICELIST>, NativeError> {
     Ok(devices)
 }
 
-pub(super) fn descriptor(handle: HANDLE, known_kind: Option<u32>) -> Option<DeviceDescriptor> {
+/// The Raw Input thread's part of a descriptor, from Raw Input queries only:
+/// kind and hashed path. The interface path is returned for the device worker,
+/// which alone opens it (`identify`, I6).
+pub(super) fn descriptor(handle: HANDLE, known_kind: Option<u32>) -> Option<(DeviceDescriptor, Option<Vec<u16>>)> {
     let id = id(handle)?;
     let mut info = RID_DEVICE_INFO::default();
     let mut size = size_of::<RID_DEVICE_INFO>() as u32;
@@ -77,19 +80,25 @@ pub(super) fn descriptor(handle: HANDLE, known_kind: Option<u32>) -> Option<Devi
     };
     let path = name(handle);
     let hash = path.as_deref().and_then(path_hash);
-    let (vendor_id, product_id, version) = path.as_deref().and_then(|path| {
-        hid_attributes(path).map(|(vendor, product, version)| (vendor, product, Some(version)))
-            .or_else(|| hardware_ids(path).map(|(vendor, product)| (vendor, product, None)))
-    }).map_or((None, None, None), |(vendor, product, version)| (Some(vendor), Some(product), version));
-    let driver_version = if matches!(kind, DeviceKind::Hid { usage_page: 0x0D, usage: 1 | 2 }) {
-        path.as_deref().and_then(driver_version)
-    } else {
-        None
-    };
-    Some(DeviceDescriptor {
-        id, kind, path_hash: hash, vendor_id, product_id, version,
-        preparsed_data_available: false, driver_version, hid: None,
-    })
+    Some((DeviceDescriptor {
+        id, kind, path_hash: hash, vendor_id: None, product_id: None, version: None,
+        preparsed_data_available: false, driver_version: None, hid: None,
+    }, path))
+}
+
+/// Device worker only: vendor, product and version (INP-8), and the pen
+/// driver version (CTX-12). These calls can block on device IO.
+pub(super) fn identify(path: &[u16], descriptor: &mut DeviceDescriptor) {
+    let identity = hid_attributes(path).map(|(vendor, product, version)| (vendor, product, Some(version)))
+        .or_else(|| hardware_ids(path).map(|(vendor, product)| (vendor, product, None)));
+    if let Some((vendor, product, version)) = identity {
+        descriptor.vendor_id = Some(vendor);
+        descriptor.product_id = Some(product);
+        descriptor.version = version;
+    }
+    if matches!(descriptor.kind, DeviceKind::Hid { usage_page: 0x0D, usage: 1 | 2 }) {
+        descriptor.driver_version = driver_version(path);
+    }
 }
 
 fn name(handle: HANDLE) -> Option<Vec<u16>> {
@@ -227,26 +236,30 @@ impl DeviceIds {
         Some(id)
     }
 
+    /// The session ID is still assigned to a present device.
+    pub(super) fn active(&self, id: DeviceId) -> bool {
+        self.active.values().any(|active| *active == id)
+    }
+
     pub(super) fn remove(&mut self, handle: DeviceId) -> Option<DeviceId> {
         self.active.remove(&handle)
     }
 
-    pub(super) fn identify(&mut self, sample: &mut InputSample) -> bool {
-        let device = match sample {
-            InputSample::RawKey(key) => &mut key.device,
-            InputSample::RawPointer(pointer) => &mut pointer.device,
-            InputSample::Hid(report) => {
-                let Some(id) = self.assign(report.device) else { return false };
-                report.device = id;
-                return true;
-            }
-            _ => return true,
+    /// Translate the record's native handle to its session device ID. `None`
+    /// when the inventory is full. `Some(Some(handle))` names a handle seen
+    /// first in this record: the caller announces it before the record.
+    pub(super) fn identify(&mut self, sample: &mut InputSample) -> Option<Option<DeviceId>> {
+        let slot = match sample {
+            InputSample::RawKey(key) => key.device.as_mut(),
+            InputSample::RawPointer(pointer) => pointer.device.as_mut(),
+            InputSample::Hid(report) => Some(&mut report.device),
+            _ => None,
         };
-        if let Some(handle) = *device {
-            let Some(id) = self.assign(handle) else { return false };
-            *device = Some(id);
-        }
-        true
+        let Some(slot) = slot else { return Some(None) };
+        let native = *slot;
+        let first_seen = !self.active.contains_key(&native);
+        *slot = self.assign(native)?;
+        Some(first_seen.then_some(native))
     }
 }
 

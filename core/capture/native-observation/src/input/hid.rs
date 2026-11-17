@@ -12,7 +12,7 @@ use screen_fix_protocol::{
 };
 use windows_sys::Win32::{
     Devices::HumanInterfaceDevice::{
-        HIDP_BUTTON_CAPS, HIDP_CAPS, HIDP_STATUS_BAD_LOG_PHY_VALUES, HIDP_STATUS_NULL,
+        HIDP_BUTTON_CAPS, HIDP_CAPS, HIDP_STATUS_NULL,
         HIDP_STATUS_SUCCESS, HIDP_VALUE_CAPS, HidP_GetButtonCaps, HidP_GetCaps,
         HidP_GetScaledUsageValue, HidP_GetUsageValue, HidP_GetUsages, HidP_GetValueCaps,
         HidP_Input,
@@ -316,10 +316,8 @@ impl Collection {
                         HidValue::Number { raw: None, spec }
                     };
                 }
-                if scaled_status as u32 != HIDP_STATUS_SUCCESS as u32
-                    && scaled_status as u32 != HIDP_STATUS_BAD_LOG_PHY_VALUES as u32 {
-                    return HidValue::Unavailable;
-                }
+                // Any other scaled status still leaves the logical value
+                // readable; an unsigned value is never lost to it (I6).
                 let mut raw = 0;
                 let status = unsafe { HidP_GetUsageValue(
                     HidP_Input, cap.page, cap.link, cap.code, &mut raw, preparsed, report, length,

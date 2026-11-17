@@ -1,15 +1,18 @@
 //! Native window, registration and scratch buffers stay on the Raw Input
 //! thread. Evidence is copied out before the next buffer operation.
 
-use std::{mem::{offset_of, size_of}, num::NonZeroU32, ptr::{null, null_mut}};
+use std::{
+    mem::{offset_of, size_of}, num::NonZeroU32, os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    ptr::{null, null_mut},
+};
 
 use screen_fix_protocol::{
     MessageTickMs, PhysicalPoint, PhysicalRect, QpcTick, SourceSequence, WindowId,
-    ipc::{CollectedInput, DeviceDescriptor, FocusAtReceipt, ForegroundAtReceipt, HelperFailureStage, InputSample, ProcessInstance, RawInputRegistrationMismatch, RawInputRegistrationObservation, RawKey, RawPointer, Receipt},
+    ipc::{CollectedInput, DeviceDescriptor, FocusAtReceipt, ForegroundAtReceipt, HelperFailureStage, InputSample, OptionalCollection, ProcessInstance, Producer, RawInputRegistrationMismatch, RawInputRegistrationObservation, RawKey, RawPointer, Receipt},
 };
 use windows_sys::{
     Win32::{
-        Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, GetLastError, HANDLE, HWND, POINT, SetLastError},
+        Foundation::{ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE, HWND, POINT},
         System::{Performance::QueryPerformanceCounter, SystemInformation::GetTickCount64, Threading::{
             GetCurrentThread, GetProcessTimes, IsWow64Process, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
             SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
@@ -22,8 +25,7 @@ use windows_sys::{
             },
             Input::KeyboardAndMouse::GetKeyboardLayout,
             WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DestroyWindow, ES_PASSWORD, GWL_STYLE, GetForegroundWindow,
-                GetWindowLongW,
+                CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow,
                 GetGUIThreadInfo, GetPhysicalCursorPos, GetSystemMetrics, GetWindowThreadProcessId,
                 GUITHREADINFO, HWND_MESSAGE, MSG, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
                 SM_CYVIRTUALSCREEN, SM_SWAPBUTTON, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -39,6 +41,13 @@ const INITIAL_RAW_BYTES: usize = 16 * 1024;
 const MAX_RAW_BYTES: usize = 256 * 1024;
 const HEADER_BYTES: usize = size_of::<RAWINPUTHEADER>();
 
+/// One Raw Input packet outcome. A packet that fails validation is skipped
+/// with its own sequence number, so the loop continues (INP-1, I5).
+pub(super) enum RawRecord {
+    Input(CollectedInput),
+    Malformed(Producer, Receipt),
+}
+
 pub(super) struct RawWindow {
     handle: HWND,
     pen_hid: bool,
@@ -46,8 +55,22 @@ pub(super) struct RawWindow {
     single: Vec<u64>,
     buffered: Vec<u64>,
     wow64: bool,
-    sequence: u64,
+    /// Separate sequences for the required Raw Input records and the
+    /// optional HID collections.
+    sequence: [u64; 2],
+    /// Optional collections currently registered.
+    optional: [bool; OptionalCollection::ALL.len()],
+    lost_optional: Vec<OptionalCollection>,
     last_registration_check: u64,
+    foreground: Option<ForegroundProcess>,
+}
+
+/// The receipt-time foreground process, reopened only when the foreground
+/// PID changes (I6). While its handle is open, the PID cannot be reused.
+struct ForegroundProcess {
+    pid: u32,
+    _process: OwnedHandle,
+    creation_filetime: u64,
 }
 
 impl RawWindow {
@@ -66,17 +89,38 @@ impl RawWindow {
         if handle.is_null() {
             return Err(last_error(HelperFailureStage::RawInputRegistration));
         }
-        let window = Self {
+        let mut window = Self {
             handle, pen_hid, hid: HidCollections::default(), single: vec![0; INITIAL_RAW_BYTES / 8], buffered: vec![0; INITIAL_RAW_BYTES / 8],
-            wow64: wow64 != 0 && cfg!(target_pointer_width = "32"), sequence: 0,
-            last_registration_check: unsafe { GetTickCount64() },
+            wow64: wow64 != 0 && cfg!(target_pointer_width = "32"), sequence: [0; 2],
+            optional: [false; OptionalCollection::ALL.len()], lost_optional: Vec::new(),
+            last_registration_check: unsafe { GetTickCount64() }, foreground: None,
         };
         let devices = registrations(handle, RIDEV_INPUTSINK | RIDEV_DEVNOTIFY, pen_hid);
         if unsafe { RegisterRawInputDevices(devices.as_ptr(), devices.len() as u32, size_of::<RAWINPUTDEVICE>() as u32) } == 0 {
             return Err(last_error(HelperFailureStage::RawInputRegistration));
         }
+        // Optional collections register one by one; a failure marks only that
+        // collection unavailable (INP-14, INP-15, M1-05).
+        for (index, collection) in OptionalCollection::ALL.into_iter().enumerate() {
+            let entry = [optional_registration(handle, RIDEV_INPUTSINK | RIDEV_DEVNOTIFY, collection)];
+            window.optional[index] = unsafe {
+                RegisterRawInputDevices(entry.as_ptr(), 1, size_of::<RAWINPUTDEVICE>() as u32)
+            } != 0;
+        }
         window.verify_registration()?;
+        // A collection missing already at startup is reported through readiness.
+        window.lost_optional.clear();
         Ok(window)
+    }
+
+    /// Optional collections verified at startup, in `OptionalCollection::ALL` order.
+    pub(super) fn optional(&self) -> [bool; OptionalCollection::ALL.len()] {
+        self.optional
+    }
+
+    /// Optional collections the registration check found missing since the last call.
+    pub(super) fn take_lost_optional(&mut self) -> Vec<OptionalCollection> {
+        std::mem::take(&mut self.lost_optional)
     }
 
     pub(super) fn handle(&self) -> HWND {
@@ -100,7 +144,9 @@ impl RawWindow {
         self.verify_registration()
     }
 
-    fn verify_registration(&self) -> Result<(), NativeError> {
+    /// A required collection mismatch is a registration loss of the helper.
+    /// A missing optional collection is reported once and stays unavailable.
+    fn verify_registration(&mut self) -> Result<(), NativeError> {
         let mut devices = [RAWINPUTDEVICE::default(); 16];
         let mut count = devices.len() as u32;
         let copied = unsafe {
@@ -111,30 +157,16 @@ impl RawWindow {
         }
         let registered = devices.get(..copied as usize).ok_or_else(invalid_raw)?;
         let flags = RIDEV_INPUTSINK | RIDEV_DEVNOTIFY;
+        for (index, collection) in OptionalCollection::ALL.into_iter().enumerate() {
+            if self.optional[index]
+                && registration_observed(registered, optional_registration(self.handle, flags, collection)).is_some()
+            {
+                self.optional[index] = false;
+                self.lost_optional.push(collection);
+            }
+        }
         for expected in registrations(self.handle, flags, self.pen_hid) {
-            let mut entries = registered.iter().filter(|entry| {
-                entry.usUsagePage == expected.usUsagePage && entry.usUsage == expected.usUsage
-            });
-            // Windows can omit DEVNOTIFY from registration readback. Registration
-            // still requests notifications, and every other readback flag must match.
-            let first = entries.next();
-            let observed = match first {
-                None => RawInputRegistrationObservation::Missing,
-                Some(first) => {
-                    let mut same_window = std::iter::once(first).chain(entries)
-                        .filter(|entry| entry.hwndTarget == expected.hwndTarget);
-                    if let Some(entry) = same_window.next() {
-                        if entry.dwFlags & !RIDEV_DEVNOTIFY == RIDEV_INPUTSINK
-                            || same_window.any(|entry| entry.dwFlags & !RIDEV_DEVNOTIFY == RIDEV_INPUTSINK)
-                        {
-                            continue;
-                        }
-                        RawInputRegistrationObservation::WrongFlags { flags: entry.dwFlags }
-                    } else {
-                        RawInputRegistrationObservation::WrongWindow { flags: first.dwFlags }
-                    }
-                }
-            };
+            let Some(observed) = registration_observed(registered, expected) else { continue };
             return Err(NativeError {
                 raw_input_registration: Some(RawInputRegistrationMismatch {
                     usage_page: expected.usUsagePage,
@@ -149,7 +181,7 @@ impl RawWindow {
     }
 
     pub(super) fn read(
-        &mut self, message: &MSG, receipt_qpc: QpcTick, buffered: bool, mut publish: impl FnMut(CollectedInput),
+        &mut self, message: &MSG, receipt_qpc: QpcTick, buffered: bool, mut publish: impl FnMut(RawRecord),
         stopping: impl Fn() -> bool,
     ) -> Result<(), NativeError> {
         let result = self.read_current(message, receipt_qpc, &mut publish)
@@ -161,34 +193,44 @@ impl RawWindow {
     }
 
     fn read_current(
-        &mut self, message: &MSG, qpc: QpcTick, publish: &mut impl FnMut(CollectedInput),
+        &mut self, message: &MSG, qpc: QpcTick, publish: &mut impl FnMut(RawRecord),
     ) -> Result<(), NativeError> {
-        let foreground = receipt_foreground();
+        let foreground = self.receipt_foreground();
         let native = message.lParam as HRAWINPUT;
+        let tick = Some(MessageTickMs(message.time));
         let mut needed = 0;
-        if unsafe { GetRawInputData(native, RID_INPUT, null_mut(), &mut needed, HEADER_BYTES as u32) } == u32::MAX {
-            return Err(last_error(HelperFailureStage::MessageLoop));
-        }
-        if needed as usize > self.single.len() * 8 {
-            grow(&mut self.single, needed as usize)?;
+        // A failed read of this one message, or an invalid packet, is counted
+        // and skipped. Only loop-level failures end the helper.
+        if unsafe { GetRawInputData(native, RID_INPUT, null_mut(), &mut needed, HEADER_BYTES as u32) } == u32::MAX
+            || (needed as usize > self.single.len() * 8 && grow(&mut self.single, needed as usize).is_err())
+        {
+            return self.malformed(qpc, tick, publish);
         }
         let mut capacity = (self.single.len() * 8) as u32;
         let copied = unsafe {
             GetRawInputData(native, RID_INPUT, self.single.as_mut_ptr().cast(), &mut capacity, HEADER_BYTES as u32)
         };
-        if copied == u32::MAX {
-            return Err(last_error(HelperFailureStage::MessageLoop));
-        }
-        let bytes = as_bytes(&self.single).get(..copied as usize).ok_or_else(invalid_raw)?;
-        let (sample, _) = packet(bytes, false)?;
+        let parsed = (copied != u32::MAX).then(|| as_bytes(&self.single).get(..copied as usize)).flatten()
+            .and_then(|bytes| packet(bytes, false).ok());
+        let Some((sample, _)) = parsed else { return self.malformed(qpc, tick, publish) };
+        let sequence = &mut self.sequence;
         emit_packet(sample, &mut self.hid, self.pen_hid, |sample| {
-            publish(stamp(&mut self.sequence, qpc, Some(MessageTickMs(message.time)), foreground, sample)?);
+            publish(RawRecord::Input(stamp(sequence, qpc, tick, foreground, sample)?));
             Ok(())
         })
     }
 
+    fn malformed(
+        &mut self, qpc: QpcTick, message_tick_ms: Option<MessageTickMs>, publish: &mut impl FnMut(RawRecord),
+    ) -> Result<(), NativeError> {
+        // A packet that cannot be classified belongs to the required producer.
+        let sequence = next_sequence(&mut self.sequence, Producer::RawInput)?;
+        publish(RawRecord::Malformed(Producer::RawInput, Receipt { sequence, qpc, message_tick_ms }));
+        Ok(())
+    }
+
     fn drain(
-        &mut self, publish: &mut impl FnMut(CollectedInput), stopping: impl Fn() -> bool,
+        &mut self, publish: &mut impl FnMut(RawRecord), stopping: impl Fn() -> bool,
     ) -> Result<(), NativeError> {
         while !stopping() {
             self.check_registration()?;
@@ -212,18 +254,36 @@ impl RawWindow {
             // gets its native order and a distinct sequence. Buffered records
             // do not have a corresponding MSG.time.
             let qpc = qpc()?;
-            let foreground = receipt_foreground();
-            let mut bytes = as_bytes(&self.buffered);
+            let foreground = self.receipt_foreground();
+            let buffered = std::mem::take(&mut self.buffered);
+            let mut bytes = as_bytes(&buffered);
+            let mut result = Ok(());
             for index in 0..count {
-                let (sample, size) = packet(bytes, self.wow64)?;
-                emit_packet(sample, &mut self.hid, self.pen_hid, |sample| {
-                    publish(stamp(&mut self.sequence, qpc, None, foreground, sample)?);
+                // A packet whose own size is invalid hides where the next one
+                // starts: the rest of this batch is counted and skipped.
+                let Ok((sample, size)) = packet(bytes, self.wow64) else {
+                    for _ in index..count {
+                        result = result.and_then(|()| self.malformed(qpc, None, publish));
+                    }
+                    break;
+                };
+                let sequence = &mut self.sequence;
+                result = result.and_then(|()| emit_packet(sample, &mut self.hid, self.pen_hid, |sample| {
+                    publish(RawRecord::Input(stamp(sequence, qpc, None, foreground, sample)?));
                     Ok(())
-                })?;
+                }));
                 if index + 1 < count {
-                    bytes = bytes.get(size.next_multiple_of(8)..).ok_or_else(invalid_raw)?;
+                    let Some(rest) = bytes.get(size.next_multiple_of(8)..) else {
+                        for _ in index + 1..count {
+                            result = result.and_then(|()| self.malformed(qpc, None, publish));
+                        }
+                        break;
+                    };
+                    bytes = rest;
                 }
             }
+            self.buffered = buffered;
+            result?;
         }
         Ok(())
     }
@@ -239,14 +299,41 @@ impl Drop for RawWindow {
     }
 }
 
+/// The required collections: keyboard, mouse and, when configured, pen.
 fn registrations(window: HWND, flags: u32, pen_hid: bool) -> Vec<RAWINPUTDEVICE> {
-    let mut collections = vec![(1, 2), (1, 6), (0x0D, 5), (1, 8)];
+    let mut collections = vec![(1, 2), (1, 6)];
     if pen_hid {
         collections.extend([(0x0D, 1), (0x0D, 2)]);
     }
     collections.into_iter().map(|(page, usage)| RAWINPUTDEVICE {
         usUsagePage: page, usUsage: usage, dwFlags: flags, hwndTarget: window,
     }).collect()
+}
+
+fn optional_registration(window: HWND, flags: u32, collection: OptionalCollection) -> RAWINPUTDEVICE {
+    let (page, usage) = collection.usage();
+    RAWINPUTDEVICE { usUsagePage: page, usUsage: usage, dwFlags: flags, hwndTarget: window }
+}
+
+/// `None` when the expected registration is present with its flags.
+fn registration_observed(registered: &[RAWINPUTDEVICE], expected: RAWINPUTDEVICE) -> Option<RawInputRegistrationObservation> {
+    let mut entries = registered.iter().filter(|entry| {
+        entry.usUsagePage == expected.usUsagePage && entry.usUsage == expected.usUsage
+    });
+    // Windows can omit DEVNOTIFY from registration readback. Registration
+    // still requests notifications, and every other readback flag must match.
+    let first = entries.next()?;
+    let mut same_window = std::iter::once(first).chain(entries)
+        .filter(|entry| entry.hwndTarget == expected.hwndTarget);
+    let Some(entry) = same_window.next() else {
+        return Some(RawInputRegistrationObservation::WrongWindow { flags: first.dwFlags });
+    };
+    if entry.dwFlags & !RIDEV_DEVNOTIFY == RIDEV_INPUTSINK
+        || same_window.any(|entry| entry.dwFlags & !RIDEV_DEVNOTIFY == RIDEV_INPUTSINK)
+    {
+        return None;
+    }
+    Some(RawInputRegistrationObservation::WrongFlags { flags: entry.dwFlags })
 }
 
 pub(super) fn qpc() -> Result<QpcTick, NativeError> {
@@ -257,11 +344,17 @@ pub(super) fn qpc() -> Result<QpcTick, NativeError> {
     Ok(QpcTick(qpc))
 }
 
+fn next_sequence(sequences: &mut [u64; 2], producer: Producer) -> Result<SourceSequence, NativeError> {
+    let sequence = &mut sequences[usize::from(producer == Producer::OptionalHid)];
+    *sequence = sequence.checked_add(1).ok_or_else(invalid_raw)?;
+    Ok(SourceSequence(*sequence))
+}
+
 fn stamp(
-    sequence: &mut u64, qpc: QpcTick, message_tick_ms: Option<MessageTickMs>,
+    sequences: &mut [u64; 2], qpc: QpcTick, message_tick_ms: Option<MessageTickMs>,
     foreground_at_receipt: Option<ForegroundAtReceipt>, sample: InputSample,
 ) -> Result<CollectedInput, NativeError> {
-    *sequence = sequence.checked_add(1).ok_or_else(invalid_raw)?;
+    let sequence = next_sequence(sequences, sample.producer())?;
     let mut point = POINT::default();
     let position_at_receipt = (matches!(&sample, InputSample::RawPointer(_))
         || matches!(&sample, InputSample::Hid(report) if report.is_pen()))
@@ -275,7 +368,7 @@ fn stamp(
         _ => (None, None),
     };
     Ok(CollectedInput {
-        receipt: Receipt { sequence: SourceSequence(*sequence), qpc, message_tick_ms },
+        receipt: Receipt { sequence, qpc, message_tick_ms },
         foreground_at_receipt,
         position_at_receipt,
         swapped_buttons,
@@ -284,65 +377,69 @@ fn stamp(
     })
 }
 
-fn receipt_foreground() -> Option<ForegroundAtReceipt> {
-    let foreground = unsafe { GetForegroundWindow() };
-    if foreground.is_null() {
-        return None;
+impl RawWindow {
+    fn receipt_foreground(&mut self) -> Option<ForegroundAtReceipt> {
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground.is_null() {
+            return None;
+        }
+        let mut pid = 0;
+        let thread = NonZeroU32::new(unsafe { GetWindowThreadProcessId(foreground, &mut pid) })?;
+        let pid = NonZeroU32::new(pid)?;
+        if self.foreground.as_ref().is_none_or(|cached| cached.pid != pid.get()) {
+            self.foreground = None;
+            let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid.get()) };
+            if process.is_null() {
+                return None;
+            }
+            // OpenProcess returns a newly owned handle.
+            let process = unsafe { OwnedHandle::from_raw_handle(process) };
+            let mut created = FILETIME::default();
+            let mut exited = FILETIME::default();
+            let mut kernel = FILETIME::default();
+            let mut user = FILETIME::default();
+            if unsafe { GetProcessTimes(process.as_raw_handle(), &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+                return None;
+            }
+            let creation_filetime = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+            self.foreground = Some(ForegroundProcess { pid: pid.get(), _process: process, creation_filetime });
+        }
+        let creation_filetime = self.foreground.as_ref()?.creation_filetime;
+        let focus = sample_focus(thread, pid);
+        let mut checked_pid = 0;
+        let stable = unsafe {
+            GetForegroundWindow() == foreground
+                && GetWindowThreadProcessId(foreground, &mut checked_pid) == thread.get()
+                && checked_pid == pid.get()
+        };
+        if !stable {
+            return None;
+        }
+        Some(ForegroundAtReceipt {
+            window: WindowId(foreground as usize as u64),
+            process: ProcessInstance { pid, creation_filetime },
+            focus,
+        })
     }
-    let mut pid = 0;
-    let thread = NonZeroU32::new(unsafe { GetWindowThreadProcessId(foreground, &mut pid) })?;
-    let pid = NonZeroU32::new(pid)?;
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid.get()) };
-    if process.is_null() {
-        return None;
-    }
-    let mut created = FILETIME::default();
-    let mut exited = FILETIME::default();
-    let mut kernel = FILETIME::default();
-    let mut user = FILETIME::default();
-    // Keep the process object open across the window checks; the PID cannot
-    // be recycled while this handle still identifies the original process.
-    let creation_available = unsafe {
-        GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) != 0
-    };
-    let focus = sample_focus(thread, pid);
-    let mut checked_pid = 0;
-    let stable = unsafe {
-        GetForegroundWindow() == foreground
-            && GetWindowThreadProcessId(foreground, &mut checked_pid) == thread.get()
-            && checked_pid == pid.get()
-    };
-    unsafe { CloseHandle(process) };
-    if !creation_available || !stable {
-        return None;
-    }
-    let creation_filetime = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
-    Some(ForegroundAtReceipt {
-        window: WindowId(foreground as usize as u64),
-        process: ProcessInstance { pid, creation_filetime },
-        focus,
-    })
 }
 
 fn sample_focus(thread: NonZeroU32, pid: NonZeroU32) -> Option<FocusAtReceipt> {
     let mut gui = GUITHREADINFO { cbSize: size_of::<GUITHREADINFO>() as u32, ..Default::default() };
-    if unsafe { GetGUIThreadInfo(thread.get(), &mut gui) } == 0 || gui.hwndFocus.is_null() {
+    if unsafe { GetGUIThreadInfo(thread.get(), &mut gui) } == 0 {
         return None;
     }
-    let focus = gui.hwndFocus;
+    let crate::focus::FocusWindow { hwnd: focus, active_fallback } = crate::focus::focus_window(&gui)?;
     let mut owner = 0;
     let focus_thread = NonZeroU32::new(unsafe { GetWindowThreadProcessId(focus, &mut owner) })?;
     if owner != pid.get() {
         return None;
     }
     let layout = unsafe { GetKeyboardLayout(focus_thread.get()) };
-    let password_style = unsafe {
-        SetLastError(0);
-        let style = GetWindowLongW(focus, GWL_STYLE);
-        (style != 0 || GetLastError() == 0).then_some((style as u32) & (ES_PASSWORD as u32) != 0)
-    };
+    // The active window used when nothing has focus is layout evidence only.
+    let password_style = (!active_fallback).then(|| crate::focus::password_style(focus)).flatten();
     if layout.is_null() || unsafe { GetGUIThreadInfo(thread.get(), &mut gui) } == 0
-        || gui.hwndFocus != focus || unsafe { GetKeyboardLayout(focus_thread.get()) } != layout
+        || crate::focus::focus_window(&gui).map(|current| current.hwnd) != Some(focus)
+        || unsafe { GetKeyboardLayout(focus_thread.get()) } != layout
     {
         return None;
     }

@@ -44,26 +44,38 @@ pub(super) enum TextStatus {
     Confirmed,
     Injected,
     Invalid,
+    /// Text was typed but could not be reconstructed (INP-3); `text` is null.
+    Unknown,
 }
 
 #[derive(Serialize)]
 pub(super) struct TextCommit {
-    pub text: String,
+    pub text: Option<String>,
     pub provenance: TextOrigin,
     pub status: TextStatus,
 }
 
 impl TextCommit {
     fn inferred(text: String) -> Self {
-        Self { text, provenance: TextOrigin::LayoutInferred, status: TextStatus::Inferred }
+        Self { text: Some(text), provenance: TextOrigin::LayoutInferred, status: TextStatus::Inferred }
     }
 
     fn packet(ch: char, valid: bool) -> Self {
         Self {
-            text: ch.into(), provenance: TextOrigin::InjectedUnicode,
+            text: Some(ch.into()), provenance: TextOrigin::InjectedUnicode,
             status: if valid { TextStatus::Injected } else { TextStatus::Invalid },
         }
     }
+
+    pub fn unknown() -> Self {
+        Self { text: None, provenance: TextOrigin::LayoutInferred, status: TextStatus::Unknown }
+    }
+}
+
+/// Virtual keys whose down can type a character: space, digits, letters,
+/// the numeric keypad, OEM punctuation and VK_PACKET.
+pub(super) fn text_key(vk: u16) -> bool {
+    matches!(vk, 0x20 | 0x30..=0x39 | 0x41..=0x5a | 0x60..=0x6f | 0xba..=0xc0 | 0xdb..=0xdf | 0xe2 | 0xe7)
 }
 
 pub(super) struct Output {
@@ -102,8 +114,10 @@ impl KeyboardText {
         let mut commits = Vec::new();
         let typing = if !key.down {
             if matches!(key.modifier, Some(Modifier::LeftAlt | Modifier::RightAlt)) && self.alt_numpad {
+                // Alt+Numpad entry is not rebuilt: it is written as unknown text (INP-3).
                 self.alt_numpad = false;
                 self.alt_numpad_unknown = true;
+                commits.push(TextCommit::unknown());
                 Typing::Unknown
             } else {
                 Typing::NonText

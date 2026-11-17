@@ -58,6 +58,11 @@ pub(crate) struct ScreenFix {
     hotkey_error: Option<String>,
     #[cfg(target_os = "windows")]
     hotkey_probe: Option<Receiver<Result<platform::RecorderHotkeys, String>>>,
+    /// The pending reply and the last result of the fixture Save producer.
+    #[cfg(all(feature = "fixture-save", target_os = "windows"))]
+    fixture_reply: Option<Receiver<screen_fix_core::capture::save::FixtureSaveResult>>,
+    #[cfg(all(feature = "fixture-save", target_os = "windows"))]
+    fixture_message: Option<String>,
 }
 
 impl Default for ScreenFix {
@@ -101,6 +106,10 @@ impl Default for ScreenFix {
             hotkey_error: None,
             #[cfg(target_os = "windows")]
             hotkey_probe: None,
+            #[cfg(all(feature = "fixture-save", target_os = "windows"))]
+            fixture_reply: None,
+            #[cfg(all(feature = "fixture-save", target_os = "windows"))]
+            fixture_message: None,
         }
     }
 }
@@ -164,14 +173,15 @@ impl eframe::App for ScreenFix {
                     }
                     Ok(Err(error)) => {
                         self.last_status = Some(session.status().unwrap_or_else(|| status.clone()));
-                        let message = match error.source_failure() {
-                            Some(failure) if failure.admitted => {
+                        let mut message = match error.source_failure() {
+                            _ if error.retained_recording().is_some() || error.source_failure().is_some_and(|failure| failure.admitted) => {
+                                // An admitted attempt, standard or elevated (M1-01).
                                 self.incomplete_pending = true;
-                                if let Some(retained) = error.retained_recording() {
-                                    format!("Recording failed after capture started. Saved the failed attempt with {} verified video frames.\n{}\n{error}",
-                                        retained.verified_video_frames, retained.root.display())
-                                } else {
-                                    format!("Recording failed after capture started. The failed recording manifest could not be confirmed.\n{error}")
+                                match error.retained_recording() {
+                                    Some(retained) if retained.manifest_confirmed => format!(
+                                        "Recording failed after capture started. Saved the failed attempt with {} verified video frames.\n{}\n{error}",
+                                        retained.verified_video_frames, retained.root.display()),
+                                    _ => format!("Recording failed after capture started. The failed recording manifest could not be confirmed.\n{error}"),
                                 }
                             }
                             Some(failure) if failure.reason == screen_fix_core::session::SourceFailureReason::TokenIdentity
@@ -182,6 +192,12 @@ impl eframe::App for ScreenFix {
                             Some(_) => format!("Elevated capture unavailable. Recording did not start.\n{error}"),
                             None => error.to_string(),
                         };
+                        // The indicator failure is reported with the attempt's own failure.
+                        #[cfg(target_os = "windows")]
+                        if self.indicator_diagnostic.take().is_some() {
+                            let issue = self.indicator_error.as_deref().unwrap_or("The recording indicator failed.");
+                            message.push_str(&format!("\n{issue}"));
+                        }
                         self.state = recording_error(message, error.into_diagnostic().with_output_root(self.folder.clone()), Some(ctx));
                     }
                     Err(TryRecvError::Disconnected) => {
@@ -438,7 +454,15 @@ impl ScreenFix {
                 let stopping = *stop_requested || matches!(status.phase, SessionPhase::Stopping);
                 match status.phase {
                     SessionPhase::Starting if !stopping => {
-                        if let Some(seconds) = status.countdown_seconds {
+                        let blocked: Vec<_> = status.pause_reasons.iter().filter_map(|reason| match reason {
+                            PauseReason::LockScreen => Some("Windows session locked"),
+                            PauseReason::SecureDesktop => Some("Input desktop unavailable"),
+                            PauseReason::Sleep => Some("System suspended"),
+                            _ => None,
+                        }).collect();
+                        if !blocked.is_empty() {
+                            ui.label(format!("Countdown waiting: {}. It restarts when this clears.", blocked.join(", ")));
+                        } else if let Some(seconds) = status.countdown_seconds {
                             if seconds == 0 {
                                 ui.label("Waiting for Windows to become ready.");
                             } else {
@@ -472,9 +496,11 @@ impl ScreenFix {
                         if !status.video_unavailable.is_empty() {
                             ui.label(format!("Video unavailable on {} monitor(s)", status.video_unavailable.len()));
                         }
+                        degraded_line(ui, &status.degraded);
                     }
                     SessionPhase::Paused if !stopping => {
                         ui.label("Recording paused");
+                        degraded_line(ui, &status.degraded);
                         for reason in &status.pause_reasons {
                             ui.label(match reason {
                                 PauseReason::User => "Paused manually",
@@ -557,6 +583,37 @@ impl ScreenFix {
                 }
                 if status.video_reports.len() < status.video_unavailable.len() {
                     ui.label("Preparing video diagnostic report…");
+                }
+                // Developer-only trusted fixture Save producer (M1-08). It is compiled into the
+                // Recorder and calls only the public confirm_fixture_save seam with the
+                // approved executable; the monitors follow the approved window geometry.
+                #[cfg(all(feature = "fixture-save", target_os = "windows"))]
+                {
+                    use screen_fix_core::capture::save::{FixtureSave, SaveKind};
+                    if let Some(reply) = &self.fixture_reply && let Ok(result) = reply.try_recv() {
+                        self.fixture_message = Some(match result {
+                            Ok(id) => format!("Fixture save {} confirmed.", id.0),
+                            Err(error) => format!("Fixture save not confirmed: {error:?}."),
+                        });
+                        self.fixture_reply = None;
+                    }
+                    if !stopping && status.phase == SessionPhase::Recording && let Some(executable) = &self.approved_executable {
+                        for (label, kind) in [("Confirm fixture save", SaveKind::Checkpoint), ("Confirm final fixture save", SaveKind::Final)] {
+                            if ui.add_enabled(self.fixture_reply.is_none(), egui::Button::new(label)).clicked() {
+                                let confirmation = FixtureSave { kind, executable: executable.clone(), affected_monitors: None };
+                                match session.confirm_fixture_save(confirmation) {
+                                    Ok(reply) => {
+                                        self.fixture_reply = Some(reply);
+                                        self.fixture_message = None;
+                                    }
+                                    Err(error) => self.fixture_message = Some(format!("Fixture save not confirmed: {error:?}.")),
+                                }
+                            }
+                        }
+                    }
+                    if let Some(message) = &self.fixture_message {
+                        ui.label(message.as_str());
+                    }
                 }
                 if !stopping && status.phase == SessionPhase::Recording && ui.button("Pause recording").clicked() {
                     self.command_error = session.submit(SessionCommand::Pause(PauseReason::User)).err();
@@ -877,6 +934,14 @@ impl ScreenFix {
             }
             Err(error) => recording_error(error.to_string(), error.into_diagnostic().with_output_root(self.folder.clone()), Some(ctx)),
         };
+    }
+}
+
+/// Activities that stopped while the attempt continues (§6.2 class L).
+fn degraded_line(ui: &mut egui::Ui, degraded: &[screen_fix_core::session::DegradedActivity]) {
+    if !degraded.is_empty() {
+        let activities: Vec<_> = degraded.iter().map(|activity| activity.label()).collect();
+        ui.label(format!("Recording degraded: {}", activities.join(", ")));
     }
 }
 

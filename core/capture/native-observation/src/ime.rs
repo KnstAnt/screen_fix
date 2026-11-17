@@ -16,9 +16,12 @@ const GET_OPEN_STATUS: usize = 0x0005;
 const GET_CONVERSION_MODE: usize = 0x0001;
 const NATIVE_AND_FULLSHAPE: usize = 0x0001 | 0x0008;
 
-pub fn has_ime(focus: Option<FocusSnapshot>) -> bool {
-    let Some(focus) = focus else { return false };
-    unsafe { ImmIsIME(focus.focus.keyboard_layout as usize as HKL) != 0 }
+/// Whether the focus thread's input language has an IME. Without a focus
+/// window (no snapshot, or only the active-window fallback) the answer is
+/// unknown, not "no IME".
+pub fn has_ime(focus: Option<FocusSnapshot>) -> Option<bool> {
+    let focus = focus.filter(|focus| !focus.active_fallback)?;
+    Some(unsafe { ImmIsIME(focus.focus.keyboard_layout as usize as HKL) != 0 })
 }
 
 pub fn read(foreground: WindowProcess, focus: Option<FocusSnapshot>, expires: Instant) -> State {
@@ -40,7 +43,7 @@ fn read_inner(
                 == focus.map(|expected| (expected.focus, false))
     }
 
-    let Some(focus) = focus.filter(|focus| !focus.hung) else { return State::Unknown };
+    let Some(focus) = focus.filter(|focus| !focus.hung && !focus.active_fallback) else { return State::Unknown };
     if Instant::now() >= expires || !guard() || !active(foreground, Some(focus)) {
         return State::Unknown;
     }

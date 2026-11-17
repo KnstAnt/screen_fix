@@ -89,6 +89,44 @@ impl Drop for ProcessHandle {
     }
 }
 
+/// The canonical executable identity of an image path, shared by the
+/// Recorder's resolver and the collector's approval proof (E6): the final
+/// Win32 path of the opened file, read by handle, with the `\\?\` prefix
+/// removed and `\\?\UNC\` written as `\\`. The file is held without write
+/// or delete sharing while it is inspected; a directory is not an identity.
+pub fn canonical_image(path: &str) -> Option<String> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle as close, GENERIC_READ, HANDLE as RawHandle, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+            GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_EXISTING,
+        },
+    };
+    struct File(RawHandle);
+    impl Drop for File {
+        fn drop(&mut self) { unsafe { close(self.0) }; }
+    }
+    let name: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let raw = unsafe {
+        CreateFileW(name.as_ptr(), GENERIC_READ, FILE_SHARE_READ, std::ptr::null(), OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, std::ptr::null_mut())
+    };
+    if raw.is_null() || raw == INVALID_HANDLE_VALUE { return None; }
+    let file = File(raw);
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.0, &mut info) } == 0 || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        return None;
+    }
+    let mut units = vec![0_u16; 32768];
+    let length = unsafe { GetFinalPathNameByHandleW(file.0, units.as_mut_ptr(), units.len() as u32, 0) } as usize;
+    if length == 0 || length >= units.len() { return None; }
+    let text = String::from_utf16(&units[..length]).ok()?;
+    Some(match text.strip_prefix(r"\\?\UNC\") {
+        Some(unc) => format!(r"\\{unc}"),
+        None => text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned(),
+    })
+}
+
 #[derive(Clone)]
 pub struct MetadataScrubber {
     substitutions: Vec<(String, &'static str)>,

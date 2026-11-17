@@ -41,7 +41,7 @@ impl Monitor {
         let started = Instant::now();
         let available_bytes = available(&directory).map_err(preflight_error)?;
         if available_bytes < START_MINIMUM {
-            return Err(CaptureError::backend("Check recording disk space", None,
+            return Err(CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, "Check recording disk space", None,
                 format!("Recording needs at least 20 GB free. Available: {available_bytes} bytes.")));
         }
         let preflight = DiskPreflight {
@@ -71,7 +71,7 @@ impl Drop for Monitor {
 }
 
 fn preflight_error(error: io::Error) -> CaptureError {
-    CaptureError::backend("Check recording disk space", error.raw_os_error(), error.to_string())
+    CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, "Check recording disk space", error.raw_os_error(), error.to_string())
 }
 
 fn available(directory: &Path) -> io::Result<u64> {

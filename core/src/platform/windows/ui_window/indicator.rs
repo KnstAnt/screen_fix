@@ -67,7 +67,7 @@ impl Indicator {
     pub(super) fn observe(&mut self, session: &SessionHandle) -> Result<(), CaptureError> {
         let mut state = self.state.borrow_mut();
         if state.failed {
-            return Err(CaptureError::backend("Show the recording indicator", None,
+            return Err(CaptureError::owned(crate::package::diagnostics::FailureComponent::Interface, "Show the recording indicator", None,
                 "The recording indicator failed. Restart Screen Fix before recording again.".into()));
         }
         state.control = Some(session.indicator_control());
@@ -185,7 +185,7 @@ unsafe extern "system" fn tick(window: HWND, _: u32, timer: usize, _: u32) {
     match catch_unwind(AssertUnwindSafe(|| state.refresh(window))) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => state.fail(window, error),
-        Err(_) => state.fail(window, CaptureError::backend("Update the recording indicator", None,
+        Err(_) => state.fail(window, CaptureError::owned(crate::package::diagnostics::FailureComponent::Interface, "Update the recording indicator", None,
             "The recording indicator stopped unexpectedly.".into())),
     }
 }
@@ -200,5 +200,5 @@ fn work_area(window: HWND) -> Option<RECT> {
 
 fn native_error(operation: &'static str) -> CaptureError {
     let error = std::io::Error::last_os_error();
-    CaptureError::backend(operation, error.raw_os_error(), format!("{operation}: {error}"))
+    CaptureError::owned(crate::package::diagnostics::FailureComponent::Interface, operation, error.raw_os_error(), format!("{operation}: {error}"))
 }

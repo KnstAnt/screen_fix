@@ -36,12 +36,15 @@ const CREATE_SESSION: &str = "Create the WGC session";
 const START_SESSION: &str = "Start WGC capture";
 const RECREATE_POOL: &str = "Recreate the WGC frame pool";
 
+/// Start capture in the monitor's color mode. HDR is tone-mapped from FP16
+/// only with a known SDR white level; otherwise, or when FP16 is rejected,
+/// it uses the system BGRA8 conversion (VID-8).
 pub(super) fn start_monitor(
     item: GraphicsCaptureItem, device: &ID3D11Device, size: SizeInt32,
-    hdr: bool, borderless: bool,
+    hdr: bool, white_known: bool, borderless: bool,
 ) -> Result<(Capture, CaptureColor, Option<i32>), ProbeError> {
     let mut fallback = None;
-    if hdr {
+    if hdr && white_known {
         match Capture::start(item.clone(), device, size, DirectXPixelFormat::R16G16B16A16Float, borderless) {
             Ok(capture) => return Ok((capture, CaptureColor::HdrToneMappedToSdr, None)),
             Err(error) => {
@@ -54,7 +57,7 @@ pub(super) fn start_monitor(
         }
     }
     let capture = Capture::start(item, device, size, DirectXPixelFormat::B8G8R8A8UIntNormalized, borderless)?;
-    let color = if fallback.is_some() { CaptureColor::HdrSystemBgra8 } else { CaptureColor::Sdr };
+    let color = if hdr { CaptureColor::HdrSystemBgra8 } else { CaptureColor::Sdr };
     Ok((capture, color, fallback))
 }
 
@@ -143,9 +146,9 @@ impl Capture {
         Ok(newest)
     }
 
-    pub fn reconfigure(&mut self, size: SizeInt32, hdr: bool) -> Result<(CaptureColor, Option<i32>), ProbeError> {
+    pub fn reconfigure(&mut self, size: SizeInt32, hdr: bool, white_known: bool) -> Result<(CaptureColor, Option<i32>), ProbeError> {
         let mut fallback = None;
-        if hdr {
+        if hdr && white_known {
             match self.recreate(size, DirectXPixelFormat::R16G16B16A16Float) {
                 Ok(()) => return Ok((CaptureColor::HdrToneMappedToSdr, None)),
                 Err(error) => {

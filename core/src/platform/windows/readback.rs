@@ -139,13 +139,14 @@ struct Pending {
     metadata: FrameMetadata,
     row_bytes: usize,
     byte_count: usize,
-    staging_bytes: Option<Bytes>,
     cpu_bytes: Option<Bytes>,
 }
 
 pub(super) struct Readbacks {
     budget: Arc<Budget>,
-    staging: Option<(FrameExtent, ID3D11Texture2D)>,
+    /// Reused for every readback of one extent (format is always BGRA8) and
+    /// charged while it exists. Dropped on an extent change or cancel_epoch.
+    staging: Option<(FrameExtent, ID3D11Texture2D, Bytes)>,
     pending: Option<Pending>,
 }
 
@@ -156,6 +157,15 @@ impl Readbacks {
 
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
+    }
+
+    /// Whether the budget takes a readback of the frame: its CPU image, and a
+    /// staging texture unless one of the same extent is kept.
+    pub fn fits(&self, frame: &NativeFrame) -> bool {
+        let extent = frame.metadata.extent;
+        let kept = self.staging.as_ref().is_some_and(|(size, ..)| *size == extent);
+        image_bytes(extent).and_then(|bytes| bytes.checked_mul(if kept { 1 } else { 2 }))
+            .is_some_and(|bytes| self.budget.fits(bytes))
     }
 
     /// Submit an exact owner-local lease, even after history eviction.
@@ -197,18 +207,23 @@ impl Readbacks {
         };
         let row_bytes = byte_count / extent.height.get() as usize;
         // Both representations count against the same per-monitor limit as
-        // distinct pinned native frames. Staging drops as soon as Unmap returns.
-        let charges = self.budget.reserve(byte_count).and_then(|staging| {
-            self.budget.reserve(byte_count).map(|cpu| (staging, cpu))
-        });
-        let (staging_bytes, cpu_bytes) = match charges {
-            Ok(charges) => charges,
+        // distinct pinned native frames.
+        let cpu_bytes = match self.budget.reserve(byte_count) {
+            Ok(bytes) => bytes,
             Err(reason) => {
                 let _ = work.result.try_send(Err(reason));
                 return Ok(());
             }
         };
-        if self.staging.as_ref().is_none_or(|(size, _)| *size != extent) {
+        if self.staging.as_ref().is_none_or(|(size, ..)| *size != extent) {
+            self.staging = None;
+            let staging_bytes = match self.budget.reserve(byte_count) {
+                Ok(bytes) => bytes,
+                Err(reason) => {
+                    let _ = work.result.try_send(Err(reason));
+                    return Ok(());
+                }
+            };
             let staging = pixels::texture(device, extent.width.get(), extent.height.get(), DXGI_FORMAT_B8G8R8A8_UNORM, 0, true);
             let staging = match staging {
                 Ok(staging) => staging,
@@ -217,18 +232,17 @@ impl Readbacks {
                     return Err(error);
                 }
             };
-            self.staging = Some((extent, staging));
+            self.staging = Some((extent, staging, staging_bytes));
         }
-        let (_, staging) = self.staging.as_ref().ok_or_else(|| super::unavailable("The still staging texture is unavailable"))?;
+        let (_, staging, _) = self.staging.as_ref().ok_or_else(|| super::unavailable("The still staging texture is unavailable"))?;
         frame.copy_into(images.context(), staging);
         self.pending = Some(Pending { work: Some(work), expired: false, metadata: frame.metadata.clone(),
-            row_bytes, byte_count, staging_bytes: Some(staging_bytes),
-            cpu_bytes: Some(cpu_bytes) });
+            row_bytes, byte_count, cpu_bytes: Some(cpu_bytes) });
         Ok(())
     }
 
     pub fn poll(&mut self, images: &NativeImages, now: Instant) -> Result<(), ProbeError> {
-        let (Some(pending), Some((_, staging))) = (&mut self.pending, &self.staging) else { return Ok(()) };
+        let (Some(pending), Some((_, staging, _))) = (&mut self.pending, &self.staging) else { return Ok(()) };
         if !pending.expired && let Some(work) = &pending.work {
             let rejection = if !pending.metadata.covered() {
                 Some(Rejected::ApprovalSuppressed)
@@ -237,7 +251,6 @@ impl Readbacks {
             };
             if let Some(reason) = rejection {
                 let _ = work.result.try_send(Err(reason));
-                // Keep staging charged until the GPU releases it.
                 pending.expired = true;
             }
         }
@@ -265,8 +278,6 @@ impl Readbacks {
             }
             Ok(true) => {}
         }
-        self.staging = None;
-        pending.staging_bytes.take();
         if !pending.expired && let Some(work) = pending.work.take() {
             let cpu = pending.cpu_bytes.take().expect("a mapped image has a CPU budget");
             let result = if !pending.metadata.covered() {

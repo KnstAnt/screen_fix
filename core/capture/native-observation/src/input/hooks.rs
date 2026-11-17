@@ -6,7 +6,7 @@
 //! allocates, locks, signals a consumer, or waits for queue space.
 
 use std::{
-    cell::RefCell,
+    cell::OnceCell,
     ptr::{null, null_mut},
     sync::{
         Arc,
@@ -20,7 +20,7 @@ use std::{
 use screen_fix_protocol::{
     MessageTickMs, PhysicalPoint, QpcTick, SourceSequence, WindowId,
     ipc::{CollectedInput, HelperFailureStage, HelperToCore, HookKey, HookPointer, InputSample,
-        Producer, ProducerGap, ProducerProgress, Receipt},
+        GapCause, Producer, ProducerGap, ProducerProgress, Receipt},
 };
 use windows_sys::Win32::{
     Foundation::{LPARAM, LRESULT, WPARAM},
@@ -140,13 +140,16 @@ impl ClosedHooks {
 }
 
 thread_local! {
-    static SCOPE: RefCell<Option<Arc<CaptureScope>>> = const { RefCell::new(None) };
+    /// Set once on the hook thread before the hooks are installed. The
+    /// callbacks run on that thread and only read it (ARCH-2).
+    static SCOPE: OnceCell<Option<Arc<CaptureScope>>> = const { OnceCell::new() };
 }
 
 fn hook_loop(
     ready: mpsc::SyncSender<Result<u32, NativeError>>, scope: Option<Arc<CaptureScope>>,
 ) -> Result<(), NativeError> {
-    SCOPE.with(|state| state.replace(scope));
+    // Each hook thread is new, so its cell is still empty here.
+    SCOPE.with(|state| { let _ = state.set(scope); });
     let mut message = MSG::default();
     // Ensure that a message queue exists before revealing the thread ID.
     unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE) };
@@ -250,8 +253,7 @@ unsafe extern "system" fn pointer_callback(code: i32, message: WPARAM, data: LPA
 
 fn hook_foreground() -> Option<Option<HookForeground>> {
     SCOPE.with(|scope| {
-        let scope = scope.borrow();
-        let Some(scope) = scope.as_ref() else { return Some(None) };
+        let Some(scope) = scope.get().and_then(Option::as_ref) else { return Some(None) };
         let serial = (scope.hook_open)()?;
         let hwnd = unsafe { GetForegroundWindow() };
         if hwnd.is_null() { return None; }
@@ -390,7 +392,7 @@ fn unpack(producer: Producer, words: Words) -> (HelperToCore, Option<HookForegro
     }
     if sequence == 0 {
         return (HelperToCore::Gap(ProducerGap {
-            producer,
+            producer, cause: GapCause::Overflow,
             first_sequence: SourceSequence(qpc),
             first_qpc: QpcTick(tick as i64),
             last_sequence: SourceSequence(message),

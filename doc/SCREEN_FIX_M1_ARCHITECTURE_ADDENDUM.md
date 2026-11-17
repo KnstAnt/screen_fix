@@ -119,6 +119,22 @@ The observation selector is app-neutral. It does not normalize full training act
 
 No subsystem receives a universal CoreContext containing all queues, tasks and resources. Route only the commands and facts it consumes. Do not introduce a broadcast bus for every record or a shared mutable session object queried by every worker.
 
+**Permitted process-wide state (explicit exceptions to "no global mutable state").** Each item is an atomic latch, a once-initialized immutable value or callback context without a user-data pointer, with one documented purpose:
+- `RECORDING_OWNED` (`session/windows.rs`): the process-wide one-recording latch.
+- `REPORT_SERIAL` (`package/diagnostics.rs`): a counter that makes diagnostic report names unique.
+- `DESKTOP_SIGNALS` (`session/windows/environment.rs`, thread-local): the context of the out-of-context desktop WinEvent callback, which has no user-data pointer. The message loop clears it before removing the hook.
+- `IN_FLIGHT` (`platform/windows/elevated/launcher.rs`): the one-flight latch of the elevated launch. It stays set until the shell call returns, so consent prompts cannot stack across attempts.
+- `RESOLVER_ACTIVE` (`platform/windows/context/identity.rs`) and `CLASSIFIER_ACTIVE` (`platform/windows/elevated/selector.rs`): single-owner latches. No replacement resolver or classifier starts while an earlier one may still be blocked in a native call.
+- `FUNCTIONS` (`platform/windows/mf.rs`): the Media Foundation function table, loaded once and immutable afterwards.
+
+**Known M1 deviation: worker-mutated session facts (S4 reduced).** The controller-owned `Facts` are not yet mutated only by the controller. Workers change them through `WorkerSession` methods under the lifecycle lock. The full move to a bounded owner/message channel was deferred by the remediation plan because it fixes no observable defect. The mutating methods are:
+- source selection and evidence: `require_source_change`, `abandon_source_preparation`, `source_ready`, `source_pending`, `source_enhanced`, `update_standard_evidence`, `update_elevated_evidence`, `elevated_registration`, `record_source_coverage`, `restrict_source_coverage`, `record_uncertified_tail`, `record_source_blind`, `source_resynchronizing`, `fail_classified_source`, `fail_source`, `required_elevated_hook_failed`, `source_finalization_failed`;
+- faults and health: `report_fault`, `report_health`, `video_failed`, `set_video_report`, `input_failed`, `set_input_report_for`, `set_input_report`;
+- lifecycle and boundaries: `request_stop`, `mark_input_prefix`, `finish_video_pause`, `finish_pause`, `complete_prefix`, `authorize_complete_publication`, `verify_startup`, `startup_step`, `video_ready`, `input_ready`, `window_coverage`, `windows_evidence`;
+- drained notices and environment: `take_fixture_saves`, `take_hotkeys`, `request_journal_flush`, `take_input_environment`, `take_elevated_environment`.
+
+The lifecycle state machine is one phase value with several latch flags, not one enum. Its states, transitions and latches are documented on `Facts` in `core/src/session/windows.rs`. Suspend data is read only through `WorkerSession::suspend_marks`. The power, desktop and window-message callbacks run inside `catch_unwind` and take no lock.
+
 ## 5. Threads, blocking and queues
 
 Use standard Rust threads and bounded channels for these native workloads. No async runtime is required for M1. Future local/network transports can use their own event-driven implementation behind hub/upload boundaries; they must not impose an executor on capture.

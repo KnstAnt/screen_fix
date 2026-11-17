@@ -4,11 +4,10 @@
 use std::sync::Arc;
 
 use crate::protocol::{
-    AdmissionEpoch, DeviceId, EventRef, Evidence, GeometryId, MessageTickAnchor, MonitorId, ObservationId, PhysicalPoint, RecordTime,
+    AdmissionEpoch, DeviceId, Evidence, GeometryId, MessageTickAnchor, MonitorId, ObservationId, PhysicalPoint, RecordTime,
     RequestId, SessionTimeUs, ipc::CollectedInput,
 };
 
-use super::DropReason;
 pub(crate) use sampling::{MotionSampler, Sampled};
 
 mod control;
@@ -24,7 +23,7 @@ pub(crate) use held::{
     button_bit, modifier_bit, modifier_vk,
 };
 pub(crate) use matching::promoted as has_promotion;
-pub(crate) use matching::{CorrelatedInput, Correlation, PenPromotion, InputGap, InputMatcher, InputStep, NativeLoss, ProvisionalInputChange, producer_index};
+pub(crate) use matching::{CorrelatedInput, Correlation, Discarded, PenPromotion, InputGap, InputMatcher, InputStep, ProvisionalInputChange};
 pub(crate) use normalize::{Action, Button, Key, Modifier, Motion, ScanCode, ScanPrefix, WheelAxis, startup_modifier};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,11 +62,4 @@ pub struct PointerEvidence {
     /// These are the receipts of the records that carry the two points.
     pub event_position_receipt_t_us: Option<SessionTimeUs>,
     pub receipt_position_t_us: Option<SessionTimeUs>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputResolution {
-    Published(EventRef),
-    Suppressed,
-    Dropped(DropReason),
 }

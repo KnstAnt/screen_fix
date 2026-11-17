@@ -6,7 +6,7 @@ use std::{
     ptr::{null, null_mut},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::{Acquire, Relaxed, Release}},
+        atomic::{AtomicBool, AtomicI64, Ordering::{Acquire, Release}},
         mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
     },
     thread::{self, JoinHandle},
@@ -26,6 +26,8 @@ use windows_sys::{
 };
 
 use screen_fix_protocol::{MessageTickMs, QpcTick, WindowId};
+
+use crate::LossCounter;
 
 pub use screen_fix_protocol::ipc::elevated::WindowNotice as Notice;
 
@@ -51,11 +53,13 @@ struct Pending {
     notices: [Notice; RING_LENGTH],
     used: usize,
     lost: u64,
+    /// Receipts of the first and last notice lost to ring overflow (C3).
+    lost_receipts: [i64; 2],
 }
 
 impl Pending {
     fn new() -> Self {
-        Self { notices: [EMPTY; RING_LENGTH], used: 0, lost: 0 }
+        Self { notices: [EMPTY; RING_LENGTH], used: 0, lost: 0, lost_receipts: [0; 2] }
     }
 }
 
@@ -88,7 +92,7 @@ enum Loop {
 
 pub struct Notifications {
     stop: Arc<AtomicBool>,
-    lost: Arc<AtomicU64>,
+    lost: Arc<LossCounter>,
     main: Option<JoinHandle<()>>,
     locations: Option<JoinHandle<()>>,
     progress: Arc<[AtomicI64; 2]>,
@@ -107,7 +111,7 @@ impl Notifications {
     fn open(scoped: bool) -> Result<Self, StartError> {
         let (send, notices) = sync_channel(QUEUE_LENGTH);
         let stop = Arc::new(AtomicBool::new(false));
-        let lost = Arc::new(AtomicU64::new(0));
+        let lost = Arc::new(LossCounter::default());
         let progress = Arc::new([const { AtomicI64::new(0) }; 2]);
         let main = start(Loop::Main, Arc::clone(&stop), Arc::clone(&lost), Arc::clone(&progress), send.clone(), scoped)?;
         let locations = match start(Loop::Locations, Arc::clone(&stop), Arc::clone(&lost), Arc::clone(&progress), send, scoped) {
@@ -126,8 +130,9 @@ impl Notifications {
         self.notices.try_iter().take(QUEUE_LENGTH)
     }
 
-    pub fn take_loss(&self) -> u64 {
-        self.lost.swap(0, Acquire)
+    /// Lost notices since the last drain: count and first and last receipt.
+    pub fn take_loss(&self) -> Option<(u64, QpcTick, QpcTick)> {
+        self.lost.take()
     }
 
     pub fn running(&self) -> bool {
@@ -161,7 +166,7 @@ impl Drop for Notifications {
 }
 
 fn start(
-    kind: Loop, stop: Arc<AtomicBool>, lost: Arc<AtomicU64>, progress: Arc<[AtomicI64; 2]>, send: SyncSender<Notice>, scoped: bool,
+    kind: Loop, stop: Arc<AtomicBool>, lost: Arc<LossCounter>, progress: Arc<[AtomicI64; 2]>, send: SyncSender<Notice>, scoped: bool,
 ) -> Result<JoinHandle<()>, StartError> {
     let (ready, initialized) = sync_channel(1);
     let name = match kind { Loop::Main => "context-window", Loop::Locations => "context-location" };
@@ -203,18 +208,16 @@ fn start(
             }
             // No Windows dispatch is performed while reading this ring.
             let pending = unsafe { &mut *storage.get() };
-            let mut dropped = std::mem::take(&mut pending.lost);
+            let [first, last] = std::mem::take(&mut pending.lost_receipts);
+            lost.note(std::mem::take(&mut pending.lost), first, last);
             for notice in &pending.notices[..pending.used] {
                 match send.try_send(*notice) {
                     Ok(()) => {}
-                    Err(TrySendError::Full(_)) => dropped = dropped.saturating_add(1),
+                    Err(TrySendError::Full(_)) => lost.note(1, notice.receipt.0, notice.receipt.0),
                     Err(TrySendError::Disconnected(_)) => return,
                 }
             }
             pending.used = 0;
-            if dropped != 0 {
-                let _ = lost.fetch_update(Release, Relaxed, |count| Some(count.saturating_add(dropped)));
-            }
             if exhausted {
                 progress[match kind { Loop::Main => 0, Loop::Locations => 1 }].store(before, Release);
             }
@@ -285,11 +288,15 @@ unsafe extern "system" fn on_event(
     let window_object = OBJID_WINDOW as i32;
     let caret_object = OBJID_CARET as i32;
     let cursor_object = OBJID_CURSOR as i32;
+    // Window-object kinds are kept only for top-level windows, so child
+    // windows never use ring capacity (CTX-1). GetAncestor does not block.
+    // A destroyed window has no ancestry left to check.
+    let top_level = || unsafe { GetAncestor(window, GA_ROOT) } == window;
     let keep = match event {
-        EVENT_OBJECT_LOCATIONCHANGE => child == 0 && (object == window_object || object == caret_object),
-        EVENT_OBJECT_SHOW | EVENT_OBJECT_HIDE => child == 0 && (object == window_object || object == caret_object),
+        EVENT_OBJECT_LOCATIONCHANGE | EVENT_OBJECT_SHOW | EVENT_OBJECT_HIDE => child == 0
+            && (object == caret_object || object == window_object && top_level()),
         EVENT_OBJECT_DESTROY => child == 0 && object == window_object,
-        EVENT_OBJECT_NAMECHANGE => child == 0 && (object == window_object || object == cursor_object),
+        EVENT_OBJECT_NAMECHANGE => child == 0 && (object == cursor_object || object == window_object && top_level()),
         _ => true,
     };
     if keep {
@@ -305,6 +312,8 @@ fn enqueue(event: u32, window: HWND, object: i32, thread: u32, source_tick: Opti
         // called while the callback touches it and no reference is retained.
         let Some(pending) = (unsafe { active.get().as_mut() }) else { return };
         if !have_stamp || pending.used >= RING_LENGTH {
+            if pending.lost == 0 { pending.lost_receipts[0] = qpc; }
+            pending.lost_receipts[1] = qpc;
             pending.lost = pending.lost.saturating_add(1);
             return;
         }

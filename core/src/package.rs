@@ -5,6 +5,7 @@ use std::fmt;
 pub mod metadata;
 pub mod diagnostics;
 pub(crate) mod journal;
+pub mod outcome;
 mod reader;
 pub use journal::StreamSummary;
 pub use reader::SourceSummary;

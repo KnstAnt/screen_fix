@@ -24,13 +24,14 @@ pub(in crate::platform::windows) struct Output {
     pub identity: usize,
     pub adapter: (u32, i32),
     pub bounds: PhysicalRect,
-    pub dpi_x: NonZeroU32,
-    pub dpi_y: NonZeroU32,
-    pub refresh: (u32, NonZeroU32),
+    pub dpi_x: Option<NonZeroU32>,
+    pub dpi_y: Option<NonZeroU32>,
+    pub refresh: Option<(u32, NonZeroU32)>,
     pub rotation: i32,
     pub primary: bool,
     pub hdr: bool,
     pub sdr_white: Option<NonZeroU32>,
+    pub unavailable: BTreeMap<crate::package::metadata::DisplayField, Option<i32>>,
 }
 
 impl Output {
@@ -40,6 +41,7 @@ impl Output {
             key: monitor.key.clone(), identity: monitor.handle.0 as usize, adapter: (adapter.LowPart, adapter.HighPart),
             bounds: monitor.bounds, dpi_x: monitor.dpi_x, dpi_y: monitor.dpi_y, refresh: monitor.refresh,
             rotation: monitor.rotation, primary: monitor.primary, hdr: monitor.hdr, sdr_white: monitor.sdr_white,
+            unavailable: monitor.unavailable.clone(),
         })
     }
 }
@@ -98,6 +100,12 @@ impl Topology {
     pub fn geometry(&self, monitor: MonitorId) -> Result<Option<GeometryId>, ()> {
         let routes = self.routes.try_read().map_err(|_| ())?;
         Ok(routes.get(&monitor).and_then(Route::capture).map(|capture| capture.geometry.id))
+    }
+
+    /// The active capture geometry of a monitor, with its bounds.
+    pub fn capture_geometry(&self, monitor: MonitorId) -> Result<Option<crate::capture::frame::MonitorGeometry>, ()> {
+        let routes = self.routes.try_read().map_err(|_| ())?;
+        Ok(routes.get(&monitor).and_then(Route::capture).map(|capture| capture.geometry))
     }
 
     pub fn routes(&self) -> Option<BTreeMap<MonitorId, Route>> {

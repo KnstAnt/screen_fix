@@ -19,13 +19,16 @@ use windows::{
 
 use crate::{
     capture::frame::{CaptureColor, FrameExtent, FrameMetadata},
-    package::metadata::{CaptureCounters, MonitorCapture},
+    package::{diagnostics::{Failure, FailureComponent}, metadata::{CaptureCounters, MonitorCapture}, outcome::HealthKind},
     protocol::{AdmissionEpoch, CaptureEpoch, FrameId, FrameSequence, GeometryEpoch, GeometryId, MonitorId, SessionTimeUs},
     config::SelectedMonitor,
-    session::{AdmissionBoundary, windows::{Admission, PauseProducer, WorkerSession}},
+    session::{AdmissionBoundary, fault::FaultReport, windows::{Admission, PauseProducer, WorkerSession}},
 };
 
-use super::{context::{ELEVATED_FRAME_WAIT_US, FramePolicy}, Apartment, ProbeError, capture_device, clock, clock_error, display, gpu, hdr, native, pixels, readback, slots, stage, still_png, still_rows, stills, unavailable, video, wgc};
+use super::{context::{ELEVATED_FRAME_WAIT_US, FramePolicy}, Apartment, ProbeError, capture_device, clock, clock_error, display, encoder, gpu, hdr, native, pixels, readback, slots, stage, still_png, still_rows, stills, unavailable, video, wgc};
+
+/// The bound on one GPU video conversion.
+pub(super) const CONVERSION_DEADLINE: Duration = Duration::from_secs(3);
 
 pub(super) struct Ready {
     pub capture: MonitorCapture,
@@ -35,7 +38,9 @@ pub(super) struct Ready {
 pub(super) struct FormatRequest {
     pub at: SessionTimeUs,
     pub output: Option<display::topology::Output>,
-    pub existing_device: Option<ID3D11Device>,
+    /// The capture device for the new output, created by this capture owner;
+    /// none when the monitor is missing.
+    pub device: Option<ID3D11Device>,
     pub reply: SyncSender<FormatReply>,
 }
 
@@ -65,18 +70,25 @@ pub(super) struct VideoTarget {
     pub unavailable: Arc<AtomicBool>,
     pub evidence: Arc<slots::Evidence>,
     pub reconfigure: SyncSender<FormatRequest>,
+    /// Encoder self-check pictures requested while a format request is pending.
+    pub probes: Receiver<encoder::Probe>,
     pub pacing: Arc<RwLock<Option<(AdmissionEpoch, slots::Timeline)>>>,
 }
 
 pub(super) fn run(
     selected: &SelectedMonitor, worker: &WorkerSession,
-    frame_policy: &FramePolicy, topology: &display::topology::Topology, borderless: bool, ready: SyncSender<Ready>, video: Option<VideoTarget>,
+    frame_policy: &FramePolicy, topology: &display::topology::Topology, borderless: bool, ready: SyncSender<Ready>, video: VideoTarget,
     png: still_png::Inbox, rows: still_rows::Rows,
 ) -> Completion {
     let mut stop = StopOnError(Some(worker));
     let mut counters = CaptureCounters::default();
     let mut epochs = Vec::new();
-    let result = capture(selected, worker, frame_policy, topology, borderless, ready, video, png, rows, &mut counters, &mut epochs);
+    let result = capture(selected, worker, frame_policy, topology, borderless, ready, video, png, rows, &mut counters, &mut epochs)
+        .map_err(|error| error.owned_by(FailureComponent::Capture));
+    // A capture-thread failure fails the attempt (§6.2 row 4).
+    if let Err(error) = &result {
+        worker.report_fault(FaultReport::attempt(&error.to_error(FailureComponent::Capture)));
+    }
     if matches!(&result, Ok(Exit::Session(_))) {
         stop.0 = None;
     }
@@ -101,7 +113,7 @@ pub(super) fn report_video_ready(worker: &WorkerSession, monitor: MonitorId, for
 
 fn capture(
     selected: &SelectedMonitor, worker: &WorkerSession,
-    frame_policy: &FramePolicy, topology: &display::topology::Topology, borderless: bool, ready: SyncSender<Ready>, video: Option<VideoTarget>,
+    frame_policy: &FramePolicy, topology: &display::topology::Topology, borderless: bool, ready: SyncSender<Ready>, video: VideoTarget,
     png: still_png::Inbox, rows: still_rows::Rows, counters: &mut CaptureCounters, epochs: &mut Vec<MonitorCapture>,
 ) -> Result<Exit, ProbeError> {
     let _apartment = Apartment::initialize()?;
@@ -117,35 +129,29 @@ fn capture(
         return Err(unavailable("The monitor physical geometry does not match its capture size"));
     }
     let adapter_luid = stage(unsafe { display.adapter.GetDesc1() }, "Read the capture adapter")?.AdapterLuid;
-    let mut device = if let Some(video) = &video {
-        if !same_adapter(adapter_luid, video.adapter_luid)
-            || display.bounds != video.source_bounds
-        {
-            return Err(unavailable("The primary display geometry or adapter changed during startup"));
-        }
-        video.device.clone()
-    } else {
-        capture_device(&display.adapter)?
-    };
-    let (capture, color, fallback) = wgc::start_monitor(item, &device, size, display.hdr, borderless)?;
+    if !same_adapter(adapter_luid, video.adapter_luid) || display.bounds != video.source_bounds {
+        return Err(unavailable("The primary display geometry or adapter changed during startup"));
+    }
+    let mut device = video.device.clone();
+    let (capture, color, fallback) = wgc::start_monitor(item, &device, size, display.hdr, display.sdr_white.is_some(), borderless)?;
+    report_conversion(worker, selected.id, color, display.sdr_white);
     let mut painter = pixels::Painter::new(&device)?;
     let mut images = Resources::new(&device, &painter, size, color, display.sdr_white)?;
     counters.native_texture_bytes_peak = images.native.allocation_bytes();
-    let mut mode = metadata(&display, selected, GeometryEpoch(1), CaptureEpoch(1), &capture, color, fallback, video.is_some());
+    let mut mode = metadata(&display, selected, GeometryEpoch(1), CaptureEpoch(1), &capture, color, fallback, true);
     let mut output = display::topology::Output::from_native(&display)?;
     epochs.push(mode.clone());
     topology.capture(mode.clone());
-    let mut converter = video.as_ref().map(|video| gpu::Converter::new(&device, video.format, video.software)).transpose()?;
+    let mut converter = Some(gpu::Converter::new(&device, video.format, video.software)?);
     let still_budget = Arc::new(readback::Budget::default());
     let mut readbacks = readback::Readbacks::new(Arc::clone(&still_budget));
     let (stills, mut observations) = stills::Stills::new(rows, still_budget);
-    if let Some(video) = &video {
-        report_video_ready(worker, selected.id, video.format, video.software);
-    }
+    report_video_ready(worker, selected.id, video.format, video.software);
     ready.try_send(Ready { capture: mode.clone(), stills })
         .map_err(|_| unavailable("The capture coordinator is unavailable"))?;
     let mut native_capture = Some(capture);
-    let mut pending_format: Option<Receiver<FormatReply>> = None;
+    // The pending request's reply and the device its self-check pictures use.
+    let mut pending_format: Option<(Receiver<FormatReply>, Option<ID3D11Device>)> = None;
     let mut requested_missing = false;
     let mut reopen_after = None;
     let mut reconfiguring = false;
@@ -159,6 +165,8 @@ fn capture(
         let mut scheduled = Instant::now();
         let mut sequence = 0_u64;
         let mut pending_video: Option<(gpu::PendingSample, FrameMetadata, Instant)> = None;
+        let mut suspends = worker.suspend_marks().sequence;
+        let mut waiting = TimelineWait::default();
         let mut last_source = None;
         let mut geometry_after = None;
         let mut next_device_check = Instant::now();
@@ -167,7 +175,7 @@ fn capture(
                 Admission::Closed(Some(cutoff)) if worker.pause_pending(cutoff) => {
                     frozen_final = Some((cutoff, native_capture.as_ref().is_some_and(|capture| !capture.item_closed())
                         && !reconfiguring));
-                    pending_video = None;
+                    discard_video(&mut pending_video, &mut waiting, counters);
                     images.native.clear_staged();
                     finish_stills(worker, cutoff, cutoff, false, false, &mode, &device, &images.native,
                         &mut observations, &mut readbacks, &png)?;
@@ -205,13 +213,13 @@ fn capture(
                 topology.missing(mode.geometry.id);
                 if let Some(capture) = native_capture.take() { capture.close()?; }
                 observations.geometry_changed(mode.geometry.id);
-                pending_video = None;
+                discard_video(&mut pending_video, &mut waiting, counters);
                 images.native.clear_staged();
                 converter = None;
                 reconfiguring = false;
             }
             let mut active_geometry = None;
-            if let Some(receiver) = &pending_format {
+            if let Some((receiver, _)) = &pending_format {
                 match receiver.try_recv() {
                     Ok(FormatReply::Ready { device: configured, encoding, output: target }) => {
                         pending_format = None;
@@ -219,9 +227,12 @@ fn capture(
                         if latest.as_ref().is_some_and(|current| current.as_ref() == Some(&target))
                             && !native_capture.as_ref().is_some_and(wgc::Capture::item_closed)
                         {
-                            let actual = display::enumerate()?.into_iter().find(|entry| entry.key == selected.key);
+                            // A failed read proves nothing about the monitor: the
+                            // request is retried on the next topology tick (VID-9).
+                            let actual = display::enumerate().ok()
+                                .and_then(|displays| displays.into_iter().find(|entry| entry.key == selected.key));
                             if let Some(actual) = actual
-                                && display::topology::Output::from_native(&actual)? == target
+                                && display::topology::Output::from_native(&actual).is_ok_and(|actual| actual == target)
                             {
                                 let next = next_geometry(mode.geometry.id.epoch)?;
                                 let epoch = next_capture(mode.capture_epoch)?;
@@ -238,14 +249,15 @@ fn capture(
                                 let (capture, color, fallback) = if same_item {
                                     let mut capture = native_capture.take()
                                         .ok_or_else(|| unavailable("The existing monitor capture item is unavailable"))?;
-                                    let (color, fallback) = capture.reconfigure(size, actual.hdr)?;
+                                    let (color, fallback) = capture.reconfigure(size, actual.hdr, actual.sdr_white.is_some())?;
                                     (capture, color, fallback)
                                 } else {
                                     let item: GraphicsCaptureItem = stage(unsafe { interop.CreateForMonitor(actual.handle) },
                                         "Create the returned monitor capture item")?;
-                                    wgc::start_monitor(item, &device, size, actual.hdr, borderless)?
+                                    wgc::start_monitor(item, &device, size, actual.hdr, actual.sdr_white.is_some(), borderless)?
                                 };
                                 mode = metadata(&actual, selected, next, epoch, &capture, color, fallback, encoding.is_some());
+                                report_conversion(worker, selected.id, color, actual.sdr_white);
                                 if same_item {
                                     observations.expire_native_epoch();
                                     readbacks.cancel_epoch(readback::Rejected::EpochMismatch);
@@ -254,7 +266,7 @@ fn capture(
                                 converter = encoding.map(|(format, software)| gpu::Converter::new(&device, format, software)).transpose()?;
                                 native_capture = Some(capture);
                                 output = target;
-                                pending_video = None;
+                                discard_video(&mut pending_video, &mut waiting, counters);
                                 last_source = None;
                                 let changed = clock::qpc()?;
                                 geometry_after = Some(changed);
@@ -280,7 +292,7 @@ fn capture(
                         rejected_snapshot = snapshot.as_ref().map(|snapshot| snapshot.received);
                     }
                     Err(TryRecvError::Disconnected) => {
-                        if video.as_ref().is_none_or(|video| !video.unavailable.load(Ordering::Acquire)) {
+                        if !video.unavailable.load(Ordering::Acquire) {
                             return Err(unavailable("The monitor's video format owner is unavailable"));
                         }
                         pending_format = None;
@@ -301,29 +313,45 @@ fn capture(
             let needs_missing = missing && !requested_missing;
             if pending_format.is_none() && (needs_missing || format_changed)
                 && snapshot.as_ref().is_none_or(|snapshot| rejected_snapshot != Some(snapshot.received))
-                && let Some(video) = &video
             {
                 let target = if needs_missing { None } else { present.cloned() };
-                let existing_device = target.as_ref().filter(|target| {
-                    native_capture.is_some() && output.adapter == target.adapter && output.identity == target.identity
-                }).map(|_| device.clone());
+                // A new adapter's device is created here, by the owner of its
+                // immediate context. A failed read is retried on the next tick.
+                let request_device = match &target {
+                    None => Some(None),
+                    Some(target) if native_capture.is_some() && output.adapter == target.adapter && output.identity == target.identity => {
+                        Some(Some(device.clone()))
+                    }
+                    Some(target) => display::enumerate().ok()
+                        .and_then(|displays| displays.into_iter().find(|entry| entry.key == target.key))
+                        .and_then(|actual| capture_device(&actual.adapter).ok()).map(Some),
+                };
                 let (reply, result) = sync_channel(1);
-                let request = FormatRequest { at: now_session, output: target, existing_device, reply };
-                match video.reconfigure.try_send(request) {
-                    Ok(()) => {
-                        pending_format = Some(result);
+                let request = request_device.clone().map(|device| FormatRequest { at: now_session, output: target, device, reply });
+                match request.map(|request| video.reconfigure.try_send(request)) {
+                    None => rejected_snapshot = snapshot.as_ref().map(|snapshot| snapshot.received),
+                    Some(Ok(())) => {
+                        let request_device = request_device.flatten();
+                        pending_format = Some((result, request_device));
                         if !needs_missing && !reconfiguring {
                             topology.reconfiguring(mode.geometry.id);
                             reconfiguring = true;
                         }
-                        pending_video = None;
+                        discard_video(&mut pending_video, &mut waiting, counters);
                         images.native.clear_staged();
                     }
-                    Err(TrySendError::Full(_)) => {}
-                    Err(TrySendError::Disconnected(_)) => return Err(unavailable("The video format owner closed unexpectedly")),
+                    Some(Err(TrySendError::Full(_))) => {}
+                    Some(Err(TrySendError::Disconnected(_))) => return Err(unavailable("The video format owner closed unexpectedly")),
                 }
             }
             if missing || format_changed || pending_format.is_some() {
+                if let Some((_, Some(probe_device))) = &pending_format {
+                    // The video owner qualifies the new format's encoder with
+                    // pictures converted on this thread (VID-12).
+                    while let Ok(probe) = video.probes.try_recv() {
+                        let _ = probe.reply.try_send(encoder::probe_input(probe_device, probe.format, probe.software));
+                    }
+                }
                 readbacks.poll(&images.native, now)?;
                 observations.work(&device, &images.native, &mut readbacks, &png, now_session, now)?;
                 observations.advance_idle(now_session);
@@ -337,19 +365,29 @@ fn capture(
                     id: GeometryId { monitor: selected.id, epoch: next_geometry(mode.geometry.id.epoch)? },
                     bounds: current.bounds, dpi_x: current.dpi_x, dpi_y: current.dpi_y,
                 };
-                mode.refresh_numerator = current.refresh.0;
-                mode.refresh_denominator = current.refresh.1;
+                mode.refresh_numerator = current.refresh.map(|refresh| refresh.0);
+                mode.refresh_denominator = current.refresh.map(|refresh| refresh.1);
                 mode.primary = current.primary;
+                mode.unavailable = current.unavailable.clone();
                 epochs.push(mode.clone());
                 topology.capture(mode.clone());
                 output = current.clone();
                 geometry_after = Some(changed);
-                pending_video = None;
+                // The pixel size and format are unchanged. A conversion of the
+                // old geometry is dropped and counted; a frame held for the
+                // timeline stays and is judged when the timeline arrives.
+                if pending_video.take().is_some() {
+                    counters.video_discarded = counters.video_discarded.saturating_add(1);
+                }
                 images.native.clear_staged();
                 observations.geometry_changed(mode.geometry.id);
             }
-            let timeline = video.as_ref().and_then(|video| video.pacing.try_read().ok()
-                .and_then(|pacing| *pacing).filter(|(epoch, _)| *epoch == open.boundary.epoch).map(|(_, timeline)| timeline));
+            let timeline = video.pacing.try_read().ok()
+                .and_then(|pacing| *pacing).filter(|(epoch, _)| *epoch == open.boundary.epoch).map(|(_, timeline)| timeline);
+            if let Some(timeline) = timeline {
+                waiting.release(&video, timeline, open.boundary.epoch, &mut converter, &mut pending_video,
+                    capture.size, now, counters)?;
+            }
             let elevated = worker.elevated_epoch(open.boundary.epoch);
             if !elevated {
                 observations.step(&images.native, &mode, frame_policy, worker.config(), open.boundary.epoch, now_session);
@@ -363,18 +401,23 @@ fn capture(
                 {
                     observations.changed(lease.metadata);
                 }
-                if let (Some(video), Some(timeline), Some(frame)) = (&video, timeline, images.native.lease(frame))
+                if let (Some(timeline), Some(frame)) = (timeline, images.native.lease(frame))
                     && change.is_some_and(|change| change > 0.002) && frame.metadata.geometry.id == mode.geometry.id
                     && frame.metadata.covered() && frame.metadata.admission == open.boundary.epoch
                 {
                     video.evidence.changed_late(timeline.containing(frame.metadata.source_t_us)?);
                 }
             }
-            if video.as_ref().is_some_and(|target| target.unavailable.load(Ordering::Acquire)) {
-                pending_video = None;
+            if video.unavailable.load(Ordering::Acquire) {
+                discard_video(&mut pending_video, &mut waiting, counters);
                 converter = None;
             }
-            if let (Some(video), Some(converter), Some((sample, metadata, deadline))) = (&video, &mut converter, &pending_video) {
+            // Time asleep does not count against the conversion bound (D-5 A).
+            let sequence = worker.suspend_marks().sequence;
+            if std::mem::replace(&mut suspends, sequence) != sequence && let Some(pending) = &mut pending_video {
+                pending.2 = Instant::now() + CONVERSION_DEADLINE;
+            }
+            if let (Some(converter), Some((sample, metadata, deadline))) = (&mut converter, &pending_video) {
                 if converter.ready(sample)? {
                     let available = open.clock.time(clock::qpc()?).map_err(clock_error)?;
                     let approval = frame_policy.try_current(open.boundary.epoch, available);
@@ -383,7 +426,8 @@ fn capture(
                         continue;
                     }
                     let approved = approval.ok().flatten().is_some_and(|approval| approval.matches(metadata));
-                    if approved && let Some(input) = converter.input(sample)? {
+                    let input = if approved { converter.input(sample)? } else { None };
+                    if let Some(input) = input {
                         let frame = video::Observation { input, metadata: metadata.clone(), available,
                             change: images.native.change(metadata.id) };
                         match video.send.try_send(frame) {
@@ -394,8 +438,18 @@ fn capture(
                                     video.evidence.queue_pressure(timeline.containing(metadata.source_t_us)?);
                                 }
                             }
-                            Err(TrySendError::Disconnected(_)) => {}
+                            Err(TrySendError::Disconnected(_)) => {
+                                counters.video_discarded = counters.video_discarded.saturating_add(1);
+                            }
                         }
+                    } else if approved {
+                        // The converted picture could not be read back as encoder input.
+                        counters.video_pressure = counters.video_pressure.saturating_add(1);
+                        if let Some(timeline) = timeline {
+                            video.evidence.capture_pressure(timeline.containing(metadata.source_t_us)?);
+                        }
+                    } else {
+                        counters.video_discarded = counters.video_discarded.saturating_add(1);
                     }
                     pending_video = None;
                 } else if now >= *deadline {
@@ -413,7 +467,7 @@ fn capture(
                     } else if approval.as_ref().is_some_and(|approval| approval.matches(&metadata)) {
                         let (owned, metadata) = images.native.take_staged().expect("staged capture is present");
                         images.publish(owned, metadata, &painter, &video, timeline, &mut converter, &mut pending_video,
-                            capture.size, now, counters)?;
+                            &mut waiting, capture.size, now, counters)?;
                     } else {
                         break;
                     }
@@ -460,6 +514,14 @@ fn capture(
                 continue;
             }
             let source_time = clock.wgc_time(wgc_time_100ns).map_err(clock_error)?;
+            let recv_time = clock.time(received).map_err(clock_error)?;
+            // A frame is received after its source time. The frames ordering
+            // receipts rely on it (§6.5), so a contradicting sample is rejected.
+            if source_time > recv_time {
+                counters.rejected_time_or_epoch = counters.rejected_time_or_epoch.saturating_add(1);
+                borrowed.close()?;
+                continue;
+            }
             let approval_at = clock.time(receipt.qpc).map_err(clock_error)?;
             let approval = frame_policy.current(receipt.boundary.epoch, approval_at)
                 .filter(|approval| approval.contains_source(source_time) || approval.can_stage(source_time, approval_at));
@@ -473,7 +535,7 @@ fn capture(
                 borrowed.close()?;
                 scheduled = now + interval;
                 counters.native_pressure = counters.native_pressure.saturating_add(1);
-                if let (Some(video), Some(timeline)) = (&video, timeline) {
+                if let Some(timeline) = timeline {
                     video.evidence.capture_pressure(timeline.containing(source_time)?);
                 }
                 continue;
@@ -501,7 +563,7 @@ fn capture(
                 geometry: mode.geometry, admission: receipt.boundary.epoch,
                 approval_generation: approval.generation, source_t_us: source_time,
                 coverage: approval.coverage.clone(),
-                recv_t_us: clock.time(received).map_err(clock_error)?,
+                recv_t_us: recv_time,
                 source_uncertainty_us: None, color: mode.conversion, extent: images.extent,
             };
             let publish_at = clock.time(super::clock::qpc()?).map_err(clock_error)?;
@@ -519,7 +581,7 @@ fn capture(
                 continue;
             }
             images.publish(owned, metadata, &painter, &video, timeline, &mut converter, &mut pending_video,
-                capture.size, now, counters)?;
+                &mut waiting, capture.size, now, counters)?;
             let now_session = receipt.clock.time(receipt.qpc).map_err(clock_error)?;
             observations.step(&images.native, &mode, frame_policy, worker.config(), open.boundary.epoch, now_session);
         }
@@ -587,9 +649,9 @@ struct Resources {
 impl Resources {
     fn publish(
         &mut self, owned: Arc<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>,
-        metadata: FrameMetadata, painter: &pixels::Painter, video: &Option<VideoTarget>, timeline: Option<slots::Timeline>,
+        metadata: FrameMetadata, painter: &pixels::Painter, video: &VideoTarget, timeline: Option<slots::Timeline>,
         converter: &mut Option<gpu::Converter>, pending_video: &mut Option<(gpu::PendingSample, FrameMetadata, Instant)>,
-        size: SizeInt32, now: Instant, counters: &mut CaptureCounters,
+        waiting: &mut TimelineWait, size: SizeInt32, now: Instant, counters: &mut CaptureCounters,
     ) -> Result<(), ProbeError> {
         if !metadata.covered() {
             counters.rejected_approval = counters.rejected_approval.saturating_add(1);
@@ -600,15 +662,10 @@ impl Resources {
         if !sampled {
             counters.thumbnail_pressure = counters.thumbnail_pressure.saturating_add(1);
         }
-        if let (Some(video), Some(timeline), Some(converter)) = (video, timeline, converter) {
-            let slot = timeline.containing(metadata.source_t_us)?;
-            if pending_video.is_none()
-                && let Some(sample) = converter.submit(&owned, size.Width, size.Height)?
-            {
-                *pending_video = Some((sample, metadata.clone(), now + Duration::from_secs(3)));
-            } else {
-                counters.video_pressure = counters.video_pressure.saturating_add(1);
-                video.evidence.capture_pressure(slot);
+        if let Some(converter) = converter {
+            match timeline {
+                Some(timeline) => submit_video(&owned, &metadata, video, timeline, converter, pending_video, &mut waiting.converted_slot, size, now, counters)?,
+                None => waiting.hold(Arc::clone(&owned), metadata.clone(), counters),
             }
         }
         let id = metadata.id;
@@ -640,11 +697,120 @@ impl Resources {
     }
 }
 
+/// Submit one approved frame for video conversion. A busy or failed
+/// conversion is counted as pressure on the frame's slot.
+fn submit_video(
+    owned: &Arc<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>, metadata: &FrameMetadata, video: &VideoTarget,
+    timeline: slots::Timeline, converter: &mut gpu::Converter,
+    pending_video: &mut Option<(gpu::PendingSample, FrameMetadata, Instant)>, converted_slot: &mut Option<u64>,
+    size: SizeInt32, now: Instant, counters: &mut CaptureCounters,
+) -> Result<(), ProbeError> {
+    let slot = timeline.containing(metadata.source_t_us)?;
+    // The software path converts and reads back one frame per video slot,
+    // at the encoding rate; thumbnails and stills keep the capture pace.
+    if converter.software() && *converted_slot == Some(slot) {
+        counters.video_software_paced = counters.video_software_paced.saturating_add(1);
+        return Ok(());
+    }
+    if pending_video.is_none()
+        && let Some(sample) = converter.submit(owned, size.Width, size.Height)?
+    {
+        *pending_video = Some((sample, metadata.clone(), now + CONVERSION_DEADLINE));
+        *converted_slot = Some(slot);
+    } else {
+        counters.video_pressure = counters.video_pressure.saturating_add(1);
+        video.evidence.capture_pressure(slot);
+    }
+    Ok(())
+}
+
+/// Drop the video work in progress at a pause or a topology change; each
+/// dropped frame is counted.
+fn discard_video(
+    pending_video: &mut Option<(gpu::PendingSample, FrameMetadata, Instant)>, waiting: &mut TimelineWait,
+    counters: &mut CaptureCounters,
+) {
+    if pending_video.take().is_some() {
+        counters.video_discarded = counters.video_discarded.saturating_add(1);
+    }
+    waiting.discard(counters);
+}
+
+/// A frame published before the video owner published this epoch's slot
+/// timeline, as after Resume. One frame is held and submitted when the
+/// timeline arrives, if it is still eligible; every other is counted as
+/// `timeline_pending`, and its slot carries that reason.
+#[derive(Default)]
+struct TimelineWait {
+    frame: Option<(Arc<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>, FrameMetadata)>,
+    /// Source times of held frames replaced before the timeline arrived.
+    replaced: Option<(SessionTimeUs, SessionTimeUs)>,
+    /// The latest slot with a frame submitted for conversion.
+    converted_slot: Option<u64>,
+}
+
+impl TimelineWait {
+    fn hold(
+        &mut self, owned: Arc<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>, metadata: FrameMetadata,
+        counters: &mut CaptureCounters,
+    ) {
+        if let Some((_, old)) = self.frame.replace((owned, metadata)) {
+            counters.timeline_pending = counters.timeline_pending.saturating_add(1);
+            let at = old.source_t_us;
+            self.replaced = Some(self.replaced.map_or((at, at), |(first, last)| (first.min(at), last.max(at))));
+        }
+    }
+
+    fn discard(&mut self, counters: &mut CaptureCounters) {
+        if self.frame.take().is_some() {
+            counters.timeline_pending = counters.timeline_pending.saturating_add(1);
+        }
+        self.replaced = None;
+        self.converted_slot = None;
+    }
+
+    fn release(
+        &mut self, video: &VideoTarget, timeline: slots::Timeline, epoch: crate::protocol::AdmissionEpoch,
+        converter: &mut Option<gpu::Converter>, pending_video: &mut Option<(gpu::PendingSample, FrameMetadata, Instant)>,
+        size: SizeInt32, now: Instant, counters: &mut CaptureCounters,
+    ) -> Result<(), ProbeError> {
+        if let Some((first, last)) = self.replaced.take() {
+            let first = timeline.containing(first)?;
+            let last = timeline.containing(last)?;
+            // The evidence ring holds at most its own length of slots.
+            for slot in (first..=last).take(usize::try_from(video.evidence.slots()).unwrap_or(usize::MAX)) {
+                video.evidence.timeline_pending(slot);
+            }
+        }
+        let Some((owned, metadata)) = self.frame.take() else { return Ok(()) };
+        match converter {
+            Some(converter) if metadata.admission == epoch =>
+                submit_video(&owned, &metadata, video, timeline, converter, pending_video, &mut self.converted_slot, size, now, counters),
+            _ => {
+                counters.timeline_pending = counters.timeline_pending.saturating_add(1);
+                if metadata.admission == epoch {
+                    video.evidence.timeline_pending(timeline.containing(metadata.source_t_us)?);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 fn display_size(display: &display::Monitor) -> Result<SizeInt32, ProbeError> {
     let (left, top, right, bottom) = display.bounds.edges();
     let width = right.checked_sub(left).ok_or_else(|| unavailable("The physical monitor width overflowed"))?;
     let height = bottom.checked_sub(top).ok_or_else(|| unavailable("The physical monitor height overflowed"))?;
     Ok(SizeInt32 { Width: width, Height: height })
+}
+
+/// An HDR monitor without an SDR white level is captured through the system
+/// BGRA8 conversion; the condition is a health row (VID-8).
+fn report_conversion(worker: &WorkerSession, monitor: MonitorId, color: CaptureColor, white: Option<std::num::NonZeroU32>) {
+    if color == CaptureColor::HdrSystemBgra8 && white.is_none() {
+        worker.report_health(HealthKind::HdrWhiteLevelUnavailable,
+            Failure::new(FailureComponent::Capture, "Read the HDR display SDR white level", None), Some(monitor), true);
+    }
 }
 
 fn next_geometry(old: GeometryEpoch) -> Result<GeometryEpoch, ProbeError> {
@@ -677,8 +843,8 @@ fn metadata(
         device_path: display.key.as_str().to_owned(),
         geometry: display.geometry(selected.id, geometry_epoch),
         capture_epoch,
-        refresh_numerator: display.refresh.0,
-        refresh_denominator: display.refresh.1,
+        refresh_numerator: display.refresh.map(|refresh| refresh.0),
+        refresh_denominator: display.refresh.map(|refresh| refresh.1),
         rotation: display.rotation,
         primary: display.primary,
         hdr: display.hdr,
@@ -690,6 +856,7 @@ fn metadata(
         cursor_in_pixels: false,
         video_connected,
         counters: CaptureCounters::default(),
+        unavailable: display.unavailable.clone(),
     }
 }
 

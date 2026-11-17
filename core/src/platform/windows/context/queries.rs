@@ -33,9 +33,12 @@ pub(super) enum Classification {
 
 #[derive(serde::Serialize)]
 pub(in crate::platform::windows) struct PointerLink {
-    request_id: RequestId,
+    /// None when no read can serve the action (`reason`).
+    request_id: Option<RequestId>,
     age_us: Option<i64>,
     basis: PointerBasis,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
 }
 
 #[derive(serde::Serialize)]
@@ -59,6 +62,8 @@ pub(super) struct Queries {
     next_id: u64,
     focus: Option<Request>,
     focus_sent: bool,
+    /// The focus read was re-issued after a stale result (D-4d).
+    focus_retried: bool,
     remote_focus: Option<ReadBinding>,
     remote_edit: Option<(ReadBinding, QpcTick)>,
     remote: bool,
@@ -81,7 +86,7 @@ impl Queries {
         let now = Instant::now();
         Ok(Self {
             worker: Worker::start(scrubber)?,
-            generation: FocusGeneration(0), revision: 0, next_id: 0, focus: None, focus_sent: false, remote_focus: None, remote_edit: None, remote: false,
+            generation: FocusGeneration(0), revision: 0, next_id: 0, focus: None, focus_sent: false, focus_retried: false, remote_focus: None, remote_edit: None, remote: false,
             classification: Classification::Resolved(TextTarget::PossiblySensitive, None),
             pointer: None, pointer_sent: false, pointer_backend: PointerBackend::Unavailable, remote_pointer: None, last_point: None, moved_at: now,
             pointer_rest_emitted: true, next_pointer_poll: now, cached_pointer: None, deferred_reads: Vec::new(), denied_target: false,
@@ -115,6 +120,14 @@ impl Queries {
         self.worker.commits()
     }
 
+    pub fn commit_losses(&self) -> Vec<screen_fix_native_observation::uia_commits::CommitLoss> {
+        self.worker.commit_losses()
+    }
+
+    pub fn uia_failure(&self) -> Option<&'static str> {
+        self.worker.failure()
+    }
+
     pub fn accepts_commit(&self, generation: FocusGeneration, revision: u64) -> bool {
         !self.changed() && self.generation == generation && self.revision == revision
             && matches!(self.classification, Classification::Resolved(TextTarget::Editable, Some(_)))
@@ -133,7 +146,7 @@ impl Queries {
 
     pub fn clipboard_safe(&self) -> bool {
         !self.changed() && matches!(self.classification,
-            Classification::Resolved(TextTarget::Editable | TextTarget::NonText, Some(_)))
+            Classification::Resolved(TextTarget::Editable | TextTarget::NonText | TextTarget::TypingUnknown, Some(_)))
     }
 
     pub fn elevated_clipboard_safe(&self, visit: screen_fix_protocol::ipc::elevated::VisitBinding) -> bool {
@@ -150,6 +163,7 @@ impl Queries {
         self.revision = self.worker.focus_revision();
         self.worker.retain_generation(generation);
         self.focus_sent = false;
+        self.focus_retried = false;
         self.remote_focus = None;
         self.remote_edit = None;
         self.remote = visit.is_some_and(|visit| visit.elevated.is_some());
@@ -213,12 +227,20 @@ impl Queries {
                     .map(|(reference, completed)| reference.0.saturating_sub(completed.0))
                     .filter(|age| *age < 500_000)
             {
-                return Ok(Some(PointerLink { request_id: id, age_us: Some(age),
-                    basis: if action_at.is_some() { PointerBasis::PreAction } else { PointerBasis::PointerRest } }));
+                return Ok(Some(PointerLink { request_id: Some(id), age_us: Some(age),
+                    basis: if action_at.is_some() { PointerBasis::PreAction } else { PointerBasis::PointerRest }, reason: None }));
             }
         }
-        if self.pointer.is_some() {
-            return Ok(None);
+        if let Some(pending) = self.pointer {
+            // C4: an action at the pending read's point links that read, which
+            // completes within its own deadline, before the action's. An action
+            // elsewhere cannot be read now.
+            let same = matches!(pending.query, Query::Pointer { point: pending_point, geometry: pending_geometry, .. }
+                if pending_point == point && pending_geometry == geometry);
+            return Ok(action_at.map(|_| PointerLink {
+                request_id: same.then_some(pending.id), age_us: None, basis: PointerBasis::PreAction,
+                reason: (!same).then_some("pointer_query_busy"),
+            }));
         }
         let mut request = self.request(Query::Pointer { point, window, root, geometry, action_at }, at, Instant::now())?;
         if self.remote && matches!(backend, PointerBackend::Ordinary) {
@@ -228,8 +250,8 @@ impl Queries {
         self.pointer = Some(request);
         self.worker.retain_pointer(Some(request.id));
         self.pointer_sent = false;
-        Ok(Some(PointerLink { request_id: request.id, age_us: None,
-            basis: if action_at.is_some() { PointerBasis::PostAction } else { PointerBasis::PointerRest } }))
+        Ok(Some(PointerLink { request_id: Some(request.id), age_us: None,
+            basis: if action_at.is_some() { PointerBasis::PostAction } else { PointerBasis::PointerRest }, reason: None }))
     }
 
     pub fn poll(&mut self, now: Instant, at: QpcTick, clock: ClockOrigin, cursor: Option<&Value>, rows: &mut Vec<Value>) {
@@ -450,6 +472,17 @@ impl Queries {
         let time = |qpc| clock.time(qpc).ok();
         let row = match read.request.query {
             Query::Focus(visit) if self.focus.is_some_and(|request| request.id == read.request.id) => {
+                // A stale read, such as an element without keyboard focus, is
+                // re-issued once within the same classification wait (D-4d).
+                if matches!(read.status, Status::Stale) && !self.focus_retried && Instant::now() < read.request.expires
+                    && let Ok(mut retry) = self.request(read.request.query, read.request.requested, Instant::now())
+                {
+                    retry.expires = read.request.expires;
+                    self.focus = Some(retry);
+                    self.focus_sent = false;
+                    self.focus_retried = true;
+                    return;
+                }
                 self.focus = None;
                 if !authorized_result { read.target = TextTarget::PossiblySensitive; }
                 self.classification = Classification::Resolved(read.target, read.completed);
@@ -538,6 +571,7 @@ fn remote_read(request: Request, read: &ReadEvidence<UiaEvidence>, at: QpcTick) 
                 (TextClassification::Password, _, _) | (_, Some(true), _) => TextTarget::Password,
                 (TextClassification::Editable, Some(false), Some(true)) if focus_safe => TextTarget::Editable,
                 (TextClassification::NonText, Some(false), Some(false)) if focus_safe => TextTarget::NonText,
+                (TextClassification::TypingUnknown, Some(false), None) if focus_safe => TextTarget::TypingUnknown,
                 _ => TextTarget::PossiblySensitive,
             };
             let strings = password == Some(false)

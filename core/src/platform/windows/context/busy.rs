@@ -81,7 +81,8 @@ impl Busy {
             let reasons = BusyReasons {
                 owned_window, menu: menu_loop || self.menu.is_some_and(|until| now < until),
                 move_size: moving || self.sizing.is_some_and(|until| now < until),
-                text_entry: matches!(target, Some(TextTarget::Editable | TextTarget::Password | TextTarget::PossiblySensitive)),
+                text_entry: matches!(target, Some(TextTarget::Editable | TextTarget::Password | TextTarget::PossiblySensitive
+                    | TextTarget::TypingUnknown)),
                 hung: process_hung || visit.native.is_some_and(|native| native.hung),
                 pointer_held: self.pointer_held || self.captured.is_some_and(|until| now < until),
                 recent_input: self.last_input.is_some_and(|(generation, input)| {

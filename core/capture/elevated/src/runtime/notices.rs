@@ -95,8 +95,8 @@ fn poll(grant: &Arc<Grant>, send: &Outbox, seen: &SeenWindows, notices: &Notific
                 grant.input_loss(visit, InputLoss { before: lower, reason: CoverageReason::UncertifiedSource, gap: None });
             }
         }
-        let lost = notices.take_loss();
-        if floor.is_some() && lost > 0 { grant.mark_uncertain(visit, grant.arm); }
+        let lost = notices.take_loss().is_some();
+        if floor.is_some() && lost { grant.mark_uncertain(visit, grant.arm); }
         if !notices.running() { return Err(Failure::Witness); }
         if let Some((floor, witness_qpc)) = floor {
             let capped = ready.min(witness_qpc);

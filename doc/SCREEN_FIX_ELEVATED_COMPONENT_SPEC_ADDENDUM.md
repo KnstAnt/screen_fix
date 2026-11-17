@@ -131,6 +131,42 @@ Use existing per-producer exclusive progress and the existing bounded staging pr
 
 The core keeps provisional input/still IDs in their own namespaces and attaches any `event_ref` only after the journal allocates a durable input sequence. `Receiver::advance_stills` advances only on the certified eligible prefix. Checkpoint and fixture Save use exact visit and QPC eligibility. Resume retains existing geometry, monitor and frame approval checks; a previous approval generation cannot back a new epoch's still. WGC, GPU slot selection, normal history, settling, PNG and journal intake remain in the core. No new global inter-stream per-event barrier, extra screen copy or retroactive video timestamp shift is needed. When a standard-source or collector prefix closes, settle or discard only its evidenced pending rows and give unauthorizable, late or uncertified work the existing reason fields. Record selected source intervals, actual registration and transport outcomes, blind or failure stage and uncertified-tail reasons in diagnostics and optional v5 metadata. Retain the standard helper fields. The v5 reader exposes the selected-source evidence when present.
 
+## 6. Remediation amendments and clarifications (2026-11-17)
+
+These follow the M1 remediation plan and the user decisions D-8 and D-9 of 2026-11-17. Where they differ from the sections above, they apply.
+
+### 6.1 Wire payloads
+
+- Each message is one fixed binary header followed by a payload. The payload is a schema-checked serde encoding of one specific bounded Rust type, decoded with the checks of section 3.2.
+- "No JSON rows" in section 3.2 refers to journal rows: no journal row, or any other output-format record, crosses the wire.
+- Any change to a type in `protocol/src/ipc/elevated` requires an increment of `attachment::VERSION`, so that peers built from different revisions fail the version binding instead of misreading a payload.
+
+### 6.2 Readiness budget
+
+Each preparation (startup or resume) gets its own 5-second readiness budget from the moment the shell returns, inside the separately bounded 60-second consent ticket. A new preparation does not inherit the remainder of an earlier one.
+
+### 6.3 Provider deadlines
+
+- Each collector read carries the Recorder's request deadline: at most 500 ms for UIA and at most 50 ms for IME. The provider's own Windows timeouts are set to the remaining budget: the UIA transaction timeout per call, and the `SendMessageTimeoutW` timeout for IME.
+- The supervisor's slot deadline for the call is the request deadline plus the 750 ms cleanup bound.
+- At the request deadline a call still running gets the typed `TimedOut` result for its request. The grant stays valid, and no new call is dispatched to that provider kind until the running call returns. This is a recorded loss (G).
+- A call that returns between the request deadline and the slot deadline is discarded as stale; its provider kind becomes available again.
+- A call still running at the slot deadline has defeated cancellation. The supervisor revokes and terminates the collector (section 3.3), which is an admitted source failure and fails the attempt.
+
+### 6.4 Target changes and ineligible foregrounds (D-8 A)
+
+- A foreground or focus change while a grant is Preparing, Armed, Activating, awaiting its held result or refreshing is a transition, not a fault: the grant is revoked.
+- Before admission the selector prepares again for the original candidate while the readiness budget remains. If the budget expires, startup fails without an admitted recording.
+- After admission the epoch stays closed with `ElevationTransition`, and the actual new foreground is classified fresh.
+- An approved foreground whose token is not eligible (different user, different session, protected, or failed linked pair) is suppressed with reason `ineligible_token`, like an unapproved foreground, including the suppression accounting of the M1 specification addendum A6.2.
+- Only host, transport, authentication and protocol failures, lease loss, witness regression, readiness-deadline expiry and failure of required access on the current grant fail the attempt.
+
+### 6.5 Collector-side approval proof (D-9 A)
+
+- On prepare the collector independently resolves the image of the pinned live target process: it takes the path from the live process handle, opens the file without write or delete sharing, reads its final path by handle and its file ID, and canonicalizes with the same function as the Recorder's resolver.
+- The grant requires equality with the sealed approval key. Any failure is a target-access failure before admission.
+- This work runs only on the collector's owner thread, never in callbacks, and never opens a path supplied by the Recorder.
+
 ## Windows API references
 
 - [Running with Administrator Privileges](https://learn.microsoft.com/en-us/windows/win32/secbp/running-with-administrator-privileges) and [UI Automation Security Overview](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-securityoverview).

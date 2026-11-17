@@ -6,9 +6,10 @@ use std::{
     ffi::c_void,
     io,
     ptr::{null, null_mut},
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU32, Ordering::{AcqRel, Acquire, Release}},
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering::{AcqRel, Acquire, Relaxed, Release}, fence},
         mpsc::{self, Receiver, SyncSender},
     },
     thread,
@@ -40,7 +41,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongW, SetWindowLongW
 #[cfg(target_pointer_width = "64")]
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLongPtrW};
 
-use crate::{CaptureError, platform::windows::on_input_desktop, protocol::ipc::EnvironmentChange};
+use crate::{
+    CaptureError,
+    platform::windows::{clock, on_input_desktop},
+    protocol::{QpcTick, ipc::EnvironmentChange},
+};
 
 const CLASS_NAME: *const u16 = w!("ScreenFixControllerNotifications");
 const DESKTOP_POLL: Duration = Duration::from_millis(100);
@@ -62,6 +67,136 @@ thread_local! {
     static DESKTOP_SIGNALS: Cell<*const Signals> = const { Cell::new(null()) };
 }
 
+/// A consistent snapshot of the latest suspend and resume marks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SuspendMarks {
+    /// The number of suspends observed so far. A reader that sees a larger
+    /// value than before knows a suspend happened in between, even if it
+    /// missed the marks of an earlier one.
+    pub sequence: u64,
+    /// QPC of the latest `PBT_APMSUSPEND`, if one was observed and QPC was readable.
+    pub suspend: Option<QpcTick>,
+    /// QPC of the `PBT_APMRESUMEAUTOMATIC` that followed the latest suspend.
+    /// `None` while that suspend has not resumed.
+    pub resume: Option<QpcTick>,
+}
+
+/// QPC time over an interval with suspended time excluded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AwakeElapsed {
+    Known(Duration),
+    /// A needed suspend or resume mark has no QPC, the latest suspend has not
+    /// resumed, or more than one suspend fell in the interval. The caller
+    /// treats the interval as not evaluable; it never produces a fault.
+    Unknown,
+}
+
+impl SuspendMarks {
+    /// QPC time over `[from, to]` excluding the latest suspend interval.
+    /// `since` is the suspend `sequence` read at or after `from`: a later suspend
+    /// beyond the latest one leaves earlier suspends in the interval unmeasured.
+    pub(crate) fn awake_elapsed(
+        &self, from: QpcTick, to: QpcTick, since: u64, frequency: crate::protocol::QpcFrequency,
+    ) -> AwakeElapsed {
+        let ticks = |from: QpcTick, to: QpcTick| u128::try_from(to.0.saturating_sub(from.0).max(0)).unwrap_or(0);
+        let total = ticks(from, to);
+        let excluded = if self.sequence == 0 {
+            0
+        } else if self.sequence > since.saturating_add(1) {
+            return AwakeElapsed::Unknown;
+        } else {
+            match (self.suspend, self.resume) {
+                // The latest suspend ended before the interval began.
+                (_, Some(resume)) if resume <= from => 0,
+                // The latest suspend began after the interval ended.
+                (Some(suspend), _) if suspend >= to => 0,
+                (Some(suspend), Some(resume)) => ticks(suspend.max(from), resume.min(to)),
+                // Open suspend, or a mark without its QPC.
+                _ => return AwakeElapsed::Unknown,
+            }
+        };
+        let nanos = total.saturating_sub(excluded).saturating_mul(1_000_000_000) / u128::from(frequency.0.get());
+        AwakeElapsed::Known(Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)))
+    }
+}
+
+/// The only store of suspend and resume times. The power callback is its sole
+/// writer; it never blocks on a reader. A sequence counter, odd while a mark
+/// is written, lets readers take consistent snapshots without a lock.
+#[derive(Default)]
+pub(crate) struct PowerMarks {
+    version: AtomicU64,
+    suspends: AtomicU64,
+    suspend_qpc: AtomicI64,
+    suspend_known: AtomicBool,
+    /// The suspend number that the resume mark follows; zero when none.
+    resumed_suspend: AtomicU64,
+    resume_qpc: AtomicI64,
+}
+
+impl PowerMarks {
+    fn write(&self, update: impl FnOnce()) {
+        // Windows delivers one registration's power notifications one at a
+        // time, so this claim normally succeeds at once. It spins only across
+        // another writer's few atomic stores and never waits on a reader.
+        let mut version = self.version.load(Relaxed);
+        loop {
+            if version % 2 == 0 {
+                match self.version.compare_exchange_weak(version, version + 1, Acquire, Relaxed) {
+                    Ok(_) => break,
+                    Err(current) => version = current,
+                }
+            } else {
+                std::hint::spin_loop();
+                version = self.version.load(Relaxed);
+            }
+        }
+        fence(Release);
+        update();
+        self.version.store(version + 2, Release);
+    }
+
+    fn suspended(&self, qpc: Option<QpcTick>) {
+        self.write(|| {
+            self.suspend_qpc.store(qpc.map_or(0, |qpc| qpc.0), Relaxed);
+            self.suspend_known.store(qpc.is_some(), Relaxed);
+            self.suspends.fetch_add(1, Relaxed);
+        });
+    }
+
+    fn resumed(&self, qpc: Option<QpcTick>) {
+        self.write(|| {
+            // A resume whose QPC could not be read leaves the suspend open.
+            let suspend = if qpc.is_some() { self.suspends.load(Relaxed) } else { 0 };
+            self.resume_qpc.store(qpc.map_or(0, |qpc| qpc.0), Relaxed);
+            self.resumed_suspend.store(suspend, Relaxed);
+        });
+    }
+
+    /// Read-only snapshot for every consumer that excludes sleep from QPC intervals.
+    pub(crate) fn snapshot(&self) -> SuspendMarks {
+        loop {
+            let before = self.version.load(Acquire);
+            if before % 2 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let sequence = self.suspends.load(Relaxed);
+            let suspend = self.suspend_known.load(Relaxed).then(|| QpcTick(self.suspend_qpc.load(Relaxed)));
+            let resumed = self.resumed_suspend.load(Relaxed);
+            let resume = QpcTick(self.resume_qpc.load(Relaxed));
+            fence(Acquire);
+            if self.version.load(Relaxed) == before {
+                return SuspendMarks {
+                    sequence,
+                    suspend: suspend.filter(|_| sequence != 0),
+                    resume: (sequence != 0 && resumed == sequence).then_some(resume),
+                };
+            }
+        }
+    }
+}
+
 pub(super) struct Notifications {
     signals: Arc<Signals>,
     stop: SyncSender<()>,
@@ -74,7 +209,7 @@ struct Signals {
     elevated_environment: Arc<AtomicU32>,
     display_revision: Arc<AtomicU32>,
     session_end: Arc<OnceLock<Instant>>,
-    suspended: Mutex<Option<Instant>>,
+    power: Arc<PowerMarks>,
     complete: AtomicBool,
     wake: SyncSender<()>,
 }
@@ -98,11 +233,11 @@ impl Signals {
 impl Notifications {
     pub(super) fn spawn(
         environment: Arc<AtomicU32>, elevated_environment: Arc<AtomicU32>, display_revision: Arc<AtomicU32>,
-        session_end: Arc<OnceLock<Instant>>, wake: SyncSender<()>,
+        session_end: Arc<OnceLock<Instant>>, power: Arc<PowerMarks>, wake: SyncSender<()>,
     ) -> Result<(Self, Receiver<Result<(), CaptureError>>), CaptureError> {
         let signals = Arc::new(Signals {
             reasons: AtomicU32::new(0), environment, elevated_environment, display_revision, session_end,
-            suspended: Mutex::new(None), complete: AtomicBool::new(false), wake,
+            power, complete: AtomicBool::new(false), wake,
         });
         let (stop, stopped) = mpsc::sync_channel(1);
         let (ready, initialized) = mpsc::sync_channel(1);
@@ -132,10 +267,6 @@ impl Notifications {
     pub(super) fn reasons(&self) -> (u32, u32) {
         let reasons = self.signals.reasons.fetch_and(!ASSERT_EDGES, AcqRel);
         (reasons & !ASSERT_EDGES, (reasons & ASSERT_EDGES) >> EDGE_SHIFT)
-    }
-
-    pub(super) fn suspend_started(&self) -> Option<Instant> {
-        *self.signals.suspended.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(super) fn running(&self) -> bool { !self.owner.is_finished() }
@@ -274,30 +405,44 @@ impl Drop for PowerRegistration {
 unsafe extern "system" fn power_changed(context: *mut c_void, event: u32, _setting: *mut c_void) -> u32 {
     // This is the live reference owned by the callback registration.
     let signals = unsafe { &*context.cast::<Signals>() };
-    match event {
+    // A panic must not unwind into the Windows power manager. The body uses
+    // only atomics and the bounded wake channel; it takes no lock of its own.
+    let _ = catch_unwind(AssertUnwindSafe(|| match event {
         PBT_APMSUSPEND => {
-            if signals.reasons.load(Acquire) & SLEEP == 0 {
-                *signals.suspended.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
-            }
+            signals.power.suspended(clock::qpc().ok());
             signals.reason(SLEEP, true);
         }
-        PBT_APMRESUMEAUTOMATIC => signals.reason(SLEEP, false),
+        PBT_APMRESUMEAUTOMATIC => {
+            signals.power.resumed(clock::qpc().ok());
+            signals.reason(SLEEP, false);
+        }
         _ => {}
-    }
+    }));
     0
 }
 
 unsafe extern "system" fn desktop_changed(
     _: HWINEVENTHOOK, _: u32, _: HWND, _: i32, _: i32, _: u32, _: u32,
 ) {
-    // Out-of-context callbacks are dispatched on this thread. The message
-    // loop clears this pointer before removing the hook.
-    if let Some(signals) = unsafe { DESKTOP_SIGNALS.get().as_ref() } {
-        signals.reason(SECURE_DESKTOP, !on_input_desktop());
-    }
+    // A panic must not unwind into the WinEvent dispatcher.
+    let _ = catch_unwind(|| {
+        // Out-of-context callbacks are dispatched on this thread. The message
+        // loop clears this pointer before removing the hook.
+        if let Some(signals) = unsafe { DESKTOP_SIGNALS.get().as_ref() } {
+            signals.reason(SECURE_DESKTOP, !on_input_desktop());
+        }
+    });
 }
 
 unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // A panic must not unwind into the window manager. The body uses only
+    // atomics, the once-initialized session-end mark and the bounded wake
+    // channel; it takes no lock.
+    catch_unwind(AssertUnwindSafe(|| unsafe { handle_message(window, message, wparam, lparam) }))
+        .unwrap_or_else(|_| unsafe { DefWindowProcW(window, message, wparam, lparam) })
+}
+
+unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if message == WM_QUERYENDSESSION { return 1; }
     if message == WM_NCCREATE {
         let creation = unsafe { &*(lparam as *const CREATESTRUCTW) };
@@ -368,5 +513,5 @@ fn native_error(stage: &'static str) -> CaptureError {
 }
 
 fn window_error(stage: &'static str, code: Option<i32>) -> CaptureError {
-    CaptureError::backend(stage, code, stage.to_owned())
+    CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, stage, code, stage.to_owned())
 }

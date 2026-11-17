@@ -8,7 +8,7 @@ use screen_fix_protocol::{
     QpcTick,
     ipc::elevated::{
         ContextEvidence, VisitBinding,
-        runtime::{ContextGap, ContextProducer, Observation},
+        runtime::{ContextGap, ContextGapCause, ContextProducer, Observation},
     },
 };
 
@@ -61,7 +61,8 @@ impl Outbox {
         self.flush(&mut state)?;
         let first = state.reserve(producer, NonZeroU64::MIN)?.0;
         let gap = ContextGap {
-            visit, producer, first_position: first, last_position: first, first_qpc: time, last_qpc: time,
+            visit, producer, cause: ContextGapCause::Overflow, first_position: first, last_position: first,
+            first_qpc: time, last_qpc: time,
         };
         if !state.lost.is_empty() {
             state.lost(grant, gap, allow_opening);
@@ -80,7 +81,7 @@ impl Outbox {
     }
 
     pub(super) fn lost(
-        &self, grant: &Arc<Grant>, visit: VisitBinding, producer: ContextProducer,
+        &self, grant: &Arc<Grant>, visit: VisitBinding, producer: ContextProducer, cause: ContextGapCause,
         first_qpc: QpcTick, last_qpc: QpcTick, count: NonZeroU64,
     ) -> Result<()> {
         let mut state = self.state.lock().map_err(|_| Failure::Supervisor)?;
@@ -88,7 +89,7 @@ impl Outbox {
         self.flush(&mut state)?;
         let (first_position, last_position) = state.reserve(producer, count)?;
         state.lost(grant, ContextGap {
-            visit, producer, first_position, last_position, first_qpc, last_qpc,
+            visit, producer, cause, first_position, last_position, first_qpc, last_qpc,
         }, false);
         self.flush(&mut state)
     }
@@ -156,14 +157,14 @@ impl State {
     }
 
     fn lost(&mut self, grant: &Arc<Grant>, gap: ContextGap, allow_opening: bool) {
-        if let Some(item) = self.lost.iter_mut().find(|item| {
+        // Only the producer's latest pending gap can extend: its positions
+        // stay contiguous, and a different cause starts a new gap.
+        if let Some(item) = self.lost.iter_mut().rev().find(|item| {
             matches!(&item.evidence, Observation::Gap(old) if old.producer == gap.producer)
-        }) {
-            if let Observation::Gap(old) = &mut item.evidence {
-                old.last_position = gap.last_position;
-                old.first_qpc = old.first_qpc.min(gap.first_qpc);
-                old.last_qpc = old.last_qpc.max(gap.last_qpc);
-            }
+        }) && let Observation::Gap(old) = &mut item.evidence && old.cause == gap.cause {
+            old.last_position = gap.last_position;
+            old.first_qpc = old.first_qpc.min(gap.first_qpc);
+            old.last_qpc = old.last_qpc.max(gap.last_qpc);
             return;
         }
         self.lost.push_back(Item {

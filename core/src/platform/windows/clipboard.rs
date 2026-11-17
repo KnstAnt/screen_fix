@@ -6,7 +6,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering::{Acquire, Release}},
-        mpsc::{Receiver, SyncSender, sync_channel},
+        mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
     },
     thread,
     time::{Duration, Instant},
@@ -28,6 +28,8 @@ use windows::{
     },
     core::w,
 };
+
+use screen_fix_native_observation::LossCounter;
 
 use crate::{protocol::{MessageTickMs, QpcTick}, session::windows::ActiveSourceProof};
 
@@ -79,7 +81,8 @@ pub(super) struct Read {
     pub visit: Visit,
     pub started: QpcTick,
     pub completed: QpcTick,
-    pub text: String,
+    /// None when the text exceeds the 64 KiB bound (`too_large`, C3).
+    pub text: Option<String>,
 }
 
 pub(super) struct Worker {
@@ -88,6 +91,8 @@ pub(super) struct Worker {
     notices: Receiver<Notice>,
     grants: SyncSender<Grant>,
     results: Receiver<Read>,
+    /// Notices and results the full queues could not hold (counts only).
+    lost: Arc<LossCounter>,
 }
 
 impl Worker {
@@ -98,6 +103,8 @@ impl Worker {
         let (result, results) = sync_channel(QUEUE);
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
+        let lost = Arc::new(LossCounter::default());
+        let worker_lost = Arc::clone(&lost);
         let thread = thread::Builder::new().name("context-clipboard".into()).spawn(move || {
             let owner = match ClipboardWindow::open() {
                 Ok(owner) => owner,
@@ -123,8 +130,10 @@ impl Worker {
                         let sequence = unsafe { GetClipboardSequenceNumber() };
                         if sequence != 0 && sequence != last_sequence {
                             last_sequence = sequence;
-                            if let Some(observation) = observe(sequence, MessageTickMs(message.time)) {
-                                let _ = notice.try_send(observation);
+                            if let Some(observation) = observe(sequence, MessageTickMs(message.time))
+                                && let Err(TrySendError::Full(observation)) = notice.try_send(observation)
+                            {
+                                worker_lost.note(1, observation.received.0, observation.received.0);
                             }
                         }
                     } else {
@@ -135,8 +144,10 @@ impl Worker {
                     if stopped.load(Acquire) {
                         break;
                     }
-                    if let Some(read) = owner.read(grant) {
-                        let _ = result.try_send(read);
+                    if let Some(read) = owner.read(grant)
+                        && let Err(TrySendError::Full(read)) = result.try_send(read)
+                    {
+                        worker_lost.note(1, read.notice.received.0, read.notice.received.0);
                     }
                 }
                 thread::park_timeout(Duration::from_millis(5));
@@ -144,15 +155,23 @@ impl Worker {
         }).map_err(|error| io_error("Start the opt-in clipboard owner", error))?;
         initialized.recv_timeout(Duration::from_secs(2))
             .map_err(|_| unavailable("The clipboard owner did not start"))??;
-        Ok(Self { stop, thread, notices, grants, results })
+        Ok(Self { stop, thread, notices, grants, results, lost })
+    }
+
+    /// The owner thread ended without being stopped (§6.2 row 17).
+    pub fn exited(&self) -> bool { self.thread.is_finished() }
+
+    pub fn take_loss(&self) -> Option<(u64, QpcTick, QpcTick)> {
+        self.lost.take()
     }
 
     pub fn notices(&self) -> impl Iterator<Item = Notice> + '_ {
         self.notices.try_iter().take(QUEUE)
     }
 
-    pub fn grant(&self, notice: Notice, visit: Visit, focus: FocusGuard) {
-        let _ = self.submit(Grant { notice, visit, focus: Authorization::Ordinary(focus) });
+    /// False when the grant queue is full.
+    pub fn grant(&self, notice: Notice, visit: Visit, focus: FocusGuard) -> bool {
+        self.submit(Grant { notice, visit, focus: Authorization::Ordinary(focus) })
     }
 
     pub fn grant_elevated(&self, notice: Notice, visit: Visit, until: QpcTick, source: ActiveSourceProof) -> Option<Permit> {
@@ -234,15 +253,19 @@ impl ClipboardWindow {
         let format = CF_UNICODETEXT.0 as u32;
         unsafe { IsClipboardFormatAvailable(format) }.ok()?;
         let handle = unsafe { GetClipboardData(format) }.ok()?;
-        let text = read_global(HGLOBAL(handle.0), MAX_BYTES, |data| {
-            if data.len() < 2 || data.len() % 2 != 0 || (data.as_ptr() as usize) % align_of::<u16>() != 0 {
-                return None;
-            }
-            let units = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u16>(), data.len() / 2) };
-            let end = units.iter().position(|unit| *unit == 0)?;
-            let text = String::from_utf16(&units[..end]).ok()?;
-            (!text.is_empty() && text.len() <= MAX_BYTES).then_some(text)
-        })?;
+        let memory = HGLOBAL(handle.0);
+        // Text over the bound is recorded as a change without content.
+        let text = if unsafe { GlobalSize(memory) } > MAX_BYTES { None } else {
+            Some(read_global(memory, MAX_BYTES, |data| {
+                if data.len() < 2 || data.len() % 2 != 0 || (data.as_ptr() as usize) % align_of::<u16>() != 0 {
+                    return None;
+                }
+                let units = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u16>(), data.len() / 2) };
+                let end = units.iter().position(|unit| *unit == 0)?;
+                let text = String::from_utf16(&units[..end]).ok()?;
+                (!text.is_empty()).then_some(text)
+            })?).filter(|text| text.len() <= MAX_BYTES)
+        };
         if !valid(&grant) {
             return None;
         }

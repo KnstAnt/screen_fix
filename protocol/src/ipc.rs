@@ -13,7 +13,7 @@ use crate::{
     PhysicalRect, QpcTick, SessionId, SourceSequence, WindowId,
 };
 
-pub const SCHEMA_VERSION: u16 = 7;
+pub const SCHEMA_VERSION: u16 = 8;
 pub const MAX_PACKET_BYTES: usize = 8192;
 pub const MAX_HID_REPORT_BYTES: usize = 1024;
 pub const MAX_HID_FIELDS: usize = 32;
@@ -66,10 +66,9 @@ pub struct EnvironmentState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "record", rename_all = "snake_case", deny_unknown_fields)]
+/// The helper reads environment changes and Stop from the shared-state atomics.
 pub enum CoreToHelper {
     Configure(ConfigureInput),
-    EnvironmentChanged(EnvironmentChange),
-    Stop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +78,58 @@ pub enum Producer {
     KeyboardHook,
     PointerHook,
     DeviceNotifications,
+    /// Raw Input HID reports of the optional touchpad and multi-axis
+    /// collections (INP-14, INP-15). Their own sequence and loss slot keep a
+    /// loss from invalidating keyboard and pointer state.
+    OptionalHid,
+}
+
+impl Producer {
+    pub const ALL: [Self; 5] = [
+        Self::RawInput, Self::DeviceNotifications, Self::KeyboardHook, Self::PointerHook, Self::OptionalHid,
+    ];
+
+    /// Dense index for per-producer state.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::RawInput => 0,
+            Self::DeviceNotifications => 1,
+            Self::KeyboardHook => 2,
+            Self::PointerHook => 3,
+            Self::OptionalHid => 4,
+        }
+    }
+
+    /// Records of this producer are received on the Raw Input thread and
+    /// carry the receipt-time foreground proof.
+    pub const fn raw_input(self) -> bool {
+        matches!(self, Self::RawInput | Self::OptionalHid)
+    }
+}
+
+/// The optional Raw Input collections, registered apart from the required ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionalCollection {
+    /// Precision touchpad (usage page 0x0D, usage 5).
+    Touchpad,
+    /// Multi-axis controller (usage page 1, usage 8).
+    MultiAxis,
+}
+
+impl OptionalCollection {
+    pub const ALL: [Self; 2] = [Self::Touchpad, Self::MultiAxis];
+
+    pub const fn usage(self) -> (u16, u16) {
+        match self {
+            Self::Touchpad => (0x0D, 5),
+            Self::MultiAxis => (1, 8),
+        }
+    }
+
+    pub fn of(usage_page: Option<u16>, usage: Option<u16>) -> Option<Self> {
+        Self::ALL.into_iter().find(|collection| Some(collection.usage()) == usage_page.zip(usage))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +148,9 @@ pub struct InputRegistration {
     pub keyboard_hook: bool,
     pub pointer_hook: bool,
     pub pen_hid: bool,
+    /// Optional collections whose registration was verified at startup.
+    pub touchpad: bool,
+    pub multi_axis: bool,
     pub hook_timeout: HookTimeoutEvidence,
 }
 
@@ -161,10 +215,21 @@ pub enum RawInputRegistrationObservation {
 #[serde(deny_unknown_fields)]
 pub struct ProducerGap {
     pub producer: Producer,
+    pub cause: GapCause,
     pub first_sequence: SourceSequence,
     pub last_sequence: SourceSequence,
     pub first_qpc: QpcTick,
     pub last_qpc: QpcTick,
+}
+
+/// Why a producer's sequence range was not delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GapCause {
+    /// A bounded native queue or the transport had no room.
+    Overflow,
+    /// The native packet or its encoded record was invalid; it was skipped.
+    Malformed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,6 +419,7 @@ pub enum InputSample {
 impl InputSample {
     pub fn producer(&self) -> Producer {
         match self {
+            Self::Hid(report) if OptionalCollection::of(report.usage_page, report.usage).is_some() => Producer::OptionalHid,
             Self::RawKey(_) | Self::RawPointer(_) | Self::Hid(_) => Producer::RawInput,
             Self::HookKey(_) => Producer::KeyboardHook,
             Self::HookPointer(_) => Producer::PointerHook,
@@ -471,10 +537,14 @@ pub enum HelperToCore {
     Environment(EnvironmentState),
     Progress(ProducerProgress),
     Gap(ProducerGap),
+    /// The periodic registration check no longer finds an optional collection.
+    OptionalUnavailable { collection: OptionalCollection, observed_qpc: QpcTick },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketError {
+    /// A shared queue cursor is corrupt; the transport cannot continue.
+    InvalidCursor,
     HeaderTooShort,
     PacketTooLarge,
     InvalidMagic,
@@ -490,6 +560,7 @@ pub enum PacketError {
 impl fmt::Display for PacketError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidCursor => f.write_str("An input IPC queue cursor is invalid."),
             Self::HeaderTooShort => f.write_str("Input IPC header is incomplete."),
             Self::PacketTooLarge => f.write_str("Input IPC packet exceeds the size limit."),
             Self::InvalidMagic => f.write_str("Input IPC header magic is invalid."),

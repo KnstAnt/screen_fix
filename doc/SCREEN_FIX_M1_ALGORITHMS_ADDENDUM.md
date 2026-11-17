@@ -145,6 +145,8 @@ Unmatched injected hooks and VK_PACKET can be legitimate input, not automaticall
 
 Detect helper/hook/registration failure and record diagnostics/blind evidence. Automatic hook reinstallation, registration repair after loss and helper restart are not implemented as hidden M1 recovery. Initial registration and normal arrival/removal handling remain required.
 
+Correlation quality, closing certification, hook-only attribution, motion and wheel association and boundary key state are specified in section 13.
+
 ### 6.2 Sampling and foreground evidence
 
 Keep all key/button transitions except PDF control/password exclusions. Keep all motion samples while a button is held or a configured stroke is active. Otherwise emit the first sample immediately, retain the latest sample in each 1/60 s sampling window, and flush the last pending sample on idle, transition or boundary. Report thinning/coalescing counts.
@@ -193,6 +195,8 @@ On result:
 - Conflicting non-sensitive evidence: typing unknown; do not guess a shortcut.
 
 A failed call resolves waiting classification conservatively. If the API call itself remains blocked beyond its expected bound, diagnose the worker; UI/capture remain responsive and no replacement worker is created in M1.
+
+Section 13.8 records how undetermined editability is classified (D-4).
 
 While classification waits, raw collection and bounded private state updates continue. Resolve the input journal prefix on result/deadline. Never dump buffered sensitive events into diagnostics.
 
@@ -305,7 +309,7 @@ An Action, Rest or confirmed Save opening during a collector-backed visit carrie
 
 For each monitor and active segment epoch:
 - Maintain integer slot boundaries from the configured encoding FPS; avoid cumulative floating-point drift.
-- Decide a slot when its interval closes. Select the newest eligible captured frame for that slot, or repeat the previous selected frame if none arrived.
+- Decide a slot under the source-time watermark of section 13.9, which amends the earlier rule "when its interval closes". Select the newest eligible captured frame for that slot, or repeat the previous selected frame if none arrived.
 - Use local segment PTS derived from slot start and a recorded common-clock offset.
 - Preserve selected frame ID/source time on repetition.
 - Before the first valid frame, during monitor absence or when queue admission fails, record encoded=false with a reason, no invented segment/frame index.
@@ -404,3 +408,184 @@ Compilation and runtime tests require the separately established execution autho
 
 Verify timing, GPU-memory budgets and Windows scenarios against the [M1 acceptance criteria](SCREEN_FIX_M1_SPEC_ADDENDUM.md#6-revised-m1-acceptance-mapping).
 
+## 13. Remediation algorithms (2026-11-17)
+
+This section records the algorithms of the M1 remediation plan (`SCREEN_FIX_M1_REMEDIATION_PLAN.md`) and the user decisions D-2 to D-10. Where it differs from an earlier section, this section applies. Journal field names change with the schema stage (D-1 A) and are documented separately with it. The behaviour below was implemented and reviewed statically. It has not been compiled or executed.
+
+### 13.1 Terminal outcomes and the loss ledger
+
+Every item an owner accepts reaches exactly one terminal outcome:
+- Persisted: the row or file was written.
+- Suppressed: withheld by approval, privacy, control or pause policy. It is counted per class only.
+- Dropped: lost to capacity, malformation, deadline or source loss. It becomes a ledger entry and a typed `gap` row in the same stream.
+- Unavailable: a required observation could not be made. It is an explicit row where the stream defines one (still, element, focus), otherwise a ledger entry.
+
+Correlation quality is never a terminal outcome. It is metadata on a persisted row.
+
+Ledger:
+- Each stream ingress owns the ledger. Its key is (reason, producer); reasons and producers are closed typed enums. At most one entry per key is pending, outside the data queue.
+- An entry holds a count (known, or unknown; unknown stays unknown when merged), the first and last receipt of the lost items, and optional native sequence and QPC ranges. Merging sums counts and widens ranges.
+- A loss of a password, possibly sensitive or approval-unknown item is Sensitive. It is counted only, carries no time or sequence range and never becomes a gap row.
+
+Emission:
+- Pending entries are written as gap rows before the next row of the same stream, in ascending first receipt.
+- A gap row's `recv_t_us` is its admission receipt: the maximum of the triggering receipt and the stream's last receipt. Its range fields keep the original loss times.
+- At a pause boundary pending entries precede the pause row. Losses noticed while paused follow the resume row with their original ranges. At close they precede the final health rows.
+- Gap and health rows use reserved capacity. Failure to append one is a journal failure (F) and produces no further health row.
+- The frames stream never records a loss. Video losses are slot rows with a reason.
+
+Health rows:
+- They are written when the condition occurs, never with a null `recv_t_us`. A condition before the session clock exists goes to diagnostics and the manifest only.
+- While paused they are counted and reported with the resume row, or at Stop in a `paused_summary` row.
+- Capture and video health reported after the input/context loop has ended (for example a still write failure during the Stop drain) is written with the final context rows. If the context journal does not exist, it is counted in the manifest `omitted_health`. If the input/context loop itself failed, so that its hand-off index is unknown, such late records are neither written nor counted; that attempt has already failed (F).
+- More than 256 capture health records are counted in `omitted_health` instead of written.
+
+The manifest `health` block holds pauses, gap rows, blind intervals, dropped stills, `recovered_prefix: false`, per-stream dropped totals by reason and suppressed totals by class, the activity losses (13.2) and `omitted_health`. The reader reconciles it with the stream summaries.
+
+### 13.2 Fault classes
+
+The controller owns the classification. Owners report typed `FaultReport` values; none decides the attempt outcome.
+- F, attempt failure: the Stop path runs and the first cause is retained.
+- L, activity loss: the activity stops for the rest of the attempt, a health row and blind or unavailable intervals are recorded, and the UI shows "Recording degraded". L-required covers input and the video of one monitor. L-auxiliary covers stills/PNG, UIA, clipboard, cursor assets and identity resolution.
+- G, recorded loss: a ledger entry, an unavailable row or a bounded blind interval.
+
+| # | Condition | Class |
+| --- | --- | --- |
+| 1 | Journal append, flush or close failure | F |
+| 2 | Manifest publication failure; a required segment unfinalized or unverified at the Stop deadline | F |
+| 3 | Clock or controller failure | F |
+| 4 | Capture-thread failure that is not a topology change (for example GPU device loss) | F |
+| 5 | Admitted collector source failure (host, transport, authentication, protocol, lease, witness regression, readiness deadline, required access on the current grant, failed standard-helper check on return) | F |
+| 6 | Collector provider call still running at request deadline + 750 ms | F |
+| 7 | Collector input-lane write outstanding beyond the 500 ms coverage stall, or control-lane write beyond the lease | F |
+| 8 | Collector request deadline expiry where the call returns before deadline + 750 ms | G |
+| 9 | Encoder failure or rejected segment verification on a monitor | L-required (that monitor's video) |
+| 10 | Helper exit or transport break | L-required (input) |
+| 11 | Input producer progress stall | G (blind interval) from 250 ms; L-required (input) from 5 s |
+| 12 | Required Raw Input registration loss or required hook loss (D-2 B) | L-required (input), blind until Stop |
+| 13 | Opening or resume resync not possible; non-ordinary foreground | G (bounded blind interval) |
+| 14 | UIA client open failure, or one UIA call blocked longer than 1 s | L-auxiliary (UIA) |
+| 15 | Identity resolver blocked in one native call longer than 2 s | L-auxiliary (identity resolution) |
+| 16 | PNG encoder exit | L-auxiliary (stills) |
+| 17 | Clipboard worker exit | L-auxiliary (clipboard) |
+| 18 | Queue overflow, malformed packet, unknown device, optional device failure, display enumeration race, identity failure for one spelling, hotkey stall, late suspend finalization, per-request UIA, IME or element timeout | G |
+| 19 | A segment's verification result not received within the verification allowance | L-required (that monitor's video) |
+| 20 | Frames staging overflow after one slot interval of waiting | F |
+| 21 | A video worker's frames mark does not advance for T while Recording | F |
+
+Rules:
+- A condition escalates only at the boundary listed in the table.
+- The result message of a failed attempt names the first F. The primary cause in diagnostics is the first F or L; later reports are attached as secondary causes. F reports beyond 32 are counted, and identical F causes are reported once. A Stop-deadline timeout never replaces a recorded cause.
+- The disposition takes the first matching line: any F gives `failed`; L-required video or the selected-monitor rule (13.11) gives `video_unavailable`; L-required input or an input-certification shortfall at Stop gives `input_unavailable`; otherwise `recorded`. L-auxiliary and G never change the disposition; they appear only in `health`.
+- The component is the reporting owner: COM/MF initialization and monitor preflight report video; topology, display enumeration and OS capability report capture; approved-application preflight reports context; hotkeys, disk, environment and clock report the controller; the indicator and window tracking report the interface; the input worker reports the receiver; helper errors report the input helper.
+
+Implementation notes:
+- Row 16: the PNG worker also owns the still journal. An encoder panic is caught; it is reported once as an L-auxiliary loss with a health row, and this and every later job resolves as `still_dropped` with reason `png_worker_unavailable`. The still journal and the recording continue. A still journal failure, or an exit of the worker outside the encoder, stays F (row 1) with no extra L report.
+- Cursor assets: a panic of the cursor asset owner is caught. The assets it already published keep their inventory entries; later assets are unavailable, and the context owner reports one L-auxiliary loss on its next health poll. A panic after the context loop's last poll keeps the inventory but is not reported.
+- Row 17: the current code has no separate activity-loss report for a clipboard worker exit.
+- Rows 20 and 21 belong to the per-monitor frames lanes introduced with the journal schema stage. Until then the frames stream is written with blocking submission only.
+
+### 13.3 Closing certification of the input prefix
+
+- An item with receipt t below the cutoff is decidable when every producer's progress is at or beyond min(t + window, cutoff), or the producer has delivered its final progress. At a closing boundary every item below the cutoff is decided with the candidates present; missing partners are treated as at expiry.
+- `Discontinuous` marks only items whose window crosses a recorded gap, barrier or device removal. It is metadata, not a reason to suppress.
+- Waits for final progress: the existing 250 ms at Pause; at Stop, the Stop deadline minus a finalization reserve (`STOP_FINALIZATION_RESERVE` = 2 s). Under the 10 s Stop deadline about 8 s remain for certification; under the 3.75 s session-end budget about 1.75 s.
+- Items after the last progress of a producer that did not deliver final progress are Dropped with reason `producer_stall` over [last progress, cutoff). At Pause this range becomes a blind interval before the pause row (G). At Stop it is recorded as `uncertified_closing_tail`, an input-certification shortfall (`input_unavailable`).
+
+Matching outcomes (key, button and wheel clusters): a cluster is a connected component of compatible raw and hook records within ±20 ms, in one admission epoch and not separated by a gap, barrier or device removal. One raw and one hook, mutually unique, give one paired row (`matched`, or `missing_scan`). Hooks alone are hook-only (13.4). Raw alone gives one row per raw record (`unmatched`). Otherwise the component gives exactly one row per raw record with `correlation: "ambiguous"`, hook-only fields null with reason `ambiguous`, and cluster sizes; excess hooks are suppressed as `cluster_excess_hook`. Ambiguity does not spread beyond its component. Every record ends in exactly one row or one count.
+
+### 13.4 Hook-only foreground attribution
+
+The Receiver keeps a bounded foreground timeline fed by the Context owner's ordered transitions. Each entry holds the approval identity, the access classification and the change interval [tick − 16 ms, receipt]. It is pruned below the published prefix.
+
+A hook-only record with receipt r is approved when:
+1. r lies strictly inside a stable segment, with no change interval overlapping [r − 16 ms, r];
+2. that segment's foreground is approved with ordinary access;
+3. the timeline's progress covers r.
+
+If condition 3 is not yet met, the record waits within the existing classification wait. Otherwise a failed condition suppresses it as `approval_unknown` (Sensitive).
+
+Keyboard records (keys and VK_PACKET) also require:
+4. one visit and one focus generation covering [r − 16 ms, r];
+5. that generation's classification resolved within the 500 ms classification deadline. Non-text keeps keys, editable follows text rules, and password, possibly sensitive, unresolved or expired goes to the redacted aggregate.
+6. If condition 4 fails, the record is counted into an adjacent open redacted aggregate, or else as a Sensitive `focus_uncertain` suppression.
+
+Origin follows INP-7 precedence: promotion signature, then hook injection flags (`injected`), then device evidence. An injected hook may pair only with a NULL-handle raw packet of the same kind and identity. Injector hints are serialized by hint name. `late` is null for injected hooks.
+
+### 13.5 Motion and wheel association (D-7 A)
+
+- Every approved hook motion is a sample; ALG section 6.2 sampling still applies.
+- Raw relative packets received in (previous hook sample − W, this sample + W], not yet attributed, are attached as `delta` and `coalesced` when exactly one raw device produced them. Several devices give a null delta with reason `raw_association_ambiguous`; none gives reason `raw_unavailable`. A raw packet received within +W after a hook sample is attributed to that sample, so in dense motion a delta can lag by one sample.
+- Unattributed raw deltas go to the per-second raw-motion evidence in `input_health` and are not counted as cursor moves. No delta is attached to two samples.
+- While the pointer hook is missing or lost, raw packets drive sampling.
+- Wheel: in a maximal run of same-axis records without a gap or barrier, pair the k-th raw with the k-th hook when the run's raw records come from one device and the counts are equal. Otherwise hook records are published with a null raw value and reason `wheel_association_ambiguous`.
+
+### 13.6 Ordinary-key state across boundaries (I4)
+
+- Each resync reads the state of all virtual keys into private state only (`KnownUp`, `KnownDown` or `Unknown`). Ordinary keys get no synthetic edges.
+- The first down of a `KnownDown` or `Unknown` key after a boundary, and its later autorepeats, are published with `repeat: null` and `held_across_boundary: true`. It is not a press, does not open a `pre_action` trigger and does not enter the published held state.
+- A key up without a published down is published with `press_unavailable: true`.
+- Text inference ignores `repeat: null` downs.
+
+### 13.7 Liveness and blind intervals (I5)
+
+- An input producer stall opens a blind interval after 250 ms of awake time and becomes L-required input at 5 s. Only records of the stalled producers are dropped; hook-health transitions inside the stall interval are not counted.
+- A malformed packet is skipped and counted (G), not fatal to the helper.
+- `input_health` rows report per-second coalesced, thinned and suppressed counts. The per-second suppressed counts exclude the privacy-adjacent classes (approval unknown, not approved, control uncertain, cluster excess).
+- A helper failure noticed after the pause prefix is published writes no runtime input health row; the final activity-loss row remains.
+- Suspend-excluded elapsed time comes from the power marks of the session; a mark without a QPC gives an unknown interval, never zero, and an unknown interval never produces a fault.
+
+### 13.8 Focus classification (D-4; clarifies CTX-9 against section 7.1)
+
+- D-4a: a successful read with IsKeyboardFocusable true and neither Value nor Text pattern gives `editable: false` (non-text, keys kept) for every control type.
+- D-4b: a present pattern whose read-only attribute is unavailable gives `editable: null` (`attribute_unavailable`) and a redacted visit. This includes the case where Value pattern presence itself is unavailable and `ValueIsReadOnly` is unreadable.
+- D-4c: a mixed Text read-only attribute with IsPassword known false gives `editable: null` (`mixed`); keys are published with `typing: "unknown"` and no text is inferred.
+- D-4d: `HasKeyboardFocus` false marks the read stale; it is reissued once within the classification wait and redacted if the wait expires. `HasKeyboardFocus` unsupported is resolved when the element came from the focused-element query and a native focus snapshot taken from `hwndFocus` confirms the same window.
+- Unchanged: read failure or timeout, IsPassword unknown and password give a redacted visit.
+
+Read corrections (C1):
+- Value read-only with Text writable gives `editable: true` (CTX-9 "either … is false"). Value read-only with Text undetermined gives `editable: null`, redacted. A present Value pattern with its attribute unavailable and Text read-only or absent gives `editable: null`, redacted.
+- `UIA_E_TIMEOUT` and an exhausted call budget are reported as `timeout`, not `unavailable`. Each provider call gets the remaining budget, with a 10 ms minimum.
+- When no `hwndFocus` exists, the `hwndActive` fallback serves keyboard layout and focus identity only. Its password evidence is unknown, the UIA read is treated as stale, and the target is possibly sensitive. Clipboard focus checks exclude it.
+- Invariant for every consumer of `FocusAtReceipt.password_style`: `None` never means "not a password". Only `Some(false)` is password-safe.
+- An IME state without a focus snapshot is unknown.
+
+### 13.9 Slot decision watermark (D-10 A; amends section 9.1, with VID-4)
+
+- Slot k [start_k, end_k) is decided when the capture owner has delivered a frame with source time ≥ end_k, or when now ≥ end_k + G.
+- G is one capture pacing interval plus the conversion allowance, capped at two slot intervals. It is recorded per segment as `slot_decision_grace_us`.
+- A frame with source time in the slot is eligible whenever it becomes available before the decision; receipt before end_k is no longer required. `late` keeps its VID-4 meaning. Frames arriving after their slot was decided are counted as `arrived_after_decision`.
+- Same-size geometry changes (DPI or position) keep the repeat source. A frame that arrives before the epoch timeline is published is held for that timeline or counted as `timeline_pending`.
+- Video capacities derive from the effective FPS: segment pictures and staged slots are computed from max(requested FPS, software FPS), and staged slots cover two segments.
+
+### 13.10 Segment verification and encoder selection (V3, V4)
+
+- The video worker performs rotation (IDR, finalize, flush, next part) and hands the closed part to a per-monitor verifier thread through a queue of two. Encoding continues. A full verifier queue makes the worker wait and is counted.
+- The verifier decodes the segment and checks timing and dimensions. Only after success, and an authorization check immediately before the rename, is the `.part` renamed to `.mp4`. An already published `.mp4` is never deleted on a later elevated revocation; the remaining race window is benign because the segment contains only frames admitted while the visit was approved.
+- A rejected verification is L-required for that monitor (row 9). A result not received within the verification allowance resolves the segment's rows as `segment_unverified`, keeps the `.part` and is L-required (row 19). Only an unfinished required segment at the Stop deadline is F.
+- Display read failures give unavailable fields instead of failing. HDR without an SDR white level uses the system BGRA8 conversion with a health row. Encoder selection failure at reconfigure is L-required for that monitor (capability selection, not recovery). Rejected hardware candidates are recorded with their causes. The encoder self-check pictures are converted on the capture thread.
+- Suspend: a monitor that has not closed its open segment within 2 s of `PBT_APMSUSPEND` writes `suspend_finalize_late` and finishes after wake (D-5 A). The encoder watchdog, the elevated prefix wait and the conversion deadline restart on a suspend.
+
+### 13.11 Session and completion rules
+
+- D-6 A: complete requires usable video for each selected monitor in each interval in which it was present and admitted. An admitted interval of a present monitor counts as without video only if it has no encoded slot and contains a slot that starts later than the interval start plus G; shorter intervals are counted in `short_intervals_without_video` and do not affect Complete. Approval-suppressed slots lie outside admitted intervals.
+- Hotkeys: a hotkey progress gap is measured as suspend-excluded time and records a control loss; it no longer disables hotkeys. There is no separate registration-loss health record: a `RegisterHotKey` registration belongs to its thread and is lost only when that thread stops, which is already detected and shown.
+- The countdown is held during lock, secure desktop and sleep. An admitted failure is reported as a retained recording with its package path when the failed manifest is confirmed.
+
+### 13.12 Stills (P1–P3)
+
+- The PNG inbox takes a short blocking lock; `capacity` is reported only when the queue is full and the new job does not outrank the lowest one.
+- Drop reasons are set at their cause: a save without an eligible interval gives `admission_closed` or `save_interval_changed`; a pointer rest gives `admission_changed`, `geometry_changed` or `frame_not_approved`; an approved private request with no selection gives `no_approved_interval` or `adjustment_failed`. Fallback reasons remain only for a handoff disconnect.
+- A PNG write failure gives one context health row (`still_write_failure`) per episode of the same failing operation; each still row keeps its operation and native code.
+- At the drain deadline a finished PNG job keeps its result; an unfinished job is cancelled before its write and before its rename. An image published after its slot gave up is kept, unreferenced, and counted in the manifest PNG counters (`unreferenced_images`).
+- A `pre_motion` envelope, with its still-row reservations, opens only for the first motion after 300 ms without motion, decided at receipt in the Receiver. Later motion reserves nothing.
+- Retention: pending private selections take part in reclaim by IMG-7 priority, newest first among equal priority. Pending private selections hold at most two distinct frames, so one extra hold stays available to public requests.
+- `start` returns `history_lost` when an eligible frame after the boundary was already evicted, instead of a later frame.
+- Scroll ticks without device attribution form one unknown-device burst per monitor and axis; known devices are never merged.
+- One readback and one PNG job serve every slot that selected the same held frame. The job uses the highest attached priority, the rate exemption if any attached slot is exempt and the least restrictive coverage; each row is still checked against its own coverage. The work is released with its last attached slot. The staging texture is kept per frame extent and recreated only on an extent change or epoch cancellation.
+
+### 13.13 Output inventory (P4)
+
+- The PNG owner and the cursor asset owner report each file they publish (attempt-relative path named by its digest, byte length, width, height). The manifest lists them as `images` and `cursors`.
+- The reader resolves a still or cursor image only if it is listed, and checks the listed size and dimensions against the file.
+- A complete package requires both lists. Complete packages recorded before this change, without the lists, fail validation; this follows the v6-only reader decision (D-1 A).

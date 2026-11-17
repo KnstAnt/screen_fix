@@ -28,6 +28,8 @@ struct Observation {
 
 pub(super) struct Hung {
     active: Vec<Observation>,
+    /// Ghost windows verifiably replacing an active approved hung window (IMG-8).
+    ghosts: Vec<(WindowId, WindowProcess)>,
     next_scan: Instant,
     coverage_limited: bool,
     ghost_unknown: bool,
@@ -37,13 +39,18 @@ pub(super) struct Hung {
 impl Hung {
     pub fn new(now: Instant) -> Self {
         Self {
-            active: Vec::with_capacity(ACTIVE_LIMIT), next_scan: now, coverage_limited: false,
+            active: Vec::with_capacity(ACTIVE_LIMIT), ghosts: Vec::new(), next_scan: now, coverage_limited: false,
             ghost_unknown: false, probe: hung::Probe::new(),
         }
     }
 
     pub fn contains(&self, process: ProcessInstance) -> bool {
         self.active.iter().any(|observation| observation.window.process == process)
+    }
+
+    /// The hung approved window a Ghost replaces, from the latest scan.
+    pub fn ghost_original(&self, ghost: WindowId) -> Option<WindowProcess> {
+        self.ghosts.iter().find(|(window, _)| *window == ghost).map(|(_, original)| *original)
     }
 
     pub fn coverage_limited(&self) -> bool {
@@ -72,11 +79,15 @@ impl Hung {
             observations: Vec::with_capacity(ACTIVE_LIMIT), foreground,
             foreground_ghost_known: false, ghost_unknown: false, limited: !complete,
         };
+        let mut ghosts = Vec::new();
         for candidate in candidates {
             match self.probe.observe_candidate(candidate) {
                 CandidateEvidence::Window { window, ghost } => {
                     scan.foreground_ghost_known |= ghost && scan.foreground.0 == candidate.window as usize as u64;
                     scan.observe(window, ghost);
+                    if ghost && ghosts.len() < ACTIVE_LIMIT {
+                        ghosts.push((WindowId(candidate.window as usize as u64), window));
+                    }
                 }
                 CandidateEvidence::UnknownGhost => scan.ghost_unknown = true,
                 CandidateEvidence::Changed => {}
@@ -130,6 +141,8 @@ impl Hung {
         if limited != self.coverage_limited {
             rows.push(json!({ "kind": "app_hung_coverage", "complete": !limited }));
         }
+        ghosts.retain(|(_, original)| next.iter().any(|observed| observed.window == *original && observed.ghost));
+        self.ghosts = ghosts;
         self.busy_changes(&next, rows);
         self.active = next;
         self.coverage_limited = limited;
@@ -165,6 +178,7 @@ impl Hung {
         let mut rows = self.active.iter().map(|old| hung_row(*old, false, "observation_ended")).collect();
         self.busy_changes(&[], &mut rows);
         self.active.clear();
+        self.ghosts.clear();
         if std::mem::take(&mut self.ghost_unknown) {
             rows.push(json!({ "kind": "app_hung_ghost", "active": false, "association": null }));
         }

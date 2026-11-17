@@ -5,6 +5,8 @@ edition = "2024"
 
 [features]
 elevated-release = []
+# Developer-only trusted fixture Save producer (M1-08). Off by default.
+fixture-save = []
 
 [dependencies]
 screen-fix-core = { path = "../core" }

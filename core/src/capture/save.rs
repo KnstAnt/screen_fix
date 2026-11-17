@@ -25,7 +25,6 @@ pub enum SaveKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmationSource {
     Fixture,
-    ApplicationNotification,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -16,7 +16,7 @@ use crate::{deadline::Cancellation, process::Process, win::{Failure, Result}};
 use super::{lifetime::{LEASE, Lifetime, qpc}, witness::{Foreground, Snapshot, Target, View}};
 
 pub(super) const INPUT_HOLDBACK: Duration = Duration::from_millis(32);
-const ESSENTIAL_PROGRESS: Duration = Duration::from_millis(500);
+pub(super) const ESSENTIAL_PROGRESS: Duration = Duration::from_millis(500);
 
 const PREPARING: u8 = 0;
 const ARMED: u8 = 1;
@@ -35,7 +35,7 @@ struct Focus {
 
 #[derive(Default)]
 struct Coverage {
-    input: [i64; 4],
+    input: [i64; screen_fix_protocol::ipc::Producer::ALL.len()],
     context: i64,
     uncertain: Option<(Revocation, QpcTick)>,
     input_loss: Option<InputLoss>,
@@ -63,6 +63,10 @@ pub(super) struct Grant {
     hook_revision: AtomicU64,
     scope_serial: AtomicU64,
     input_paused: AtomicBool,
+    /// Latched when a token verification of the pinned target fails. Token
+    /// facts are queried on prepare, renewal and egress batch boundaries;
+    /// per-record checks read this result (E3).
+    token_failed: AtomicBool,
 }
 
 impl Grant {
@@ -83,6 +87,13 @@ impl Grant {
         }
         let observed = witness.read()?.ok_or(Failure::Witness)?;
         let target = Target::prove(observed.foreground.ok_or(Failure::TargetChanged)?, &request.foreground, &parent)?;
+        // D-9 A: the collector's independent proof of the approval key. It
+        // canonicalizes the live process's own image, never a supplied path.
+        let image = String::from_utf16(&target.process.win32_image()?).map_err(|_| Failure::TargetAccess)?;
+        let canonical = screen_fix_native_observation::identity::canonical_image(&image).ok_or(Failure::TargetAccess)?;
+        if canonical != request.foreground.approval.as_str() {
+            return Err(Failure::TargetAccess);
+        }
         let expires_qpc = AtomicI64::new(request.expires_qpc.0);
         let hook_revision = AtomicU64::new(request.visit.focus_revision);
         let focus = Focus {
@@ -91,7 +102,7 @@ impl Grant {
         let grant = Arc::new(Self {
             target, expires_qpc, hook_revision, focus: Mutex::new(focus), arm: qpc()?, parent, witness, lifetime, session_stop,
             stop: Cancellation::new()?, phase: AtomicU8::new(PREPARING), lower_qpc: AtomicI64::new(0),
-            scope_serial: AtomicU64::new(1), input_paused: AtomicBool::new(false),
+            scope_serial: AtomicU64::new(1), input_paused: AtomicBool::new(false), token_failed: AtomicBool::new(false),
         });
         grant.check(true)?;
         Ok(grant)
@@ -171,7 +182,8 @@ impl Grant {
             return Err(Failure::TargetChanged);
         }
         if detailed {
-            self.target.recheck(&self.parent)?;
+            if self.token_failed.load(Acquire) { return Err(Failure::TargetChanged); }
+            self.target.bound()?;
             let expected = self.focus.lock().map_err(|_| Failure::Supervisor)?.native;
             if expected.is_some_and(|focus| self.native_focus() != Some(focus)) {
                 return Err(Failure::TargetChanged);
@@ -179,6 +191,13 @@ impl Grant {
             return self.check(false);
         }
         Ok(now)
+    }
+
+    /// Query the pinned target's token facts and liveness (E3).
+    pub(super) fn verify_token(&self) -> Result<()> {
+        let verified = crate::process::verify_capture_target(&self.parent, &self.target.process);
+        if verified.is_err() { self.token_failed.store(true, Release); }
+        verified
     }
 
     pub(super) fn prove_other(
@@ -227,7 +246,8 @@ impl Grant {
         self.session_stop.check()?;
         self.stop.check()?;
         self.lifetime.check(qpc()?)?;
-        self.target.recheck(&self.parent)?;
+        self.verify_token()?;
+        self.target.bound()?;
         let view = self.witness.read()?.filter(|view| view.safe && view.foreground == Some(self.target.window)
             && view.revision == next.witness_revision && view.focus_revision == next.focus_revision)
             .ok_or(Failure::TargetChanged)?;
@@ -251,6 +271,7 @@ impl Grant {
     }
 
     pub(super) fn activate(&self, command: Activation, lease: Lease) -> Result<QpcTick> {
+        self.verify_token()?;
         let now = self.check(true)?;
         if command.visit != self.visit() || lease.epoch != Some(command.visit.epoch)
             || command.lease != lease.sequence || command.opening_qpc < self.arm || command.opening_qpc > now
@@ -309,10 +330,11 @@ impl Grant {
             if self.loss(now).is_some_and(|(reason, _)| reason != Revocation::Focus) {
                 return Err(Failure::TargetChanged);
             }
-            self.target.recheck(&self.parent)?;
+            self.target.bound()?;
         } else {
             self.check(true)?;
         }
+        self.verify_token()?;
         let bound = lease.controller_qpc.min(lease.pump_qpc).0
             .checked_add(self.lifetime.ticks(LEASE)?).ok_or(Failure::Supervisor)?;
         if bound <= now.0 { return Err(Failure::LeaseExpired); }
@@ -379,13 +401,7 @@ impl Grant {
     }
 
     pub(super) fn input_progress(&self, visit: VisitBinding, progress: screen_fix_protocol::ipc::ProducerProgress) {
-        use screen_fix_protocol::ipc::Producer;
-        let index = match progress.producer {
-            Producer::RawInput => 0,
-            Producer::KeyboardHook => 1,
-            Producer::PointerHook => 2,
-            Producer::DeviceNotifications => 3,
-        };
+        let index = progress.producer.index();
         self.credit(visit, progress.before_qpc, |coverage| &mut coverage.input[index]);
     }
 

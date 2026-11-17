@@ -12,7 +12,7 @@ use std::{
 
 use screen_fix_protocol::{
     MessageTickMs, QpcTick, SourceSequence,
-    ipc::{EnvironmentChange, EnvironmentState, HelperFailureStage, HelperToCore, Producer, ProducerProgress, Receipt},
+    ipc::{DeviceDescriptor, EnvironmentChange, EnvironmentState, HelperFailureStage, HelperToCore, Producer, ProducerProgress, Receipt},
 };
 use windows_sys::Win32::{
     System::Threading::{GetCurrentThreadId, SetEvent},
@@ -23,20 +23,25 @@ use windows_sys::Win32::{
     },
 };
 
-use super::{CaptureScope, NativeError, device, last_error, loss::{self, Losses}, raw::{RawWindow, qpc}};
+use super::{CaptureScope, NativeError, device, last_error, loss::{self, Losses}, raw::{RawRecord, RawWindow, qpc}};
+
+/// The Raw Input thread's identity and the optional collections it registered.
+type RawReady = (u32, [bool; screen_fix_protocol::ipc::OptionalCollection::ALL.len()]);
 
 const CHECK_TIMER: usize = 1;
 const PROGRESS_TIMER: usize = 2;
 const WAKE: u32 = WM_APP + 1;
 const STOP: u32 = 1 << 31;
 const RAW_QUEUE_CAPACITY: usize = 4096;
-const DEVICE_AND_RAW: [Producer; 2] = [Producer::DeviceNotifications, Producer::RawInput];
+const RAW_THREAD: [Producer; 3] = [Producer::DeviceNotifications, Producer::RawInput, Producer::OptionalHid];
+const DEVICE_REQUESTS: usize = 64;
 
 pub(super) struct RawOwner {
     thread_id: u32,
     pending: Arc<AtomicU32>,
     owner: thread::JoinHandle<RawResult>,
     governed: bool,
+    optional: [bool; screen_fix_protocol::ipc::OptionalCollection::ALL.len()],
     pub(super) records: Receiver<HelperToCore>,
 }
 
@@ -61,7 +66,7 @@ impl RawOwner {
         let pending = Arc::new(AtomicU32::new(0));
         let thread_pending = Arc::clone(&pending);
         let owner = thread::Builder::new().name("input-raw".into()).spawn(move || {
-            let mut output = Evidence { ingress, data_wake, losses: Losses::default(), environment: None };
+            let mut output = Evidence { ingress, data_wake, losses: Losses::default(), environment: None, notices: Vec::new() };
             let result = raw_loop(&mut output, &thread_pending, &ready, frequency / 80, pen_hid, scope.as_deref());
             if let Err(error) = result {
                 let _ = ready.try_send(Err(error));
@@ -73,8 +78,8 @@ impl RawOwner {
             code: error.raw_os_error(),
             raw_input_registration: None,
         })?;
-        let thread_id = match initialized.recv_timeout(Duration::from_secs(2)) {
-            Ok(Ok(thread_id)) => thread_id,
+        let (thread_id, optional) = match initialized.recv_timeout(Duration::from_secs(2)) {
+            Ok(Ok(ready)) => ready,
             result => {
                 drop(initialized);
                 if governed { let _ = owner.join(); }
@@ -84,7 +89,12 @@ impl RawOwner {
                 };
             }
         };
-        Ok(Self { thread_id, pending, owner, records, governed })
+        Ok(Self { thread_id, pending, owner, records, governed, optional })
+    }
+
+    /// Optional collections registered at startup, in `OptionalCollection::ALL` order.
+    pub(super) fn optional(&self) -> [bool; screen_fix_protocol::ipc::OptionalCollection::ALL.len()] {
+        self.optional
     }
 
     pub(super) fn ended(&self) -> bool {
@@ -122,9 +132,19 @@ struct Evidence {
     data_wake: OwnedHandle,
     losses: Losses,
     environment: Option<EnvironmentState>,
+    /// Registration notices waiting for queue room; at most one per collection.
+    notices: Vec<HelperToCore>,
 }
 
 impl Evidence {
+    fn flush_notices(&mut self) {
+        while let Some(notice) = self.notices.first() {
+            if self.ingress.try_send(notice.clone()).is_err() { return; }
+            self.notices.remove(0);
+            self.signal();
+        }
+    }
+
     fn offer(&mut self, record: HelperToCore) {
         if let Some(producer) = loss::producer(&record)
             && !self.flush_loss(producer)
@@ -140,10 +160,11 @@ impl Evidence {
     }
 
     fn flush_loss(&mut self, producer: Producer) -> bool {
-        let Some(gap) = self.losses.pending(producer) else { return true };
-        if self.ingress.try_send(HelperToCore::Gap(gap)).is_err() { return false; }
-        self.losses.clear(producer);
-        self.signal();
+        while let Some(gap) = self.losses.front(producer) {
+            if self.ingress.try_send(HelperToCore::Gap(gap)).is_err() { return false; }
+            self.losses.delivered(producer);
+            self.signal();
+        }
         true
     }
 
@@ -167,27 +188,85 @@ impl Evidence {
     }
 }
 
+/// Device descriptor IO (`CreateFileW`, `HidD_*`, `SetupDi*`) runs on this
+/// helper-owned worker, never on the Raw Input thread (ARCH-2, I6). A device
+/// is announced at once with its Raw Input facts; the identified descriptor
+/// follows as a second arrival with the same session ID.
+struct DeviceWorker {
+    requests: SyncSender<(DeviceDescriptor, Vec<u16>)>,
+    replies: Receiver<DeviceDescriptor>,
+}
+
+impl DeviceWorker {
+    fn start(raw_thread: u32) -> Result<Self, NativeError> {
+        let (requests, pending) = mpsc::sync_channel::<(DeviceDescriptor, Vec<u16>)>(DEVICE_REQUESTS);
+        let (reply, replies) = mpsc::sync_channel(DEVICE_REQUESTS);
+        // The worker is detached: it can be blocked in device IO at exit, and
+        // ends when either channel closes.
+        thread::Builder::new().name("input-devices".into()).spawn(move || {
+            for (mut descriptor, path) in pending {
+                device::identify(&path, &mut descriptor);
+                if reply.send(descriptor).is_err() { return; }
+                unsafe { PostThreadMessageW(raw_thread, WAKE, 0, 0) };
+            }
+        }).map_err(|error| NativeError {
+            stage: HelperFailureStage::Startup,
+            code: error.raw_os_error(),
+            raw_input_registration: None,
+        })?;
+        Ok(Self { requests, replies })
+    }
+
+    /// Queue identification of an announced device. A full queue leaves the
+    /// descriptor unidentified and is a device-notification loss.
+    fn request(
+        &self, output: &mut Evidence, sequence: &mut u64, descriptor: DeviceDescriptor, path: Option<Vec<u16>>,
+    ) -> Result<(), NativeError> {
+        let Some(path) = path else { return Ok(()) };
+        if let Err(mpsc::TrySendError::Full((descriptor, _)) | mpsc::TrySendError::Disconnected((descriptor, _)))
+            = self.requests.try_send((descriptor, path))
+        {
+            let receipt = device_receipt_at(sequence, None, qpc()?)?;
+            output.losses.drop_record(&HelperToCore::DeviceArrived { receipt, descriptor });
+        }
+        Ok(())
+    }
+
+    /// Announce identified descriptors of devices that are still present.
+    fn deliver(&self, output: &mut Evidence, devices: &device::DeviceIds, sequence: &mut u64) -> Result<(), NativeError> {
+        while let Ok(descriptor) = self.replies.try_recv() {
+            if devices.active(descriptor.id) {
+                let receipt = device_receipt_at(sequence, None, qpc()?)?;
+                output.offer(HelperToCore::DeviceArrived { receipt, descriptor });
+            }
+        }
+        Ok(())
+    }
+}
+
 fn raw_loop(
     output: &mut Evidence,
     pending: &AtomicU32,
-    ready: &SyncSender<Result<u32, NativeError>>,
+    ready: &SyncSender<Result<RawReady, NativeError>>,
     progress_interval: i64,
     pen_hid: bool,
     scope: Option<&CaptureScope>,
 ) -> Result<(), NativeError> {
     let mut raw = RawWindow::open(pen_hid)?;
+    let worker = DeviceWorker::start(unsafe { GetCurrentThreadId() })?;
     let mut device_sequence = 0;
     let mut devices = device::DeviceIds::default();
     let first_inventory = scope.is_none().then(device::inventory).transpose()?;
     let mut inventory_serial = None;
     let _timer = Timer::start(&raw)?;
-    ready.try_send(Ok(unsafe { GetCurrentThreadId() }))
+    ready.try_send(Ok((unsafe { GetCurrentThreadId() }, raw.optional())))
         .map_err(|_| NativeError::without_code(HelperFailureStage::Startup))?;
     if let Some(inventory) = first_inventory {
-        observe_inventory(&mut raw, &mut devices, &mut device_sequence, output, inventory)?;
+        observe_inventory(&mut raw, &worker, &mut devices, &mut device_sequence, output, inventory)?;
         inventory_serial = Some(0);
     }
     let mut next_progress = QpcTick(0);
+    let mut batch = Vec::new();
     loop {
         let mut message = MSG::default();
         match unsafe { GetMessageW(&mut message, null_mut(), 0, 0) } {
@@ -222,9 +301,11 @@ fn raw_loop(
         if scoped_message && active && inventory_serial != Some(serial) {
             devices.clear();
             raw.reset_devices();
+            // The old scope's pending gaps keep their sequence and QPC ranges (E3).
+            for producer in RAW_THREAD { output.flush_loss(producer); }
             output.losses = Losses::default();
             output.environment = None;
-            observe_inventory(&mut raw, &mut devices, &mut device_sequence, output, device::inventory()?)?;
+            observe_inventory(&mut raw, &worker, &mut devices, &mut device_sequence, output, device::inventory()?)?;
             inventory_serial = Some(serial);
         }
         match message.message {
@@ -243,26 +324,66 @@ fn raw_loop(
                         return Err(error);
                     }
                 };
-                raw.read(&message, qpc, scope.is_none(), |mut input| {
-                    if !allowed() { return; }
-                    if devices.identify(&mut input.sample) {
-                        output.offer(HelperToCore::Input(input));
-                    } else {
-                        output.losses.drop_record(&HelperToCore::Input(input));
+                let mut lazily_seen = Vec::new();
+                raw.read(&message, qpc, true, |record| batch.push(record), || pending.load(Acquire) & STOP != 0)?;
+                // The governed scope is checked once per drained batch: before
+                // the read (`active`) and after it (E3).
+                if !allowed() { batch.clear(); }
+                for record in batch.drain(..) {
+                    let mut input = match record {
+                        RawRecord::Input(input) => input,
+                        RawRecord::Malformed(producer, receipt) => {
+                            output.losses.malformed(producer, receipt);
+                            continue;
+                        }
+                    };
+                    match devices.identify(&mut input.sample) {
+                        Some(first_seen) => {
+                            // A device without a prior arrival is announced
+                            // before its first record, so the core inventory resolves it.
+                            if let Some(native) = first_seen
+                                && let Some(id) = devices.assign(native)
+                            {
+                                let handle = native.0 as usize as windows_sys::Win32::Foundation::HANDLE;
+                                match (device::descriptor(handle, None),
+                                    device_receipt_at(&mut device_sequence, input.receipt.message_tick_ms, input.receipt.qpc))
+                                {
+                                    (Some((mut descriptor, _)), Ok(receipt)) => {
+                                        descriptor.id = id;
+                                        output.offer(HelperToCore::DeviceArrived { receipt, descriptor });
+                                    }
+                                    (None, Ok(receipt)) => output.losses.malformed(Producer::DeviceNotifications, receipt),
+                                    (_, Err(_)) => {}
+                                }
+                                lazily_seen.push((handle, id));
+                            }
+                            output.offer(HelperToCore::Input(input));
+                        }
+                        None => output.losses.drop_record(&HelperToCore::Input(input)),
                     }
-                }, || pending.load(Acquire) & STOP != 0)?;
+                }
+                // HID report parsing for the lazily seen devices starts with
+                // their next packet; their identification is queued.
+                for (handle, id) in lazily_seen {
+                    if let Some((mut descriptor, path)) = device::descriptor(handle, None) {
+                        raw.observe_device(handle, &mut descriptor);
+                        descriptor.id = id;
+                        worker.request(output, &mut device_sequence, descriptor, path)?;
+                    }
+                }
             }
             WM_INPUT_DEVICE_CHANGE if message.hwnd == raw.handle() && active => {
                 let handle = message.lParam as windows_sys::Win32::Foundation::HANDLE;
                 if message.wParam == GIDC_ARRIVAL as usize {
                     let received = observed?;
-                    if let Some(mut descriptor) = device::descriptor(handle, None) {
+                    if let Some((mut descriptor, path)) = device::descriptor(handle, None) {
                         raw.remove_device(handle);
                         raw.observe_device(handle, &mut descriptor);
                         let receipt = device_receipt_at(&mut device_sequence, Some(MessageTickMs(message.time)), received)?;
                         if let Some(id) = devices.assign(descriptor.id) {
                             descriptor.id = id;
-                            output.offer(HelperToCore::DeviceArrived { receipt, descriptor });
+                            output.offer(HelperToCore::DeviceArrived { receipt, descriptor: descriptor.clone() });
+                            worker.request(output, &mut device_sequence, descriptor, path)?;
                         } else {
                             output.losses.drop_record(&HelperToCore::DeviceArrived { receipt, descriptor });
                         }
@@ -277,7 +398,13 @@ fn raw_loop(
             }
             WM_TIMER if message.hwnd == raw.handle() && message.wParam == CHECK_TIMER => {
                 raw.check_registration()?;
-                for producer in DEVICE_AND_RAW { output.flush_loss(producer); }
+                if let Ok(observed_qpc) = observed {
+                    for collection in raw.take_lost_optional() {
+                        output.notices.push(HelperToCore::OptionalUnavailable { collection, observed_qpc });
+                    }
+                }
+                output.flush_notices();
+                for producer in RAW_THREAD { output.flush_loss(producer); }
                 if output.environment.is_some() { output.environment(0)?; }
             }
             WM_TIMER if message.hwnd == raw.handle() && message.wParam == PROGRESS_TIMER => {}
@@ -285,9 +412,17 @@ fn raw_loop(
             _ => { unsafe { DispatchMessageW(&message) }; }
         }
         let changes = changes & EnvironmentChange::ALL_BITS;
-        if changes != 0 { output.environment(changes)?; }
+        if changes != 0 {
+            // An environment record also attests a passed registration check;
+            // the Recorder requests one before returning to this source (E4).
+            raw.check_registration()?;
+            output.environment(changes)?;
+        }
+        if inventory_serial == Some(serial) && allowed() {
+            worker.deliver(output, &devices, &mut device_sequence)?;
+        }
         if inventory_serial == Some(serial) && active && let Some(before_qpc) = progress && before_qpc >= next_progress {
-            for producer in DEVICE_AND_RAW {
+            for producer in RAW_THREAD {
                 output.offer(HelperToCore::Progress(ProducerProgress { producer, before_qpc }));
             }
             next_progress = QpcTick(before_qpc.0.saturating_add(progress_interval.max(1)));
@@ -296,18 +431,19 @@ fn raw_loop(
 }
 
 fn observe_inventory(
-    raw: &mut RawWindow, devices: &mut device::DeviceIds, device_sequence: &mut u64, output: &mut Evidence,
-    inventory: Vec<windows_sys::Win32::UI::Input::RAWINPUTDEVICELIST>,
+    raw: &mut RawWindow, worker: &DeviceWorker, devices: &mut device::DeviceIds, device_sequence: &mut u64,
+    output: &mut Evidence, inventory: Vec<windows_sys::Win32::UI::Input::RAWINPUTDEVICELIST>,
 ) -> Result<(), NativeError> {
     output.environment(EnvironmentChange::Settings.bit() | EnvironmentChange::Display.bit())?;
     for entry in inventory {
         let received = qpc()?;
-        if let Some(mut descriptor) = device::descriptor(entry.hDevice, Some(entry.dwType)) {
+        if let Some((mut descriptor, path)) = device::descriptor(entry.hDevice, Some(entry.dwType)) {
             raw.observe_device(entry.hDevice, &mut descriptor);
             let receipt = device_receipt_at(device_sequence, None, received)?;
             if let Some(id) = devices.assign(descriptor.id) {
                 descriptor.id = id;
-                output.offer(HelperToCore::DeviceArrived { receipt, descriptor });
+                output.offer(HelperToCore::DeviceArrived { receipt, descriptor: descriptor.clone() });
+                worker.request(output, device_sequence, descriptor, path)?;
             } else {
                 output.losses.drop_record(&HelperToCore::DeviceArrived { receipt, descriptor });
             }

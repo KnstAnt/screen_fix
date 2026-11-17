@@ -32,7 +32,6 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::capture::input::producer_index;
 use crate::protocol::{
     QpcTick, SourceSequence,
     ipc::{ConfigureInput, CoreToHelper, HelperFailure, HelperFailureStage, HelperToCore,
@@ -66,8 +65,8 @@ pub(super) struct InputHelper {
     process: OwnedHandle,
     // Closing this is the last-resort process cleanup, including parent crash.
     job: Option<OwnedHandle>,
-    received: [Option<(SourceSequence, QpcTick)>; 4],
-    progress: [Option<QpcTick>; 4],
+    received: [Option<(SourceSequence, QpcTick)>; Producer::ALL.len()],
+    progress: [Option<QpcTick>; Producer::ALL.len()],
     registration: Option<InputRegistration>,
 }
 
@@ -128,7 +127,7 @@ impl InputHelper {
             return Err(native_error("Resume the input helper"));
         }
         Ok(Self {
-            channel, wake, process, job: Some(job), received: [None; 4], progress: [None; 4], registration: None,
+            channel, wake, process, job: Some(job), received: [None; Producer::ALL.len()], progress: [None; Producer::ALL.len()], registration: None,
         })
     }
 
@@ -174,9 +173,9 @@ impl InputHelper {
             HelperToCore::DeviceArrived { receipt, .. } | HelperToCore::DeviceRemoved { receipt, .. } =>
                 (Producer::DeviceNotifications, receipt.sequence, receipt.sequence, receipt.qpc, receipt.qpc),
             HelperToCore::Gap(gap) => (gap.producer, gap.first_sequence, gap.last_sequence, gap.first_qpc, gap.last_qpc),
-            HelperToCore::Environment(_) => return Ok(()),
+            HelperToCore::Environment(_) | HelperToCore::OptionalUnavailable { .. } => return Ok(()),
             HelperToCore::Progress(progress) => {
-                let bound = &mut self.progress[producer_index(progress.producer)];
+                let bound = &mut self.progress[progress.producer.index()];
                 if bound.is_some_and(|previous| progress.before_qpc < previous) {
                     return Err(HelperError::Protocol(PacketError::InvalidRecord("An input progress bound moved backward.")));
                 }
@@ -185,7 +184,7 @@ impl InputHelper {
             }
             _ => return Err(HelperError::Protocol(PacketError::InvalidRecord("Input status used the evidence queue."))),
         };
-        let index = producer_index(producer);
+        let index = producer.index();
         let previous = &mut self.received[index];
         let expected = previous.map_or(Some(1), |(seq, _)| seq.0.checked_add(1));
         if Some(first.0) != expected || first_qpc.0 < 0
@@ -259,9 +258,10 @@ impl InputHelper {
 
 impl Drop for InputHelper {
     fn drop(&mut self) {
+        // Closing the job kills the helper; the wait for its exit keeps the
+        // ordinary cleanup bound (A2).
         drop(self.job.take());
-        const INFINITE_WAIT: u32 = u32::MAX;
-        unsafe { WaitForSingleObject(self.process.as_raw_handle(), INFINITE_WAIT) };
+        unsafe { WaitForSingleObject(self.process.as_raw_handle(), CLEANUP_WAIT.as_millis() as u32) };
     }
 }
 
@@ -340,7 +340,7 @@ impl Drop for HandleList {
 
 impl HelperError {
     pub(super) fn runtime_failure(
-        self, at: crate::protocol::SessionTimeUs,
+        self, at: crate::protocol::SessionTimeUs, first_missing: crate::protocol::SessionTimeUs,
     ) -> crate::session::windows::InputFailure {
         use crate::{
             package::{diagnostics::{Failure, FailureComponent}, metadata::InputBlindReason},
@@ -349,12 +349,12 @@ impl HelperError {
         let (reason, native_code) = match &self {
             Self::UnexpectedExit(code) => (InputBlindReason::HelperExited, Some(*code as i32)),
             Self::ShutdownTimeout => (InputBlindReason::HelperCleanupFailed, None),
-            Self::SuspectedHookLoss(_) => (InputBlindReason::HookUnavailable, None),
-            Self::ProducerStalled(_) => (InputBlindReason::ProducerProgressStalled, None),
+            Self::SuspectedHookLoss(_) => (InputBlindReason::HookLost, None),
+            Self::ProducerStalled(_) => (InputBlindReason::ProducerStall, None),
             Self::Reported(failure) => {
                 let reason = match failure.stage {
-                    HelperFailureStage::RawInputRegistration => InputBlindReason::RawInputRegistrationLost,
-                    HelperFailureStage::KeyboardHook | HelperFailureStage::PointerHook => InputBlindReason::HookUnavailable,
+                    HelperFailureStage::RawInputRegistration => InputBlindReason::RegistrationLost,
+                    HelperFailureStage::KeyboardHook | HelperFailureStage::PointerHook => InputBlindReason::HookLost,
                     _ => InputBlindReason::HelperCommunicationFailed,
                 };
                 (reason, failure.native_code)
@@ -366,7 +366,7 @@ impl HelperError {
         let operation = error.stage;
         let mut failure = Failure::new(FailureComponent::InputHelper, operation, native_code);
         failure.raw_input_registration = error.raw_input_registration;
-        InputFailure { operation, at, reason, failure }
+        InputFailure { operation, at, first_missing: first_missing.min(at), reason, failure }
     }
 }
 
@@ -414,6 +414,7 @@ impl From<HelperError> for super::ProbeError {
                 Producer::DeviceNotifications => "Input device-notification progress stalled",
                 Producer::KeyboardHook => "Keyboard-hook progress stalled",
                 Producer::PointerHook => "Mouse-hook progress stalled",
+                Producer::OptionalHid => "Optional HID progress stalled",
             }, None),
         };
         Self {
@@ -421,6 +422,7 @@ impl From<HelperError> for super::ProbeError {
             source: code.map(|code| Error::from_hresult(HRESULT::from_win32(code as u32))),
             journal: None,
             raw_input_registration,
+            owner: Some(crate::package::diagnostics::FailureComponent::InputHelper),
         }
     }
 }

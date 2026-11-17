@@ -41,7 +41,8 @@ impl RecorderBootstrap {
         let parent = Process::current()?;
         installation.verify_recorder(&parent)?;
         let (sid, server_logon) = verify_medium(&parent)?;
-        let args = LaunchArguments { parent: parent.instance(), rendezvous: Secret::random()? };
+        let mut args = Box::new(LaunchArguments { parent: parent.instance(), rendezvous: Secret::zeroed() });
+        args.rendezvous.randomize()?;
         let scope = Scope { attempt, session, release: installation.release.id, qpc_frequency: frequency()? };
         check_consent(cancel, consent_deadline)?;
         let bootstrap_pipe = Pipe::bootstrap(&args.bootstrap(), &sid, &server_logon)?;
@@ -79,8 +80,7 @@ impl RecorderBootstrap {
         bootstrap.receive_seal(&mut pipes[0], Transition::Authenticated, deadline)?;
         deadline.check()?;
         parent.ensure_live()?;
-        let Bootstrap { connection, scope, .. } = bootstrap;
-        Ok(Authenticated { scope, connection, child, pipes })
+        Ok(Authenticated { scope: bootstrap.scope.clone(), connection: bootstrap.connection, child, pipes })
     }
 }
 
@@ -93,7 +93,7 @@ fn check_consent(cancel: &Cancellation, until: Instant) -> Result<()> {
 /// The fixed shell inputs own all installation guards through the shell call.
 pub struct LaunchRequest {
     installation: Arc<Installation>,
-    args: LaunchArguments,
+    args: Box<LaunchArguments>,
 }
 
 impl LaunchRequest {

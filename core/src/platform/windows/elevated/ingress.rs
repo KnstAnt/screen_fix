@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
 
 use screen_fix_elevated::{Failure, Result};
-use screen_fix_protocol::{QpcTick, ipc::{FocusAtReceipt, Producer, ProducerGap, ProducerProgress,
+use screen_fix_protocol::{QpcTick, ipc::{FocusAtReceipt, GapCause, Producer, ProducerGap, ProducerProgress,
     elevated::{ContextEvidence, GrantedInput, InputEvidence, VisitBinding, runtime::{ContextProducer, Observation}},
 }};
 
 const CAPACITY: usize = 256;
-const PRODUCERS: [Producer; 4] = [Producer::RawInput, Producer::DeviceNotifications, Producer::KeyboardHook, Producer::PointerHook];
+const PRODUCERS: usize = Producer::ALL.len();
 
 #[derive(Clone, Copy)]
 pub(in crate::platform::windows) struct InputCertificate {
@@ -14,13 +14,15 @@ pub(in crate::platform::windows) struct InputCertificate {
     pub opening: QpcTick,
     pub before: QpcTick,
     pub context_before: QpcTick,
-    pub producers: [ProducerProgress; 4],
+    pub producers: [ProducerProgress; PRODUCERS],
 }
 
 pub(in crate::platform::windows) struct InputStagingLoss {
     pub visit: VisitBinding,
     pub before: QpcTick,
-    pub gaps: [Option<ProducerGap>; 4],
+    pub gaps: [Option<ProducerGap>; PRODUCERS],
+    /// Records with valid framing whose payload the Recorder could not decode.
+    pub malformed: u64,
 }
 
 pub(super) struct Ingress {
@@ -28,8 +30,8 @@ pub(super) struct Ingress {
     focus: FocusAtReceipt,
     sample: QpcTick,
     opening: QpcTick,
-    sources: [Option<QpcTick>; 4],
-    source_positions: [u64; 4],
+    sources: [Option<QpcTick>; PRODUCERS],
+    source_positions: [u64; PRODUCERS],
     context: Option<(QpcTick, QpcTick)>,
     context_position: [u64; 5],
     lost_notice_before: Option<QpcTick>,
@@ -37,13 +39,16 @@ pub(super) struct Ingress {
     pending: VecDeque<InputEvidence>,
     delivered_before: QpcTick,
     pressure: Option<InputStagingLoss>,
+    /// Native gaps before the resync sample, carried from the previous
+    /// binding. They only count (E3).
+    prior: [Option<ProducerGap>; PRODUCERS],
 }
 
 impl Ingress {
     pub(super) fn new(visit: VisitBinding, focus: FocusAtReceipt, sample: QpcTick, opening: QpcTick) -> Self {
-        Self { visit, focus, sample, opening, sources: [None; 4], source_positions: [0; 4], context: None,
+        Self { visit, focus, sample, opening, sources: [None; PRODUCERS], source_positions: [0; PRODUCERS], context: None,
             context_position: [0, 1, 0, 0, 0], lost_notice_before: None, uncovered_before: None,
-            pending: VecDeque::with_capacity(CAPACITY), delivered_before: sample, pressure: None }
+            pending: VecDeque::with_capacity(CAPACITY), delivered_before: sample, pressure: None, prior: [None; PRODUCERS] }
     }
 
     pub(super) fn visit(&self) -> VisitBinding { self.visit }
@@ -58,12 +63,16 @@ impl Ingress {
     }
 
     pub(super) fn input(
-        &mut self, item: GrantedInput, now: QpcTick, restrict: impl Fn(VisitBinding, QpcTick),
+        &mut self, mut item: GrantedInput, now: QpcTick, restrict: impl Fn(VisitBinding, QpcTick),
     ) -> Result<()> {
         if self.visit != item.visit { return Ok(()); }
+        // A gap crossing the resync sample keeps its part after the sample (E3).
+        if let InputEvidence::Gap(gap) = &mut item.evidence && gap.first_qpc <= self.sample && gap.last_qpc > self.sample {
+            gap.first_qpc = QpcTick(self.sample.0 + 1);
+        }
         if let InputEvidence::Progress(progress) = item.evidence {
             if progress.before_qpc > now { return Err(Failure::Protocol); }
-            let source = &mut self.sources[crate::capture::input::producer_index(progress.producer)];
+            let source = &mut self.sources[progress.producer.index()];
             if source.is_some_and(|before| before > progress.before_qpc) { return Err(Failure::Protocol); }
             *source = Some(progress.before_qpc);
             return Ok(());
@@ -73,20 +82,23 @@ impl Ingress {
         match &item.evidence {
             InputEvidence::Input(input) => {
                 if input.receipt.qpc <= self.opening { return Ok(()); }
-                if input.sample.producer() == Producer::RawInput && !input.foreground_at_receipt.is_some_and(|foreground| {
+                if input.sample.producer().raw_input() && !input.foreground_at_receipt.is_some_and(|foreground| {
                     foreground.window == self.visit.foreground.window && foreground.process == self.visit.foreground.process
                         && foreground.focus == Some(self.focus)
                 }) {
                     return Err(Failure::Protocol);
                 }
             }
-            InputEvidence::Gap(gap) if gap.first_qpc <= self.sample => return Ok(()),
+            InputEvidence::Gap(gap) if gap.first_qpc <= self.sample => {
+                merge_gap(&mut self.prior[gap.producer.index()], *gap);
+                return Ok(());
+            }
             _ if at <= self.sample => return Ok(()),
             _ => {}
         }
         let first = first_receipt(&item.evidence);
         if first < self.delivered_before || producer(&item.evidence).is_some_and(|producer| {
-            self.sources[crate::capture::input::producer_index(producer)].is_some_and(|before| first < before)
+            self.sources[producer.index()].is_some_and(|before| first < before)
         }) {
             self.restrict(first, &restrict);
             return Err(Failure::Witness);
@@ -96,22 +108,16 @@ impl Ingress {
         }
         let range = input_range(&item.evidence);
         if let Some(gap) = range {
-            let position = &mut self.source_positions[crate::capture::input::producer_index(gap.producer)];
+            let position = &mut self.source_positions[gap.producer.index()];
             if gap.first_sequence.0 <= *position { return Err(Failure::Protocol); }
             *position = gap.last_sequence.0;
         }
         if self.pending.len() == CAPACITY || self.pressure.is_some() {
             self.restrict(first, &restrict);
-            let loss = self.pressure.get_or_insert(InputStagingLoss { visit: self.visit, before: first, gaps: [None; 4] });
+            let loss = self.pressure.get_or_insert(InputStagingLoss { visit: self.visit, before: first, gaps: [None; PRODUCERS], malformed: 0 });
             loss.before = loss.before.min(first);
             if let Some(gap) = range {
-                let slot = &mut loss.gaps[crate::capture::input::producer_index(gap.producer)];
-                if let Some(existing) = slot {
-                    existing.last_sequence = existing.last_sequence.max(gap.last_sequence);
-                    existing.last_qpc = existing.last_qpc.max(gap.last_qpc);
-                } else {
-                    *slot = Some(gap);
-                }
+                merge_gap(&mut loss.gaps[gap.producer.index()], gap);
             }
             return Ok(());
         }
@@ -119,7 +125,24 @@ impl Ingress {
         Ok(())
     }
 
+    /// A record with valid framing whose payload did not decode (E3, §6.2).
+    /// It is counted like staging pressure; its receipt is unknown, so coverage
+    /// closes at the least delivered producer progress, the earliest receipt
+    /// the record could have had.
+    pub(super) fn malformed(&mut self, restrict: impl Fn(VisitBinding, QpcTick)) {
+        let least = self.sources.iter().map(|bound| bound.unwrap_or(self.sample)).min().unwrap_or(self.sample);
+        let first = least.max(self.delivered_before);
+        self.restrict(first, &restrict);
+        let loss = self.pressure.get_or_insert(InputStagingLoss { visit: self.visit, before: first, gaps: [None; PRODUCERS], malformed: 0 });
+        loss.before = loss.before.min(first);
+        loss.malformed = loss.malformed.saturating_add(1);
+    }
+
     pub(super) fn take_pressure(&mut self) -> Option<InputStagingLoss> { self.pressure.take() }
+
+    pub(super) fn take_prior(&mut self) -> impl Iterator<Item = ProducerGap> + '_ {
+        self.prior.iter_mut().filter_map(Option::take)
+    }
 
     pub(super) fn pressure_before(&self) -> Option<QpcTick> { self.pressure.as_ref().map(|loss| loss.before) }
 
@@ -185,10 +208,10 @@ impl Ingress {
     }
 
     pub(super) fn certificate(&self, cutoff: Option<QpcTick>) -> Option<InputCertificate> {
-        let bounds = |producer| self.sources[crate::capture::input::producer_index(producer)]
+        let bounds = |producer: Producer| self.sources[producer.index()]
             .map(|before_qpc| ProducerProgress { producer, before_qpc });
-        let [raw, devices, hook_key, hook_pointer] = PRODUCERS.map(bounds);
-        let producers = [raw?, devices?, hook_key?, hook_pointer?];
+        let [raw, devices, hook_key, hook_pointer, optional_hid] = Producer::ALL.map(bounds);
+        let producers = [raw?, devices?, hook_key?, hook_pointer?, optional_hid?];
         let context_before = self.context_before()?;
         let before = producers.iter().fold(cutoff.map_or(context_before, |cut| context_before.min(cut)),
             |before, progress| before.min(progress.before_qpc));
@@ -206,6 +229,11 @@ impl Ingress {
         self.visit == visit && completed >= self.delivered_before
     }
 
+    /// Every record still waiting for a certificate.
+    pub(super) fn drain(&mut self) -> impl Iterator<Item = InputEvidence> + '_ {
+        self.pending.drain(..)
+    }
+
     pub(super) fn take(&mut self, certificate: InputCertificate, mut accept: impl FnMut(InputEvidence)) {
         if certificate.visit != self.visit || certificate.before <= self.delivered_before { return; }
         for _ in 0..self.pending.len() {
@@ -220,13 +248,24 @@ impl Ingress {
     }
 }
 
+fn merge_gap(slot: &mut Option<ProducerGap>, gap: ProducerGap) {
+    if let Some(existing) = slot {
+        existing.first_sequence = existing.first_sequence.min(gap.first_sequence);
+        existing.last_sequence = existing.last_sequence.max(gap.last_sequence);
+        existing.first_qpc = existing.first_qpc.min(gap.first_qpc);
+        existing.last_qpc = existing.last_qpc.max(gap.last_qpc);
+    } else {
+        *slot = Some(gap);
+    }
+}
+
 fn producer(item: &InputEvidence) -> Option<Producer> {
     match item {
         InputEvidence::Input(sample) => Some(sample.sample.producer()),
         InputEvidence::DeviceArrived { .. } | InputEvidence::DeviceRemoved { .. } => Some(Producer::DeviceNotifications),
         InputEvidence::Progress(progress) => Some(progress.producer),
         InputEvidence::Gap(gap) => Some(gap.producer),
-        InputEvidence::Environment(_) => None,
+        InputEvidence::Environment(_) | InputEvidence::OptionalUnavailable { .. } => None,
     }
 }
 
@@ -237,7 +276,7 @@ fn input_range(item: &InputEvidence) -> Option<ProducerGap> {
         InputEvidence::Gap(gap) => return Some(*gap),
         _ => return None,
     };
-    Some(ProducerGap { producer: producer(item)?, first_sequence: receipt.sequence, last_sequence: receipt.sequence,
+    Some(ProducerGap { producer: producer(item)?, cause: GapCause::Overflow, first_sequence: receipt.sequence, last_sequence: receipt.sequence,
         first_qpc: receipt.qpc, last_qpc: receipt.qpc })
 }
 
@@ -253,6 +292,7 @@ fn last_receipt(item: &InputEvidence) -> QpcTick {
         InputEvidence::Input(input) => input.receipt.qpc,
         InputEvidence::DeviceArrived { receipt, .. } | InputEvidence::DeviceRemoved { receipt, .. } => receipt.qpc,
         InputEvidence::Environment(state) => state.observed_qpc,
+        InputEvidence::OptionalUnavailable { observed_qpc, .. } => *observed_qpc,
         InputEvidence::Progress(progress) => progress.before_qpc,
         InputEvidence::Gap(gap) => gap.last_qpc,
     }

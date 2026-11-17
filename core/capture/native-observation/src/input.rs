@@ -25,7 +25,7 @@ use windows_sys::{
         Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
         System::{
             Performance::QueryPerformanceFrequency,
-            Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW},
+            Registry::{HKEY_CURRENT_USER, REG_DWORD, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW},
             Threading::{CreateEventW, GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
                 PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
                 ProcessPowerThrottling, SetProcessInformation, WaitForMultipleObjects,
@@ -153,9 +153,10 @@ pub fn run_scoped(
         Ok(raw) => raw,
         Err(error) => { let _ = hooks.stop(); return Err(error); }
     };
+    let [touchpad, multi_axis] = raw.optional();
     let ready = InputRegistration {
         raw_keyboard: true, raw_pointer: true,
-        keyboard_hook: true, pointer_hook: true, pen_hid: settings.pen_hid, hook_timeout,
+        keyboard_hook: true, pointer_hook: true, pen_hid: settings.pen_hid, touchpad, multi_axis, hook_timeout,
     };
     let handles = [owner.as_raw_handle(), control_wake.as_raw_handle(), data_wake.as_raw_handle()];
     let result = output.ready(ready).and_then(|()| collect(output, &handles, &mut raw, &mut hooks));
@@ -221,21 +222,24 @@ fn owner_exited(owner: BorrowedHandle<'_>) -> Result<bool, NativeError> {
     }
 }
 
+/// The value is a REG_SZ or a REG_DWORD; Windows applies at most 1,000 ms (INP-12).
 fn hook_timeout() -> HookTimeoutEvidence {
     let mut bytes = [0_u16; 32];
     let mut size = size_of::<[u16; 32]>() as u32;
+    let mut kind = 0;
     let result = unsafe {
         RegGetValueW(HKEY_CURRENT_USER, w!("Control Panel\\Desktop"), w!("LowLevelHooksTimeout"),
-            RRF_RT_REG_SZ, std::ptr::null_mut(), bytes.as_mut_ptr().cast(), &mut size)
+            RRF_RT_REG_SZ | RRF_RT_REG_DWORD, &mut kind, bytes.as_mut_ptr().cast(), &mut size)
     };
-    match result {
-        ERROR_FILE_NOT_FOUND => HookTimeoutEvidence::Absent,
-        ERROR_SUCCESS => {
+    let milliseconds = match (result, kind) {
+        (ERROR_FILE_NOT_FOUND, _) => return HookTimeoutEvidence::Absent,
+        (ERROR_SUCCESS, REG_DWORD) if size == 4 => Some(u32::from(bytes[0]) | (u32::from(bytes[1]) << 16)),
+        (ERROR_SUCCESS, REG_SZ) => {
             let len = bytes.iter().position(|unit| *unit == 0).unwrap_or(bytes.len());
-            String::from_utf16(&bytes[..len]).ok().and_then(|text| text.trim().parse().ok())
-                .map(HookTimeoutEvidence::ConfiguredMs).unwrap_or(HookTimeoutEvidence::Unavailable)
+            String::from_utf16(&bytes[..len]).ok().and_then(|text| text.trim().parse::<u32>().ok())
         }
-        _ => HookTimeoutEvidence::Unavailable,
-    }
+        _ => None,
+    };
+    milliseconds.map_or(HookTimeoutEvidence::Unavailable, |value| HookTimeoutEvidence::ConfiguredMs(value.min(1_000)))
 }
 

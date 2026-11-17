@@ -19,7 +19,7 @@ use crate::{
 use super::{context::identity::{ProcessHandle, WindowProcess, approved_image_index, approved_index, canonical_executable, image_name}, display};
 
 pub(crate) fn approved_windows(approved: &ExecutableIdentity) -> Result<ApprovedWindows, CaptureError> {
-    let displays = display::enumerate()?;
+    let displays = display::enumerate().map_err(|error| error.into_error(crate::package::diagnostics::FailureComponent::Capture))?;
     let approved = std::slice::from_ref(approved);
     let mut scan = WindowScan { approved, candidates: process_candidates(approved)?, bounds: Vec::new(), incomplete: false };
     // EnumWindows calls back synchronously on this thread and does not retain the pointer.
@@ -278,5 +278,5 @@ pub(super) fn window_coverage(config: &ResolvedCaptureConfig) -> crate::session:
 }
 
 fn error(message: &'static str) -> CaptureError {
-    CaptureError::backend("Verify approved application readiness", None, message.into())
+    CaptureError::owned(crate::package::diagnostics::FailureComponent::Context, "Verify approved application readiness", None, message.into())
 }

@@ -10,8 +10,8 @@ use screen_fix_elevated::{Failure, READINESS, Result};
 use screen_fix_protocol::{
     AdmissionEpoch, AttemptId, GeometryId, QpcFrequency, QpcTick, SessionId,
     ipc::{EnvironmentChange, FocusAtReceipt, InputRegistration, ProducerGap, elevated::{
-        ContextEvidence, HeldSnapshot, InputEvidence, Query, ReadBinding, ReadUnavailable, VisitBinding,
-        runtime::{Control, CoverageLoss, CoverageReason, ContextGap, ContextProducer, EnvironmentRevision, IdentityClaim, Observation, Revocation, Status},
+        ContextEvidence, HeldSnapshot, InputEvidence, Query, ReadBinding, ReadUnavailable, VisitBinding, WindowInstance,
+        runtime::{Control, CoverageLoss, CoverageReason, ContextGap, ContextGapCause, ContextProducer, EnvironmentRevision, IdentityClaim, Observation, Revocation, Status},
     }},
 };
 
@@ -58,6 +58,16 @@ pub(in crate::platform::windows) struct Selector<'a> {
     geometry_revision: Option<u64>,
     stopping: bool,
     stage: SourceStage,
+    /// A standard-helper registration check requested before returning to
+    /// the standard source: its preparation epoch, the suspend sequence, the
+    /// request QPC and the deadline (E4).
+    helper_check: Option<(AdmissionEpoch, u64, QpcTick, Instant)>,
+    /// QPC of the last tick that found the attached collector live (E4).
+    host_live: QpcTick,
+    /// The collector was lost across a system sleep. It is not relaunched in
+    /// this attempt (A2, A5): elevated foregrounds stay with the standard
+    /// source and are suppressed (E4).
+    collector_lost: bool,
 }
 
 pub(in crate::platform::windows) enum ContextDelivery {
@@ -92,20 +102,65 @@ impl<'a> Selector<'a> {
             opened: None, ingress: None, observations: VecDeque::new(), interrupted: None,
             closed_before: None, focus_deadline: None, loss: None, recovered: None, context_pressure: None, optional_dropped: None,
             environment_sequence: 0, geometry_revision: None, stopping: false, stage: SourceStage::Foreground,
+            helper_check: None, host_live: QpcTick(0), collector_lost: false,
         })
     }
 
     pub(in crate::platform::windows) fn tick(
         &mut self, session: &WorkerSession, topology: &Topology,
-        active: Option<AdmissionBoundary>, mut changes: u32, ordinary_available: bool,
+        active: Option<AdmissionBoundary>, changes: u32, ordinary: Option<QpcTick>,
     ) -> Result<()> {
-        if self.stopping || session.stop_requested() { return Ok(()); }
+        let result = self.service(session, topology, active, changes, ordinary);
+        let Some(host) = self.host.as_ref() else { return result; };
+        if host.peer.live() {
+            if result.is_ok() { self.host_live = clock::qpc().map_err(|_| Failure::Supervisor)?; }
+            return result;
+        }
+        // E4: a collector lost across a system sleep is G, not a source
+        // failure. Its lease, watchdogs and suspend cleanup bound run on QPC,
+        // which includes the sleep. It needs a known resume after the host
+        // was last live, and no elevated epoch open. There is no relaunch.
+        let marks = session.suspend_marks();
+        let slept = marks.resume.is_some_and(|resume| self.host_live <= resume);
+        if result.is_err() && slept && active.is_none_or(|open| !session.elevated_epoch(open.epoch)) {
+            self.host = None;
+            self.pending = None;
+            self.collector_lost = true;
+            self.stage = SourceStage::Foreground;
+            session.report_health(crate::package::outcome::HealthKind::ElevatedSourceSleep,
+                crate::package::diagnostics::Failure::new(crate::package::diagnostics::FailureComponent::ElevatedSource,
+                    "Keep the elevated collector across a system sleep", None), None, false);
+            return Ok(());
+        }
+        result
+    }
+
+    fn service(
+        &mut self, session: &WorkerSession, topology: &Topology,
+        active: Option<AdmissionBoundary>, mut changes: u32, ordinary: Option<QpcTick>,
+    ) -> Result<()> {
         let observed = clock::qpc().map_err(|_| Failure::Supervisor)?;
+        if self.stopping || session.stop_requested() {
+            // The lease stays renewed until `stop` has sent Control::Stop (E4).
+            // A failed renewal surfaces as the actual Stop outcome there.
+            let progress = self.progress(session, observed)?;
+            if let Some(host) = self.host.as_mut() { let _ = host.renew_lease(progress); }
+            return Ok(());
+        }
         self.withdraw_unauthorized(session, observed)?;
         let foreground = self.classifier.poll()?;
+        let classified_failure = match foreground {
+            Some(Foreground::Unknown(error)) => error.source_failure(),
+            _ => None,
+        };
+        let elevated = matches!(foreground, Some(Foreground::Elevated(_)));
+        // D-8 A: only a failure of the current grant's required access fails
+        // the source; any other unclassifiable foreground stays suppressed.
+        let grant_target = self.classifier.current.as_ref().map(|(proof, _)| WindowInstance::from(*proof))
+            .is_some_and(|proof| self.host.as_ref().and_then(Host::binding).is_some_and(|visit| visit.foreground == proof));
         if (active.is_some() || session.source_preparation().is_some_and(|pending| pending.startup.is_none()))
-            && let Some(Foreground::Unknown(error)) = foreground
-            && let Some(failure) = error.source_failure()
+            && grant_target
+            && let Some(failure) = classified_failure
         {
             if session.fail_classified_source(failure) {
                 self.frames.clear();
@@ -113,7 +168,6 @@ impl<'a> Selector<'a> {
             }
             return Ok(());
         }
-        let elevated = matches!(foreground, Some(Foreground::Elevated(_)));
         if self.geometry_revision.is_some_and(|revision| topology.revision() != revision) {
             changes |= EnvironmentChange::Display.bit();
             self.geometry_revision = None;
@@ -129,13 +183,13 @@ impl<'a> Selector<'a> {
                         self.host.as_mut().ok_or(Failure::Protocol)?.revoke(observed)?;
                     }
                 }
-            } else if elevated {
+            } else if elevated && !self.collector_lost {
                 self.frames.clear();
                 session.require_source_change(open.epoch);
             }
         }
         if changes != 0 && self.host.is_some() {
-            self.environment(changes, observed, session.segment_deadline())?;
+            self.environment(changes, observed, session.cleanup_deadline())?;
         }
         self.poll_launch(session)?;
         self.poll_host(session, active)?;
@@ -169,7 +223,7 @@ impl<'a> Selector<'a> {
                 Some(Foreground::Ordinary(approval) | Foreground::Elevated(approval)) => Some(approval.clone()),
                 _ => None,
             };
-            self.prepare(session, topology, phase, candidate, progress, ordinary_available)?;
+            self.prepare(session, topology, phase, candidate, progress, ordinary)?;
         }
         if let Some(host) = self.host.as_mut() {
             host.maintain(progress)?;
@@ -335,6 +389,11 @@ impl<'a> Selector<'a> {
         self.ingress.as_mut().and_then(Ingress::take_pressure)
     }
 
+    /// Native gaps of the previous binding delivered before the resync sample (E3).
+    pub(in crate::platform::windows) fn take_prior_gaps(&mut self) -> Vec<ProducerGap> {
+        self.ingress.as_mut().map(|ingress| ingress.take_prior().collect()).unwrap_or_default()
+    }
+
     pub(in crate::platform::windows) fn take_context_pressure(&mut self) -> Option<ContextGap> {
         self.context_pressure.take()
     }
@@ -356,12 +415,26 @@ impl<'a> Selector<'a> {
         self.pending.is_some() || self.ticket.is_some()
     }
 
+    /// E1: a pending or unknown classification is not inactivity. The
+    /// standard source stays selected until the selector decides that the
+    /// collector is required, which also latches the source change; approval
+    /// is decided per receipt by the gate.
     pub(in crate::platform::windows) fn ordinary_allowed(&self) -> bool {
-        if self.stopping { return false; }
-        match self.classifier.current.as_ref().map(|(_, value)| value) {
-            Some(Foreground::Ordinary(approval)) => approval.still_current(),
-            Some(Foreground::Unapproved) => true,
-            _ => false,
+        !self.stopping && !self.source_latched()
+    }
+
+    /// The selector decided that the collector is required, which latches the
+    /// source change (E1). Stopping is not a latch: its standard records stay
+    /// inventory-only.
+    pub(in crate::platform::windows) fn source_latched(&self) -> bool {
+        !self.stopping && !self.collector_lost && matches!(self.classifier.current.as_ref().map(|(_, value)| value), Some(Foreground::Elevated(_)))
+    }
+
+    /// Records of an interrupted visit past its certified prefix (E1). They
+    /// never reach the Receiver; the caller counts them.
+    pub(in crate::platform::windows) fn take_uncertified(&mut self, visit: VisitBinding, lost: impl FnMut(InputEvidence)) {
+        if let Some(ingress) = self.ingress.as_mut().filter(|ingress| ingress.visit() == visit) {
+            ingress.drain().for_each(lost);
         }
     }
 
@@ -380,7 +453,8 @@ impl<'a> Selector<'a> {
         }
         self.stopping = true;
         self.ticket.take();
-        self.host.take();
+        // The host stays attached: `stop` still sends Control::Stop and waits
+        // for the terminal acknowledgement within the cleanup bound (E4).
         self.opened = None;
         retire_observations(&mut self.observations, &mut self.closed_before, self.frames, self.session_status);
         self.focus_deadline = None;
@@ -457,10 +531,10 @@ impl<'a> Selector<'a> {
 
     fn prepare(
         &mut self, session: &WorkerSession, topology: &Topology, phase: SourcePreparation,
-        candidate: Option<ForegroundApproval>, progress: Progress, ordinary_available: bool,
+        candidate: Option<ForegroundApproval>, progress: Progress, ordinary: Option<QpcTick>,
     ) -> Result<()> {
         if self.ticket.is_some() { return Ok(()); }
-        let ready = self.host.as_ref().map(Host::armed).transpose()?.flatten();
+        let ready = self.host.as_mut().map(|host| host.armed(progress.now)).transpose()?.flatten();
         if let (Some((registration, focus)), Some(pending)) = (ready, &self.pending) {
             if !required_registration(registration, session.config().profile().pen_hid()) {
                 return Err(Failure::RequiredRegistration);
@@ -485,11 +559,33 @@ impl<'a> Selector<'a> {
         }
         if self.pending.is_none() {
             let Some(approval) = phase.startup.or(candidate) else { return Ok(()); };
+            // A lost collector is not relaunched (E4); this candidate waits.
+            if approval.elevated().is_some() && self.collector_lost { return Ok(()); }
             if approval.elevated().is_none() {
-                if !ordinary_available {
+                let Some(checked) = ordinary else {
                     self.stage = SourceStage::Readiness;
                     return Err(Failure::StandardHelperUnavailable);
+                };
+                // Returning from the collector needs a registration check of
+                // the standard helper newer than this switch request (E4).
+                if self.host.is_some() {
+                    // The request belongs to this switch; a sleep restarts it.
+                    let suspends = session.suspend_marks().sequence;
+                    let current = self.helper_check.filter(|(epoch, sequence, _, _)| *epoch == phase.epoch && *sequence == suspends);
+                    let (_, _, requested, until) = match current {
+                        Some(check) => check,
+                        None => {
+                            session.request_input_check();
+                            *self.helper_check.insert((phase.epoch, suspends, progress.now, Instant::now() + READINESS))
+                        }
+                    };
+                    if checked <= requested {
+                        if Instant::now() < until { return Ok(()); }
+                        self.stage = SourceStage::Readiness;
+                        return Err(Failure::StandardHelperUnavailable);
+                    }
                 }
+                self.helper_check = None;
                 session.source_ready(phase.epoch, approval, None);
                 return Ok(());
             }
@@ -555,12 +651,19 @@ impl<'a> Selector<'a> {
                 }
                 let dispatched = ticket.was_dispatched();
                 self.ticket.take();
+                // The shell call returned when binding began or consent failed (E4).
+                let returned = authenticating || matches!(&result, Err(Failure::ConsentDenied | Failure::ConsentLaunch));
+                session.update_elevated_evidence(|evidence| {
+                    evidence.consent_dispatched |= dispatched;
+                    evidence.consent_returned |= returned;
+                });
                 if matches!(&result, Err(Failure::Cancelled)) && !dispatched
                     && self.pending.as_ref().is_some_and(|pending| !session.source_authorized(pending.epoch))
                 {
                     self.pending = None;
                     self.launched = false;
                     self.withdrawn_dispatch = true;
+                    session.update_elevated_evidence(|evidence| evidence.withdrawn_launches = evidence.withdrawn_launches.saturating_add(1));
                     return Ok(());
                 }
                 let (authenticated, until) = result?;
@@ -588,6 +691,7 @@ impl<'a> Selector<'a> {
             self.pending = None;
             self.launched = false;
             self.withdrawn_dispatch = true;
+            session.update_elevated_evidence(|evidence| evidence.withdrawn_launches = evidence.withdrawn_launches.saturating_add(1));
         }
         Ok(())
     }
@@ -606,8 +710,8 @@ impl<'a> Selector<'a> {
             match host.status(status, now)? {
                 Change::None => {}
                 Change::Configured => session.update_elevated_evidence(|evidence| evidence.configured = true),
-                Change::Registered { binding, at, registration } => {
-                    session.elevated_registration(binding.epoch, at, registration);
+                Change::Registered { binding, at, registration, held } => {
+                    session.elevated_registration(binding.epoch, at, registration, held);
                 }
                 Change::ReadRejected { read, reason } => {
                     if self.opened.is_some_and(|opened| opened.binding == read.visit) {
@@ -643,9 +747,11 @@ impl<'a> Selector<'a> {
                     self.focus_deadline = None;
                     match reason {
                         Revocation::Requested | Revocation::Environment | Revocation::Stopping => {}
+                        // D-8 A: a target change is a transition. Before admission the
+                        // candidate is prepared again within its readiness budget.
                         Revocation::Foreground | Revocation::Focus | Revocation::LateNotice
                             if session.started() => session.require_source_change(binding.epoch),
-                        Revocation::Foreground | Revocation::Focus | Revocation::LateNotice => return Err(Failure::TargetChanged),
+                        Revocation::Foreground | Revocation::Focus | Revocation::LateNotice => {}
                         reason => return Err(revocation_failure(reason).ok_or(Failure::Protocol)?),
                     }
                 }
@@ -654,7 +760,23 @@ impl<'a> Selector<'a> {
                     keep_earlier(&mut self.closed_before, before);
                     self.focus_deadline = None;
                     self.geometry_revision = None;
-                    if active.is_none() && self.pending.as_ref().is_some_and(|pending| pending.epoch == binding.epoch) {
+                    // Before admission the startup candidate stays pending (D-8 A).
+                    if active.is_none() && session.started()
+                        && self.pending.as_ref().is_some_and(|pending| pending.epoch == binding.epoch)
+                    {
+                        session.abandon_source_preparation(binding.epoch);
+                        self.pending = None;
+                    }
+                }
+                // D-8 A: a target change during preparation is a transition.
+                // Before admission the candidate is prepared again within its
+                // readiness budget. After admission the preparation is dropped,
+                // the epoch stays closed and the foreground is classified fresh.
+                Change::PrepareRejected { binding } => {
+                    if session.started() {
+                        if active.is_some() || self.pending.as_ref().is_none_or(|pending| pending.epoch != binding.epoch) {
+                            return Err(Failure::Protocol);
+                        }
                         session.abandon_source_preparation(binding.epoch);
                         self.pending = None;
                     }
@@ -695,7 +817,7 @@ impl<'a> Selector<'a> {
                                 gap.last_qpc = gap.last_qpc.max(notice.observed_qpc);
                             } else {
                                 self.context_pressure = Some(ContextGap { visit: notice.visit, producer: ContextProducer::Notices,
-                                    first_position: position, last_position: position, first_qpc: notice.first_qpc,
+                                    cause: ContextGapCause::Overflow, first_position: position, last_position: position, first_qpc: notice.first_qpc,
                                     last_qpc: notice.observed_qpc });
                             }
                         }
@@ -724,7 +846,10 @@ impl<'a> Selector<'a> {
                 let Some(record) = host.peer.input()? else { break; };
                 let now = clock::qpc().map_err(|_| Failure::Supervisor)?;
                 if let Some(ingress) = &mut self.ingress {
-                    ingress.input(record, now, restrict)?;
+                    match record {
+                        Some(record) => ingress.input(record, now, restrict)?,
+                        None => ingress.malformed(restrict),
+                    }
                 }
             }
         }
@@ -813,7 +938,10 @@ fn drain_closed_lanes(
         };
         let Some(ingress) = ingress.as_mut() else { continue; };
         let now = clock::qpc().map_err(|_| Failure::Supervisor)?;
-        ingress.input(record, now, restrict)?;
+        match record {
+            Some(record) => ingress.input(record, now, restrict)?,
+            None => ingress.malformed(restrict),
+        }
     }
     if let Some(before) = ingress.as_ref().and_then(Ingress::pressure_before) {
         keep_earlier(cutoff, before);

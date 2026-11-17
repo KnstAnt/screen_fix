@@ -3,8 +3,8 @@
 
 use std::{
     sync::{
-        Arc, RwLock,
-        atomic::{AtomicU64, Ordering::{Acquire, Release}},
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Release}},
         mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     },
     thread,
@@ -62,6 +62,7 @@ impl Read {
             TextClassification::Editable => TextTarget::Editable,
             TextClassification::NonText => TextTarget::NonText,
             TextClassification::PossiblySensitive => TextTarget::PossiblySensitive,
+            TextClassification::TypingUnknown => TextTarget::TypingUnknown,
         };
         Self { request, started: native.started, completed: native.completed,
             status: native.status, target, element: native.element, scoped_dpi: None }
@@ -98,6 +99,10 @@ struct Gate {
     revision: Arc<AtomicU64>,
     pointer_id: AtomicU64,
     blocks: RwLock<Blocks>,
+    /// The client failed to open; every request resolves as unavailable.
+    unopened: AtomicBool,
+    /// When the worker left its queue wait; none while it waits.
+    busy_since: Mutex<Option<Instant>>,
 }
 
 impl Gate {
@@ -144,9 +149,15 @@ impl Worker {
         let worker_gate = Arc::clone(&gate);
         let thread = thread::Builder::new().name("context-uia-mta".into()).spawn(move || {
             let mut client = Client::open(Arc::clone(&worker_gate.revision)).ok();
+            worker_gate.unopened.store(client.is_none(), Release);
             let invalid = |request| worker_gate.invalid(request);
+            let set_busy = |busy: bool| if let Ok(mut since) = worker_gate.busy_since.lock() {
+                *since = busy.then(Instant::now);
+            };
             loop {
+                set_busy(false);
                 let request = queued.recv_timeout(Duration::from_millis(50));
+                set_busy(true);
                 if let Some(client) = &mut client {
                     client.remove_stale_subscription(&invalid);
                 }
@@ -216,8 +227,23 @@ impl Worker {
         self.commits.take()
     }
 
+    pub fn commit_losses(&self) -> Vec<screen_fix_native_observation::uia_commits::CommitLoss> {
+        self.commits.take_loss()
+    }
+
     pub fn running(&self) -> bool {
         !self.thread.is_finished()
+    }
+
+    /// The worker cannot serve UI Automation: its client did not open, or
+    /// one call has been blocked longer than two transaction timeouts
+    /// (§6.2 row 14). Requests keep resolving per request.
+    pub fn failure(&self) -> Option<&'static str> {
+        if self.gate.unopened.load(Acquire) {
+            return Some("UI Automation client open");
+        }
+        let blocked = self.gate.busy_since.lock().ok()?.is_some_and(|since| since.elapsed() >= 2 * DEADLINE);
+        blocked.then_some("UI Automation call blocked")
     }
 }
 

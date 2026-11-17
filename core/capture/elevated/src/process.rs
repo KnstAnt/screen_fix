@@ -94,13 +94,19 @@ impl Process {
     }
 
     pub(crate) fn matches_win32_image(&self, claimed: &str) -> Result<bool> {
-        let mut path = [0u16; 4096];
+        let actual = self.win32_image()?;
+        Ok(!actual.is_empty() && actual.iter().copied().eq(claimed.encode_utf16()))
+    }
+
+    /// The Win32 image path Windows reports for this live process.
+    pub(crate) fn win32_image(&self) -> Result<Vec<u16>> {
+        let mut path = vec![0u16; 4096];
         let mut length = path.len() as u32;
         if unsafe { QueryFullProcessImageNameW(self.raw(), 0, path.as_mut_ptr(), &mut length) } == 0 {
             return Err(Failure::ProcessIdentity);
         }
-        let actual = path.get(..length as usize).ok_or(Failure::ProcessIdentity)?;
-        Ok(!actual.is_empty() && actual.iter().copied().eq(claimed.encode_utf16()))
+        path.truncate(length as usize);
+        Ok(path)
     }
 
     pub(crate) fn session(&self) -> Result<u32> {

@@ -195,6 +195,11 @@ impl Converter {
         Ok(Some(PendingSample { texture, fence_value }))
     }
 
+    /// The software encoder path reads converted frames back to memory.
+    pub(super) fn software(&self) -> bool {
+        self.staging.is_some()
+    }
+
     pub fn ready(&self, sample: &PendingSample) -> Result<bool, ProbeError> {
         let value = unsafe { self.fence.GetCompletedValue() };
         if value == u64::MAX {

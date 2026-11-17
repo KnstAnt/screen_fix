@@ -9,7 +9,7 @@ use screen_fix_native_observation::input::{
 };
 use screen_fix_protocol::ipc::{
     CoreToHelper, EnvironmentState, HelperFailureStage, HelperToCore,
-    InputRegistration, Producer, shared::HelperEndpoint,
+    InputRegistration, PacketError, Producer, shared::HelperEndpoint,
 };
 use windows_sys::Win32::{
     Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation,
@@ -128,12 +128,19 @@ impl Collector for Output {
         {
             state.changes |= pending.changes;
         }
-        if !self.channel.send(&record).map_err(|_| transport_error())? {
-            if let HelperToCore::Environment(state) = record {
-                self.environment = Some(state);
-            } else {
-                self.losses.drop_record(&record);
+        match self.channel.send(&record) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let HelperToCore::Environment(state) = record {
+                    self.environment = Some(state);
+                } else {
+                    self.losses.drop_record(&record);
+                }
             }
+            // A record that cannot be encoded is skipped with a counted gap.
+            // Only a corrupt queue breaks the transport.
+            Err(PacketError::InvalidCursor) => return Err(transport_error()),
+            Err(_) => self.losses.malformed_record(&record),
         }
         Ok(())
     }
@@ -141,14 +148,17 @@ impl Collector for Output {
 
 impl Output {
     fn flush_loss(&mut self, producer: Producer) -> Result<bool, NativeError> {
-        let Some(gap) = self.losses.pending(producer) else { return Ok(true) };
-        let sent = self.channel.send(&HelperToCore::Gap(gap)).map_err(|_| transport_error())?;
-        if sent { self.losses.clear(producer); }
-        Ok(sent)
+        while let Some(gap) = self.losses.front(producer) {
+            if !self.channel.send(&HelperToCore::Gap(gap)).map_err(|_| transport_error())? {
+                return Ok(false);
+            }
+            self.losses.delivered(producer);
+        }
+        Ok(true)
     }
 
     fn flush_pending(&mut self) -> Result<bool, NativeError> {
-        for producer in [Producer::RawInput, Producer::DeviceNotifications, Producer::KeyboardHook, Producer::PointerHook] {
+        for producer in Producer::ALL {
             if !self.flush_loss(producer)? { return Ok(false); }
         }
         if let Some(state) = self.environment {

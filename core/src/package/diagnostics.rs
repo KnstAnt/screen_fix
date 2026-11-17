@@ -8,7 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{CapturePace, ClipboardMode, ResolvedCaptureConfig},
@@ -19,17 +19,43 @@ use super::{StreamSummary, metadata::{CaptureCounters, PngCounters, VideoCounter
 
 static REPORT_SERIAL: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, Copy, Serialize)]
+/// The owner that reported a failure. It is always the reporting owner,
+/// never a fixed default (§6.2 rule 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureComponent {
     Interface,
     Controller,
-    WindowsCapture,
+    /// Windows capability, display and per-monitor capture owners.
+    Capture,
     Video,
     InputHelper,
+    /// The Recorder's input receiver and context loop.
+    Receiver,
+    /// Approved-application and foreground evidence.
+    Context,
+    Stills,
     ElevatedSource,
     PackageMetadata,
     Journal,
+}
+
+impl FailureComponent {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Interface => "interface",
+            Self::Controller => "session controller",
+            Self::Capture => "screen capture",
+            Self::Video => "video",
+            Self::InputHelper => "input helper",
+            Self::Receiver => "input receiver",
+            Self::Context => "context",
+            Self::Stills => "stills",
+            Self::ElevatedSource => "elevated collector",
+            Self::PackageMetadata => "package metadata",
+            Self::Journal => "journal",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -53,6 +79,24 @@ impl Failure {
 
     pub fn new(component: FailureComponent, operation: &'static str, native_code: Option<i32>) -> Self {
         Self { component, operation, stream: None, native_code, source: None, raw_input_registration: None }
+    }
+
+    pub(crate) fn component(&self) -> FailureComponent {
+        self.component
+    }
+
+    /// The same owner reported the same operation and native result.
+    pub(crate) fn same_cause(&self, other: &Self) -> bool {
+        self.component == other.component && self.operation == other.operation && self.stream == other.stream
+            && self.native_code == other.native_code && self.source == other.source
+    }
+
+    pub(crate) fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    pub(crate) fn native_code(&self) -> Option<i32> {
+        self.native_code
     }
 
     pub(crate) fn journal(operation: &'static str, stream: StreamId, native_code: Option<i32>) -> Self {
@@ -85,8 +129,15 @@ pub(crate) struct DiagnosticContext {
     pub(crate) source_evidence: Option<super::metadata::SourceEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) failed_manifest_published: Option<bool>,
+    /// Causes recorded after the primary cause, in report order (§6.2 rule 2).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) additional_failures: Vec<Failure>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) omitted_fault_reports: u64,
+}
+
+fn is_zero(count: &u64) -> bool {
+    *count == 0
 }
 
 impl DiagnosticContext {
@@ -112,6 +163,7 @@ impl DiagnosticContext {
             source_evidence: None,
             failed_manifest_published: None,
             additional_failures: Vec::new(),
+            omitted_fault_reports: 0,
         }
     }
 }

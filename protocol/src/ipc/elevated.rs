@@ -11,7 +11,7 @@ use crate::{
 };
 
 use super::{
-    CollectedInput, DeviceDescriptor, EnvironmentState, FocusAtReceipt, ProcessInstance,
+    CollectedInput, DeviceDescriptor, EnvironmentState, FocusAtReceipt, OptionalCollection, ProcessInstance,
     ProducerGap, ProducerProgress, Receipt,
 };
 
@@ -118,6 +118,9 @@ pub struct HeldSnapshot {
     pub physical_buttons: [bool; 5],
     pub swapped: bool,
     pub caps_lock: bool,
+    /// Every virtual key whose physical high bit was set, as a 256-bit set
+    /// (bit `vk % 64` of word `vk / 64`).
+    pub keys: [u64; 4],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +151,9 @@ pub enum TextClassification {
     Editable,
     NonText,
     PossiblySensitive,
+    /// A non-password field whose Text range reports a mixed read-only
+    /// attribute: keys are published with unknown typing (D-4c).
+    TypingUnknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +246,8 @@ pub struct CommitEvidence {
     pub binding: ReadBinding,
     pub receipt_qpc: QpcTick,
     pub text: CommitText,
+    /// False for invalid UTF-16; `text` then carries U+FFFD replacements.
+    pub valid: bool,
 }
 
 /// Input payloads reuse the ordinary evidence and exclusive producer progress.
@@ -252,6 +260,8 @@ pub enum InputEvidence {
     Environment(EnvironmentState),
     Progress(ProducerProgress),
     Gap(ProducerGap),
+    /// The registration check no longer finds an optional collection (E3).
+    OptionalUnavailable { collection: OptionalCollection, observed_qpc: QpcTick },
 }
 
 /// A fixed observation kind selects the local native algorithm. The source

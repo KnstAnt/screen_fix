@@ -16,9 +16,15 @@ struct Channel {
     latest_callback: Option<SessionTimeUs>,
     first_miss: Option<(SessionTimeUs, QpcTick)>,
     lost_before: Option<QpcTick>,
+    /// The first missed receipt of the confirming streak.
+    lost_at: Option<SessionTimeUs>,
     transitions: u8,
     unavailable: bool,
     report: bool,
+    /// The hook's latest `producer_stall` interval, `[start, end)`, open while
+    /// `end` is none. A raw transition received inside it has no hook partner
+    /// because of the stall (§6.2 row 11, G), not because the hook was lost.
+    stall: Option<(SessionTimeUs, Option<SessionTimeUs>)>,
 }
 
 impl HookHealth {
@@ -29,6 +35,35 @@ impl HookHealth {
             _ => return,
         };
         channel.latest_callback = Some(at);
+    }
+
+    /// The hook producer's progress stalled from `start`. Transitions received
+    /// from then on are not evidence of hook loss until the stall ends, so a
+    /// transient stall never escalates through INP-12 (§6.2 rule 1).
+    pub fn begin_stall(&mut self, producer: Producer, start: SessionTimeUs) {
+        if let Some(channel) = self.channel(producer) {
+            channel.stall = Some((start, None));
+            channel.clear_streak();
+        }
+    }
+
+    /// The hook producer's progress advanced again at `end`: the stall
+    /// interval closes and counting restarts from an empty streak.
+    pub fn end_stall(&mut self, producer: Producer, end: SessionTimeUs) {
+        if let Some(channel) = self.channel(producer)
+            && let Some((start, None)) = channel.stall
+        {
+            channel.stall = Some((start, Some(end)));
+            channel.clear_streak();
+        }
+    }
+
+    fn channel(&mut self, producer: Producer) -> Option<&mut Channel> {
+        match producer {
+            Producer::KeyboardHook => Some(&mut self.keyboard),
+            Producer::PointerHook => Some(&mut self.pointer),
+            _ => None,
+        }
     }
 
     pub fn note_correlation(&mut self, input: &CorrelatedInput) {
@@ -43,6 +78,9 @@ impl HookHealth {
             return;
         }
         let at = first.time.recv_t_us;
+        if channel.stall.is_some_and(|(start, end)| at >= start && end.is_none_or(|end| at < end)) {
+            return;
+        }
         if input.correlation != Correlation::Unmatched {
             channel.clear_streak();
             return;
@@ -57,6 +95,7 @@ impl HookHealth {
         if channel.transitions >= TRANSITIONS_WITHOUT_HOOK {
             channel.unavailable = true;
             channel.lost_before = Some(first_miss.1);
+            channel.lost_at = Some(first_miss.0);
             channel.report = true;
         }
     }
@@ -66,8 +105,29 @@ impl HookHealth {
         self.pointer.clear_streak();
     }
 
+    /// A reopening starts without stall intervals; its receipts follow them.
+    pub fn reopen(&mut self) {
+        for channel in [&mut self.keyboard, &mut self.pointer] {
+            channel.clear_streak();
+            channel.stall = None;
+        }
+    }
+
     pub fn pointer_lost(&self) -> bool { self.pointer.unavailable }
     pub fn keyboard_lost(&self) -> bool { self.keyboard.unavailable }
+
+    /// The first missed receipt of the hook's loss, the start of its blind interval.
+    pub fn lost_at(&self, producer: Producer) -> Option<SessionTimeUs> {
+        match producer {
+            Producer::KeyboardHook => self.keyboard.lost_at,
+            Producer::PointerHook => self.pointer.lost_at,
+            _ => None,
+        }
+    }
+
+    pub fn first_lost_at(&self) -> Option<SessionTimeUs> {
+        self.keyboard.lost_at.into_iter().chain(self.pointer.lost_at).min()
+    }
 
     pub fn lost_before(&self) -> Option<QpcTick> {
         self.keyboard.lost_before.into_iter().chain(self.pointer.lost_before).min()

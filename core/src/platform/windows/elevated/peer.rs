@@ -15,7 +15,9 @@ use crate::config::ResolvedProfile;
 
 use super::super::clock;
 
-const WRITE_BUDGET: Duration = Duration::from_millis(100);
+/// The lease bound: a command or query write fails the connection only when
+/// the collector stopped reading for a whole lease, not on a brief stall (E3).
+const WRITE_BUDGET: Duration = Duration::from_secs(1);
 const IDLE_READ: Duration = Duration::from_secs(86_400);
 const CONTROL_QUEUE: usize = 8;
 const QUERY_QUEUE: usize = 8;
@@ -91,7 +93,8 @@ pub(super) struct Peer {
     command: SyncSender<Commands>,
     query: SyncSender<(ContextCommand, Instant)>,
     status: Queue<Status>,
-    input: Queue<GrantedInput>,
+    /// `None` is an input record whose payload did not decode (E3).
+    input: Queue<Option<GrantedInput>>,
     observation: Queue<(QpcTick, Observation)>,
 }
 
@@ -146,10 +149,12 @@ impl Peer {
         let (commands, command_queue) = mpsc::sync_channel::<Commands>(CONTROL_QUEUE);
         let (queries, query_queue) = mpsc::sync_channel::<(ContextCommand, Instant)>(QUERY_QUEUE);
         let result = (|| {
-            let status = read_lane(&connection, status, STATUS_QUEUE, "elevated-control-read", Some(until), false, Ok)?;
+            let status = read_lane(&connection, status, STATUS_QUEUE, "elevated-control-read", Some(until), false,
+                |record| record.ok_or(Failure::Protocol))?;
+            // An undecodable input record is counted, not transport-fatal (§6.2).
             let input = read_lane(&connection, input, INPUT_QUEUE, "elevated-input-read", None, true, Ok)?;
             let observation = read_lane(&connection, observation, OBSERVATION_QUEUE, "elevated-context-read", None, true,
-                |record| Ok((clock::qpc().map_err(|_| Failure::Supervisor)?, record)))?;
+                |record| Ok((clock::qpc().map_err(|_| Failure::Supervisor)?, record.ok_or(Failure::Protocol)?)))?;
             spawn(&connection, "elevated-control-write", move || {
                 command.send(&Control::Configure { approved_count, pen_hid }, until)?;
                 for key in keys {
@@ -209,7 +214,10 @@ impl Peer {
 
     pub(super) fn status(&self) -> Result<Option<Status>> { poll(&self.status, &self.connection) }
 
-    pub(super) fn input(&self) -> Result<Option<GrantedInput>> { poll(&self.input, &self.connection) }
+    /// No lane failed and the connection was not cancelled.
+    pub(super) fn live(&self) -> bool { self.connection.check().is_ok() }
+
+    pub(super) fn input(&self) -> Result<Option<Option<GrantedInput>>> { poll(&self.input, &self.connection) }
 
     pub(super) fn observation(&self) -> Result<Option<(QpcTick, Observation)>> { poll(&self.observation, &self.connection) }
 }
@@ -233,7 +241,7 @@ fn spawn(
 
 fn read_lane<T: Record + Send + 'static, U: Send + 'static>(
     connection: &Arc<Connection>, mut source: Receiver<T>, capacity: usize, name: &'static str,
-    mut first_deadline: Option<Instant>, backpressure: bool, received: impl Fn(T) -> Result<U> + Send + 'static,
+    mut first_deadline: Option<Instant>, backpressure: bool, received: impl Fn(Option<T>) -> Result<U> + Send + 'static,
 ) -> Result<Queue<U>> {
     let (send, receive) = mpsc::sync_channel(capacity);
     let live = Arc::clone(connection);
@@ -241,7 +249,7 @@ fn read_lane<T: Record + Send + 'static, U: Send + 'static>(
         // An idle lane is valid. Connection cancellation, peer exit and the
         // controller's stage/coverage deadlines remain independently active.
         let deadline = first_deadline.take().unwrap_or_else(|| Instant::now() + IDLE_READ);
-        let mut record = received(source.receive(deadline)?)?;
+        let mut record = received(source.receive_lossy(deadline)?)?;
         loop {
             match send.try_send(record) {
                 Ok(()) => break,

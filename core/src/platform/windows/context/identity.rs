@@ -40,16 +40,9 @@ struct CachedApproval {
     not_before: Option<QpcTick>,
 }
 
+/// The collector applies the same canonical rule to its own proof (E6).
 pub(in crate::platform::windows) fn canonical_executable(path: &Path) -> Option<ExecutableIdentity> {
-    let resolved = path.canonicalize().ok()?;
-    if !resolved.is_file() {
-        return None;
-    }
-    let text = resolved.to_str()?;
-    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
-        return ExecutableIdentity::new(&format!(r"\\{unc}")).ok();
-    }
-    ExecutableIdentity::new(text.strip_prefix(r"\\?\").unwrap_or(text)).ok()
+    ExecutableIdentity::new(&screen_fix_native_observation::identity::canonical_image(path.to_str()?)?).ok()
 }
 
 pub(in crate::platform::windows) fn image_name(path: &str) -> Option<String> {
@@ -94,6 +87,9 @@ pub(in crate::platform::windows) struct ApprovedProcesses<'a> {
     requests: SyncSender<ProcessInstance>,
     results: Receiver<(ProcessInstance, Result<Option<usize>, ResolutionError>)>,
     stop: Arc<AtomicBool>,
+    /// The resolver is blocked or gone (§6.2 row 15). Alternative spellings
+    /// stay approval-unknown; no replacement thread is started.
+    lost: bool,
 }
 
 impl<'a> ApprovedProcesses<'a> {
@@ -119,10 +115,16 @@ impl<'a> ApprovedProcesses<'a> {
             }
         }).map_err(|error| super::super::mp4::io_error("Start executable path resolution", error))?;
         Ok(Self { profile, cache: VecDeque::with_capacity(PROCESS_CACHE),
-            pending: VecDeque::with_capacity(PROCESS_CACHE), requests, results, stop })
+            pending: VecDeque::with_capacity(PROCESS_CACHE), requests, results, stop, lost: false })
     }
 
-    pub fn poll(&mut self) -> Result<(), super::ProbeError> {
+    /// Apply resolver results. Returns the number of spellings that could not
+    /// be canonicalized (each foreground stays approval-unknown, G) and
+    /// whether the resolver was newly lost (L-auxiliary). Neither fails the
+    /// context loop (C3).
+    pub fn poll(&mut self) -> (u64, bool) {
+        let mut unresolved = 0_u64;
+        let mut lost = false;
         loop {
             match self.results.try_recv() {
                 Ok((proof, index)) => {
@@ -133,22 +135,30 @@ impl<'a> ApprovedProcesses<'a> {
                         // Unknown identity grants nothing and is not a mismatch.
                         Err(ResolutionError::ProcessIdentityUnavailable) => continue,
                         Err(ResolutionError::ExecutablePathUnavailable) => {
-                            return Err(super::unavailable("The executable path could not be resolved"));
+                            unresolved = unresolved.saturating_add(1);
+                            self.remember(proof, None, None);
+                            continue;
                         }
                     };
-                    let not_before = index.map(|_| super::clock::qpc()).transpose()?;
+                    // Without a receipt bound, the approval admits no earlier evidence.
+                    let not_before = index.map(|_| super::clock::qpc().unwrap_or(QpcTick(i64::MAX)));
                     self.remember(proof, index, not_before);
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    return Err(super::unavailable("The executable path resolution owner exited unexpectedly"));
+                    lost = true;
+                    break;
                 }
             }
         }
-        if self.pending.iter().any(|(_, submitted)| submitted.elapsed() >= RESOLUTION_WAIT) {
-            return Err(super::unavailable("Executable path resolution exceeded its bounded wait"));
+        // A resolution pending past the bound means the resolver is blocked in a native call.
+        lost |= self.pending.iter().any(|(_, submitted)| submitted.elapsed() >= RESOLUTION_WAIT);
+        if lost {
+            self.pending.clear();
         }
-        Ok(())
+        let newly = lost && !self.lost;
+        self.lost |= lost;
+        (unresolved, newly)
     }
 
     fn remember(&mut self, proof: ProcessInstance, index: Option<usize>, not_before: Option<QpcTick>) {
@@ -176,7 +186,7 @@ impl<'a> ApprovedProcesses<'a> {
         let index = match approval_match(&process.image_path()?, self.profile.approved_identities()).ok()? {
             ApprovalMatch::Resolved(index) => index,
             ApprovalMatch::Canonicalize(_) => {
-                if self.pending.len() < PROCESS_CACHE
+                if !self.lost && self.pending.len() < PROCESS_CACHE
                     && !self.pending.iter().any(|(pending, _)| *pending == proof)
                     && self.requests.try_send(proof).is_ok()
                 {

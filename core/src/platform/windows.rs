@@ -36,11 +36,15 @@ use crate::{
     package::{
         ArtifactKind,
         diagnostics::{DiagnosticContext, DiagnosticSnapshot, FailureComponent, ReportOutcome},
-        journal::{FinalHealth, JournalError, JournalIngress, JournalOwner, JournalStep},
-        metadata::{AttemptLayout, CaptureDisposition, InputBlind, MetadataOwner, MonitorCapture, MonitorVideo, PackageError, PngCounters},
+        journal::{FinalHealth, HealthRecord, JournalError, JournalIngress, JournalLimits, JournalOwner, JournalStep},
+        outcome::HealthKind,
+        metadata::{AttemptFaults, AttemptLayout, CaptureDisposition, ImageFile, InputBlind, MetadataOwner, MonitorCapture, MonitorVideo, PackageError, PngCounters, UndeliveredFrames},
     },
     protocol::StreamId,
-    session::{DiskPreflight, SessionOutcome, SessionResult, StartupStep, windows::{Admission, InputFailure, MAX_INPUT_FAILURES, VideoFailure, WorkerSession, disk}},
+    session::{
+        DiskPreflight, SessionOutcome, SessionResult, StartupStep, fault::FaultReport,
+        windows::{Admission, InputFailure, MAX_INPUT_FAILURES, VideoFailure, WorkerSession, disk},
+    },
 };
 
 use windows::{
@@ -66,6 +70,8 @@ pub(crate) struct ProbeError {
     source: Option<core::Error>,
     journal: Option<JournalError>,
     raw_input_registration: Option<crate::protocol::ipc::RawInputRegistrationMismatch>,
+    /// The owner that first attributed the error at its boundary.
+    owner: Option<FailureComponent>,
 }
 
 impl fmt::Display for ProbeError {
@@ -81,24 +87,35 @@ impl fmt::Display for ProbeError {
     }
 }
 
-impl From<ProbeError> for crate::CaptureError {
-    fn from(error: ProbeError) -> Self {
-        let mut error = error;
-        if let Some(journal) = error.journal.take() {
-            return Self::journal(error.stage, journal);
+impl ProbeError {
+    /// Attribute the error to the owner whose boundary it crosses first. A
+    /// deeper owner's attribution is kept.
+    pub(crate) fn owned_by(mut self, owner: FailureComponent) -> Self {
+        self.owner.get_or_insert(owner);
+        self
+    }
+
+    /// The error of the owner at this boundary, unless a deeper owner attributed it.
+    pub(crate) fn to_error(&self, owner: FailureComponent) -> CaptureError {
+        if let Some(journal) = &self.journal {
+            return CaptureError::journal(self.stage, journal);
         }
-        let code = error.source.as_ref().map(|source| source.code().0);
-        Self::backend(error.stage, code, error.to_string())
-            .with_raw_input_registration(error.raw_input_registration)
+        let code = self.source.as_ref().map(|source| source.code().0);
+        CaptureError::owned(self.owner.unwrap_or(owner), self.stage, code, self.to_string())
+            .with_raw_input_registration(self.raw_input_registration)
+    }
+
+    pub(crate) fn into_error(self, owner: FailureComponent) -> CaptureError {
+        self.to_error(owner)
     }
 }
 
 fn stage<T>(result: core::Result<T>, name: &'static str) -> Result<T, ProbeError> {
-    result.map_err(|source| ProbeError { stage: name, source: Some(source), journal: None, raw_input_registration: None })
+    result.map_err(|source| ProbeError { stage: name, source: Some(source), journal: None, raw_input_registration: None, owner: None })
 }
 
 pub(crate) fn unavailable(stage: &'static str) -> ProbeError {
-    ProbeError { stage, source: None, journal: None, raw_input_registration: None }
+    ProbeError { stage, source: None, journal: None, raw_input_registration: None, owner: None }
 }
 
 struct Apartment;
@@ -153,7 +170,7 @@ fn record_with_disk(worker: &WorkerSession, preflight: DiskPreflight, disk: disk
     let mut monitor_epochs = Vec::new();
     let output: Result<RecordedVideo, CaptureError> = (|| {
         let mut stream = |id| {
-            let (ingress, owner) = spawn_journal(worker, id, layout.path(ArtifactKind::Journal(id)))?;
+            let (ingress, owner) = spawn_journal(worker, id, layout.path(ArtifactKind::Journal(id)), JournalLimits::for_stream(id))?;
             owners.push((id, owner));
             Ok::<_, CaptureError>(ingress)
         };
@@ -161,13 +178,26 @@ fn record_with_disk(worker: &WorkerSession, preflight: DiskPreflight, disk: disk
         let context = stream(StreamId::Context)?;
         let frames = stream(StreamId::Frames)?;
         let stills = stream(StreamId::Stills)?;
-        record(worker, &layout, input, context, video::Frames::new(frames), stills, &mut monitor_capture, &mut monitor_epochs)
-            .map_err(Into::into)
+        let frames = video::Frames::spawn(worker, frames.into_verified())
+            .map_err(|error| error.into_error(FailureComponent::Journal))?;
+        record(worker, &layout, input, context, frames, stills, &mut monitor_capture, &mut monitor_epochs)
+            .map_err(|error| error.into_error(FailureComponent::Controller))
     })();
 
-    let (video, png, mut producer_prefix, mut failure, required_finalization_failure) = match output {
-        Ok(output) => (output.video, output.png, output.input, output.failure.map(Into::into), output.required_finalization_failure),
-        Err(error) => (Vec::new(), None, None, Some(error), None),
+    // Every attempt failure found here joins the controller's fault log, which
+    // retains the first cause (§6.2 rule 2) and decides the attempt outcome.
+    let report = |error: &CaptureError| worker.report_fault(FaultReport::attempt(error));
+    let (video, png, images, mut producer_prefix, required_finalization_failure, undelivered_frames) = match output {
+        Ok(output) => {
+            if let Some(error) = output.failure {
+                report(&error.into_error(FailureComponent::Controller));
+            }
+            (output.video, output.png, output.images, output.input, output.required_finalization_failure, output.undelivered_frames)
+        }
+        Err(error) => {
+            report(&error);
+            (Vec::new(), None, None, None, None, Vec::new())
+        }
     };
     let mut streams = BTreeMap::new();
     let mut context_owner = None;
@@ -178,47 +208,61 @@ fn record_with_disk(worker: &WorkerSession, preflight: DiskPreflight, disk: disk
         }
         match owner.finish() {
             Ok(summary) => { streams.insert(stream, summary); }
-            Err(error) => {
-                let error = CaptureError::from(package_journal_error(error));
-                if failure.as_ref().is_none_or(|previous| previous.native_code.is_none()) {
-                    failure = Some(error);
-                }
-            }
+            Err(error) => report(&package_journal_error(error).into_error(FailureComponent::Journal)),
         }
     }
+    // Capture health reported after the input loop's last hand-off, for example
+    // a still write failure while the PNG worker drains at Stop, is written with
+    // the final context rows (§6.1). Without a context journal it is counted.
+    let late_health = producer_prefix.as_ref().map_or_else(Vec::new, |prefix| worker.health_after(prefix.health_seen));
+    let mut omitted_health = worker.omitted_health();
+    if context_owner.is_none() {
+        omitted_health = omitted_health.saturating_add(late_health.len() as u64);
+    }
     if let Some(owner) = context_owner {
+        // A failure detected before the session clock started has no receipt
+        // on the common timeline. It is reported only through diagnostics.
         let mut health: Vec<_> = worker.video_failures_after(0).into_iter().filter(|entry| {
             producer_prefix.as_ref().is_none_or(|prefix| !prefix.video_health.contains(&entry.monitor))
-        }).map(|entry| FinalHealth { at: entry.at, failure: entry.failure, monitor: Some(entry.monitor), blind: None }).collect();
-        let source_error = worker.source_failure().map(CaptureError::elevated);
-        if let Some(error) = source_error.as_ref().or(failure.as_ref()) {
-            health.push(FinalHealth { at: worker.session_time(), failure: error.failure(), monitor: None, blind: None });
+        }).filter_map(|entry| entry.at.map(|at| FinalHealth { record: video_failure_health(entry.failure, entry.monitor, at), blind: None }))
+            .collect();
+        health.extend(late_health.into_iter().map(|record| FinalHealth { record, blind: None }));
+        if let Some(error) = worker.fault_outcome().error && let Some(at) = worker.session_time() {
+            health.push(FinalHealth {
+                record: HealthRecord {
+                    kind: HealthKind::AttemptFailure, failure: error.failure(), detected: at, first_affected: None,
+                    ongoing: false, monitor: None, count: None,
+                },
+                blind: None,
+            });
         }
         for input in worker.input_failures() {
             worker.update_standard_evidence(|evidence| { evidence.blind_reason.get_or_insert(input.reason); });
             let end_t_us = producer_prefix.as_ref().and_then(|prefix| prefix.cutoff)
                 .map(|boundary| boundary.time).or_else(|| worker.session_time()).unwrap_or(input.at);
-            let blind = InputBlind { start_t_us: input.at.min(end_t_us), end_t_us, reason: input.reason };
-            health.push(FinalHealth { at: Some(input.at), failure: input.failure, monitor: None, blind: Some(blind) });
+            let blind = InputBlind { start_t_us: input.first_missing.min(end_t_us), end_t_us, reason: input.reason };
+            health.push(FinalHealth {
+                record: HealthRecord {
+                    kind: HealthKind::InputFailure, failure: input.failure, detected: input.at,
+                    first_affected: Some(blind.start_t_us), ongoing: true, monitor: None, count: None,
+                },
+                blind: Some(blind),
+            });
             if let Some(capture) = producer_prefix.as_mut().and_then(|prefix| prefix.capture.as_mut()) {
                 capture.blind.get_or_insert(blind);
             }
         }
         match owner.finish_with_health(health) {
             Ok(summary) => { streams.insert(StreamId::Context, summary); }
-            Err(error) => {
-                let error = CaptureError::from(package_journal_error(error));
-                if failure.as_ref().is_none_or(|previous| previous.native_code.is_none()) {
-                    failure = Some(error);
-                }
-            }
+            Err(error) => report(&package_journal_error(error).into_error(FailureComponent::Journal)),
         }
     }
     diagnostics.input_registration = worker.input_registration();
     metadata.set_input_capture(
         producer_prefix.as_mut().and_then(|prefix| prefix.capture.take()), diagnostics.input_registration,
     );
-    if failure.is_none() && let Some(prefix) = producer_prefix {
+    metadata.set_image_inventory(images, producer_prefix.as_mut().and_then(|prefix| prefix.cursors.take()));
+    if !worker.attempt_failed() && let Some(prefix) = producer_prefix {
         let matches_prefix = |id, prefix: &input::ReceiptPrefix| streams.get(&id).is_some_and(|summary| {
             summary.data_rows == prefix.queued && summary.last_data_receipt == prefix.last_queued
         });
@@ -228,34 +272,25 @@ fn record_with_disk(worker: &WorkerSession, preflight: DiskPreflight, disk: disk
             || !matches_prefix(StreamId::Context, &prefix.context)
             || !frames_match
         {
-            failure = Some(unavailable("The written journals do not match the admitted producer prefixes").into());
-        } else if let Some(cutoff) = prefix.cutoff {
-            failure = worker.complete_prefix(cutoff).err().map(Into::into);
+            report(&unavailable("The written journals do not match the admitted producer prefixes").into_error(FailureComponent::Journal));
+        } else if let Some(cutoff) = prefix.cutoff
+            && let Err(error) = worker.complete_prefix(cutoff)
+        {
+            report(&error.into_error(FailureComponent::Controller));
         }
     }
     drop(disk);
     if let Some(operation) = required_finalization_failure {
-        let error = CaptureError::from(unavailable(operation));
-        if failure.is_some() {
-            diagnostics.additional_failures.push(error.failure());
-        } else {
-            failure = Some(error);
-        }
+        report(&unavailable(operation).into_error(FailureComponent::Video));
     }
-    if let Some(source) = worker.source_failure() {
-        if let Some(previous) = failure.replace(CaptureError::elevated(source))
-            && previous.source_failure() != Some(source)
-        {
-            diagnostics.additional_failures.push(previous.failure());
-        }
-    }
-    if let Some(operation) = worker.controller_failure() {
-        failure.get_or_insert_with(|| unavailable(operation).into());
-    }
+    let faults = worker.fault_outcome();
+    diagnostics.additional_failures.extend(faults.additional);
+    diagnostics.omitted_fault_reports = faults.omitted;
+    let failure = faults.error;
     let failed_step = failure.as_ref().map(|error| error.operation);
     let frame_count = video.iter().map(|monitor| monitor.encoded).sum::<u64>();
     let unavailable_video = config.monitors().iter().filter(|selection| {
-        !video.iter().any(|monitor| monitor.monitor == selection.id && !monitor.unavailable && monitor.encoded != 0)
+        !video.iter().any(|monitor| monitor.monitor == selection.id && monitor.usable())
     }).count();
     diagnostics.streams = streams.clone();
     diagnostics.capture = monitor_capture.iter().map(|mode| (mode.geometry.id.monitor, mode.counters.clone())).collect();
@@ -268,7 +303,8 @@ fn record_with_disk(worker: &WorkerSession, preflight: DiskPreflight, disk: disk
     metadata.set_clock(worker.attempt_clock());
     metadata.set_png(png);
     let publication = metadata.finish_recording(
-        failed_step, streams, video, || worker.stop_deadline(), || worker.authorize_complete_publication(),
+        AttemptFaults { failed_step, activity_losses: faults.activity_losses, omitted_health, undelivered_frames }, streams, video,
+        || worker.stop_deadline(), || worker.authorize_complete_publication(),
     ).map_err(package_error);
     if let Some(mut error) = failure {
         let saved = matches!(&publication, Ok(CaptureDisposition::Failed));
@@ -276,14 +312,19 @@ fn record_with_disk(worker: &WorkerSession, preflight: DiskPreflight, disk: disk
         if let Err(publication_error) = publication {
             diagnostics.additional_failures.push(publication_error.failure());
         }
-        if saved && error.source_failure().is_some_and(|source| source.admitted) {
-            error = error.with_retained_recording(layout.root().to_owned(), frame_count);
+        // Any admitted attempt, standard or elevated, reports its package as
+        // an admitted failure rather than as a start error (M1-01).
+        if worker.started() || error.source_failure().is_some_and(|source| source.admitted) {
+            error = error.with_retained_recording(layout.root().to_owned(), frame_count, saved);
         }
         return Err(error.with_context(diagnostics));
     }
     let outcome = match publication {
         Ok(outcome) => outcome,
-        Err(error) => return Err(error.with_context(diagnostics)),
+        Err(error) => {
+            report(&error);
+            return Err(error.with_context(diagnostics));
+        }
     };
     let root = layout.root().display();
     let mut message = match outcome {
@@ -302,9 +343,19 @@ fn record_with_disk(worker: &WorkerSession, preflight: DiskPreflight, disk: disk
             "Recording cancelled before capture started.\n{root}"),
         CaptureDisposition::StoppedBeforeFirstFrame => format!(
             "Recording incomplete. No video frames were verified before Stop.\n{root}"),
-        CaptureDisposition::Recorded => format!("Recording complete. Frames: {frame_count}.\n{root}"),
+        CaptureDisposition::Recorded => {
+            // Unsaved stills are recorded losses of a complete recording (C6).
+            let unsaved = diagnostics.streams.get(&StreamId::Stills).map_or(0, |stills| {
+                stills.unavailable_by_reason.values().fold(stills.dropped, |total, count| total.saturating_add(*count))
+            });
+            if unsaved == 0 {
+                format!("Recording complete. Frames: {frame_count}.\n{root}")
+            } else {
+                format!("Recording complete with recorded losses ({unsaved} stills not saved). Frames: {frame_count}.\n{root}")
+            }
+        }
         CaptureDisposition::Pending | CaptureDisposition::Failed =>
-            return Err(unavailable("The recording manifest has an unexpected final disposition").into()),
+            return Err(unavailable("The recording manifest has an unexpected final disposition").into_error(FailureComponent::PackageMetadata)),
     };
     if let Some(summary) = diagnostics.source_evidence.as_ref().map(|evidence| evidence.summary()) {
         if let Some(mode) = summary.mode_label() {
@@ -325,12 +376,21 @@ fn record_with_disk(worker: &WorkerSession, preflight: DiskPreflight, disk: disk
     Ok(SessionResult { outcome, message })
 }
 
+/// One monitor's video can no longer be produced for the rest of the attempt.
+pub(super) fn video_failure_health(failure: crate::package::diagnostics::Failure, monitor: crate::protocol::MonitorId, at: crate::protocol::SessionTimeUs) -> HealthRecord {
+    HealthRecord {
+        kind: HealthKind::VideoFailure, failure, detected: at, first_affected: Some(at), ongoing: true,
+        monitor: Some(monitor), count: None,
+    }
+}
+
 fn spawn_journal(
-    worker: &WorkerSession, stream: StreamId, path: std::path::PathBuf,
+    worker: &WorkerSession, stream: StreamId, path: std::path::PathBuf, limits: JournalLimits,
 ) -> Result<(JournalIngress, JournalOwner), CaptureError> {
     let worker = worker.clone();
-    JournalOwner::spawn(stream, path, move || worker.request_stop())
-        .map_err(package_journal_error).map_err(Into::into)
+    JournalOwner::spawn(stream, path, limits, move |error| {
+        worker.report_fault(FaultReport::attempt(&CaptureError::journal(journal_operation(error.step), error)));
+    }).map_err(|error| package_journal_error(error).into_error(FailureComponent::Journal))
 }
 
 fn package_error(error: PackageError) -> CaptureError {
@@ -342,8 +402,8 @@ fn package_error(error: PackageError) -> CaptureError {
     CaptureError::classified(CaptureErrorKind::PackageFailure, FailureComponent::PackageMetadata, operation, code, error.to_string())
 }
 
-pub(super) fn package_journal_error(error: JournalError) -> ProbeError {
-    let step = match error.step {
+fn journal_operation(step: JournalStep) -> &'static str {
+    match step {
         JournalStep::Start => "Start the journal owner",
         JournalStep::Create => "Create the journal file",
         JournalStep::Order => "Order the journal stream",
@@ -352,16 +412,25 @@ pub(super) fn package_journal_error(error: JournalError) -> ProbeError {
         JournalStep::BufferedFlush => "Flush the journal buffer",
         JournalStep::OsFlush => "Flush the journal to disk",
         JournalStep::Close => "Close the journal",
-    };
-    ProbeError { stage: step, source: None, journal: Some(error), raw_input_registration: None }
+    }
+}
+
+pub(super) fn package_journal_error(error: JournalError) -> ProbeError {
+    ProbeError {
+        stage: journal_operation(error.step), source: None, journal: Some(error), raw_input_registration: None,
+        owner: Some(FailureComponent::Journal),
+    }
 }
 
 struct RecordedVideo {
     video: Vec<MonitorVideo>,
     png: Option<PngCounters>,
+    images: Option<Vec<ImageFile>>,
     input: Option<input::InputPrefix>,
     failure: Option<ProbeError>,
     required_finalization_failure: Option<&'static str>,
+    /// Frames rows of monitors whose worker was blocked in a native call (§6.2 row 21).
+    undelivered_frames: Vec<UndeliveredFrames>,
 }
 
 pub(super) enum RecordingReport {
@@ -374,14 +443,15 @@ fn record(
     context: JournalIngress, frames: video::Frames, stills: JournalIngress, monitor_capture: &mut Vec<MonitorCapture>, monitor_epochs: &mut Vec<MonitorCapture>,
 ) -> Result<RecordedVideo, ProbeError> {
     let cancelled = || Ok(RecordedVideo {
-        video: Vec::new(), png: None, input: Some(input::InputPrefix::cancelled()), failure: None, required_finalization_failure: None,
+        video: Vec::new(), png: None, images: Some(Vec::new()), input: Some(input::InputPrefix::cancelled()), failure: None,
+        required_finalization_failure: None, undelivered_frames: Vec::new(),
     });
     if worker.stop_requested() {
         return cancelled();
     }
     worker.startup_step(StartupStep::MediaFoundation);
-    let _apartment = Apartment::initialize()?;
-    let _media_foundation = mf::Runtime::initialize()?;
+    let _apartment = Apartment::initialize().map_err(|error| error.owned_by(FailureComponent::Video))?;
+    let _media_foundation = mf::Runtime::initialize().map_err(|error| error.owned_by(FailureComponent::Video))?;
     worker.startup_step(StartupStep::DisplaysAndEncoders);
     let borderless = wgc::request_borderless();
     if worker.stop_requested() {
@@ -396,15 +466,15 @@ fn record(
     let frame_policy = &context::FramePolicy::default();
     let topology = &display::topology::Topology::default();
     let topology_stop = &AtomicBool::new(false);
-    thread::scope(|scope| {
-        topology.spawn(scope, worker, topology_stop)?;
+    let recorded = thread::scope(|scope| {
+        topology.spawn(scope, worker, topology_stop).map_err(|error| error.owned_by(FailureComponent::Capture))?;
         let _stop_topology = TopologyStop(topology_stop);
         let (png, mut lanes, still_worker) = still_png::Worker::new(worker.config().monitors().len() + 1);
         let still_rows = lanes.pop().expect("the input still producer has a lane");
         let mut lanes = lanes.into_iter();
         let still_owner = thread::Builder::new().name("native-png".into())
             .spawn_scoped(scope, move || still_worker.run(layout, stills, worker))
-            .map_err(|error| mp4::io_error("Start the native PNG worker", error))?;
+            .map_err(|error| mp4::io_error("Start the native PNG worker", error).owned_by(FailureComponent::Stills))?;
         // Each selected monitor can report a terminal video failure once.
         // Report writes are independent of admission and capture/video threads.
         let (reports, pending_reports) = mpsc::sync_channel::<RecordingReport>(worker.config().monitors().len() + MAX_INPUT_FAILURES);
@@ -449,7 +519,7 @@ fn record(
                     readiness.push(initialized);
                 }
                 Err(error) => {
-                    startup_error = Some(mp4::io_error("Start the monitor video owner", error));
+                    startup_error = Some(mp4::io_error("Start the monitor video owner", error).owned_by(FailureComponent::Video));
                     break;
                 }
             }
@@ -462,7 +532,8 @@ fn record(
                         monitor_capture.push(capture);
                     }
                     Err(_) => {
-                        startup_error = Some(unavailable("A selected monitor did not pass capture and encoder preflight"));
+                        startup_error = Some(unavailable("A selected monitor did not pass capture and encoder preflight")
+                            .owned_by(FailureComponent::Video));
                         break;
                     }
                 }
@@ -473,18 +544,19 @@ fn record(
         } else if startup_error.is_none() {
             worker.startup_step(StartupStep::InputHelper);
             input::with_journal(layout, frame_policy, input, context, worker, topology, &still_endpoints, &still_rows, reports.as_ref(), executable_versions, || {
-                if let Admission::Closed(cutoff) = worker.admit()? {
+                let controller = |error: ProbeError| error.owned_by(FailureComponent::Controller);
+                if let Admission::Closed(cutoff) = worker.admit().map_err(controller)? {
                     return Ok(cutoff);
                 }
-                worker.ready()?;
+                worker.ready().map_err(controller)?;
                 worker.verify_startup(|| {
                     let config = worker.config();
                     worker.window_coverage(preflight::window_coverage(config));
                     preflight::validate_processes(config)?;
                     preflight::validate_foreground(config)
                 });
-                worker.wait_for_stop()
-            }).map(Some)
+                worker.wait_for_stop().map_err(controller)
+            }).map(Some).map_err(|error| error.owned_by(FailureComponent::Receiver))
         } else {
             Ok(None)
         };
@@ -508,16 +580,20 @@ fn record(
                     match result.outcome {
                         Ok(capture_cutoff) => {
                             if let Ok(Some((cutoff, _))) = &input && capture_cutoff != *cutoff {
-                                worker_error.get_or_insert_with(|| unavailable("A monitor closed at the wrong admission boundary"));
+                                worker_error.get_or_insert_with(|| unavailable("A monitor closed at the wrong admission boundary")
+                                    .owned_by(FailureComponent::Controller));
                             }
                         }
-                        Err(error) => { worker_error.get_or_insert(error); }
+                        Err(error) => { worker_error.get_or_insert(error.owned_by(FailureComponent::Video)); }
                     }
                     required_finalization_failure = required_finalization_failure.or(result.required_finalization_failure);
                     videos.push(result.video);
                 }
-                Ok(Err(error)) => { worker_error.get_or_insert(error); }
-                Err(_) => { worker_error.get_or_insert_with(|| unavailable("A monitor video owner terminated unexpectedly")); }
+                Ok(Err(error)) => { worker_error.get_or_insert(error.owned_by(FailureComponent::Video)); }
+                Err(_) => {
+                    worker_error.get_or_insert_with(|| unavailable("A monitor video owner terminated unexpectedly")
+                        .owned_by(FailureComponent::Video));
+                }
             }
         }
         if let Ok(reporter) = reporter {
@@ -533,25 +609,39 @@ fn record(
         drop(still_rows);
         drop(lanes);
         drop(png);
-        let (png, still_error) = match still_owner.join() {
-            Ok((counters, result)) => (Some(counters), result.err()),
-            Err(_) => (None, Some(unavailable("The still PNG worker terminated unexpectedly"))),
+        // The worker returns an error or exits only on a still journal failure
+        // (§6.2 row 1, F). An encoder exit is reported by the worker itself as
+        // an auxiliary activity loss (row 16) and does not end the worker.
+        let (png, images, still_error) = match still_owner.join() {
+            Ok((counters, images, result)) => (Some(counters), Some(images), result.err().map(|error| error.owned_by(FailureComponent::Stills))),
+            Err(_) => (None, None, Some(unavailable("The still journal worker terminated unexpectedly").owned_by(FailureComponent::Stills))),
         };
         let mut failure = startup_error.or(worker_error).or(still_error);
         let input = match input {
             Ok(Some((cutoff, input))) => {
                 if cutoff != input.cutoff {
-                    failure.get_or_insert_with(|| unavailable("The video and input producers closed at different boundaries"));
+                    failure.get_or_insert_with(|| unavailable("The video and input producers closed at different boundaries")
+                        .owned_by(FailureComponent::Controller));
                 }
                 Some(input)
             }
             Ok(None) => {
-                failure.get_or_insert_with(|| unavailable("The input journal owner did not start"));
+                failure.get_or_insert_with(|| unavailable("The input journal owner did not start").owned_by(FailureComponent::Receiver));
                 None
             }
             Err(error) => { failure.get_or_insert(error); None }
         };
-        Ok(RecordedVideo { video: videos, png, input, failure, required_finalization_failure })
+        Ok(RecordedVideo { video: videos, png, images, input, failure, required_finalization_failure, undelivered_frames: Vec::new() })
+    });
+    // Every video worker has exited: the merge owner releases the remaining
+    // lane rows and closes the frames ingress.
+    let undelivered = frames.finish();
+    recorded.map(|mut recorded| {
+        match undelivered {
+            Ok(undelivered) => recorded.undelivered_frames = undelivered,
+            Err(error) => { recorded.failure.get_or_insert(error.owned_by(FailureComponent::Journal)); }
+        }
+        recorded
     })
 }
 

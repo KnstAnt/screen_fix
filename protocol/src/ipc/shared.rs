@@ -168,6 +168,12 @@ impl HelperEndpoint {
 }
 
 impl<const N: usize> Ring<N> {
+    // Protocol invariant: a slot belongs to the producer between a returned
+    // read cursor and its write-cursor publication, and to the consumer
+    // between that publication and the read-cursor return. A faulty peer
+    // process can still write the mapping at any time, so slot fields are
+    // accessed only through raw-pointer volatile operations, never through a
+    // reference (ARCH-2, I6). Records are encoded and decoded in local memory.
     fn push(&self, encode: impl FnOnce(&mut [u8]) -> Result<usize, PacketError>) -> Result<bool, PacketError> {
         let write = self.write.load(Relaxed);
         let occupied = write.wrapping_sub(self.read.load(Acquire));
@@ -175,13 +181,23 @@ impl<const N: usize> Ring<N> {
             return if occupied == N as u32 {
                 Ok(false)
             } else {
-                Err(PacketError::InvalidRecord("Input IPC write cursor is invalid."))
+                Err(PacketError::InvalidCursor)
             };
         }
-        // This cursor denotes a returned slot. The consumer cannot read it
-        // until the release-store publishes the newly encoded record.
-        let slot = unsafe { &mut *self.slots[write as usize % N].get() };
-        slot.length = encode(&mut slot.packet)? as u32;
+        let mut packet = [0_u8; MAX_PACKET_BYTES];
+        let length = encode(&mut packet)?;
+        let bytes = packet.get(..length).ok_or(PacketError::InvalidLength)?;
+        let slot = self.slots[write as usize % N].get();
+        // This cursor denotes a returned slot inside the view. The consumer
+        // cannot read it until the release-store publishes the new record.
+        unsafe {
+            let target = (&raw mut (*slot).packet).cast::<u8>();
+            for (index, byte) in bytes.iter().enumerate() {
+                target.add(index).write_volatile(*byte);
+            }
+            (&raw mut (*slot).length).write_volatile(length as u32);
+        }
+        packet.fill(0);
         self.write.store(write.wrapping_add(1), Release);
         Ok(true)
     }
@@ -193,19 +209,27 @@ impl<const N: usize> Ring<N> {
             return Ok(None);
         }
         if available > N as u32 {
-            return Err(PacketError::InvalidRecord("Input IPC read cursor is invalid."));
+            return Err(PacketError::InvalidCursor);
         }
-        // This cursor denotes a published slot. The producer can reuse it
-        // only after the release-store below returns it to the free prefix.
-        let slot = unsafe { &mut *self.slots[read as usize % N].get() };
-        let decoded = slot.packet.get_mut(..slot.length as usize)
-            .ok_or(PacketError::InvalidLength).and_then(|bytes| {
-                let result = decode(bytes);
-                // Clear consumed private evidence before returning the slot.
-                bytes.fill(0);
-                result
-            });
-        slot.length = 0;
+        let slot = self.slots[read as usize % N].get();
+        let mut packet = [0_u8; MAX_PACKET_BYTES];
+        // This cursor denotes a published slot inside the view. The producer
+        // can reuse it only after the release-store below returns it.
+        let length = unsafe { (&raw const (*slot).length).read_volatile() } as usize;
+        let decoded = packet.get_mut(..length).ok_or(PacketError::InvalidLength).and_then(|bytes| {
+            unsafe {
+                let source = (&raw mut (*slot).packet).cast::<u8>();
+                for (index, byte) in bytes.iter_mut().enumerate() {
+                    *byte = source.add(index).read_volatile();
+                    // Clear consumed private evidence before returning the slot.
+                    source.add(index).write_volatile(0);
+                }
+            }
+            let result = decode(bytes);
+            bytes.fill(0);
+            result
+        });
+        unsafe { (&raw mut (*slot).length).write_volatile(0) };
         self.read.store(read.wrapping_add(1), Release);
         decoded.map(Some)
     }

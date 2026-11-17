@@ -3,7 +3,7 @@ use std::{
     num::NonZeroU64,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Release}},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::{AcqRel, Acquire, Release}},
         mpsc::{self, Receiver, SyncSender},
     },
     thread::{self, JoinHandle},
@@ -12,7 +12,7 @@ use std::{
 
 use screen_fix_native_observation::{
     hung, identity::{MetadataScrubber, WindowProcess}, ime,
-    uia::{self, Client}, uia_commits::{CommitScope, Queue as Commits},
+    uia::{self, Client}, uia_commits::{CommitLossReason, CommitScope, Queue as Commits},
     windows::{FocusSnapshot, WindowMetadata, window_dpi},
 };
 use screen_fix_protocol::{
@@ -21,7 +21,7 @@ use screen_fix_protocol::{
         CommitEvidence, CommitText, ContextEvidence, FocusEvidence, HungEvidence,
         ImeState, PointBinding, Query, ReadBinding, ReadEvidence, ReadOutcome, ReadUnavailable, TextClassification,
         UiaEvidence, UiaStatus, VisitBinding, WindowEvidence, WindowInstance,
-        runtime::{ApprovalKey, ContextGap, ContextProducer, IdentityClaim, Observation},
+        runtime::{ApprovalKey, ContextGap, ContextGapCause, ContextProducer, IdentityClaim, Observation},
     }},
 };
 
@@ -51,11 +51,17 @@ impl SeenWindows {
     }
 }
 
+/// Who resolves a pending read: its worker, its delivery after hand-off, or
+/// the owner after the request deadline (E2). Exactly one result leaves.
+const RUNNING: u8 = 0;
+const HANDED_OFF: u8 = 1;
+const TIMED_OUT: u8 = 2;
+
 #[derive(Clone)]
 struct Pending {
     read: ReadBinding,
     cancelled: Arc<AtomicBool>,
-    handed_off: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
 }
 
 type PendingReads = Arc<Mutex<[Option<Pending>; 8]>>;
@@ -114,7 +120,8 @@ impl Delivery {
                 {
                     let ContextEvidence::Commit(text) = evidence else { return Err(Failure::Protocol); };
                     *record = Observation::Gap(ContextGap {
-                        visit: commit.visit, producer: *producer, first_position: *position, last_position: *position,
+                        visit: commit.visit, producer: *producer, cause: ContextGapCause::Stale,
+                        first_position: *position, last_position: *position,
                         first_qpc: text.receipt_qpc, last_qpc: text.receipt_qpc,
                     });
                 }
@@ -229,15 +236,33 @@ impl Owners {
             Query::Held(_) => return Err(Failure::Protocol),
         };
         let mut pending = self.pending.lock().map_err(|_| Failure::Supervisor)?;
-        if pending[slot].is_some() || pending.iter().flatten().any(|item| item.read.request == read.request) {
+        // A call still running past its request deadline blocks its provider
+        // kind until it returns (E2).
+        let blocked = pending.iter().enumerate().any(|(index, item)| item.as_ref().is_some_and(|item| {
+            ime_slot(index) == ime_slot(slot) && item.state.load(Acquire) == TIMED_OUT
+        }));
+        if blocked || pending[slot].is_some() || pending.iter().flatten().any(|item| item.read.request == read.request) {
             return Err(Failure::Busy);
         }
         let current = Pending {
-            read, cancelled: Arc::new(AtomicBool::new(false)), handed_off: Arc::new(AtomicBool::new(false)),
+            read, cancelled: Arc::new(AtomicBool::new(false)), state: Arc::new(AtomicU8::new(RUNNING)),
         };
         pending[slot] = Some(current.clone());
-        let lane = if (2..=3).contains(&slot) { &self.ime } else { &self.uia };
+        let lane = if ime_slot(slot) { &self.ime } else { &self.uia };
         lane.try_send(Job { query, secondary, pending: current, slot }).map_err(|_| Failure::Transport)
+    }
+
+    /// Resolves every read still unresolved at its request deadline as timed
+    /// out (E2). The worker discards its late return, and the slot stays
+    /// occupied until the call actually returns.
+    pub(super) fn expire(&self, now: QpcTick) -> Result<Vec<ReadBinding>> {
+        let pending = self.pending.lock().map_err(|_| Failure::Supervisor)?;
+        Ok(pending.iter().flatten().filter(|item| {
+            item.read.deadline_qpc <= now && item.state.compare_exchange(RUNNING, TIMED_OUT, AcqRel, Acquire).is_ok()
+        }).map(|item| {
+            item.cancelled.store(true, Release);
+            item.read
+        }).collect())
     }
 
     pub(super) fn cancel(&self, visit: VisitBinding, request: RequestId) -> Result<()> {
@@ -292,7 +317,7 @@ impl Worker {
     }
 
     fn complete(&self, job: &Job) -> Result<()> {
-        if !job.pending.handed_off.load(Acquire) {
+        if job.pending.state.load(Acquire) != HANDED_OFF {
             clear_slot(&self.pending, job.slot, &job.pending);
         }
         Ok(())
@@ -338,9 +363,14 @@ impl Worker {
             Err(Failure::ReadinessDeadline) => return send_error(ReadUnavailable::TimedOut),
             Err(error) => return Err(error),
         };
-        let Some(_call) = self.grant.lifetime.provider(ProviderKind::Read, limited.0) else {
+        let Some(_call) = self.call(ProviderKind::Read, limited.0) else {
             return send_error(ReadUnavailable::TimedOut);
         };
+        if expected.is_some() {
+            // A new focus read replaces the subscription; its pending commits
+            // and losses are delivered or counted first (E3).
+            self.commits(uia)?;
+        }
         let expected_revision = uia.revision.load(Acquire);
         let invalid = |_: uia::Request| {
             let current = self.live(&job.pending) && uia.revision.load(Acquire) == expected_revision
@@ -362,8 +392,6 @@ impl Worker {
             client.clear_subscription();
             uia.subscription = None;
             uia.editable = None;
-            uia.commits.take();
-            uia.commits.take_loss();
         }
         let result = client.read(native, scrubber, &invalid);
         let (dpi, dpi_awareness) = if invalid(native).is_none() && result.element.is_some() {
@@ -435,7 +463,7 @@ impl Worker {
         let read = job.pending.read;
         let start = qpc()?;
         let limited = self.deadline(read, NATIVE_BUDGET).ok();
-        let _call = limited.and_then(|(until, _)| self.grant.lifetime.provider(ProviderKind::Read, until));
+        let _call = limited.and_then(|(until, _)| self.call(ProviderKind::Read, until));
         let window = self.foreground();
         let live = self.live(&job.pending) && _call.is_some();
         let details = if live && read.target == WindowInstance::from(window) && job.secondary.is_none() {
@@ -521,11 +549,13 @@ impl Worker {
             let foreground = self.foreground();
             if let Some(focus) = FocusSnapshot::read(foreground).filter(|focus| focus.focus == expected)
                 && let Ok((until, expires)) = self.deadline(read, IME_BUDGET)
-                && let Some(_call) = self.grant.lifetime.provider(ProviderKind::Ime, until)
+                && let Some(_call) = self.call(ProviderKind::Ime, until)
             {
-                let state = if ime::has_ime(Some(focus)) {
-                    ime::read_scoped(foreground, Some(focus), expires, || self.live(&job.pending))
-                } else { ImeState::NotIme };
+                let state = match ime::has_ime(Some(focus)) {
+                    Some(true) => ime::read_scoped(foreground, Some(focus), expires, || self.live(&job.pending)),
+                    Some(false) => ImeState::NotIme,
+                    None => ImeState::Unknown,
+                };
                 if self.live(&job.pending) { value = Some(state); }
             }
         }
@@ -539,12 +569,27 @@ impl Worker {
     fn commits(&self, uia: &mut Uia) -> Result<()> {
         let Some((read, focus, revision)) = uia.subscription else { return Ok(()) };
         let now = qpc()?;
+        // Commit losses reach the Recorder per reason (E3).
+        let lose = |cause, count, first, last| match NonZeroU64::new(count) {
+            Some(count) => self.send.lost(&self.grant, read.visit, ContextProducer::TextEdit, cause, first, last, count),
+            None => Ok(()),
+        };
+        for loss in uia.commits.take_loss() {
+            lose(match loss.reason {
+                CommitLossReason::Capacity => ContextGapCause::Overflow,
+                CommitLossReason::TooLong => ContextGapCause::CommitTooLong,
+                CommitLossReason::Parts => ContextGapCause::CommitParts,
+                CommitLossReason::Rejected => ContextGapCause::CommitRejected,
+                CommitLossReason::Stale => ContextGapCause::Stale,
+            }, loss.count, loss.first, loss.last)?;
+        }
         if !self.commit_current(read.visit, focus, &uia.revision, revision) {
             uia.desired.store(0, Release);
             uia.subscription = None;
             uia.editable = None;
-            uia.commits.take();
-            uia.commits.take_loss();
+            for commit in uia.commits.take() {
+                lose(ContextGapCause::Stale, 1, commit.receipt, commit.receipt)?;
+            }
             if let Some(client) = uia.client.as_mut() {
                 let deadline = QpcTick(now.0.checked_add(self.grant.lifetime.ticks(CLEANUP)?).ok_or(Failure::Supervisor)?);
                 let _call = self.grant.lifetime.provider(ProviderKind::Teardown, deadline).ok_or(Failure::Supervisor)?;
@@ -552,16 +597,19 @@ impl Worker {
             }
             return Ok(());
         }
-        let lost = uia.commits.take_loss();
-        if let Some(lost) = NonZeroU64::new(lost) {
-            self.send.lost(&self.grant, read.visit, ContextProducer::TextEdit, read.requested_qpc, now, lost)?;
-        }
         for commit in uia.commits.take() {
             if commit.generation != read.visit.focus_generation || commit.revision != revision
-                || !self.commit_current(read.visit, focus, &uia.revision, revision) { continue; }
-            let Ok(text) = CommitText::new(&commit.text) else { continue };
+                || !self.commit_current(read.visit, focus, &uia.revision, revision)
+            {
+                lose(ContextGapCause::Stale, 1, commit.receipt, commit.receipt)?;
+                continue;
+            }
+            let Ok(text) = CommitText::new(&commit.text) else {
+                lose(ContextGapCause::CommitTooLong, 1, commit.receipt, commit.receipt)?;
+                continue;
+            };
             self.send.publish_checked(&self.grant, read.visit, ContextEvidence::Commit(CommitEvidence {
-                binding: read, receipt_qpc: commit.receipt, text,
+                binding: read, receipt_qpc: commit.receipt, text, valid: commit.valid,
             }), false, Some(Delivery::Commit(CommitDelivery {
                 visit: read.visit, focus, revision: Arc::clone(&uia.revision), expected_revision: revision,
             })))?;
@@ -625,6 +673,15 @@ impl Worker {
         WindowProcess { window: window.window, process: window.process, thread: window.thread }
     }
 
+    /// Registers a provider call with the supervisor. Its slot deadline is
+    /// the request deadline plus the cleanup bound (E2): a call returning in
+    /// between is stale, one still running at the slot deadline defeats
+    /// cancellation and the supervisor terminates the collector.
+    fn call(&self, kind: ProviderKind, request: QpcTick) -> Option<super::lifetime::Provider<'_>> {
+        let slot = request.0.checked_add(self.grant.lifetime.ticks(CLEANUP).ok()?)?;
+        self.grant.lifetime.provider(kind, QpcTick(slot))
+    }
+
     fn deadline(&self, read: ReadBinding, cap: Duration) -> Result<(QpcTick, Instant)> {
         let start = qpc()?;
         let capped = read.deadline_qpc.0.min(start.0.checked_add(self.grant.lifetime.ticks(cap)?).ok_or(Failure::Supervisor)?);
@@ -639,11 +696,19 @@ impl Worker {
     }
 
     fn publish_item(&self, job: &Job, result: ContextEvidence, proof: Proof) -> Result<bool> {
-        if job.pending.cancelled.load(Acquire) || job.pending.read.visit != self.grant.visit() { return Ok(false); }
+        if job.pending.cancelled.load(Acquire) || job.pending.read.visit != self.grant.visit()
+            || job.pending.state.compare_exchange(RUNNING, HANDED_OFF, AcqRel, Acquire).is_err()
+        {
+            return Ok(false);
+        }
+        // A call returning past its request deadline is stale (E2).
+        let now = qpc()?;
+        let result = if now >= job.pending.read.deadline_qpc {
+            ContextEvidence::Rejected(unavailable(job.pending.read, now, ReadUnavailable::TimedOut))
+        } else { result };
         let delivery = Delivery::Read(ReadDelivery {
             pending: job.pending.clone(), slots: Arc::clone(&self.pending), slot: job.slot, proof,
         });
-        job.pending.handed_off.store(true, Release);
         self.send.publish_checked(&self.grant, job.pending.read.visit, result, false, Some(delivery))
     }
 }
@@ -665,6 +730,8 @@ impl Uia {
         }
     }
 }
+
+fn ime_slot(slot: usize) -> bool { (2..=3).contains(&slot) }
 
 fn unavailable<T>(read: ReadBinding, now: QpcTick, status: ReadUnavailable) -> ReadEvidence<T> {
     ReadEvidence { binding: read, started_qpc: None, completed_qpc: Some(now), outcome: ReadOutcome::Unavailable(status) }

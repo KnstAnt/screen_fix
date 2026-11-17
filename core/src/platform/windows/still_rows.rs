@@ -13,7 +13,15 @@ use std::{
 
 use serde_json::Value;
 
-use crate::{capture::frame::FrameCoverage, package::journal::JournalIngress, protocol::SessionTimeUs};
+use crate::{
+    capture::frame::FrameCoverage,
+    package::{
+        diagnostics::{Failure, FailureComponent},
+        journal::{HealthRecord, JournalIngress},
+        outcome::{HealthKind, LossEvidence, LossReason},
+    },
+    protocol::SessionTimeUs,
+};
 
 use super::{ProbeError, package_journal_error, unavailable};
 
@@ -23,31 +31,37 @@ const WAIT: Duration = Duration::from_secs(15);
 #[derive(Default)]
 struct Budget {
     slots: AtomicUsize,
-    omitted: Mutex<Option<Omitted>>,
+    /// At most one pending omission per loss reason.
+    omitted: Mutex<BTreeMap<LossReason, Omitted>>,
 }
 
+#[derive(Clone, Copy)]
 struct Omitted {
-    count: u64,
+    count: std::num::NonZeroU64,
     first: SessionTimeUs,
     last: SessionTimeUs,
 }
 
 impl Budget {
-    fn omit(&self, at: SessionTimeUs) {
+    fn omit(&self, at: SessionTimeUs, reason: LossReason) {
         let mut pending = self.omitted.lock().unwrap_or_else(PoisonError::into_inner);
-        let omitted = pending.get_or_insert(Omitted { count: 0, first: at, last: at });
-        omitted.count = omitted.count.saturating_add(1);
-        omitted.first = omitted.first.min(at);
-        omitted.last = omitted.last.max(at);
+        pending.entry(reason).and_modify(|omitted| {
+            omitted.count = omitted.count.saturating_add(1);
+            omitted.first = omitted.first.min(at);
+            omitted.last = omitted.last.max(at);
+        }).or_insert(Omitted { count: std::num::NonZeroU64::MIN, first: at, last: at });
     }
 
-    fn take_gap(&self, before: SessionTimeUs, first_row: SessionTimeUs) -> Option<Omitted> {
+    /// Omissions that every earlier still row has already passed, in ascending last receipt.
+    fn take_gaps(&self, before: SessionTimeUs, first_row: SessionTimeUs) -> Vec<(LossReason, Omitted)> {
         let mut pending = self.omitted.lock().unwrap_or_else(PoisonError::into_inner);
-        if pending.as_ref().is_some_and(|gap| gap.last < before && gap.last <= first_row) {
-            pending.take()
-        } else {
-            None
+        let mut ready: Vec<_> = pending.iter().filter(|(_, gap)| gap.last < before && gap.last <= first_row)
+            .map(|(reason, gap)| (*reason, *gap)).collect();
+        for (reason, _) in &ready {
+            pending.remove(reason);
         }
+        ready.sort_by_key(|(_, gap)| (gap.last, gap.first));
+        ready
     }
 }
 
@@ -153,19 +167,24 @@ impl Drop for Producer {
 pub(super) struct Rows(Arc<Producer>);
 
 impl Rows {
-    pub fn reserve(&self, at: SessionTimeUs, fallback: Option<Value>) -> Option<Reservation> {
+    /// A failed reservation reports why, so a public caller can account it with `note_loss`.
+    pub fn reserve(&self, at: SessionTimeUs, fallback: Option<Value>) -> Result<Reservation, LossReason> {
         let producer = &self.0;
-        if producer.progress.excluded.load(Ordering::Acquire) || at.0 < producer.progress.before.load(Ordering::Relaxed) {
-            return None;
+        if producer.progress.excluded.load(Ordering::Acquire) {
+            return Err(LossReason::ProducerStall);
+        }
+        if at.0 < producer.progress.before.load(Ordering::Relaxed) {
+            return Err(LossReason::LateRow);
         }
         producer.budget.slots.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             (count < SLOTS).then_some(count + 1)
-        }).ok()?;
+        }).map_err(|_| LossReason::StagingPressure)?;
+        let charge = Charge(Arc::clone(&producer.budget));
         let (finish, result) = sync_channel(1);
         let shared = Arc::new(Mutex::new(SharedSlot { fallback, expired: false }));
         producer.send.try_send(Slot { at, deadline: Instant::now() + WAIT, result,
-            shared: Arc::clone(&shared), _charge: Charge(Arc::clone(&producer.budget)) }).ok()?;
-        Some(Reservation { result: finish, shared })
+            shared: Arc::clone(&shared), _charge: charge }).map_err(|_| LossReason::StagingPressure)?;
+        Ok(Reservation { result: finish, shared })
     }
 
     /// Called only after offering every earlier logical row or accounting for
@@ -174,8 +193,8 @@ impl Rows {
         self.0.progress.before.fetch_max(before.0, Ordering::Release);
     }
 
-    pub fn note_loss(&self, at: SessionTimeUs) {
-        self.0.budget.omit(at);
+    pub fn note_loss(&self, at: SessionTimeUs, reason: LossReason) {
+        self.0.budget.omit(at, reason);
     }
 }
 
@@ -263,11 +282,12 @@ impl Merge {
 
         loop {
             let first_row = self.ordered.first_key_value().map_or(SessionTimeUs(i64::MAX), |(key, _)| key.0);
-            if let Some(gap) = self.budget.take_gap(before, first_row) {
+            for (reason, gap) in self.budget.take_gaps(before, first_row) {
                 let at = self.last.max(gap.last);
-                // A coalesced public pressure gap occupies its terminal
-                // receipt. Earlier valid rows keep their own receipt order.
-                journal.record_loss_at(gap.count, gap.first, gap.last, at).map_err(package_journal_error)?;
+                // A coalesced public loss occupies its terminal receipt.
+                // Earlier valid rows keep their own receipt order.
+                let loss = LossEvidence::ordinary(reason, None, gap.count, gap.first, gap.last);
+                journal.record_loss(loss, at).map_err(package_journal_error)?;
                 self.last = at;
             }
             let Some((&key, slot)) = self.ordered.first_key_value() else { break; };
@@ -292,7 +312,7 @@ impl Merge {
             self.ordered.pop_first();
             if let Some(row) = row {
                 if key.0 < self.last {
-                    self.budget.omit(key.0);
+                    self.budget.omit(key.0, LossReason::LateRow);
                 } else {
                     journal.try_submit(key.0, row.publishable()).map_err(package_journal_error)?;
                     self.last = key.0;
@@ -300,8 +320,11 @@ impl Merge {
             }
         }
         if stalled != 0 {
-            journal.try_submit(self.last, serde_json::json!({ "kind": "health", "reason": "still_producer_progress_stalled",
-                "producer_count": stalled })).map_err(package_journal_error)?;
+            journal.submit_health(HealthRecord {
+                kind: HealthKind::StillProgressStall,
+                failure: Failure::new(FailureComponent::Stills, "Advance the still producer progress", None),
+                detected: self.last, first_affected: None, ongoing: true, monitor: None, count: Some(stalled),
+            }).map_err(package_journal_error)?;
         }
         journal.offer_gap(self.last).map_err(package_journal_error)?;
         Ok(())

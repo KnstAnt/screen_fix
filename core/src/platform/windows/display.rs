@@ -1,6 +1,6 @@
 pub(super) mod topology;
 
-use std::{mem::size_of, num::NonZeroU32};
+use std::{collections::BTreeMap, mem::size_of, num::NonZeroU32};
 
 use windows::{
     core::Interface,
@@ -19,6 +19,7 @@ use windows::{
 use crate::{
     capture::frame::MonitorGeometry,
     config::DisplayKey,
+    package::metadata::DisplayField,
     protocol::{GeometryEpoch, GeometryId, MonitorId, PhysicalRect},
 };
 
@@ -30,13 +31,16 @@ pub(super) struct Monitor {
     pub adapter: IDXGIAdapter1,
     pub handle: HMONITOR,
     pub bounds: PhysicalRect,
-    pub dpi_x: NonZeroU32,
-    pub dpi_y: NonZeroU32,
-    pub refresh: (u32, NonZeroU32),
+    pub dpi_x: Option<NonZeroU32>,
+    pub dpi_y: Option<NonZeroU32>,
+    pub refresh: Option<(u32, NonZeroU32)>,
     pub rotation: i32,
     pub primary: bool,
     pub hdr: bool,
     pub sdr_white: Option<NonZeroU32>,
+    /// Properties of this monitor that could not be read, with the native
+    /// code of the failed read. They never fail the enumeration (VID-9).
+    pub unavailable: BTreeMap<DisplayField, Option<i32>>,
 }
 
 impl Monitor {
@@ -123,6 +127,10 @@ pub(super) fn resolve(key: &DisplayKey) -> Result<Monitor, ProbeError> {
         .ok_or_else(|| unavailable("The selected physical display is no longer available"))
 }
 
+/// The active monitors. A failure to read a monitor's identity, color mode
+/// or rectangle fails the whole snapshot, which then proves nothing about any
+/// monitor and is retried on the next topology tick. DPI, refresh and SDR
+/// white failures only leave that monitor's field null.
 pub(super) fn enumerate() -> Result<Vec<Monitor>, ProbeError> {
     let targets = targets()?;
     // The enumeration owns a fresh factory and never caches an HMONITOR across re-resolution.
@@ -153,14 +161,19 @@ pub(super) fn enumerate() -> Result<Vec<Monitor>, ProbeError> {
             let output6: IDXGIOutput6 = stage(output.cast(), "Get the advanced display output")?;
             let color = stage(unsafe { output6.GetDesc1() }, "Read the display color mode")?;
             let hdr = color.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+            let mut missing = BTreeMap::new();
             let sdr_white = if hdr {
                 let mut level = DISPLAYCONFIG_SDR_WHITE_LEVEL {
                     header: header::<DISPLAYCONFIG_SDR_WHITE_LEVEL>(DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
                         target.path.adapterId, target.path.id),
                     ..Default::default()
                 };
-                status(unsafe { DisplayConfigGetDeviceInfo(&mut level.header) } as u32, "Read the HDR display SDR white level")?;
-                Some(NonZeroU32::new(level.SDRWhiteLevel).ok_or_else(|| unavailable("The HDR display SDR white level is zero"))?)
+                let code = unsafe { DisplayConfigGetDeviceInfo(&mut level.header) };
+                let white = if code == 0 { NonZeroU32::new(level.SDRWhiteLevel) } else { None };
+                if white.is_none() {
+                    missing.insert(DisplayField::SdrWhiteLevel, (code != 0).then_some(code));
+                }
+                white
             } else {
                 None
             };
@@ -170,18 +183,27 @@ pub(super) fn enumerate() -> Result<Vec<Monitor>, ProbeError> {
             let bounds = PhysicalRect::new(rect.left, rect.top, rect.right, rect.bottom)
                 .ok_or_else(|| unavailable("The monitor rectangle has invalid physical bounds"))?;
             let (mut dpi_x, mut dpi_y) = (0, 0);
-            stage(unsafe { GetDpiForMonitor(desc.Monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) },
-                "Read the monitor effective DPI")?;
-            let dpi_x = NonZeroU32::new(dpi_x).ok_or_else(|| unavailable("The monitor horizontal DPI is zero"))?;
-            let dpi_y = NonZeroU32::new(dpi_y).ok_or_else(|| unavailable("The monitor vertical DPI is zero"))?;
+            let dpi = unsafe { GetDpiForMonitor(desc.Monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+            let (dpi_x, dpi_y) = match dpi {
+                Ok(()) => (NonZeroU32::new(dpi_x), NonZeroU32::new(dpi_y)),
+                Err(_) => (None, None),
+            };
+            if dpi_x.is_none() || dpi_y.is_none() {
+                missing.insert(DisplayField::Dpi, dpi.err().map(|error| error.code().0));
+            }
             let rate = target.path.refreshRate;
-            let denominator = NonZeroU32::new(rate.Denominator).ok_or_else(|| unavailable("The monitor refresh rate is unavailable"))?;
+            let refresh = NonZeroU32::new(rate.Denominator).filter(|_| rate.Numerator != 0)
+                .map(|denominator| (rate.Numerator, denominator));
+            if refresh.is_none() {
+                missing.insert(DisplayField::Refresh, None);
+            }
             monitors.push(Monitor {
                 key: target.key.clone(),
                 name: if target.name.is_empty() { name } else { target.name.clone() },
-                adapter: adapter.clone(), handle: desc.Monitor, bounds, dpi_x, dpi_y,
-                refresh: (rate.Numerator, denominator), rotation: target.path.rotation.0,
-                primary: info.dwFlags & 1 != 0, hdr, sdr_white,
+                adapter: adapter.clone(), handle: desc.Monitor, bounds,
+                dpi_x: dpi_x.filter(|_| dpi_y.is_some()), dpi_y: dpi_y.filter(|_| dpi_x.is_some()),
+                refresh, rotation: target.path.rotation.0,
+                primary: info.dwFlags & 1 != 0, hdr, sdr_white, unavailable: missing,
             });
         }
     }

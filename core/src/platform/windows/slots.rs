@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::{
     capture::frame::{FrameCoverage, FrameMetadata},
@@ -29,6 +29,10 @@ impl Timeline {
     pub(super) fn with_first(mut self, first: u64) -> Self {
         self.first = first;
         self
+    }
+
+    pub(super) fn first(self) -> u64 {
+        self.first
     }
 
     pub(super) fn slot(self, index: u64) -> Result<Slot, ProbeError> {
@@ -88,17 +92,28 @@ impl Slot {
     }
 }
 
-// One segment plus the permitted rotation delay and a bounded margin.
-const EVIDENCE_SLOTS: usize = 2048;
 const CAPTURE_PRESSURE: u64 = 1;
 const QUEUE_PRESSURE: u64 = 2;
 const CHANGED_LATE: u64 = 4;
+/// A frame of this slot waited for the epoch timeline and could not be used.
+const TIMELINE_PENDING: u64 = 8;
+const TAG_BITS: u32 = 4;
+const TAG_MASK: u64 = (1 << TAG_BITS) - 1;
 
+/// Per-slot capture evidence in a ring that covers at least the staged slot bound.
 pub(super) struct Evidence(Box<[AtomicU64]>);
 
 impl Evidence {
-    pub(super) fn new() -> Self {
-        Self((0..EVIDENCE_SLOTS).map(|_| AtomicU64::new(0)).collect())
+    pub(super) fn new(slots: u64) -> Self {
+        Self((0..slots.max(1)).map(|_| AtomicU64::new(0)).collect())
+    }
+
+    pub(super) fn slots(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    fn cell(&self, slot: u64) -> &AtomicU64 {
+        &self.0[(slot % self.slots()) as usize]
     }
 
     pub(super) fn capture_pressure(&self, slot: u64) {
@@ -113,12 +128,18 @@ impl Evidence {
         self.mark(slot, CHANGED_LATE);
     }
 
+    pub(super) fn timeline_pending(&self, slot: u64) {
+        self.mark(slot, TIMELINE_PENDING);
+    }
+
     pub(super) fn pressure(&self, slot: u64) -> Option<Missing> {
         let tags = self.tags(slot);
         if tags & QUEUE_PRESSURE != 0 {
             Some(Missing::QueuePressure)
         } else if tags & CAPTURE_PRESSURE != 0 {
             Some(Missing::ConversionPressure)
+        } else if tags & TIMELINE_PENDING != 0 {
+            Some(Missing::TimelinePending)
         } else {
             None
         }
@@ -129,23 +150,23 @@ impl Evidence {
     }
 
     fn mark(&self, slot: u64, tag: u64) {
-        let Some(sequence) = slot.checked_add(1).filter(|&slot| slot <= (u64::MAX >> 3)) else { return };
-        let cell = &self.0[(slot % EVIDENCE_SLOTS as u64) as usize];
+        let Some(sequence) = slot.checked_add(1).filter(|&slot| slot <= (u64::MAX >> TAG_BITS)) else { return };
+        let cell = self.cell(slot);
         let _ = cell.fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-            let previous = old >> 3;
+            let previous = old >> TAG_BITS;
             if previous > sequence {
                 None
             } else if previous == sequence {
                 Some(old | tag)
             } else {
-                Some((sequence << 3) | tag)
+                Some((sequence << TAG_BITS) | tag)
             }
         });
     }
 
     fn tags(&self, slot: u64) -> u64 {
-        let current = self.0[(slot % EVIDENCE_SLOTS as u64) as usize].load(Ordering::Acquire);
-        if Some(current >> 3) == slot.checked_add(1) { current & 7 } else { 0 }
+        let current = self.cell(slot).load(Ordering::Acquire);
+        if Some(current >> TAG_BITS) == slot.checked_add(1) { current & TAG_MASK } else { 0 }
     }
 }
 
@@ -158,12 +179,16 @@ pub(super) struct Source<'a> {
 
 pub(super) use crate::package::metadata::MissingVideoSlot as Missing;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One frames journal row. Its `recv_t_us` is `receipt` (§6.5): the capture
+/// receipt of a newly selected frame, otherwise an ordering receipt.
+#[derive(Debug, Clone, Serialize)]
 pub(super) struct Row {
     pub monitor: MonitorId,
     pub slot: u64,
     pub pts_us: SessionTimeUs,
-    pub slot_decided_t_us: Option<SessionTimeUs>,
+    pub slot_decided_t_us: SessionTimeUs,
+    /// When the worker published the resolved row to its frames lane.
+    pub published_t_us: Option<SessionTimeUs>,
     pub admission_epoch: AdmissionEpoch,
     pub encoded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -198,15 +223,18 @@ pub(super) struct Row {
     pub(super) coverage: Option<Arc<FrameCoverage>>,
     #[serde(skip)]
     coverage_end: Option<SessionTimeUs>,
+    /// The row's frames receipt, fixed at decision; withdrawal keeps it.
+    #[serde(skip)]
+    pub(super) receipt: SessionTimeUs,
 }
 
 impl Row {
     pub(super) fn pending(
-        monitor: MonitorId, epoch: AdmissionEpoch, slot: Slot,
-        decided: Option<SessionTimeUs>, source: Option<Source<'_>>, changed_arrived_late: Option<bool>,
+        monitor: MonitorId, epoch: AdmissionEpoch, slot: Slot, decided: SessionTimeUs, receipt: SessionTimeUs,
+        source: Option<Source<'_>>, changed_arrived_late: Option<bool>,
     ) -> Self {
         Self {
-            monitor, slot: slot.index, pts_us: slot.start, slot_decided_t_us: decided,
+            monitor, slot: slot.index, pts_us: slot.start, slot_decided_t_us: decided, published_t_us: None,
             admission_epoch: epoch, encoded: false, reason: None, segment: None,
             frame_in_segment: None, pts_100ns: None, duration_100ns: None,
             obs_id: source.map(|source| source.metadata.id.sequence.0),
@@ -219,6 +247,7 @@ impl Row {
             change: source.filter(|source| !source.repeated).and_then(|source| source.change),
             late: changed_arrived_late,
             coverage: source.and_then(|source| source.metadata.coverage.clone()), coverage_end: Some(slot.end),
+            receipt,
         }
     }
 

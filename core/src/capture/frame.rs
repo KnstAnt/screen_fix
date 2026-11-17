@@ -3,18 +3,16 @@ use std::{num::NonZeroU32, sync::{Arc, atomic::{AtomicI64, Ordering}}};
 use screen_fix_protocol::ipc::elevated::VisitBinding;
 
 use crate::protocol::{
-    AdmissionEpoch, ClockOrigin, FrameId, GeometryId, MonitorId, PhysicalRect, QpcTick, SegmentId,
-    SessionTimeUs, UncertaintyUs,
+    AdmissionEpoch, ClockOrigin, FrameId, GeometryId, PhysicalRect, QpcTick, SessionTimeUs, UncertaintyUs,
 };
-
-use super::DropReason;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MonitorGeometry {
     pub id: GeometryId,
     pub bounds: PhysicalRect,
-    pub dpi_x: NonZeroU32,
-    pub dpi_y: NonZeroU32,
+    /// Null when the monitor's DPI could not be read (VID-9).
+    pub dpi_x: Option<NonZeroU32>,
+    pub dpi_y: Option<NonZeroU32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -85,22 +83,4 @@ impl FrameMetadata {
     pub(crate) fn covered(&self) -> bool {
         self.coverage.as_ref().and_then(|coverage| coverage.before()).is_none_or(|before| self.source_t_us < before)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SegmentPts100ns(pub i64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VideoSlot {
-    pub monitor: MonitorId,
-    pub segment: SegmentId,
-    pub slot_t_us: SessionTimeUs,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlotDisposition {
-    New { frame: FrameId, pts: SegmentPts100ns },
-    Repeated { frame: FrameId, pts: SegmentPts100ns },
-    Missing,
-    Skipped(DropReason),
 }

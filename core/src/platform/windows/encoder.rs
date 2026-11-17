@@ -1,4 +1,4 @@
-use std::{thread, time::{Duration, Instant}};
+use std::{borrow::Cow, sync::mpsc::SyncSender, thread, time::{Duration, Instant}};
 
 use windows::{
     Win32::{
@@ -9,6 +9,8 @@ use windows::{
     },
     core::{self, Interface},
 };
+
+use crate::package::metadata::RejectedEncoder;
 
 use super::{ProbeError, capture_device, encode, gpu, h264, mf, pixels, stage, unavailable};
 
@@ -22,6 +24,17 @@ pub(super) struct Encoder {
     activation: Option<IMFActivate>,
     _manager: Option<IMFDXGIDeviceManager>,
     pub device: Option<ID3D11Device>,
+    /// Hardware candidates rejected before this encoder qualified.
+    pub rejected: Vec<RejectedEncoder>,
+}
+
+/// A request for one self-check picture of a candidate format. The capture
+/// owner converts it on its device, so the selecting video thread never uses
+/// that device's immediate context (VID-12).
+pub(super) struct Probe {
+    pub format: gpu::VideoFormat,
+    pub software: bool,
+    pub reply: SyncSender<Result<encode::Input, ProbeError>>,
 }
 
 impl Encoder {
@@ -47,7 +60,25 @@ impl Drop for Encoder {
     }
 }
 
-pub(super) fn select(capture: &ID3D11Device, adapter: &IDXGIAdapter1, luid: LUID, source: [u32; 2], requested_fps: u32) -> Result<Encoder, ProbeError> {
+/// The highest frame rate `select` can qualify for a requested pace: a
+/// hardware encoder runs at the requested pace, the software fallback at
+/// its fixed rate. Every bound sized before selection uses this value.
+pub(super) fn max_effective_fps(requested_fps: u32) -> u32 {
+    requested_fps.max(SOFTWARE_FPS)
+}
+
+/// The lowest frame rate `select` can qualify: it sets the longest slot interval.
+pub(super) fn min_effective_fps(requested_fps: u32) -> u32 {
+    requested_fps.min(SOFTWARE_FPS)
+}
+
+/// Qualify an encoder for a display format: each hardware candidate in turn,
+/// then the software encoder at its fixed rate. `probe` supplies the
+/// converted self-check picture of a candidate format.
+pub(super) fn select(
+    adapter: &IDXGIAdapter1, luid: LUID, source: [u32; 2], requested_fps: u32,
+    probe: &mut dyn FnMut(gpu::VideoFormat, bool) -> Result<encode::Input, ProbeError>,
+) -> Result<Encoder, ProbeError> {
     let attributes = mf::attributes(1)?;
     // Serialize the two 32-bit fields of the Windows LUID in ABI order.
     let mut luid_bytes = [0; 8];
@@ -63,22 +94,48 @@ pub(super) fn select(capture: &ID3D11Device, adapter: &IDXGIAdapter1, luid: LUID
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_H264,
     };
+    let mut rejected = Vec::new();
+    let reject = |name: Option<String>, error: ProbeError| RejectedEncoder {
+        name, cause: Cow::Borrowed(error.stage), native_code: error.source.as_ref().map(|source| source.code().0),
+    };
     let candidates = mf::enum_on_adapter(MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-        &input, &output, &attributes).unwrap_or_default();
+        &input, &output, &attributes).unwrap_or_else(|error| {
+            rejected.push(reject(None, error));
+            Vec::new()
+        });
 
     // Probe native shape first. Lower shapes are eligible only after the
     // higher shape failed configuration or the actual encode check.
-    if !candidates.is_empty() && let Ok(device) = capture_device(adapter) {
-        for candidate in &candidates {
-            if let Ok(encoder) = qualify(capture, source, requested_fps, Some((candidate, &device))) {
-                return Ok(encoder);
-            }
+    if !candidates.is_empty() {
+        match capture_device(adapter) {
+            Ok(device) => for candidate in &candidates {
+                match qualify(source, requested_fps, Some((candidate, &device)), probe) {
+                    Ok(mut encoder) => {
+                        encoder.rejected = rejected;
+                        return Ok(encoder);
+                    }
+                    Err(error) => rejected.push(reject(friendly_name(candidate), error)),
+                }
+            },
+            Err(error) => rejected.push(reject(None, error)),
         }
     }
-    qualify(capture, source, SOFTWARE_FPS, None)
+    let mut encoder = qualify(source, SOFTWARE_FPS, None, probe)?;
+    encoder.rejected = rejected;
+    Ok(encoder)
 }
 
-fn qualify(device: &ID3D11Device, source: [u32; 2], fps: u32, hardware: Option<(&IMFActivate, &ID3D11Device)>) -> Result<Encoder, ProbeError> {
+fn friendly_name(candidate: &IMFActivate) -> Option<String> {
+    let length = unsafe { candidate.GetStringLength(&MFT_FRIENDLY_NAME_Attribute) }.ok().filter(|&length| length <= 256)?;
+    let mut name = vec![0_u16; length as usize + 1];
+    unsafe { candidate.GetString(&MFT_FRIENDLY_NAME_Attribute, &mut name, None) }.ok()?;
+    Some(String::from_utf16_lossy(&name[..length as usize]))
+}
+
+fn qualify(
+    source: [u32; 2], fps: u32, hardware: Option<(&IMFActivate, &ID3D11Device)>,
+    probe: &mut dyn FnMut(gpu::VideoFormat, bool) -> Result<encode::Input, ProbeError>,
+) -> Result<Encoder, ProbeError> {
     let native_limit = (source[0].max(source[1]).min(4096) + 1) & !1;
     let mut low = 2;
     let mut high = native_limit;
@@ -89,7 +146,7 @@ fn qualify(device: &ID3D11Device, source: [u32; 2], fps: u32, hardware: Option<(
         let format = gpu::VideoFormat::fit(source, candidate, fps)?;
         match configure(hardware, format) {
             Ok(encoder) => {
-                let check = self_check(device, &encoder);
+                let check = probe(format, encoder.software()).and_then(|input| self_check(&encoder, input));
                 match check {
                     Ok(()) if candidate == native_limit => return Ok(encoder),
                     Ok(()) => {
@@ -116,7 +173,7 @@ fn qualify(device: &ID3D11Device, source: [u32; 2], fps: u32, hardware: Option<(
     }
     let format = best.ok_or(last_error)?;
     let encoder = configure(hardware, format)?;
-    self_check(device, &encoder)?;
+    self_check(&encoder, probe(format, encoder.software())?)?;
     Ok(encoder)
 }
 
@@ -130,7 +187,7 @@ fn configure(
     };
     let mut encoder = Encoder {
         transform, format, activation: hardware.map(|(activation, _)| activation.clone()),
-        _manager: None, device: hardware.map(|(_, device)| device.clone()),
+        _manager: None, device: hardware.map(|(_, device)| device.clone()), rejected: Vec::new(),
     };
     if let Some((_, device)) = hardware {
         let attributes = stage(unsafe { encoder.transform.GetAttributes() }, "Read the hardware H.264 encoder properties")?;
@@ -158,10 +215,11 @@ fn configure(
     Ok(encoder)
 }
 
-fn self_check(device: &ID3D11Device, encoder: &Encoder) -> Result<(), ProbeError> {
-    let format = encoder.format;
+/// Convert one self-check picture of `format` on the capture device. Only the
+/// owner of that device's immediate context calls this.
+pub(super) fn probe_input(device: &ID3D11Device, format: gpu::VideoFormat, software: bool) -> Result<encode::Input, ProbeError> {
     let [width, height] = format.source;
-    let mut converter = gpu::Converter::new(device, format, encoder.software())?;
+    let mut converter = gpu::Converter::new(device, format, software)?;
     let source = pixels::texture(device, width, height, DXGI_FORMAT_B8G8R8A8_UNORM,
         D3D11_BIND_RENDER_TARGET.0 as u32, false)?;
     let mut target: Option<ID3D11RenderTargetView> = None;
@@ -181,16 +239,21 @@ fn self_check(device: &ID3D11Device, encoder: &Encoder) -> Result<(), ProbeError
         }
         thread::sleep(Duration::from_millis(1));
     };
+    Ok(input)
+}
 
-    struct Probe {
+fn self_check(encoder: &Encoder, input: encode::Input) -> Result<(), ProbeError> {
+    let format = encoder.format;
+
+    struct Check {
         sent: u32,
         received: u32,
         headers: h264::Headers,
     }
-    let mut probe = Probe { sent: 0, received: 0, headers: h264::Headers::default() };
+    let mut probe = Check { sent: 0, received: 0, headers: h264::Headers::default() };
     let ticks = |index: u32| i64::from(index) * 10_000_000 / i64::from(format.fps);
     let pace_origin = Instant::now();
-    let submitted = encode::record(&encoder.transform, encoder.device.as_ref(), &mut probe, |_| Ok(()), |probe| {
+    let submitted = encode::record(&encoder.transform, encoder.device.as_ref(), &mut probe, |_| Ok(false), |probe| {
         if probe.sent == SELF_CHECK_PICTURES {
             return Ok(encode::Next::End);
         }

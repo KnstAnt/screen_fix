@@ -71,6 +71,44 @@ Before starting or resuming a collector-backed visit, keep target publication cl
 
 Decline, timeout, unsupported deployment or required source failure before admission ends startup without an admitted recording. Stop before admission cancels it. An admitted source failure closes the earliest safely known per-visit prefix and finalizes a failed attempt under the existing bounded failure flow. Transition and uncertified time remain explicit. Relaunch, automatic recovery and retrospective removal of already published evidence are outside this amendment.
 
+### A6. Remediation amendments (user decisions, 2026-11-17)
+
+These amendments follow the M1 remediation plan (`SCREEN_FIX_M1_REMEDIATION_PLAN.md`, section 5). Each one overrides the cited PDF requirement for M1 only.
+
+**A6.1 Registration and hook loss is detected, not repaired (D-2 B; amends INP-1 and INP-12).**
+- M1 does not re-register Raw Input collections and does not reinstall low-level hooks.
+- A lost required registration, or a required hook confirmed lost by hook health, opens an input blind interval and writes an `input_health` record.
+- The loss is a required activity loss of input (L-required): the interval stays open until Stop, and the disposition is `input_unavailable`.
+- A lost optional collection (touchpad or multi-axis HID) is recorded as unavailable and does not affect the disposition.
+
+**A6.2 An unapproved foreground is suppressed, not paused (D-3 A; amends CTX-6 and PRIV-2 for M1).**
+- M1 does not auto-pause on an unapproved or `always_pause_window` foreground and writes no `late_pause` record. The unified pause-cutoff policy stays in M3.
+- Each suppressed interval stays observable:
+  - a `foreground` row with `approved:false`;
+  - suppression intervals with their reason and bounds;
+  - suppressed-input counts per class in the stream summary, without per-key timing.
+- Gate 4 has no pause interval for these periods. Gate 3 excludes suppression intervals instead.
+
+**A6.3 Suspend finalization is bounded and continues after wake (D-5 A; amends CLK-7).**
+- On `PBT_APMSUSPEND` the controller waits at most 2 s for each monitor to close its open segment, then lets the system sleep.
+- A monitor that misses the bound writes a `suspend_finalize_late` health record. It finishes finalization and verification after wake and publishes the segment normally.
+- The attempt continues in Paused(Sleep). Sleep never fails the attempt.
+- Session end (REL-9) keeps its own budgets and the leave-`.part` rule.
+
+**A6.4 Complete uses the interval rule for selected monitors (D-6 A; clarifies "usable video for each selected monitor").**
+- Complete requires usable video for each selected monitor in each interval in which that monitor was present and admitted.
+- Slots of an absent monitor are recorded as `monitor_missing` and do not prevent Complete.
+- An admitted interval of a present monitor counts as without video only if it has no encoded slot and contains a slot that starts later than the interval start plus the slot decision grace G. Shorter intervals, for example Resume followed at once by Stop, are counted separately in `short_intervals_without_video` and do not prevent Complete.
+- Approval-suppressed slots lie outside admitted intervals.
+
+**A6.5 GPU device loss fails the attempt in M1 (limitation under A2).**
+- A capture-thread failure that is not a topology change, for example GPU device loss, is an attempt failure.
+- The VID-9 device-loss rebuild is deferred with the other recovery work. The PDF statement that such an event does not end the attempt is therefore not met for device loss in M1.
+
+**A6.6 Checksums and gate 8 start in M2 (clarification of DATA-3).**
+- PDF section 17 lists the M1 scope without `checksums.sha256`, and M1 acceptance uses gates 1–4 only. Gate 8 first appears in the M2 acceptance (T18).
+- M1 packages carry no `checksums.sha256`. This is not an M1 defect.
+
 ## 3. Implementation contracts
 
 ### C1. Time and observations
