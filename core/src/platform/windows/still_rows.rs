@@ -98,7 +98,7 @@ impl Completed {
     fn publishable(mut self) -> Value {
         if self.coverage.as_ref().is_some_and(|coverage| !coverage.allows()) {
             self.row["kind"] = serde_json::json!("still_dropped");
-            for field in ["source_t_us", "frame_obs_id", "seen_obs_id", "file", "seen_file", "width", "height", "frame", "settled_confirmed_t_us"] {
+            for field in ["source_t_us", "frame_obs_id", "file", "width", "height", "frame", "settled_confirmed_t_us"] {
                 self.row[field] = Value::Null;
             }
             self.row["reason"] = serde_json::json!("elevated_frame_uncertified");
@@ -108,9 +108,24 @@ impl Completed {
     }
 }
 
+/// One row per trigger (IMG-2): the before half's row with the seen frame's
+/// id, and the seen file only when it differs from the row's file.
+fn with_seen(mut row: Value, seen: Value) -> Value {
+    row["seen_obs_id"] = seen["frame_obs_id"].clone();
+    if let Some(file) = seen["file"].as_str().filter(|file| row["file"].as_str() != Some(*file)) {
+        row["seen_file"] = file.into();
+    }
+    row["seen_frame"] = seen["frame"].clone();
+    row["seen_outcome"] = seen["outcome"].clone();
+    row
+}
+
+/// A handle that finishes one half of its slot: the only half, or the
+/// before (0) or seen (1) half of a paired row.
 pub(super) struct Reservation {
-    result: SyncSender<Option<Completed>>,
+    result: SyncSender<(u8, Option<Completed>)>,
     shared: Arc<Mutex<SharedSlot>>,
+    half: u8,
 }
 
 impl Reservation {
@@ -124,7 +139,7 @@ impl Reservation {
     }
 
     pub fn suppress(self) {
-        let _ = self.result.try_send(None);
+        let _ = self.result.try_send((self.half, None));
     }
 
     pub fn finish(self, row: Value) {
@@ -132,16 +147,31 @@ impl Reservation {
     }
 
     pub fn finish_frame(self, row: Value, coverage: Option<StillCoverage>) {
-        let _ = self.result.try_send(Some(Completed { row, coverage }));
+        let _ = self.result.try_send((self.half, Some(Completed { row, coverage })));
     }
 }
 
 struct Slot {
     at: SessionTimeUs,
     deadline: Instant,
-    result: Receiver<Option<Completed>>,
+    result: Receiver<(u8, Option<Completed>)>,
     shared: Arc<Mutex<SharedSlot>>,
+    /// The halves still owed, and the ones received by index.
+    owed: u8,
+    halves: [Option<Completed>; 2],
     _charge: Charge,
+}
+
+impl Slot {
+    /// The slot's row once every half is in; none when it was suppressed.
+    fn row(self) -> Option<Value> {
+        let [row, seen] = self.halves;
+        let row = row?.publishable();
+        Some(match seen {
+            Some(seen) => with_seen(row, seen.publishable()),
+            None => row,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -169,6 +199,23 @@ pub(super) struct Rows(Arc<Producer>);
 impl Rows {
     /// A failed reservation reports why, so a public caller can account it with `note_loss`.
     pub fn reserve(&self, at: SessionTimeUs, fallback: Option<Value>) -> Result<Reservation, LossReason> {
+        self.reserve_halves(at, fallback, 1)
+    }
+
+    /// Reserve a public row; a failure is accounted as a loss.
+    pub fn reserve_public(&self, at: SessionTimeUs, fallback: Value) -> Option<Reservation> {
+        self.reserve(at, Some(fallback)).inspect_err(|reason| self.note_loss(at, *reason)).ok()
+    }
+
+    /// One row of a pre-motion or pre-action trigger, finished by its before
+    /// and seen halves (IMG-2). Its fallback is set at approval.
+    pub fn reserve_pair(&self, at: SessionTimeUs) -> Result<[Reservation; 2], LossReason> {
+        let before = self.reserve_halves(at, None, 2)?;
+        let seen = Reservation { result: before.result.clone(), shared: Arc::clone(&before.shared), half: 1 };
+        Ok([before, seen])
+    }
+
+    fn reserve_halves(&self, at: SessionTimeUs, fallback: Option<Value>, halves: u8) -> Result<Reservation, LossReason> {
         let producer = &self.0;
         if producer.progress.excluded.load(Ordering::Acquire) {
             return Err(LossReason::ProducerStall);
@@ -180,11 +227,12 @@ impl Rows {
             (count < SLOTS).then_some(count + 1)
         }).map_err(|_| LossReason::StagingPressure)?;
         let charge = Charge(Arc::clone(&producer.budget));
-        let (finish, result) = sync_channel(1);
+        let (finish, result) = sync_channel(usize::from(halves));
         let shared = Arc::new(Mutex::new(SharedSlot { fallback, expired: false }));
         producer.send.try_send(Slot { at, deadline: Instant::now() + WAIT, result,
-            shared: Arc::clone(&shared), _charge: charge }).map_err(|_| LossReason::StagingPressure)?;
-        Ok(Reservation { result: finish, shared })
+            shared: Arc::clone(&shared), owed: halves, halves: [None, None], _charge: charge })
+            .map_err(|_| LossReason::StagingPressure)?;
+        Ok(Reservation { result: finish, shared, half: 0 })
     }
 
     /// Called only after offering every earlier logical row or accounting for
@@ -290,12 +338,32 @@ impl Merge {
                 journal.record_loss(loss, at).map_err(package_journal_error)?;
                 self.last = at;
             }
-            let Some((&key, slot)) = self.ordered.first_key_value() else { break; };
+            let Some(mut entry) = self.ordered.first_entry() else { break; };
+            let key = *entry.key();
             if !finishing && key.0 >= before { break; }
-            let row = match slot.result.try_recv() {
-                Ok(row) => row,
-                Err(TryRecvError::Empty) if !finishing && now < slot.deadline => break,
-                Err(error) => {
+            let slot = entry.get_mut();
+            let mut failed = None;
+            while slot.owed != 0 {
+                match slot.result.try_recv() {
+                    Ok((half, completed)) => {
+                        slot.owed -= 1;
+                        slot.halves[usize::from(half)] = completed;
+                    }
+                    Err(TryRecvError::Empty) if !finishing && now < slot.deadline => break,
+                    Err(error) => {
+                        failed = Some(error);
+                        break;
+                    }
+                }
+            }
+            if slot.owed != 0 && failed.is_none() { break; }
+            let slot = entry.remove();
+            // A slot whose halves did not all finish is its approved fallback.
+            // A half that already saved its PNG leaves that file unreferenced
+            // and uncounted, so `unreferenced_images` is a lower bound.
+            let row = match failed {
+                None => slot.row(),
+                Some(error) => {
                     let mut shared = slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
                     shared.expired = true;
                     let mut fallback = shared.fallback.take();
@@ -306,15 +374,14 @@ impl Merge {
                             if finishing { "still_owner_closed" } else { "still_ordered_deadline" }
                         );
                     }
-                    fallback.map(|row| Completed { row, coverage: None })
+                    fallback
                 }
             };
-            self.ordered.pop_first();
             if let Some(row) = row {
                 if key.0 < self.last {
                     self.budget.omit(key.0, LossReason::LateRow);
                 } else {
-                    journal.try_submit(key.0, row.publishable()).map_err(package_journal_error)?;
+                    journal.try_submit(key.0, row).map_err(package_journal_error)?;
                     self.last = key.0;
                 }
             }

@@ -1,0 +1,71 @@
+# Review findings, area A: video pipeline (`core/src/platform/windows/`)
+
+**Status:** the §6.5 merge was verified as correct.
+
+- **A1 · medium · bugfix (§6.2 rows 9/2, ALG §9.2)**
+  - **Where:** video.rs:800-806, 1233-1236.
+  - **Problem:** `ROTATION_IDR_MISSING` mid-recording flags L, then sets `required_finalization_failure`, which platform/windows.rs:284 reports as F. A `Segment::close` error during ordinary rotation also escalates via `finish_current`.
+  - **Fix:** set `required_finalization_failure` only when the Stop deadline caused the failure (`stop_expired()` / `mp4::DEADLINE`). Otherwise keep the `.part`, call `flag_failure` only, and let `complete_unavailable` handle the rows.
+- **A2 · low · bugfix (§6.2 row 9)**
+  - **Where:** video.rs:851, 930 (compare 815).
+  - **Problem:** `Encoder::finish()?` at a format change or at Stop returns Err, which becomes F; at line 815 the same call is ignored.
+  - **Fix:** route the error to `flag_failure`/`lose_video` and continue. Use one helper for all three sites.
+- **A3 · medium · bugfix (ALG §9.1 newest eligible frame; V4)**
+  - **Where:** monitor.rs:713-718.
+  - **Problem:** the software path converts the first frame of each slot and skips the later ones (`video_software_paced`), so a slot shows its oldest frame.
+  - **Fix:** defer the SW conversion. Keep the newest native texture of the current slot and submit it when a later slot's frame arrives or the slot ends.
+- **A4 · medium · change, plausible**
+  - **Where:** gpu.rs:230-233 (`VIDEO_TEXTURES = 3`), gpu.rs:149.
+  - **Problem:** the pool has no slack for previous/candidate/future plus 3 encoder inputs plus 1 in conversion.
+  - **Fix:** size the pool from named consts.
+- **A5 · low · none**
+  - **Where:** encoder.rs:158-170, 117.
+  - **Problem:** on `PROBE_INTERRUPTED`, `qualify` keeps binary-searching and `select` tries the other candidates.
+  - **Fix:** return immediately and propagate.
+- **A6 · low · bugfix (V4: record every rejected candidate)**
+  - **Where:** encoder.rs:123, 98-105.
+  - **Problem:** when nothing qualifies, the `rejected` list is dropped.
+  - **Fix:** return `SelectError{last, rejected}` and emit `EncoderCandidateRejected` health rows on the failure path too.
+- **A7 · low · none**
+  - **Where:** video.rs:513-515, 879, 1371; mp4.rs:136, 178; wgc.rs:64-69; encoder.rs:159.
+  - **Problem:** F/L classification, interruption, deadline, revocation and B-frame handling compare `ProbeError.stage` strings. encoder.rs:159 repeats the literal from 286.
+  - **Fix:** a typed `kind` enum on `ProbeError`, or at minimum shared consts.
+- **A8 · low · bugfix (V2a: every skip is counted)**
+  - **Where:** wgc.rs:130-147.
+  - **Problem:** `Capture::newest` closes up to 2 superseded frames uncounted.
+  - **Fix:** return the count and add it to `CaptureCounters`.
+- **A9 · low · bugfix (V4: an unselected monitor's failure never affects capture)**
+  - **Where:** display.rs:130-133, 161-184.
+  - **Problem:** one unreadable output fails the whole `enumerate()`.
+  - **Fix:** record the failure per output.
+- **A10 · low · bugfix**
+  - **Where:** video.rs:291-296 (requests at 1242, 1378).
+  - **Problem:** a flush request is cleared after flushing to `released`, even if the segment's rows are still waiting in the lane.
+  - **Fix:** pass the target receipt and keep the request pending until `released` reaches it.
+- **A11 · low · none (duplication)**
+  - **Problem:**
+    - rect width/height: video.rs:517, 522; monitor.rs:804, 829;
+    - mean bitrate `*3/4`: encoder.rs:210, video.rs:1169;
+    - pacing interval: monitor.rs:168, video.rs:672;
+    - thumbnail 256×144 in the shader (pixels.rs:30) vs `THUMB_*`;
+    - `clock::message_tick_interval` (clock.rs:48-58) duplicates the protocol wrap logic.
+- **A12 · low · none (redundant)**
+  - **Where:** video.rs:59 (`.max(1)` fps), 672-674, 524-527 (`>0` w/h, guaranteed by `PhysicalRect`), 752-754 (`staged_slots > evidence.slots()` → `debug_assert`).
+- **A13 · low · none**
+  - **Problem:**
+    - magic numbers: encode.rs:199-200 (3), encode.rs:103-106 (5 s, also in the message), monitor.rs:460 ("3 seconds"), encoder.rs:237, video.rs:1213, monitor.rs:616 (3 s), `Selection::collect` `0..3`, mp4.rs:223 `32|33`;
+    - wgc.rs:269-270 `status.0 == 0/1` → `AsyncStatus`;
+    - display.rs:206 `dwFlags & 1` → `MONITORINFOF_PRIMARY`;
+    - encoder.rs:211 profile 100 → `eAVEncH264VProfile_High`;
+    - encode.rs:169 `Output::Empty if outstanding != 0 => continue` spins → park 1 ms;
+    - gpu.rs:183 has a wrong safety comment (it mentions a WGC lease).
+- **A14 · low · none**
+  - **Where:** mp4.rs:17-28.
+  - **Problem:** `io_error` is a general constructor living in mp4.rs (about 12 importers), and it invents code 1 when there is no OS code.
+  - **Fix:** move it to windows.rs and use `source: None` when there is no OS code.
+- **A15 · low · none**
+  - **Where:** mp4.rs:158.
+  - **Problem:** a verifier COM init failure is silent.
+  - **Fix:** init before spawn, or send the error as the first verdict.
+- **A16 · low · none (long functions)**
+  - **Problem:** `monitor::capture` is about 490 lines; `video::record` is about 220 lines (724-942); `next_frame` is 983-1113; `Video` has 45 fields.

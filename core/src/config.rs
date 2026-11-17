@@ -2,12 +2,11 @@ use std::{fmt, num::NonZeroU16, path::{Path, PathBuf}};
 
 use crate::protocol::{
     BoundedList, BoundedText, DeviceId, Evidence, MonitorId, UnavailableReason, UncertaintyUs,
+    ipc::elevated::runtime::{MAX_APPROVAL_KEY_BYTES, MAX_APPROVED_EXECUTABLES},
 };
 
 pub const MAX_SELECTED_MONITORS: usize = 32;
-const MAX_APPROVED_EXECUTABLES: usize = 64;
 const MAX_CALIBRATED_DEVICES: usize = 128;
-const MAX_EXECUTABLE_ID_BYTES: usize = 4096;
 
 /// A stable display-selection key. Windows supplies the physical monitor device path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,7 +47,7 @@ impl CapturePace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecutableIdentity(BoundedText<MAX_EXECUTABLE_ID_BYTES>);
+pub struct ExecutableIdentity(BoundedText<MAX_APPROVAL_KEY_BYTES>);
 
 impl ExecutableIdentity {
     /// Takes the executable identity already resolved by the platform/profile provider.

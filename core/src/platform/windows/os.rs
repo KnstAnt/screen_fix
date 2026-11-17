@@ -11,6 +11,8 @@ use windows_sys::Win32::{
 
 use crate::{CaptureError, platform::{SecuritySupport, WindowsEvidence}};
 
+use super::wide;
+
 const VERSION_KEY: &str = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
 const PRODUCT_KEY: &str = "SYSTEM\\CurrentControlSet\\Control\\ProductOptions";
 const AMD64: u16 = 0x8664;
@@ -117,10 +119,6 @@ fn dword(key: &str, value: &str) -> Option<u32> {
     (unsafe { RegGetValueW(HKEY_LOCAL_MACHINE, wide(key).as_ptr(), wide(value).as_ptr(),
         RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, null_mut(), (&mut data as *mut u32).cast(), &mut bytes) } == ERROR_SUCCESS
         && bytes as usize == size_of::<u32>()).then_some(data)
-}
-
-fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain([0]).collect()
 }
 
 fn unknown(message: &'static str) -> CaptureError {

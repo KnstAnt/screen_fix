@@ -28,7 +28,7 @@ use windows_sys::Win32::{
 
 use crate::{package::{ArtifactKind, ArtifactRef, ImageDigest, metadata::{AttemptLayout, ImageFile}},
     protocol::{ClockOrigin, PhysicalPoint, QpcTick}};
-use super::super::{ProbeError, clock, mp4::io_error};
+use super::super::{ProbeError, clock, io_error};
 
 const POLL: Duration = Duration::from_millis(50);
 const MAX_EDGE: usize = 256;
@@ -144,24 +144,22 @@ impl Tracker {
         let observed = Observed { at, state, standard };
         if !approved || standard.is_some() || state.handle == 0 || !state.visible {
             self.unqueued = None;
-            return Some(Completion { observed, resolved: None, kind: ResultKind::State { asset: CustomAsset::NotNeeded } });
+            return Some(Completion::state(observed, CustomAsset::NotNeeded));
         }
         let Some(image) = Pixels::read(info.hCursor) else {
             self.unqueued = None;
-            return (!retry).then_some(Completion { observed, resolved: None,
-                kind: ResultKind::State { asset: CustomAsset::Unavailable("pixels_unavailable") } });
+            return (!retry).then_some(Completion::state(observed, CustomAsset::Unavailable("pixels_unavailable")));
         };
         if self.pending.len() < QUEUE
             && self.sender.as_ref().is_some_and(|sender| sender.try_send(Job { observed, image }).is_ok())
         {
             self.unqueued = None;
             self.pending.push(observed);
-            return Some(Completion { observed, resolved: None, kind: ResultKind::State { asset: CustomAsset::Pending } });
+            return Some(Completion::state(observed, CustomAsset::Pending));
         }
         // A retry that fails again adds no row.
         self.unqueued = Some(state.handle);
-        (!retry).then_some(Completion { observed, resolved: None,
-            kind: ResultKind::State { asset: CustomAsset::Unavailable("cursor_asset_queue") } })
+        (!retry).then_some(Completion::state(observed, CustomAsset::Unavailable("cursor_asset_queue")))
     }
 
     pub fn results(&mut self) -> Vec<Completion> {
@@ -253,6 +251,10 @@ pub(super) struct Completion {
 }
 
 impl Completion {
+    fn state(observed: Observed, asset: CustomAsset) -> Self {
+        Self { observed, resolved: None, kind: ResultKind::State { asset } }
+    }
+
     pub fn received(&self) -> QpcTick {
         self.observed.at
     }

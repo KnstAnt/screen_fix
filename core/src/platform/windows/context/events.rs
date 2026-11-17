@@ -2,7 +2,7 @@ use screen_fix_native_observation::events::{self, StartError};
 
 pub(super) use events::{DISPLAY_CHANGE, Notice, SETTINGS_CHANGE};
 
-use super::super::{ProbeError, mp4::io_error, unavailable};
+use super::super::{ProbeError, io_error, unavailable};
 
 pub(super) struct Notifications(events::Notifications);
 

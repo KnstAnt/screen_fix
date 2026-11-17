@@ -23,7 +23,7 @@ use crate::{
     CaptureError,
     capture::save::{FixtureSave, FixtureSaveError, FixtureSaveResult},
     config::ResolvedCaptureConfig,
-    package::{diagnostics::{DiagnosticContext, Failure, FailureComponent, ReportOutcome}, metadata::{
+    package::{diagnostics::{DiagnosticContext, Failure, FailureComponent, ReportOutcome}, journal::HealthRecord, outcome::HealthKind, metadata::{
         ElevatedSourceEvidence, InputBlindReason, LostActivity, SelectedSourceInterval, SelectedSourceKind, SourceBlindInterval, SourceBlindReason,
         SourceEvidence, SourceRegistration, SourceTail, StandardSourceEvidence, UncertifiedInputTail,
     }},
@@ -215,7 +215,7 @@ struct Facts {
     tick_anchor: Option<MessageTickAnchor>,
     video_failures: Vec<VideoFailure>,
     /// Capture and video health conditions for the context stream, in report order.
-    health: Vec<crate::package::journal::HealthRecord>,
+    health: Vec<HealthRecord>,
     /// Conditions beyond `MAX_HEALTH_REPORTS`, counted in the manifest health block.
     omitted_health: u64,
     /// The suspend sequence read at the previous hotkey drain.
@@ -255,6 +255,13 @@ struct Facts {
     source_evidence: SourceEvidence,
     selected_intervals: Vec<SelectedInterval>,
 
+}
+
+impl Facts {
+    /// The session time now; none before the clock exists or when a sample fails.
+    fn now(&self) -> Option<SessionTimeUs> {
+        self.status.clock.and_then(|origin| origin.time(clock::qpc().ok()?).ok())
+    }
 }
 
 struct SelectedInterval {
@@ -1007,9 +1014,8 @@ impl WorkerSession {
         Ok(facts.status.closed)
     }
 
-    pub(crate) fn session_time(&self) -> Option<crate::protocol::SessionTimeUs> {
-        let origin = self.lifecycle.lock().status.clock?;
-        origin.time(clock::qpc().ok()?).ok()
+    pub(crate) fn session_time(&self) -> Option<SessionTimeUs> {
+        self.lifecycle.lock().now()
     }
 
     pub(crate) fn video_failed(&self, monitor: MonitorId, failure: Failure) -> Option<VideoFailure> {
@@ -1017,7 +1023,7 @@ impl WorkerSession {
         if facts.status.video_unavailable.contains(&monitor) {
             return None;
         }
-        let at = facts.status.clock.and_then(|origin| origin.time(clock::qpc().ok()?).ok());
+        let at = facts.now();
         let entry = VideoFailure { monitor, at, failure };
         facts.video_failures.push(entry);
         facts.status.video_unavailable.push(monitor);
@@ -1042,7 +1048,7 @@ impl WorkerSession {
     /// it occurs (CTX-7). Before the session clock exists it stays only in the
     /// manifest. Conditions beyond the bound are counted as `omitted_health`.
     pub(crate) fn report_health(
-        &self, kind: crate::package::outcome::HealthKind, failure: Failure, monitor: Option<MonitorId>, ongoing: bool,
+        &self, kind: HealthKind, failure: Failure, monitor: Option<MonitorId>, ongoing: bool,
     ) {
         push_health(&mut self.lifecycle.lock(), kind, failure, monitor, ongoing);
     }
@@ -1051,7 +1057,7 @@ impl WorkerSession {
         self.lifecycle.lock().omitted_health
     }
 
-    pub(crate) fn health_after(&self, prefix: usize) -> Vec<crate::package::journal::HealthRecord> {
+    pub(crate) fn health_after(&self, prefix: usize) -> Vec<HealthRecord> {
         self.lifecycle.lock().health.get(prefix..).unwrap_or_default().to_vec()
     }
 
@@ -1412,7 +1418,7 @@ fn coordinate(
                         let late: Vec<_> = session.config().monitors().iter().map(|monitor| monitor.id)
                             .filter(|id| !facts.pause_prefix.contains(&PauseProducer::Video(*id))).collect();
                         for monitor in late {
-                            push_health(&mut facts, crate::package::outcome::HealthKind::SuspendFinalizeLate,
+                            push_health(&mut facts, HealthKind::SuspendFinalizeLate,
                                 Failure::new(FailureComponent::Video, "Finish the suspended video segment", None), Some(monitor), false);
                         }
                     }
@@ -1729,7 +1735,7 @@ fn clear_source_status(facts: &mut Facts) {
 
 /// Record a fault in the controller's log. A lost activity becomes visible in the status at once.
 fn record_fault(facts: &mut Facts, report: FaultReport) {
-    let now = facts.status.clock.and_then(|origin| origin.time(clock::qpc().ok()?).ok());
+    let now = facts.now();
     if let Some(degraded) = facts.faults.record(report, now)
         && !facts.status.degraded.contains(&degraded)
     {
@@ -1811,11 +1817,11 @@ fn open_frames(lifecycle: &Lifecycle, opening: AdmissionBoundary) -> Result<(), 
 }
 
 fn push_health(
-    facts: &mut Facts, kind: crate::package::outcome::HealthKind, failure: Failure, monitor: Option<MonitorId>, ongoing: bool,
+    facts: &mut Facts, kind: HealthKind, failure: Failure, monitor: Option<MonitorId>, ongoing: bool,
 ) {
-    let Some(at) = facts.status.clock.and_then(|origin| origin.time(clock::qpc().ok()?).ok()) else { return };
+    let Some(at) = facts.now() else { return };
     if facts.health.len() < MAX_HEALTH_REPORTS {
-        facts.health.push(crate::package::journal::HealthRecord {
+        facts.health.push(HealthRecord {
             kind, failure, detected: at, first_affected: Some(at), ongoing, monitor, count: None,
         });
     } else {

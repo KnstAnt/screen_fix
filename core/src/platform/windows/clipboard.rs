@@ -35,7 +35,7 @@ use crate::{protocol::{MessageTickMs, QpcTick}, session::windows::ActiveSourcePr
 
 use super::{
     ProbeError, clock, context::{FocusGuard, Visit, identity::WindowProcess},
-    mp4::io_error, stage, unavailable,
+    io_error, stage, unavailable,
 };
 
 const QUEUE: usize = 8;

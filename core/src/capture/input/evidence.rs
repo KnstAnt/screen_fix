@@ -5,7 +5,7 @@ use crate::{
 
 use super::{
     Action, Button, CorrelatedInput, Correlation, InputOrigin, Key, Motion, PendingInput,
-    PointerEvidence, matching::promoted,
+    PointerEvidence, matching::{injected_hook, promoted},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,9 +193,9 @@ fn origin(
             injector_hint: None,
         };
     }
-    let injected = hook.and_then(|slot| match slot.packet.sample {
-        InputSample::HookKey(key) if key.flags & 0x12 != 0 => Some(key.extra_information),
-        InputSample::HookPointer(pointer) if pointer.flags & 3 != 0 => Some(pointer.extra_information),
+    let injected = hook.filter(|slot| injected_hook(&slot.packet.sample)).and_then(|slot| match slot.packet.sample {
+        InputSample::HookKey(key) => Some(key.extra_information),
+        InputSample::HookPointer(pointer) => Some(pointer.extra_information),
         _ => None,
     });
     if let Some(extra) = injected {

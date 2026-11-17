@@ -25,6 +25,16 @@ pub(in crate::platform::windows) struct InputStagingLoss {
     pub malformed: u64,
 }
 
+/// The last context position per producer already consumed when ingress
+/// opens. The visit's held-state read is NativeRead position 1; the visit
+/// consumes it (`visit.rs` `observation`) before ingress exists, so ingress
+/// starts that producer at 1 (`[0, 1, 0, 0, 0]`).
+const OPENING_CONTEXT_POSITION: [u64; ContextProducer::ALL.len()] = {
+    let mut position = [0; ContextProducer::ALL.len()];
+    position[ContextProducer::NativeRead.index()] = 1;
+    position
+};
+
 pub(super) struct Ingress {
     visit: VisitBinding,
     focus: FocusAtReceipt,
@@ -33,7 +43,7 @@ pub(super) struct Ingress {
     sources: [Option<QpcTick>; PRODUCERS],
     source_positions: [u64; PRODUCERS],
     context: Option<(QpcTick, QpcTick)>,
-    context_position: [u64; 5],
+    context_position: [u64; ContextProducer::ALL.len()],
     lost_notice_before: Option<QpcTick>,
     uncovered_before: Option<QpcTick>,
     pending: VecDeque<InputEvidence>,
@@ -47,7 +57,7 @@ pub(super) struct Ingress {
 impl Ingress {
     pub(super) fn new(visit: VisitBinding, focus: FocusAtReceipt, sample: QpcTick, opening: QpcTick) -> Self {
         Self { visit, focus, sample, opening, sources: [None; PRODUCERS], source_positions: [0; PRODUCERS], context: None,
-            context_position: [0, 1, 0, 0, 0], lost_notice_before: None, uncovered_before: None,
+            context_position: OPENING_CONTEXT_POSITION, lost_notice_before: None, uncovered_before: None,
             pending: VecDeque::with_capacity(CAPACITY), delivered_before: sample, pressure: None, prior: [None; PRODUCERS] }
     }
 
@@ -190,13 +200,7 @@ impl Ingress {
     }
 
     fn position(&mut self, producer: ContextProducer, first: u64, last: u64) -> Result<()> {
-        let slot = &mut self.context_position[match producer {
-            ContextProducer::Notices => 0,
-            ContextProducer::NativeRead => 1,
-            ContextProducer::Automation => 2,
-            ContextProducer::Ime => 3,
-            ContextProducer::TextEdit => 4,
-        }];
+        let slot = &mut self.context_position[producer.index()];
         if slot.checked_add(1) != Some(first) || last < first { return Err(Failure::Protocol); }
         *slot = last;
         Ok(())

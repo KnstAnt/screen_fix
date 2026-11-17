@@ -164,6 +164,40 @@ pub enum HealthKind {
     ElevatedSourceSleep,
 }
 
+/// Why a UI Automation read ended without an element: the `uia` value of a
+/// focus or element row in place of its element (CTX-9 `"timeout"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiaOutcome {
+    Timeout,
+    Hung,
+    Unavailable,
+    Stale,
+    OutsideApproval,
+}
+
+impl UiaOutcome {
+    /// The recorded outcome of a read unavailable for this reason.
+    pub(crate) fn of(reason: crate::protocol::ipc::elevated::ReadUnavailable) -> Self {
+        use crate::protocol::ipc::elevated::ReadUnavailable;
+        match reason {
+            ReadUnavailable::TimedOut => Self::Timeout,
+            ReadUnavailable::Hung => Self::Hung,
+            ReadUnavailable::Unavailable => Self::Unavailable,
+            ReadUnavailable::Stale => Self::Stale,
+            ReadUnavailable::OutsideApproval => Self::OutsideApproval,
+        }
+    }
+}
+
+/// The context read of a row whose `uia` value is an outcome (manifest `uia_unavailable`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiaRead {
+    Focus,
+    Element,
+}
+
 /// The number of lost items. An unknown count stays unknown when merged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LossCount {
@@ -249,7 +283,7 @@ impl LossEvidence {
     }
 }
 
-fn merge_bounds<T: Ord + Copy>(left: Option<[T; 2]>, right: Option<[T; 2]>) -> Option<[T; 2]> {
+pub(crate) fn merge_bounds<T: Ord + Copy>(left: Option<[T; 2]>, right: Option<[T; 2]>) -> Option<[T; 2]> {
     match (left, right) {
         (Some(left), Some(right)) => Some([left[0].min(right[0]), left[1].max(right[1])]),
         (range, None) | (None, range) => range,

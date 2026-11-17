@@ -287,7 +287,7 @@ The following is an implementation checklist, not a list of completed work.
 - Bounded ordinary Stop, required segment finalization and manifest publication.
 - Clear English error messages and local diagnostic reports with technical cause and affected component.
 - No automatic upload of diagnostics; no recovery scan or automatic damaged-file repair.
-- Include optional selected-source intervals, protected setup and stop observations, and blind/uncertified reasons in diagnostics and v5 metadata. Retain the standard helper fields alongside the optional selected-source evidence.
+- Include optional selected-source intervals, protected setup and stop observations, and blind/uncertified reasons in diagnostics and v6 metadata. Retain the standard helper fields alongside the optional selected-source evidence.
 
 ### M1-10. Verification support and evidence
 

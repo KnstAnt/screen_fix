@@ -119,13 +119,19 @@ The observation selector is app-neutral. It does not normalize full training act
 
 No subsystem receives a universal CoreContext containing all queues, tasks and resources. Route only the commands and facts it consumes. Do not introduce a broadcast bus for every record or a shared mutable session object queried by every worker.
 
-**Permitted process-wide state (explicit exceptions to "no global mutable state").** Each item is an atomic latch, a once-initialized immutable value or callback context without a user-data pointer, with one documented purpose:
+**Permitted process-wide state (explicit exceptions to "no global mutable state").** Each item is an atomic latch or counter, a once-initialized immutable value or callback context for a native callback without a user-data pointer, with one documented purpose. In the core crate:
 - `RECORDING_OWNED` (`session/windows.rs`): the process-wide one-recording latch.
 - `REPORT_SERIAL` (`package/diagnostics.rs`): a counter that makes diagnostic report names unique.
 - `DESKTOP_SIGNALS` (`session/windows/environment.rs`, thread-local): the context of the out-of-context desktop WinEvent callback, which has no user-data pointer. The message loop clears it before removing the hook.
 - `IN_FLIGHT` (`platform/windows/elevated/launcher.rs`): the one-flight latch of the elevated launch. It stays set until the shell call returns, so consent prompts cannot stack across attempts.
 - `RESOLVER_ACTIVE` (`platform/windows/context/identity.rs`) and `CLASSIFIER_ACTIVE` (`platform/windows/elevated/selector.rs`): single-owner latches. No replacement resolver or classifier starts while an earlier one may still be blocked in a native call.
 - `FUNCTIONS` (`platform/windows/mf.rs`): the Media Foundation function table, loaded once and immutable afterwards.
+
+In the shared native crates `screen-fix-native-observation` and `screen-fix-elevated`, linked by the Recorder and, as applicable, the standard helper and the collector:
+- `KEYBOARD` and `POINTER` (`native-observation/src/input/hooks.rs`): the lock-free rings that the low-level hook callbacks write, because those callbacks have no user-data pointer. `PROGRESS_PENDING` coalesces progress probes posted to the hook thread, and the thread-local `SCOPE` holds the hook thread's capture scope, set once before the hooks are installed.
+- `ACTIVE` (`native-observation/src/events.rs`, thread-local): the context of the WinEvent callback on its installing thread, cleared after unhooking.
+- `SERIAL` and `CHANGES` (`elevated/src/runtime/witness.rs`, thread-local): the context of the collector witness's WinEvent callbacks.
+- `DRAINING` (`elevated/src/pipe.rs`): a counter of abandoned overlapped pipe operations whose buffers are retained until the kernel acknowledges cancellation. While it is nonzero, no new attachment starts in that process.
 
 **Known M1 deviation: worker-mutated session facts (S4 reduced).** The controller-owned `Facts` are not yet mutated only by the controller. Workers change them through `WorkerSession` methods under the lifecycle lock. The full move to a bounded owner/message channel was deferred by the remediation plan because it fixes no observable defect. The mutating methods are:
 - source selection and evidence: `require_source_change`, `abandon_source_preparation`, `source_ready`, `source_pending`, `source_enhanced`, `update_standard_evidence`, `update_elevated_evidence`, `elevated_registration`, `record_source_coverage`, `restrict_source_coverage`, `record_uncertified_tail`, `record_source_blind`, `source_resynchronizing`, `fail_classified_source`, `fail_source`, `required_elevated_hook_failed`, `source_finalization_failed`;
@@ -434,7 +440,7 @@ The official release requires a machine-wide installation in the protected 64-bi
 
 The Recorder uses the selected monitors and one controller clock. Per-monitor capture owners supply both paced video and history for native stills. Video uses independently verified segments. A still can reference a native observation even when that observation has no encoded video sample.
 
-The package writer publishes v5 attempts. The reader opens only v5 attempts and can inspect optional selected-source evidence when present. The package inventory supplies native still references.
+The package writer publishes v6 attempts ([M1 journal schema](SCREEN_FIX_M1_JOURNAL_SCHEMA.md)). The reader opens only v6 attempts (D-1 A-v6only) and can inspect optional selected-source evidence when present. The package inventory supplies native still references.
 
 ## 15. M1 scope and later extensions
 

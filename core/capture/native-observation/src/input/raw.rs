@@ -258,13 +258,12 @@ impl RawWindow {
             let buffered = std::mem::take(&mut self.buffered);
             let mut bytes = as_bytes(&buffered);
             let mut result = Ok(());
+            // A packet whose own size is invalid hides where the next one
+            // starts: the rest of this batch is counted and skipped.
+            let mut skipped = 0..0;
             for index in 0..count {
-                // A packet whose own size is invalid hides where the next one
-                // starts: the rest of this batch is counted and skipped.
                 let Ok((sample, size)) = packet(bytes, self.wow64) else {
-                    for _ in index..count {
-                        result = result.and_then(|()| self.malformed(qpc, None, publish));
-                    }
+                    skipped = index..count;
                     break;
                 };
                 let sequence = &mut self.sequence;
@@ -274,13 +273,14 @@ impl RawWindow {
                 }));
                 if index + 1 < count {
                     let Some(rest) = bytes.get(size.next_multiple_of(8)..) else {
-                        for _ in index + 1..count {
-                            result = result.and_then(|()| self.malformed(qpc, None, publish));
-                        }
+                        skipped = index + 1..count;
                         break;
                     };
                     bytes = rest;
                 }
+            }
+            for _ in skipped {
+                result = result.and_then(|()| self.malformed(qpc, None, publish));
             }
             self.buffered = buffered;
             result?;

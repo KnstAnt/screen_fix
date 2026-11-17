@@ -114,7 +114,7 @@ impl Context<'_> {
             }
             if self.elevated.window.is_none() && self.elevated.windows.is_empty() {
                 self.elevated.window = request(source, binding, binding.foreground, at, Query::Window, None)?
-                    .map(|read| (read, "foreground_window", None));
+                    .map(|read| (read, "foreground", None));
             }
         }
         if self.elevated.ime_focus.is_some_and(|read| read.deadline_qpc <= at && !source.deferred_read(read)) {
@@ -369,16 +369,7 @@ impl Context<'_> {
     ) -> Result<()> {
         let Some(worker) = &self.clipboard else { return Ok(()); };
         let Some((binding, _)) = visit.elevated else { return Ok(()); };
-        if let Some((count, first, last)) = worker.take_loss() {
-            self.losses.note(LossReason::ClipboardQueue, count, first, last);
-        }
-        for notice in worker.notices() {
-            if self.clipboard_notices.len() < 8 {
-                self.clipboard_notices.push_back(notice);
-            } else {
-                self.losses.note(LossReason::ClipboardQueue, 1, notice.received, notice.received);
-            }
-        }
+        take_clipboard_notices(worker, &mut self.clipboard_notices, &mut self.losses);
         self.clipboard_notices.retain(|notice| notice.observed.elapsed() < clipboard::MAX_AGE
             && notice.foreground == visit.foreground && notice.received >= visit.started_at
             && notice.received >= receipt.boundary.qpc);

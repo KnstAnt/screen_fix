@@ -109,13 +109,15 @@ impl ClockOrigin {
     }
 
     pub fn wgc_time(self, system_relative_100ns: i64) -> Result<SessionTimeUs, ClockRangeError> {
-        checked_i64(self.wgc_offset(system_relative_100ns) / 10).map(SessionTimeUs)
+        checked_i64(self.wgc_offset(system_relative_100ns).div_euclid(10)).map(SessionTimeUs)
     }
 
+    /// Rounded once from the exact QPC-scale difference, like `time`, so a
+    /// source stamped at or before a receipt's QPC never maps after it.
     fn wgc_offset(self, system_relative_100ns: i64) -> i128 {
-        let origin = i128::from(self.origin_qpc.0) * 10_000_000
-            / i128::from(self.qpc_frequency.0.get());
-        i128::from(system_relative_100ns) - origin
+        let frequency = i128::from(self.qpc_frequency.0.get());
+        (i128::from(system_relative_100ns) * frequency - i128::from(self.origin_qpc.0) * 10_000_000)
+            .div_euclid(frequency)
     }
 
     fn scale_delta(self, from: QpcTick, to: QpcTick, units_per_second: i128) -> Result<i64, ClockRangeError> {

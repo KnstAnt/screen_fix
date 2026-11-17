@@ -2,13 +2,9 @@
 //! A child is launched once, in the recorder's Windows session and token.
 
 use std::{
-    ffi::OsStr,
     io,
     mem::size_of,
-    os::windows::{
-        ffi::OsStrExt,
-        io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle},
-    },
+    os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle},
     ptr::{null, null_mut},
     time::{Duration, Instant},
 };
@@ -74,7 +70,7 @@ impl InputHelper {
     pub(super) fn start(config: ConfigureInput) -> Result<Self, HelperError> {
         let exe = std::env::current_exe().map_err(|error|
             HelperError::Windows("Find the recorder executable", error))?.with_file_name(HELPER_NAME);
-        let executable: Vec<u16> = exe.as_os_str().encode_wide().chain([0]).collect();
+        let executable = super::wide(&exe);
         let mut channel = RecorderEndpoint::create()
             .map_err(|error| HelperError::Windows("Create the anonymous input channel", error))?;
         if !channel.configure(&CoreToHelper::Configure(config)).map_err(HelperError::Protocol)? {
@@ -100,7 +96,7 @@ impl InputHelper {
         // argument supplies an explicit absolute path, with no PATH search.
         let arguments = format!("{HELPER_NAME} --recorder-child {} {} {}",
             handles[0] as usize, handles[1] as usize, handles[2] as usize);
-        let mut arguments: Vec<u16> = OsStr::new(&arguments).encode_wide().chain([0]).collect();
+        let mut arguments = super::wide(&arguments);
         let mut child = PROCESS_INFORMATION::default();
         let result = unsafe {
             CreateProcessW(executable.as_ptr(), arguments.as_mut_ptr(), null(), null(), 1,

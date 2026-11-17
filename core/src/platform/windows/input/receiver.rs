@@ -15,7 +15,7 @@ use crate::{
     },
     package::{
         diagnostics::{Failure, FailureComponent},
-        journal::{HealthRecord, JournalIngress}, metadata::{InputBlindReason, UncertifiedInputTail},
+        journal::JournalIngress, metadata::{InputBlindReason, UncertifiedInputTail},
         outcome::{HealthKind, LossCount, LossEvidence, LossProducer, LossRange, LossReason, LossScope, SuppressionClass},
     },
     protocol::{
@@ -25,7 +25,7 @@ use crate::{
     session::{AdmissionBoundary, hotkey::ControlOutcome, windows::{AwakeElapsed, ControlPrefix, InputFailure, Receipt, SuspendMarks}},
 };
 
-use super::{ProbeError, ReceiptPrefix, blind::{BlindInterval, Blinds}, clock, clock_error, devices::Devices, gate::{Gate, Selection}, hook_health::HookHealth, input_timing, resync, unavailable};
+use super::{ProbeError, ReceiptPrefix, blind::Blinds, clock, clock_error, devices::Devices, gate::{Gate, Selection}, hook_health::HookHealth, input_timing, resync, unavailable};
 use super::super::{context::{ConfirmedText, Context, Visit}, elevated::InputCertificate, still_rows, stills};
 
 /// A producer without progress for this long, suspend excluded, opens a
@@ -112,11 +112,10 @@ impl Receiver {
         self.suspends = sequence;
     }
 
-    /// Evaluate producer liveness at `receipt.qpc` with sleep excluded
-    /// (§6.2 row 11). A stall from 250 ms opens a `producer_stall` blind
-    /// interval at the last progress; its admitted records are resolved as in
-    /// §6.3. A stall of 5 s is returned for the input activity loss, with the
-    /// first missing receipt. An unknown suspend interval is not evaluated.
+    /// Producer liveness at `receipt.qpc`, sleep excluded (§6.2 row 11): a 250 ms
+    /// stall opens a `producer_stall` blind interval at the last progress (§6.3);
+    /// a 5 s stall is returned with its first missing receipt for the activity
+    /// loss. An unknown suspend interval is not evaluated.
     pub fn check_stall(&mut self, receipt: Receipt, power: SuspendMarks) -> Result<Option<(Producer, SessionTimeUs)>, ProbeError> {
         let now = receipt.clock.time(receipt.qpc).map_err(clock_error)?;
         // Liveness is measured from this (re)opening of ordinary input, which
@@ -145,16 +144,15 @@ impl Receiver {
         }
         if let Some(stall) = &self.stall {
             // The open blind interval covers the stalled producers' receipts.
-            for (producer, _) in stall.stalled.clone() {
-                self.matcher.progress(producer, now);
+            for (producer, _) in &stall.stalled {
+                self.matcher.progress(*producer, now);
             }
         }
         let Some(producer) = lost else { return Ok(None) };
-        let first_missing = self.stall.as_mut().filter(|stall| !stall.escalated).map(|stall| {
+        let Some(first_missing) = self.stall.as_mut().filter(|stall| !stall.escalated).map(|stall| {
             stall.escalated = true;
             stall.start
-        });
-        let Some(first_missing) = first_missing else { return Ok(None) };
+        }) else { return Ok(None) };
         // The activity loss reports this interval through its own blind row.
         self.blinds.discard(InputBlindReason::ProducerStall);
         Ok(Some((producer, first_missing)))
@@ -163,11 +161,8 @@ impl Receiver {
     fn begin_stall(&mut self, start: SessionTimeUs, now: SessionTimeUs, stalled: Vec<(Producer, QpcTick)>) {
         let producers: Vec<_> = stalled.iter().map(|(producer, _)| *producer).collect();
         self.blinds.open_for(InputBlindReason::ProducerStall, start, &producers);
-        self.gate.note_health(HealthRecord {
-            kind: HealthKind::InputProducerStall,
-            failure: Failure::new(FailureComponent::Receiver, "Input producer progress", None),
-            detected: now, first_affected: Some(start), ongoing: true, monitor: None, count: None,
-        });
+        self.gate.note_health(HealthKind::InputProducerStall,
+            Failure::new(FailureComponent::Receiver, "Input producer progress", None), now, start);
         // Records before the last progress are decided; later admitted ones
         // already held are counted. The held boundary and resync bracket the
         // interval; other producers' records keep being decided, with the
@@ -208,10 +203,7 @@ impl Receiver {
             InputBlindReason::ProducerStall => HealthKind::InputProducerStall,
             _ => return,
         };
-        self.gate.note_health(HealthRecord {
-            kind, failure: failure.failure, detected: failure.at, first_affected: Some(failure.first_missing),
-            ongoing: true, monitor: None, count: None,
-        });
+        self.gate.note_health(kind, failure.failure, failure.at, failure.first_missing);
     }
 
     /// Close every open blind interval at a closing boundary.
@@ -224,10 +216,6 @@ impl Receiver {
         self.blinds.open(reason, start);
     }
 
-    pub fn take_blinds(&mut self) -> Vec<BlindInterval> {
-        self.blinds.take_closed()
-    }
-
     pub fn optional_unavailable(&self) -> Vec<OptionalCollection> {
         self.optional_lost.clone()
     }
@@ -236,11 +224,8 @@ impl Receiver {
         if self.optional_lost.contains(&collection) { return; }
         self.optional_lost.push(collection);
         if let Some(at) = at {
-            self.gate.note_health(HealthRecord {
-                kind: HealthKind::OptionalCollectionUnavailable,
-                failure: Failure::new(FailureComponent::InputHelper, "Optional Raw Input registration", None),
-                detected: at, first_affected: Some(at), ongoing: true, monitor: None, count: None,
-            });
+            self.gate.note_health(HealthKind::OptionalCollectionUnavailable,
+                Failure::new(FailureComponent::InputHelper, "Optional Raw Input registration", None), at, at);
         }
     }
 
@@ -417,9 +402,7 @@ impl Receiver {
                 let first = receipt.clock.time(first_qpc).map_err(clock_error)?;
                 let last = receipt.clock.time(last_qpc).map_err(clock_error)?;
                 let clipped = gap.first_qpc < receipt.boundary.qpc || closing.is_some_and(|end| gap.last_qpc > end.qpc);
-                // A clipped native range also covers records outside this admission.
-                let count = std::num::NonZeroU64::new(gap.last_sequence.0.saturating_sub(gap.first_sequence.0).saturating_add(1))
-                    .filter(|_| !clipped).map_or(LossCount::Unknown, LossCount::Known);
+                let count = native_count(gap, clipped);
                 let reason = match gap.cause {
                     GapCause::Overflow => LossReason::NativeQueueOverflow,
                     GapCause::Malformed => LossReason::MalformedPacket,
@@ -685,9 +668,7 @@ impl Receiver {
         if last_qpc < receipt.boundary.qpc { return Ok(()); }
         let clipped = first_qpc < receipt.boundary.qpc;
         let first_qpc = first_qpc.max(receipt.boundary.qpc);
-        let count = gap.filter(|_| !clipped)
-            .and_then(|gap| std::num::NonZeroU64::new(gap.last_sequence.0.saturating_sub(gap.first_sequence.0).saturating_add(1)))
-            .map_or(LossCount::Unknown, LossCount::Known);
+        let count = gap.map_or(LossCount::Unknown, |gap| native_count(gap, clipped));
         self.gate.note_loss(LossEvidence {
             reason, producer: gap.map(|gap| LossProducer::from(gap.producer)), count,
             scope: LossScope::Ordinary(LossRange {
@@ -754,7 +735,7 @@ impl Receiver {
             let at = receipt.clock.time(before).map_err(clock_error)?;
             certified.map(|bound| bound.min(at))
         } else { certified };
-        self.gate.drain(context, output, prefix, &mut self.provisional, receipt, through, certified, final_boundary)
+        self.gate.drain(context, output, prefix, &mut self.provisional, &mut self.blinds, receipt, through, certified, final_boundary)
     }
 
     pub fn synchronization_qpc(&self) -> Option<QpcTick> {
@@ -800,12 +781,11 @@ impl Receiver {
         self.interrupt_inner(close_at, boundary, Some(cutoff), true);
     }
 
-    /// End the certified prefix at `close_at`. The prefix is the records
-    /// strictly before `cutoff`; each is decided with the candidates actually
-    /// present (§6.3). Admitted records outside the prefix are counted as lost,
-    /// over a range from the cutoff. When `closing`, records and gaps at or
-    /// after `close_at` were never admitted; otherwise the interval continues
-    /// with a blind interval and every later record is admitted.
+    /// End the certified prefix, the records strictly before `cutoff`, at
+    /// `close_at`; each is decided with the candidates present (§6.3). Admitted
+    /// records outside it are lost over a range from the cutoff. When `closing`,
+    /// nothing at or after `close_at` was admitted; otherwise a blind interval
+    /// continues and every later record is admitted.
     fn interrupt_inner(&mut self, close_at: SessionTimeUs, boundary: HeldBoundary, certificate: Option<SessionTimeUs>, closing: bool) {
         let cutoff = certificate.unwrap_or(close_at);
         if self.matcher.certified_before().is_none_or(|bound| bound <= cutoff) {
@@ -839,22 +819,14 @@ impl Receiver {
         };
         let admitted = |at: SessionTimeUs| !closing || at < close_at;
         let Discarded { pending, decided, gaps } = self.matcher.discard();
-        for row in &decided {
-            if admitted(row.first.time.recv_t_us) {
-                self.gate.note_records_lost(reason(&row.first), [&row.first], true, Some(cutoff));
-            }
-        }
-        for input in pending.iter().filter(|input| admitted(input.time.recv_t_us)) {
+        // A decided row is one item, accounted through its first record.
+        for input in decided.iter().map(|row| &row.first).chain(&pending).filter(|input| admitted(input.time.recv_t_us)) {
             self.gate.note_records_lost(reason(input), [input], true, Some(cutoff));
         }
         for gap in gaps.into_iter().filter(|gap| admitted(gap.first)) {
             self.gate.note_loss(gap.evidence());
         }
-        for input in pending.into_iter().chain(decided.into_iter().flat_map(|row| row.into_records())) {
-            if let Some(observation) = input.observation {
-                self.provisional.resolve(observation);
-            }
-        }
+        self.provisional.resolve_records(pending.iter().chain(decided.iter().flat_map(|row| row.records())));
     }
 
     pub fn overflowed(&self) -> bool {
@@ -885,15 +857,9 @@ impl Receiver {
     fn consume(&mut self, step: InputStep) {
         match step {
             InputStep::Record(input) => {
-                // Absorbed records are represented by their row; their own
-                // provisional requests end here. Hooks beyond the raw count of
-                // a cluster are counted once, through the first row. Absorbed
-                // raw motion stays with the row for its raw-motion evidence.
-                for record in &input.absorbed {
-                    if let Some(id) = record.observation {
-                        self.provisional.resolve(id);
-                    }
-                }
+                // Absorbed records are represented by their row (raw motion stays
+                // for its evidence); cluster excess hooks count once, via the first row.
+                self.provisional.resolve_records(&input.absorbed);
                 if let Some(cluster) = input.cluster {
                     self.gate.note_suppressed(SuppressionClass::ClusterExcessHook, u64::from(cluster.excess_hooks));
                 }
@@ -903,11 +869,7 @@ impl Receiver {
                     self.hook_health.note_correlation(&input);
                     if self.elevated_hook_loss().is_some() {
                         self.gate.note_records_lost(LossReason::HookLost, [&input.first], true, None);
-                        for receipt in input.records() {
-                            if let Some(id) = receipt.observation {
-                                self.provisional.resolve(id);
-                            }
-                        }
+                        self.provisional.resolve_records(input.records());
                         return;
                     }
                 }
@@ -947,11 +909,7 @@ impl Receiver {
             InputStep::Undecidable { records, since } => {
                 // Keys of an unclassified visit are counted without times.
                 self.gate.note_records_lost(LossReason::ProducerStall, &records, true, Some(since));
-                for input in records {
-                    if let Some(id) = input.observation {
-                        self.provisional.resolve(id);
-                    }
-                }
+                self.provisional.resolve_records(&records);
             }
             InputStep::DeviceRemoved { id, at } => {
                 self.flush_motion();
@@ -1082,10 +1040,17 @@ impl Receiver {
     }
 }
 
+/// The record count of a native sequence range. A clipped range also covers
+/// records outside this admission, so its count is unknown.
+fn native_count(gap: ProducerGap, clipped: bool) -> LossCount {
+    std::num::NonZeroU64::new(gap.last_sequence.0.saturating_sub(gap.first_sequence.0).saturating_add(1))
+        .filter(|_| !clipped).map_or(LossCount::Unknown, LossCount::Known)
+}
+
 #[derive(Default)]
 struct SampleLoss {
     interval: Option<(SessionTimeUs, SessionTimeUs)>,
-    by_producer: [Option<InputGap>; 4],
+    by_producer: [Option<InputGap>; Producer::ALL.len()],
 }
 
 impl SampleLoss {
@@ -1214,10 +1179,11 @@ impl ProvisionalRequests {
         // A motion that opened no pre-motion envelope reserved no still rows.
         let reserved = kind != Some(ProvisionalInputKind::PreMotion)
             || observation.and_then(|id| self.pending.get(&id)).is_some_and(|entry| entry.rows.is_some());
-        if reserved && let Some(rows) = &self.rows {
+        if reserved && let Some(rows) = &self.rows && let Some(kind) = kind {
             // The gate had no confirmation capacity for the approved action.
-            rows.note_loss(at, LossReason::StagingPressure);
-            rows.note_loss(at, LossReason::StagingPressure);
+            for _ in 0..stills::trigger_rows(kind) {
+                rows.note_loss(at, LossReason::StagingPressure);
+            }
         }
     }
 
@@ -1278,7 +1244,7 @@ impl ProvisionalRequests {
             geometry: motion.geometry, proof: motion.proof, visit: source, pointer });
         Ok(())
     }
-    pub fn choose(&self, input: &crate::capture::input::HeldInput, geometry: Evidence<GeometryId>, proof: ForegroundAtReceipt, kind: ProvisionalInputKind)
+    pub fn choose(&self, input: &HeldInput, geometry: Evidence<GeometryId>, proof: ForegroundAtReceipt, kind: ProvisionalInputKind)
         -> Option<ObservationId>
     {
         let correlated = &input.normalized.correlated;
@@ -1299,8 +1265,9 @@ impl ProvisionalRequests {
         self.mark_action(at, geometry, kind);
         let Some(mut entry) = id.and_then(|id| self.pending.remove(&id)) else {
             if let Some(rows) = &self.rows {
-                rows.note_loss(at, LossReason::RetentionUnavailable);
-                rows.note_loss(at, LossReason::RetentionUnavailable);
+                for _ in 0..stills::trigger_rows(kind) {
+                    rows.note_loss(at, LossReason::RetentionUnavailable);
+                }
             }
             return;
         };
@@ -1332,7 +1299,7 @@ impl ProvisionalRequests {
                     previous.is_none_or(|last| at.0.saturating_sub(last.0) >= MOTION_IDLE_US)
                 };
                 let source = source.filter(|_| opens);
-                let rows = self.rows.as_ref().filter(|_| opens).map(|lane| stills::EarlyRows::reserve(lane, at));
+                let rows = self.rows.as_ref().filter(|_| opens).map(|lane| stills::EarlyRows::reserve(lane, at, request.kind));
                 let decision = if opens && source.is_none() { Self::open(&self.endpoints, request, None) } else { None };
                 self.pending.insert(request.id, PrivateRequest { envelope: request, decision, deferred_source: source, rows });
             }
@@ -1369,7 +1336,14 @@ impl ProvisionalRequests {
         }
     }
 
-    pub fn retire_except(&mut self, input: &crate::capture::input::HeldInput, permit: Option<ObservationId>) {
+    /// End the provisional requests of `records`.
+    fn resolve_records<'a>(&mut self, records: impl IntoIterator<Item = &'a PendingInput>) {
+        for id in records.into_iter().filter_map(|record| record.observation) {
+            self.resolve(id);
+        }
+    }
+
+    pub fn retire_except(&mut self, input: &HeldInput, permit: Option<ObservationId>) {
         let input = &input.normalized.correlated;
         for slot in std::iter::once(&input.first).chain(&input.partners) {
             if let Some(id) = slot.observation.filter(|id| Some(*id) != permit) {
@@ -1378,12 +1352,8 @@ impl ProvisionalRequests {
         }
     }
 
-    pub fn retire_input(&mut self, input: crate::capture::input::HeldInput) {
-        let input = input.normalized.correlated;
-        for slot in std::iter::once(input.first).chain(input.partners) {
-            if let Some(observation) = slot.observation {
-                self.resolve(observation);
-            }
-        }
+    pub fn retire_input(&mut self, input: HeldInput) {
+        let input = &input.normalized.correlated;
+        self.resolve_records(std::iter::once(&input.first).chain(&input.partners));
     }
 }

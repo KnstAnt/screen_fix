@@ -28,7 +28,7 @@ use crate::{
     },
 };
 
-use super::{ProbeError, RecordingReport, clock, clock_error, context::{Context, FramePolicy}, elevated::{InputCertificate, InputStagingLoss, Selector}, input_helper::{HelperError, InputHelper, READY_WAIT}, mp4::io_error, package_journal_error, still_rows, stills, unavailable, video_failure_health};
+use super::{ProbeError, RecordingReport, clock, clock_error, context::{Context, FramePolicy}, elevated::{InputCertificate, InputStagingLoss, Selector}, input_helper::{HelperError, InputHelper, READY_WAIT}, io_error, package_journal_error, still_rows, stills, unavailable, video_failure_health};
 
 /// The bounded wait for producer progress past a pause cutoff (§6.3).
 const PAUSE_CERTIFICATION_WAIT: Duration = Duration::from_millis(250);
@@ -134,11 +134,20 @@ impl ReceiptPrefix {
         Ok(())
     }
 
+    /// `at` raised to the published prefix.
+    fn raised(&self, at: SessionTimeUs) -> SessionTimeUs {
+        self.last_time.map_or(at, |last| last.max(at))
+    }
+
+    /// Submit lifecycle rows at `at`; each is queued and advances the prefix.
+    fn submit_boundary(&mut self, output: &mut JournalIngress, at: SessionTimeUs, rows: Vec<serde_json::Value>) -> Result<(), ProbeError> {
+        let count = rows.len();
+        output.submit_boundary(at, rows).map_err(package_journal_error)?;
+        (0..count).try_for_each(|_| self.advance_time(at, Submit::Queued))
+    }
+
     fn advance_time(&mut self, admitted: SessionTimeUs, disposition: Submit) -> Result<(), ProbeError> {
-        if self.last_time.is_some_and(|previous| previous > admitted) {
-            return Err(unavailable("Input receipts are out of order"));
-        }
-        self.last_time = Some(admitted);
+        self.admit(admitted)?;
         if disposition == Submit::Queued {
             self.queued = self.queued.checked_add(1)
                 .ok_or_else(|| unavailable("The input record counter overflowed"))?;
@@ -196,8 +205,7 @@ fn pump(
         }
         let _ = session.wait_for_close(Duration::from_millis(5))?;
     };
-    let required_ready = registration.raw_keyboard && registration.raw_pointer
-        && registration.keyboard_hook && registration.pointer_hook
+    let required_ready = registration.required_ready()
         && (!session.config().profile().pen_hid() || registration.pen_hid);
     session.input_ready(registration, required_ready);
     session.update_standard_evidence(|evidence| {
@@ -412,11 +420,6 @@ fn pump(
                         }
                     }
                 }
-                if let Some(timing) = input_timing(receipt, observed_at, None)? {
-                    for blind in receiver.take_blinds() {
-                        send_boundary_event(&mut context, blind.row(), timing, &mut context_prefix, &mut next_context_index)?;
-                    }
-                }
                 publish_context_health(&mut native_context, &mut context, &context_prefix, session, receipt, observed_at)?;
                 context.offer_gap(watermark).map_err(package_journal_error)?;
                 let revision = session.journal_flush_revision();
@@ -490,6 +493,14 @@ fn pump(
         } else {
             receiver.interrupt(closed.time, HeldBoundary::Pause);
         }
+        // An uncertified ordinary tail is an explicit blind interval before the
+        // pause; with it, the prefix up to the pause is certified (§6.3). Every
+        // open input blind interval closes at the cutoff and joins the input
+        // prefix published here.
+        if let Some(tail) = tail.filter(|tail| tail.reason == Some(InputTailReason::ProducerProgress)) {
+            receiver.open_blind(InputBlindReason::ProducerStall, tail.first_t_us);
+        }
+        receiver.close_blinds(closed.time);
         receiver.publish(&mut native_context, &mut input, &mut input_prefix, receipt, closed.time, true)?;
         for notice in session.take_fixture_saves() {
             let _ = notice.reply.try_send(Err(FixtureSaveError::AdmissionClosed));
@@ -519,19 +530,11 @@ fn pump(
                 session, reports, receipt, closed, false, ordinary)?;
             thread::park_timeout(Duration::from_millis(2));
         };
-        // An uncertified ordinary tail is an explicit blind interval before the
-        // pause row; with it, the prefix up to the pause is certified (§6.3).
-        // Every open input blind interval closes at the cutoff.
-        if let Some(tail) = tail.filter(|tail| tail.reason == Some(InputTailReason::ProducerProgress)) {
-            receiver.open_blind(InputBlindReason::ProducerStall, tail.first_t_us);
-        }
-        receiver.close_blinds(closed.time);
-        for blind in receiver.take_blinds() {
-            send_boundary_event(&mut context, blind.row(), timing, &mut context_prefix, &mut next_context_index)?;
-        }
         let reasons = session.pause_interval_reasons(closed);
         let mut pause = serde_json::json!({
-            "kind": "pause", "reasons": reasons, "cutoff_t_us": closed.time,
+            // `reason` is the primary (first ordered) reason (CTX-6);
+            // `reasons` keeps the full ordered set as an extension.
+            "kind": "pause", "reason": reasons.first(), "reasons": reasons, "cutoff_t_us": closed.time,
             "uncertified_input_tail": tail, "paused_slots": ranges,
             "paused_slots_all_monitors": ranges.len() == session.config().monitors().len(),
         });
@@ -594,7 +597,7 @@ fn pump(
         let resumed = Receipt { qpc: opened.boundary.qpc, clock: opened.clock, boundary: opened.boundary, tick_anchor: None };
         let timing = input_timing(resumed, opened.boundary.qpc, None)?
             .ok_or_else(|| unavailable("The input resume boundary is invalid"))?;
-        publish_blind_pause(&mut context, timing, &mut context_prefix, &mut next_context_index, closed, &reasons)?;
+        publish_blind_pause(&mut input, &mut input_prefix, closed.time, opened.boundary.time, opened.boundary.time, &reasons)?;
         send_boundary_event(&mut context, serde_json::json!({
             "kind": "discontinuity", "start_t_us": closed.time, "end_t_us": opened.boundary.time,
             "gap_us": opened.boundary.time.0.saturating_sub(closed.time.0),
@@ -607,7 +610,7 @@ fn pump(
             *total = total.saturating_add(count);
         }
         send_boundary_event(&mut context, serde_json::json!({
-            "kind": "resume", "reasons": reasons, "paused_start_t_us": closed.time,
+            "kind": "resume", "reason": reasons.first(), "reasons": reasons, "paused_start_t_us": closed.time,
             "paused_slots": paused_slots, "suppressed_context_notifications": discarded_context,
             "suppressed_health": suppressed_health,
         }), timing, &mut context_prefix, &mut next_context_index)?;
@@ -701,6 +704,8 @@ fn pump(
         for producer in receiver.take_hook_reports().into_iter().flatten() {
             note_helper_failure(session, reports, &mut receiver, HelperError::SuspectedHookLoss(producer), cutoff.time, true);
         }
+        // Open input blind intervals end at the cutoff (already closed at a pause).
+        receiver.close_blinds(cutoff.time);
         receiver.publish(&mut native_context, &mut input, &mut input_prefix,
             session.foreground_closing_receipt(cutoff)?, cutoff.time, true)?;
         flush_boundary(&mut input, cutoff.time, session, || Ok(()))?;
@@ -724,16 +729,13 @@ fn pump(
             }
         }
         if let Some(timing) = input_timing(receipt, stopped.qpc, None)? {
-            // Open input blind intervals end at the cutoff (already closed at a pause).
-            receiver.close_blinds(cutoff.time);
-            for blind in receiver.take_blinds() {
-                send_boundary_event(&mut context, blind.row(), timing, &mut context_prefix, &mut next_context_index)?;
-            }
             if let Some(loss) = staging_loss {
                 publish_input_staging_loss(&mut context, loss, timing, &mut context_prefix, &mut next_context_index)?;
             }
             let paused_slots = if let Some((closed, reasons, ranges)) = paused {
-                publish_blind_pause(&mut context, timing, &mut context_prefix, &mut next_context_index, closed, &reasons)?;
+                // The input stream closed at the pause cutoff: the blind rows of
+                // the pause up to Stop are admitted there.
+                publish_blind_pause(&mut input, &mut input_prefix, closed.time, stopped.time, closed.time, &reasons)?;
                 Some(paused_slot_ranges(&ranges, closed.time, stopped.time))
             } else { None };
             let mut stop = serde_json::json!({
@@ -830,21 +832,17 @@ fn poll_elevated(
         let reason = if gap.cause == GapCause::Malformed { LossReason::MalformedPacket } else { LossReason::NativeQueueOverflow };
         receiver.note_elevated_loss(reason, Some(gap), gap.first_qpc, receipt)?;
     }
-    if let Some(timing) = input_timing(receipt, observed_at, None)? {
-        if let Some(loss) = staging_loss {
-            publish_input_staging_loss(context, loss, timing, context_prefix, next_context_index)?;
-        }
-        if let Some(gap) = context_pressure {
-            send_boundary_event(context, serde_json::json!({
-                "kind": "context_source_gap", "source": "elevated", "reason": "recorder_staging", "gap": gap,
-            }), timing, context_prefix, next_context_index)?;
-        }
-        if let Some((first, last, count)) = source.take_optional_loss() {
-            send_event(context, serde_json::json!({
-                "kind": "context_source_gap", "source": "elevated", "reason": "optional_staging",
-                "first_qpc": first, "last_qpc": last, "count": count,
-            }), timing, context_prefix, next_context_index)?;
-        }
+    // Elevated context evidence the Recorder's staging could not hold is a
+    // typed context loss (E3, D-1).
+    if let Some(gap) = context_pressure {
+        let count = gap.last_position.get().saturating_sub(gap.first_position.get()).saturating_add(1);
+        native.note_loss(LossReason::StagingPressure, count, gap.first_qpc, gap.last_qpc);
+    }
+    if let Some((first, last, count)) = source.take_optional_loss() {
+        native.note_loss(LossReason::StagingPressure, u64::from(count), first, last);
+    }
+    if let Some(loss) = staging_loss && let Some(timing) = input_timing(receipt, observed_at, None)? {
+        publish_input_staging_loss(context, loss, timing, context_prefix, next_context_index)?;
     }
     if let Some((binding, before, cause, gap)) = loss {
         if gap.is_some() {
@@ -892,7 +890,7 @@ fn poll_elevated(
                 receipt.boundary.qpc
             };
             let cutoff = receipt.clock.time(certified.max(receipt.boundary.qpc)).map_err(clock_error)?;
-            let through = input_prefix.last_time.map_or(cutoff, |last| last.max(cutoff));
+            let through = input_prefix.raised(cutoff);
             let boundary = if loss.is_some() || overflowed { HeldBoundary::InputGap } else { HeldBoundary::FocusChanged };
             receiver.interrupt_certified(cutoff, through, boundary);
             receiver.publish(native, input, input_prefix, receipt, through, true)?;
@@ -1244,9 +1242,11 @@ fn paused_slot_ranges(
     })).collect()
 }
 
+/// The input blind rows of a pause interval (INP-13), admitted to the input
+/// stream at `at`: the resume boundary, or the input cutoff of a Stop while paused.
 fn publish_blind_pause(
-    context: &mut JournalIngress, timing: InputTiming, prefix: &mut ReceiptPrefix, next_context_index: &mut u64,
-    boundary: AdmissionBoundary, reasons: &[PauseReason],
+    input: &mut JournalIngress, prefix: &mut ReceiptPrefix, start: SessionTimeUs, end: SessionTimeUs,
+    at: SessionTimeUs, reasons: &[PauseReason],
 ) -> Result<(), ProbeError> {
     // A source-transition pause is labelled with its actual reasons; the
     // transition label is used only when the latch alone paused (S2).
@@ -1258,16 +1258,13 @@ fn publish_blind_pause(
         _ => None,
     }).filter(|_| transition).collect();
     let secure = reasons.iter().any(|reason| matches!(reason, PauseReason::LockScreen | PauseReason::SecureDesktop));
-    for reason in [
+    let rows: Vec<_> = [
         secure.then_some("secure_desktop"),
         (transition && !secure && others.is_empty()).then_some("elevation_transition"),
-    ].into_iter().flatten().chain(others) {
-        send_boundary_event(context, serde_json::json!({
-            "kind": "blind", "reason": reason,
-            "start_t_us": boundary.time, "end_t_us": timing.time.recv_t_us,
-        }), timing, prefix, next_context_index)?;
-    }
-    Ok(())
+    ].into_iter().flatten().chain(others).map(|reason| serde_json::json!({
+        "kind": "blind", "reason": reason, "start_us": start, "end_us": end,
+    })).collect();
+    prefix.submit_boundary(input, at, rows)
 }
 
 fn send_boundary_event(
@@ -1559,7 +1556,7 @@ fn publish_context_health(
 ) -> Result<(), ProbeError> {
     use crate::{package::{journal::HealthRecord, metadata::LostActivity}, session::fault::FaultReport};
     let Some(timing) = input_timing(receipt, observed, None)? else { return Ok(()) };
-    let admitted = prefix.last_time.map_or(timing.time.recv_t_us, |last| last.max(timing.time.recv_t_us));
+    let admitted = prefix.raised(timing.time.recv_t_us);
     for loss in native.take_losses(receipt, observed) {
         context.record_loss(loss, admitted).map_err(package_journal_error)?;
     }
@@ -1620,8 +1617,9 @@ fn send_boundary_events(
 }
 
 fn apply_context_envelope(event: &mut serde_json::Value, timing: InputTiming) -> Result<(), ProbeError> {
+    // The package format version (manifest v6) versions every row; a row's
+    // own `version` is the foreground product version (D-1).
     let record = event.as_object_mut().ok_or_else(|| unavailable("The input record is not an object"))?;
-    record.insert("version".into(), serde_json::json!(2));
     record.insert("recv_t_us".into(), serde_json::json!(timing.time.recv_t_us));
     record.insert("source_t_us".into(), serde_json::json!(timing.time.source_t_us));
     record.insert("source_uncertainty_us".into(), serde_json::json!(timing.time.source_uncertainty_us));

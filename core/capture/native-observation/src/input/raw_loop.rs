@@ -217,6 +217,18 @@ impl DeviceWorker {
         Ok(Self { requests, replies })
     }
 
+    /// Announce an arrived device and queue its identification; without a session ID it is dropped.
+    fn announce(&self, output: &mut Evidence, devices: &mut device::DeviceIds, sequence: &mut u64, receipt: Receipt,
+        mut descriptor: DeviceDescriptor, path: Option<Vec<u16>>) -> Result<(), NativeError> {
+        let Some(id) = devices.assign(descriptor.id) else {
+            output.losses.drop_record(&HelperToCore::DeviceArrived { receipt, descriptor });
+            return Ok(());
+        };
+        descriptor.id = id;
+        output.offer(HelperToCore::DeviceArrived { receipt, descriptor: descriptor.clone() });
+        self.request(output, sequence, descriptor, path)
+    }
+
     /// Queue identification of an announced device. A full queue leaves the
     /// descriptor unidentified and is a device-notification loss.
     fn request(
@@ -380,13 +392,7 @@ fn raw_loop(
                         raw.remove_device(handle);
                         raw.observe_device(handle, &mut descriptor);
                         let receipt = device_receipt_at(&mut device_sequence, Some(MessageTickMs(message.time)), received)?;
-                        if let Some(id) = devices.assign(descriptor.id) {
-                            descriptor.id = id;
-                            output.offer(HelperToCore::DeviceArrived { receipt, descriptor: descriptor.clone() });
-                            worker.request(output, &mut device_sequence, descriptor, path)?;
-                        } else {
-                            output.losses.drop_record(&HelperToCore::DeviceArrived { receipt, descriptor });
-                        }
+                        worker.announce(output, &mut devices, &mut device_sequence, receipt, descriptor, path)?;
                     }
                 } else if message.wParam == GIDC_REMOVAL as usize {
                     raw.remove_device(handle);
@@ -440,13 +446,7 @@ fn observe_inventory(
         if let Some((mut descriptor, path)) = device::descriptor(entry.hDevice, Some(entry.dwType)) {
             raw.observe_device(entry.hDevice, &mut descriptor);
             let receipt = device_receipt_at(device_sequence, None, received)?;
-            if let Some(id) = devices.assign(descriptor.id) {
-                descriptor.id = id;
-                output.offer(HelperToCore::DeviceArrived { receipt, descriptor: descriptor.clone() });
-                worker.request(output, device_sequence, descriptor, path)?;
-            } else {
-                output.losses.drop_record(&HelperToCore::DeviceArrived { receipt, descriptor });
-            }
+            worker.announce(output, devices, device_sequence, receipt, descriptor, path)?;
         }
     }
     Ok(())

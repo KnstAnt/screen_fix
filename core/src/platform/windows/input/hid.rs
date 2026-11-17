@@ -8,7 +8,10 @@ use serde_json::{Value, json};
 
 use crate::protocol::{
     DeviceId, SessionTimeUs,
-    ipc::{ForegroundAtReceipt, HidAngleReading, HidReport, HidReportResult, HidUsage, HidValue, HidValueSpec, MAX_INPUT_DEVICES, NdofData},
+    ipc::{
+        DecodedHidReport, ForegroundAtReceipt, HidAngleReading, HidReport, HidReportResult, HidUsage, HidValue,
+        HidValueSpec, MAX_INPUT_DEVICES, NdofData,
+    },
 };
 
 const FIT_SAMPLES: usize = 32;
@@ -168,6 +171,9 @@ impl HidPublication {
                     "report_reference": reference,
                     "source_clock": source.map(|_| "hid_scan_time_sliding_minimum"),
                 });
+                if kind == "pen" {
+                    lift_pen(&mut row, report);
+                }
                 if kind == "touchpad_report" {
                     let mut frame = self.frames.remove(&sample.device);
                     let (frame_row, active) = if self.frames.len() == MAX_INPUT_DEVICES {
@@ -220,6 +226,74 @@ struct NdofButton {
     at: SessionTimeUs,
     reference: Option<String>,
     proof: ForegroundAtReceipt,
+}
+
+/// INP-11 top-level pen keys lifted from the decoded fields. A usage the
+/// report does not declare stays absent; one declared but unreadable or in
+/// its null state is null. A usage declared in several link collections
+/// (several transducers) is ambiguous and also stays absent. `fields` keeps
+/// the per-link evidence as an extension.
+fn lift_pen(row: &mut Value, report: &DecodedHidReport) {
+    let field = |usage: HidUsage| {
+        let mut declared = report.fields.as_slice().iter().filter(|field| field.usage == usage);
+        match (declared.next(), declared.next()) {
+            (Some(field), None) => Some(field.value),
+            _ => None,
+        }
+    };
+    for (key, usage) in [
+        ("tip", HidUsage::Tip), ("in_range", HidUsage::InRange), ("barrel", HidUsage::Barrel),
+        ("secondary_barrel", HidUsage::SecondaryBarrel), ("invert", HidUsage::Invert), ("eraser", HidUsage::Eraser),
+    ] {
+        if let Some(value) = field(usage) {
+            row[key] = json!(match value { HidValue::Switch(active) => Some(active), _ => None });
+        }
+    }
+    let (x, y) = (field(HidUsage::X), field(HidUsage::Y));
+    if x.is_some() || y.is_some() {
+        row["xy"] = json!([x.and_then(number), y.and_then(number)]);
+    }
+    if let Some(value) = field(HidUsage::Pressure) {
+        let (raw, normalized) = match value {
+            HidValue::Number { raw, spec } => (raw, raw.and_then(|raw| normalize(raw, spec.logical))),
+            _ => (None, None),
+        };
+        row["pressure"] = json!(normalized);
+        row["pressure_raw"] = json!(raw);
+    }
+    let (tilt_x, tilt_y) = (field(HidUsage::TiltX).map(angle), field(HidUsage::TiltY).map(angle));
+    if tilt_x.is_some() || tilt_y.is_some() {
+        let ((x, x_raw), (y, y_raw)) = (tilt_x.unwrap_or_default(), tilt_y.unwrap_or_default());
+        row["tilt"] = json!([x, y]);
+        row["tilt_raw"] = json!([x_raw, y_raw]);
+    }
+    if let Some((twist, raw)) = field(HidUsage::Twist).map(angle) {
+        row["twist"] = json!(twist);
+        row["twist_raw"] = json!(raw);
+    }
+    if let Some(value) = field(HidUsage::ScanTime) {
+        row["scan_time"] = json!(number(value));
+    }
+}
+
+/// The logical value read with HidP_GetUsageValue; None in the null state.
+fn number(value: HidValue) -> Option<i64> {
+    match value {
+        HidValue::Number { raw, .. } => raw,
+        _ => None,
+    }
+}
+
+/// Signed degrees and the signed reading they come from: the scaled
+/// physical value, or the sign-extended logical value when scaling failed.
+fn angle(value: HidValue) -> (Option<f64>, Option<i64>) {
+    match value {
+        HidValue::Angle { reading: Some(reading), spec, .. } => (degrees(reading, spec), Some(match reading {
+            HidAngleReading::ScaledPhysical(scaled) => i64::from(scaled),
+            HidAngleReading::SignedLogicalFallback(signed) => signed,
+        })),
+        _ => (None, None),
+    }
 }
 
 fn normalize(raw: i64, [min, max]: [i64; 2]) -> Option<f64> {

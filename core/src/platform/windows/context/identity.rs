@@ -113,7 +113,7 @@ impl<'a> ApprovedProcesses<'a> {
                         .map_err(|()| ResolutionError::ExecutablePathUnavailable));
                 if stopping.load(Ordering::Acquire) || completed.try_send((proof, index)).is_err() { break; }
             }
-        }).map_err(|error| super::super::mp4::io_error("Start executable path resolution", error))?;
+        }).map_err(|error| super::super::io_error("Start executable path resolution", error))?;
         Ok(Self { profile, cache: VecDeque::with_capacity(PROCESS_CACHE),
             pending: VecDeque::with_capacity(PROCESS_CACHE), requests, results, stop, lost: false })
     }

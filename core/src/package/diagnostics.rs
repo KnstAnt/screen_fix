@@ -15,7 +15,7 @@ use crate::{
     protocol::{AttemptId, MonitorId, SessionTimeUs, StreamId},
 };
 
-use super::{StreamSummary, metadata::{CaptureCounters, PngCounters, VideoCounters}};
+use super::{StreamSummary, metadata::{CaptureCounters, PngCounters, VideoCounters, is_zero}};
 
 static REPORT_SERIAL: AtomicU64 = AtomicU64::new(0);
 
@@ -134,10 +134,6 @@ pub(crate) struct DiagnosticContext {
     pub(crate) additional_failures: Vec<Failure>,
     #[serde(skip_serializing_if = "is_zero")]
     pub(crate) omitted_fault_reports: u64,
-}
-
-fn is_zero(count: &u64) -> bool {
-    *count == 0
 }
 
 impl DiagnosticContext {

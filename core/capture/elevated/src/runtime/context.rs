@@ -20,7 +20,7 @@ use screen_fix_protocol::{
     ipc::{FocusAtReceipt, elevated::{
         CommitEvidence, CommitText, ContextEvidence, FocusEvidence, HungEvidence,
         ImeState, PointBinding, Query, ReadBinding, ReadEvidence, ReadOutcome, ReadUnavailable, TextClassification,
-        UiaEvidence, UiaStatus, VisitBinding, WindowEvidence, WindowInstance,
+        UiaEvidence, VisitBinding, WindowEvidence, WindowInstance,
         runtime::{ApprovalKey, ContextGap, ContextGapCause, ContextProducer, IdentityClaim, Observation},
     }},
 };
@@ -376,7 +376,7 @@ impl Worker {
             let current = self.live(&job.pending) && uia.revision.load(Acquire) == expected_revision
                 && secondary.as_ref().is_none_or(|target| target.recheck(&self.grant.parent).is_ok())
                 && expected.is_none_or(|expected| FocusSnapshot::read(window).is_some_and(|now| now.focus == expected));
-            (!current).then_some(UiaStatus::Stale)
+            (!current).then_some(ReadUnavailable::Stale)
         };
         if uia.client.is_none() {
             uia.client = Client::open_scoped(Arc::clone(&uia.revision)).ok();
@@ -408,13 +408,8 @@ impl Worker {
             ReadOutcome::Observed(UiaEvidence { target: result.target, dpi, dpi_awareness,
                 element: element.try_into().map_err(|_| Failure::Protocol)? })
         } else {
-            ReadOutcome::Unavailable(match result.status {
-                UiaStatus::TimedOut => ReadUnavailable::TimedOut,
-                UiaStatus::Hung => ReadUnavailable::Hung,
-                UiaStatus::Stale => ReadUnavailable::Stale,
-                UiaStatus::OutsideApproval => ReadUnavailable::OutsideApproval,
-                _ => ReadUnavailable::Unavailable,
-            })
+            // A completed read without an element is reported as unavailable.
+            ReadOutcome::Unavailable(result.status.err().unwrap_or(ReadUnavailable::Unavailable))
         };
         let completed = result.completed;
         let returned = self.publish_item(job, build(ReadEvidence {
@@ -527,7 +522,7 @@ impl Worker {
         let current_revision = &uia.revision;
         let invalid = |_: uia::Request| {
             (!self.live(&job.pending) || current_revision.load(Acquire) != revision || !self.safe_focus(window, expected))
-                .then_some(UiaStatus::Stale)
+                .then_some(ReadUnavailable::Stale)
         };
         let request = uia::Request { id: read.request, generation: visit.focus_generation, focus_revision: revision,
             expires, query: uia::Query::Focus { foreground: window, native: Some(focus) } };

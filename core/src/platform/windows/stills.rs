@@ -44,9 +44,18 @@ pub(super) struct Permission {
     pub rows: EarlyRows,
 }
 
+/// The still rows reserved for one action: a pre-motion or pre-action trigger
+/// reserves one row whose before and seen halves are `rows` (IMG-2); a next
+/// trigger reserves its next and settled rows.
 pub(super) struct EarlyRows {
     lane: still_rows::Rows,
+    paired: bool,
     rows: [EarlyRow; 2],
+}
+
+/// The journal rows an action of this kind reserves.
+pub(super) fn trigger_rows(kind: ProvisionalInputKind) -> usize {
+    if kind == ProvisionalInputKind::Next { 2 } else { 1 }
 }
 
 /// A private still-row reservation stays uncounted until its action is approved.
@@ -66,34 +75,46 @@ impl EarlyRow {
 }
 
 impl EarlyRows {
-    pub fn reserve(lane: &still_rows::Rows, at: SessionTimeUs) -> Self {
-        Self { lane: lane.clone(), rows: [EarlyRow::reserve(lane, at), EarlyRow::reserve(lane, at)] }
+    pub fn reserve(lane: &still_rows::Rows, at: SessionTimeUs, kind: ProvisionalInputKind) -> Self {
+        let paired = trigger_rows(kind) == 1;
+        let rows = if paired {
+            match lane.reserve_pair(at) {
+                Ok([before, seen]) => [EarlyRow::Reserved(before), EarlyRow::Reserved(seen)],
+                Err(reason) => [EarlyRow::Unavailable(reason), EarlyRow::Unavailable(reason)],
+            }
+        } else {
+            [EarlyRow::reserve(lane, at), EarlyRow::reserve(lane, at)]
+        };
+        Self { lane: lane.clone(), paired, rows }
     }
 
     pub fn approve(&mut self, kind: ProvisionalInputKind, event: EventRef, geometry: Evidence<GeometryId>,
         admission: AdmissionEpoch, at: SessionTimeUs, missing: &'static str,
     ) {
         let roles = match kind {
-            ProvisionalInputKind::PreMotion => [("pre_motion", "before"), ("pre_motion", "seen")],
-            ProvisionalInputKind::PreAction | ProvisionalInputKind::Scroll { .. } =>
-                [("pre_action", "before"), ("pre_action", "seen")],
+            ProvisionalInputKind::PreMotion => [("pre_motion", "before"); 2],
+            ProvisionalInputKind::PreAction | ProvisionalInputKind::Scroll { .. } => [("pre_action", "before"); 2],
             ProvisionalInputKind::Next => [("next", "image"), ("settled", "image")],
         };
         let observed = match geometry { Evidence::Observed(geometry) => Some(geometry), _ => None };
-        for (entry, (trigger, role)) in self.rows.iter_mut().zip(roles) {
-            let fallback = serde_json::json!({ "kind": "still_dropped", "schema_version": 1,
+        // Both halves of a paired row share its reservation and fallback.
+        for (index, (trigger, role)) in roles.into_iter().enumerate().take(if self.paired { 1 } else { 2 }) {
+            let fallback = serde_json::json!({ "kind": "still_dropped",
                 "trigger": trigger, "role": role, "trigger_t_us": at, "geometry": observed, "geometry_evidence": geometry,
                 "monitor": observed.map(|geo| geo.monitor), "admission_epoch": admission, "event_ref": event,
                 "source_t_us": null, "file": null, "width": null, "height": null, "reason": missing,
             });
-            let lost = match entry {
+            let lost = match &self.rows[index] {
                 // The ordered still deadline expired the slot before approval.
                 EarlyRow::Reserved(row) => (!row.approve(fallback)).then_some(LossReason::ProducerStall),
                 EarlyRow::Unavailable(reason) => Some(*reason),
                 EarlyRow::HandedOff => None,
             };
             if let Some(reason) = lost {
-                *entry = EarlyRow::Unavailable(reason);
+                self.rows[index] = EarlyRow::Unavailable(reason);
+                if self.paired {
+                    self.rows[1] = EarlyRow::Unavailable(reason);
+                }
                 self.lane.note_loss(at, reason);
             }
         }
@@ -208,6 +229,10 @@ impl Selected {
             Err(reason) => Self::Missing(reason),
         }
     }
+
+    fn retained(&self) -> Option<&Rc<HeldFrame>> {
+        match self { Self::Retained(frame) => Some(frame), _ => None }
+    }
 }
 
 enum PrivateSelection {
@@ -233,10 +258,7 @@ impl Private {
             PrivateSelection::Next(selected) => [Some(selected), None],
             PrivateSelection::Unavailable(_) => [None, None],
         };
-        selection.into_iter().flatten().chain([&self.scroll_next]).filter_map(|selected| match selected {
-            Selected::Retained(frame) => Some(frame),
-            _ => None,
-        })
+        selection.into_iter().flatten().chain([&self.scroll_next]).filter_map(Selected::retained)
     }
 }
 
@@ -315,28 +337,24 @@ impl Public {
         }
     }
 
+    /// The row of this slot. A seen slot is the second half of its trigger's
+    /// row, which `still_rows` joins to the before half (IMG-2).
     fn row(&self, outcome: &serde_json::Value) -> serde_json::Value {
         let saved = outcome.get("kind").and_then(serde_json::Value::as_str) == Some("saved");
         let frame = self.frame.as_ref();
-        let seen = matches!(self.role, Role::Seen);
-        let file = outcome.get("image");
-        let frame_obs_id = frame.map(|frame| frame.id.sequence);
         serde_json::json!({
-            "schema_version": 1,
             "kind": if saved { "still" } else { "still_dropped" },
             "source_t_us": frame.map(|frame| frame.source_t_us),
             "monitor": self.geometry.monitor,
             "trigger": self.trigger, "role": self.role, "trigger_t_us": self.at,
-            "frame_obs_id": frame_obs_id,
-            "seen_obs_id": seen.then_some(frame_obs_id).flatten(),
+            "frame_obs_id": frame.map(|frame| frame.id.sequence),
             "event_ref": self.event,
-            "file": file,
-            "seen_file": seen.then_some(file).flatten(),
+            "file": outcome.get("image"),
             "width": frame.map(|frame| frame.width), "height": frame.map(|frame| frame.height),
             "reason": outcome.get("reason").or_else(|| outcome.get("operation")),
             "geometry": self.geometry, "admission_epoch": self.admission, "scroll_device": self.scroll_device,
             "settled_confirmed_t_us": self.settled_confirmed_t_us, "adjustment": self.adjustment,
-            "frame": self.frame, "pointer_element": self.pointer, "outcome": outcome,
+            "frame": self.frame, "element": self.pointer, "outcome": outcome,
             "save": self.save.as_ref().map(|save| serde_json::json!({
                 "id": save.id(), "kind": save.kind(), "routing_basis": save.routing_basis(),
             })),
@@ -397,8 +415,9 @@ impl FrameWork {
             }
             WorkStage::Encoding(ticket) => match ticket.poll() {
                 None => return,
+                // A still `file` is relative to `raw/`, where the journal lives (D-1).
                 Some(still_png::Outcome::Saved { reference, reused }) => done(serde_json::json!({
-                    "kind": "saved", "image": reference.relative_uri(), "deduplicated": reused,
+                    "kind": "saved", "image": reference.relative_uri().strip_prefix("raw/"), "deduplicated": reused,
                 }), false),
                 Some(still_png::Outcome::Dropped(reason)) => done(serde_json::json!({ "kind": "dropped", "reason": reason }),
                     matches!(reason, still_png::Dropped::ApprovalSuppressed)),
@@ -506,14 +525,10 @@ impl Stills {
             at: boundary.time, geometry, admission: boundary.epoch, interval: None, adjustment: None,
             frame: None, pointer: None, save: None, reservation: None, settled_confirmed_t_us: None,
             scroll_device: None, state: State::Selected(Selected::Waiting) };
-        match self.rows.reserve(boundary.time, Some(start.row(&dropped("start_frame_unavailable")))) {
-            Ok(reservation) => start.reservation = Some(reservation),
-            Err(reason) => {
-                self.rows.note_loss(boundary.time, reason);
-                return;
-            }
+        start.reservation = self.rows.reserve_public(boundary.time, start.row(&dropped("start_frame_unavailable")));
+        if start.reservation.is_some() {
+            self.start = Some(start);
         }
-        self.start = Some(start);
     }
 
     pub fn step(
@@ -927,8 +942,7 @@ impl Stills {
 
     fn private_holds(&self, extra: Option<&Selected>) -> usize {
         let mut frames: Vec<*const HeldFrame> = Vec::new();
-        let extra = extra.and_then(|selected| match selected { Selected::Retained(frame) => Some(frame), _ => None });
-        for frame in self.pending.iter().flat_map(Private::held).chain(extra) {
+        for frame in self.pending.iter().flat_map(Private::held).chain(extra.and_then(Selected::retained)) {
             if !frames.contains(&Rc::as_ptr(frame)) {
                 frames.push(Rc::as_ptr(frame));
             }
@@ -982,18 +996,8 @@ impl Stills {
     }
 
     fn push_public(&mut self, mut slot: Public) {
-        let reservation = match slot.reservation.take() {
-            Some(reservation) => reservation,
-            None => {
-                match self.rows.reserve(self.receipt, Some(slot.row(&dropped("still_owner_closed")))) {
-                    Ok(reservation) => reservation,
-                    Err(reason) => {
-                        self.rows.note_loss(self.receipt, reason);
-                        return;
-                    }
-                }
-            }
-        };
+        let Some(reservation) = slot.reservation.take()
+            .or_else(|| self.rows.reserve_public(self.receipt, slot.row(&dropped("still_owner_closed")))) else { return };
         if self.public.len() >= PUBLIC_SLOTS {
             let lowest = self.public.iter().enumerate()
                 .filter(|(_, old)| old.priority() < slot.priority()
@@ -1080,9 +1084,8 @@ impl Stills {
                 let outcome = dropped("scroll_burst_capacity");
                 for slot in next.dropped_observations(&outcome) {
                     let row = slot.row(&outcome);
-                    match self.rows.reserve(self.receipt, Some(row.clone())) {
-                        Ok(reservation) => reservation.finish(row),
-                        Err(reason) => self.rows.note_loss(self.receipt, reason),
+                    if let Some(reservation) = self.rows.reserve_public(self.receipt, row.clone()) {
+                        reservation.finish(row);
                     }
                 }
             }
@@ -1369,7 +1372,7 @@ pub(super) fn dropped_trigger(
     trigger: &'static str, role: &'static str, at: SessionTimeUs, geometry: GeometryId,
     admission: AdmissionEpoch, reason: &'static str,
 ) -> serde_json::Value {
-    serde_json::json!({ "schema_version": 1, "kind": "still_dropped",
+    serde_json::json!({ "kind": "still_dropped",
         "trigger": trigger, "role": role, "trigger_t_us": at, "monitor": geometry.monitor,
         "geometry": geometry, "admission_epoch": admission, "event_ref": null, "source_t_us": null,
         "file": null, "width": null, "height": null, "reason": reason })

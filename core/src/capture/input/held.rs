@@ -2,7 +2,15 @@ use std::collections::BTreeSet;
 
 use crate::protocol::{DeviceId, Evidence, SessionTimeUs, UnavailableReason, ipc::InputSample};
 
-use super::{Action, Button, Correlation, InputOrigin, Key, Modifier, NormalizedInput, ScanCode};
+use super::{
+    Action, Button, Correlation, InputOrigin, Key, Modifier, NormalizedInput, ScanCode,
+    normalize::{LLKHF_UP, VK_CAPITAL},
+};
+
+/// The longest separation between the system's left-Ctrl companion and the
+/// right Alt of one AltGr press. Both are hook records; this is not the
+/// raw-to-hook matching window, although it has the same initial value.
+const ALT_GR_COMPANION_US: i64 = 20_000;
 
 const MAX_HELD: usize = 512;
 const MODIFIER_MASK: u8 = 0xff;
@@ -106,9 +114,9 @@ impl PhysicalHeld {
         if let Action::AltGrCompanion = action
             && let crate::protocol::ipc::InputSample::HookKey(key) = normalized.correlated.first.packet.sample
         {
-            if key.flags & 0x80 == 0 {
+            if key.flags & LLKHF_UP == 0 {
                 self.companion_at = Some(at);
-                self.alt_gr |= self.right_alt_at.is_some_and(|right| at.0.saturating_sub(right.0) <= 20_000);
+                self.alt_gr |= self.right_alt_at.is_some_and(|right| at.0.saturating_sub(right.0) <= ALT_GR_COMPANION_US);
             } else {
                 self.companion_at = None;
                 self.alt_gr = false;
@@ -117,7 +125,7 @@ impl PhysicalHeld {
         if let Action::Key(Key { modifier: Some(Modifier::RightAlt), down, .. }) = action {
             if down && self.right_alt_at.is_none() {
                 self.right_alt_at = Some(at);
-                self.alt_gr = self.companion_at.is_some_and(|ctrl| at.0.saturating_sub(ctrl.0) <= 20_000);
+                self.alt_gr = self.companion_at.is_some_and(|ctrl| at.0.saturating_sub(ctrl.0) <= ALT_GR_COMPANION_US);
             } else if !down {
                 self.right_alt_at = None;
                 self.alt_gr = false;
@@ -154,7 +162,7 @@ impl PhysicalHeld {
             Some(_) => Evidence::Unavailable(UnavailableReason::Ambiguous),
             None => Evidence::Unavailable(UnavailableReason::Unsupported),
         };
-        if let Action::Key(Key { virtual_key: 0x14, down: true, .. }) = action {
+        if let Action::Key(Key { virtual_key: VK_CAPITAL, down: true, .. }) = action {
             if uncertain_edge {
                 self.caps_lock = None;
             } else if !matches!(repeat, Evidence::Observed(true)) {
@@ -325,7 +333,7 @@ impl PhysicalHeld {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct PublishedHeld {
     held: BTreeSet<HeldIdentity>,
 }
@@ -423,3 +431,13 @@ pub(crate) fn modifier_vk(modifier: Modifier) -> u16 {
 
 pub(crate) fn modifier_bit(modifier: Modifier) -> u8 { 1 << (modifier as u8) }
 pub(crate) fn button_bit(button: Button) -> u8 { 1 << (button as u8) }
+
+/// The sides set in a modifier mask: a journal `mods` list (INP-2).
+pub(crate) fn modifiers_in(bits: u8) -> Vec<Modifier> {
+    Modifier::ALL.into_iter().filter(|modifier| bits & modifier_bit(*modifier) != 0).collect()
+}
+
+/// The buttons set in a button mask: a journal `held` list (INP-5).
+pub(crate) fn buttons_in(bits: u8) -> Vec<Button> {
+    Button::ALL.into_iter().filter(|button| bits & button_bit(*button) != 0).collect()
+}

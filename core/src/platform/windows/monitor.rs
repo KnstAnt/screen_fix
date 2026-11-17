@@ -9,7 +9,7 @@ use windows::{
     Win32::{
         Foundation::LUID,
         Graphics::{
-            Direct3D11::ID3D11Device,
+            Direct3D11::{ID3D11Device, ID3D11Texture2D},
             Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT},
         },
         System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop,
@@ -29,6 +29,10 @@ use super::{context::{ELEVATED_FRAME_WAIT_US, FramePolicy}, Apartment, ProbeErro
 
 /// The bound on one GPU video conversion.
 pub(super) const CONVERSION_DEADLINE: Duration = Duration::from_secs(3);
+
+/// A frame in video conversion, with its conversion deadline.
+type PendingVideo = Option<(gpu::PendingSample, FrameMetadata, Instant)>;
+type Texture = Arc<ID3D11Texture2D>;
 
 pub(super) struct Ready {
     pub capture: MonitorCapture,
@@ -164,7 +168,7 @@ fn capture(
         let interval = Duration::from_nanos(1_000_000_000 / u64::from(worker.config().profile().capture_pace().frames_per_second()));
         let mut scheduled = Instant::now();
         let mut sequence = 0_u64;
-        let mut pending_video: Option<(gpu::PendingSample, FrameMetadata, Instant)> = None;
+        let mut pending_video: PendingVideo = None;
         let mut suspends = worker.suspend_marks().sequence;
         let mut waiting = TimelineWait::default();
         let mut last_source = None;
@@ -316,7 +320,7 @@ fn capture(
             {
                 let target = if needs_missing { None } else { present.cloned() };
                 // A new adapter's device is created here, by the owner of its
-                // immediate context. A failed read is retried on the next tick.
+                // immediate context. A failed read is retried on the next topology snapshot.
                 let request_device = match &target {
                     None => Some(None),
                     Some(target) if native_capture.is_some() && output.adapter == target.adapter && output.identity == target.identity => {
@@ -327,12 +331,12 @@ fn capture(
                         .and_then(|actual| capture_device(&actual.adapter).ok()).map(Some),
                 };
                 let (reply, result) = sync_channel(1);
-                let request = request_device.clone().map(|device| FormatRequest { at: now_session, output: target, device, reply });
-                match request.map(|request| video.reconfigure.try_send(request)) {
+                let sent = request_device.clone()
+                    .map(|device| video.reconfigure.try_send(FormatRequest { at: now_session, output: target, device, reply }));
+                match sent {
                     None => rejected_snapshot = snapshot.as_ref().map(|snapshot| snapshot.received),
                     Some(Ok(())) => {
-                        let request_device = request_device.flatten();
-                        pending_format = Some((result, request_device));
+                        pending_format = Some((result, request_device.flatten()));
                         if !needs_missing && !reconfiguring {
                             topology.reconfiguring(mode.geometry.id);
                             reconfiguring = true;
@@ -413,8 +417,8 @@ fn capture(
                 converter = None;
             }
             // Time asleep does not count against the conversion bound (D-5 A).
-            let sequence = worker.suspend_marks().sequence;
-            if std::mem::replace(&mut suspends, sequence) != sequence && let Some(pending) = &mut pending_video {
+            let suspend_sequence = worker.suspend_marks().sequence;
+            if std::mem::replace(&mut suspends, suspend_sequence) != suspend_sequence && let Some(pending) = &mut pending_video {
                 pending.2 = Instant::now() + CONVERSION_DEADLINE;
             }
             if let (Some(converter), Some((sample, metadata, deadline))) = (&mut converter, &pending_video) {
@@ -648,9 +652,9 @@ struct Resources {
 
 impl Resources {
     fn publish(
-        &mut self, owned: Arc<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>,
+        &mut self, owned: Texture,
         metadata: FrameMetadata, painter: &pixels::Painter, video: &VideoTarget, timeline: Option<slots::Timeline>,
-        converter: &mut Option<gpu::Converter>, pending_video: &mut Option<(gpu::PendingSample, FrameMetadata, Instant)>,
+        converter: &mut Option<gpu::Converter>, pending_video: &mut PendingVideo,
         waiting: &mut TimelineWait, size: SizeInt32, now: Instant, counters: &mut CaptureCounters,
     ) -> Result<(), ProbeError> {
         if !metadata.covered() {
@@ -700,9 +704,9 @@ impl Resources {
 /// Submit one approved frame for video conversion. A busy or failed
 /// conversion is counted as pressure on the frame's slot.
 fn submit_video(
-    owned: &Arc<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>, metadata: &FrameMetadata, video: &VideoTarget,
+    owned: &Texture, metadata: &FrameMetadata, video: &VideoTarget,
     timeline: slots::Timeline, converter: &mut gpu::Converter,
-    pending_video: &mut Option<(gpu::PendingSample, FrameMetadata, Instant)>, converted_slot: &mut Option<u64>,
+    pending_video: &mut PendingVideo, converted_slot: &mut Option<u64>,
     size: SizeInt32, now: Instant, counters: &mut CaptureCounters,
 ) -> Result<(), ProbeError> {
     let slot = timeline.containing(metadata.source_t_us)?;
@@ -727,7 +731,7 @@ fn submit_video(
 /// Drop the video work in progress at a pause or a topology change; each
 /// dropped frame is counted.
 fn discard_video(
-    pending_video: &mut Option<(gpu::PendingSample, FrameMetadata, Instant)>, waiting: &mut TimelineWait,
+    pending_video: &mut PendingVideo, waiting: &mut TimelineWait,
     counters: &mut CaptureCounters,
 ) {
     if pending_video.take().is_some() {
@@ -742,7 +746,7 @@ fn discard_video(
 /// `timeline_pending`, and its slot carries that reason.
 #[derive(Default)]
 struct TimelineWait {
-    frame: Option<(Arc<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>, FrameMetadata)>,
+    frame: Option<(Texture, FrameMetadata)>,
     /// Source times of held frames replaced before the timeline arrived.
     replaced: Option<(SessionTimeUs, SessionTimeUs)>,
     /// The latest slot with a frame submitted for conversion.
@@ -751,7 +755,7 @@ struct TimelineWait {
 
 impl TimelineWait {
     fn hold(
-        &mut self, owned: Arc<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>, metadata: FrameMetadata,
+        &mut self, owned: Texture, metadata: FrameMetadata,
         counters: &mut CaptureCounters,
     ) {
         if let Some((_, old)) = self.frame.replace((owned, metadata)) {
@@ -771,7 +775,7 @@ impl TimelineWait {
 
     fn release(
         &mut self, video: &VideoTarget, timeline: slots::Timeline, epoch: crate::protocol::AdmissionEpoch,
-        converter: &mut Option<gpu::Converter>, pending_video: &mut Option<(gpu::PendingSample, FrameMetadata, Instant)>,
+        converter: &mut Option<gpu::Converter>, pending_video: &mut PendingVideo,
         size: SizeInt32, now: Instant, counters: &mut CaptureCounters,
     ) -> Result<(), ProbeError> {
         if let Some((first, last)) = self.replaced.take() {
@@ -798,9 +802,8 @@ impl TimelineWait {
 }
 
 fn display_size(display: &display::Monitor) -> Result<SizeInt32, ProbeError> {
-    let (left, top, right, bottom) = display.bounds.edges();
-    let width = right.checked_sub(left).ok_or_else(|| unavailable("The physical monitor width overflowed"))?;
-    let height = bottom.checked_sub(top).ok_or_else(|| unavailable("The physical monitor height overflowed"))?;
+    let width = i32::try_from(display.bounds.width()).map_err(|_| unavailable("The physical monitor width overflowed"))?;
+    let height = i32::try_from(display.bounds.height()).map_err(|_| unavailable("The physical monitor height overflowed"))?;
     Ok(SizeInt32 { Width: width, Height: height })
 }
 
@@ -822,12 +825,8 @@ fn next_capture(old: CaptureEpoch) -> Result<CaptureEpoch, ProbeError> {
 }
 
 fn same_format(old: &display::topology::Output, new: &display::topology::Output) -> bool {
-    let extent = |bounds: crate::protocol::PhysicalRect| {
-        let (l, t, r, b) = bounds.edges();
-        (i64::from(r) - i64::from(l), i64::from(b) - i64::from(t))
-    };
     old.identity == new.identity && old.adapter == new.adapter && old.rotation == new.rotation
-        && old.hdr == new.hdr && old.sdr_white == new.sdr_white && extent(old.bounds) == extent(new.bounds)
+        && old.hdr == new.hdr && old.sdr_white == new.sdr_white && old.bounds.size() == new.bounds.size()
 }
 
 fn same_adapter(a: LUID, b: LUID) -> bool {

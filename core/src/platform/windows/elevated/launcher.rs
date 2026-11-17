@@ -1,7 +1,7 @@
 use std::{
     ffi::OsStr,
     mem::size_of,
-    os::windows::{ffi::OsStrExt, io::{FromRawHandle, OwnedHandle}},
+    os::windows::io::{FromRawHandle, OwnedHandle},
     ptr::null_mut,
     sync::{
         Arc, Mutex, MutexGuard, mpsc,
@@ -14,7 +14,7 @@ use std::{
 use screen_fix_elevated::{Authenticated, Cancellation, Failure, LaunchRequest, RecorderBootstrap, Result};
 use screen_fix_protocol::{AttemptId, SessionId};
 use crate::session::windows::SourceDispatch;
-use super::visit::matches_target;
+use super::{super::wide, visit::matches_target};
 
 use windows_sys::Win32::{
     Foundation::{ERROR_CANCELLED, GetLastError, INVALID_HANDLE_VALUE},
@@ -314,8 +314,4 @@ fn shell(request: LaunchRequest, permit: &Permit, source: &SourceDispatch) -> Re
     };
     // The shell worker forwards this value before uninitializing its apartment.
     result
-}
-
-fn wide(value: &OsStr) -> Vec<u16> {
-    value.encode_wide().chain(std::iter::once(0)).collect()
 }

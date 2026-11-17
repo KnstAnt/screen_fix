@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{AdmissionEpoch, AttemptId, BoundedText, GeometryId, QpcTick, RequestId, SessionId};
 use crate::ipc::{
-    EnvironmentChange, FocusAtReceipt, HelperFailure, HelperToCore, InputRegistration, PacketError, ProducerGap,
+    FocusAtReceipt, HelperFailure, HelperToCore, InputRegistration, PacketError, ProducerGap,
 };
 
 use super::{
@@ -16,7 +16,9 @@ use super::{
 };
 
 pub const MAX_APPROVED_EXECUTABLES: usize = 64;
-pub type ApprovalKey = BoundedText<4096>;
+/// Byte bound of one approved executable identity (`ApprovalKey`).
+pub const MAX_APPROVAL_KEY_BYTES: usize = 4096;
+pub type ApprovalKey = BoundedText<MAX_APPROVAL_KEY_BYTES>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -174,6 +176,22 @@ pub enum ContextProducer {
     TextEdit,
 }
 
+impl ContextProducer {
+    /// Every producer, ordered so that `ALL[p.index()] == p`.
+    pub const ALL: [Self; 5] = [Self::Notices, Self::NativeRead, Self::Automation, Self::Ime, Self::TextEdit];
+
+    /// Dense index for per-producer state sized by `ALL`.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Notices => 0,
+            Self::NativeRead => 1,
+            Self::Automation => 2,
+            Self::Ime => 3,
+            Self::TextEdit => 4,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextGap {
@@ -325,9 +343,7 @@ fn status_valid(status: &Status) -> bool {
         Status::Witness { revision, focus_revision, observed_qpc, .. } =>
             *revision != 0 && *focus_revision != 0 && tick(*observed_qpc),
         Status::Armed { visit, arm_qpc, registration, focus, .. } =>
-            visit_valid(*visit) && tick(*arm_qpc) && focus.window.0 != 0
-                && registration.raw_keyboard && registration.raw_pointer
-                && registration.keyboard_hook && registration.pointer_hook,
+            visit_valid(*visit) && tick(*arm_qpc) && focus.window.0 != 0 && registration.required_ready(),
         Status::Activated { visit, activation_qpc } => visit_valid(*visit) && tick(*activation_qpc),
         Status::FocusSuspended { visit, before_qpc } | Status::Invalidated { visit, before_qpc, .. }
         | Status::Closed { visit, before_qpc } => visit_valid(*visit) && tick(*before_qpc),
@@ -377,8 +393,7 @@ fn input_valid(input: &GrantedInput) -> bool {
             tick(receipt.qpc) && receipt.sequence.0 != 0 && descriptor.id.0 != 0,
         InputEvidence::DeviceRemoved { receipt, id } =>
             tick(receipt.qpc) && receipt.sequence.0 != 0 && id.0 != 0,
-        InputEvidence::Environment(state) => tick(state.observed_qpc)
-            && state.changes != 0 && state.changes & !EnvironmentChange::ALL_BITS == 0,
+        InputEvidence::Environment(state) => tick(state.observed_qpc) && state.valid(),
         InputEvidence::Progress(progress) => tick(progress.before_qpc),
         InputEvidence::Gap(gap) => gap_valid(*gap),
         InputEvidence::OptionalUnavailable { observed_qpc, .. } => tick(*observed_qpc),

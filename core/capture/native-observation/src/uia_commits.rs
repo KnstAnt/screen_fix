@@ -103,8 +103,6 @@ pub struct CommitLoss {
     pub last: QpcTick,
 }
 
-
-
 struct WriteReservation<'a> {
     slot: &'a Slot,
     length: usize,

@@ -1,7 +1,6 @@
 use std::{
     cell::Cell,
     fs,
-    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::{Arc, atomic::{AtomicU8, Ordering}, mpsc::{Receiver, SyncSender}},
 };
@@ -10,22 +9,9 @@ use windows::{Win32::{Graphics::Dxgi::IDXGIAdapter1, Media::MediaFoundation::*},
 
 use crate::protocol::SegmentId;
 
-use super::{ProbeError, mf, stage, unavailable};
+use super::{ProbeError, io_error, mf, stage, unavailable, wide};
 
 const REVOKED: &str = "The elevated video prefix was revoked before publication";
-
-pub(super) fn io_error(stage: &'static str, error: std::io::Error) -> ProbeError {
-    ProbeError {
-        stage,
-        journal: None,
-        raw_input_registration: None,
-        owner: None,
-        source: Some(windows::core::Error::new(
-            windows::core::HRESULT::from_win32(error.raw_os_error().unwrap_or(1) as u32),
-            error.to_string(),
-        )),
-    }
-}
 
 pub(super) struct Recording {
     writer: IMFSinkWriter,
@@ -74,7 +60,7 @@ impl Recording {
     pub(super) fn open(media_type: &IMFMediaType, path: &Path) -> Result<Self, ProbeError> {
         let pending = path.with_extension("mp4.part");
         let path = path.to_owned();
-        let filename: Vec<u16> = pending.as_os_str().encode_wide().chain([0]).collect();
+        let filename = wide(&pending);
         // Container attributes select MP4 for the .part file. Identical compressed
         // media types preserve the existing bitstream.
         let settings = mf::attributes(3)?;
@@ -245,7 +231,7 @@ fn verify_decoded_frames(
     path: &Path, expected: &mut [(i64, i64)], size: [u32; 2],
     check: &impl Fn() -> Result<(), ProbeError>, decoder: Option<&IMFDXGIDeviceManager>,
 ) -> Result<i64, ProbeError> {
-    let filename: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let filename = wide(path);
     let reader = mf::mp4_part_reader(PCWSTR(filename.as_ptr()), decoder)?;
     let output = mf::media_type()?;
     stage(unsafe { output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video) }, "Select video for verification")?;

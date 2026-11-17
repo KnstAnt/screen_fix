@@ -129,7 +129,7 @@ The same receiver consumes two selectable evidence streams through the existing 
 
 Use existing per-producer exclusive progress and the existing bounded staging prefix. Require the associated context certificate or watermark so delayed focus, gap or revocation observations cannot qualify a newer input record. During Pause and Stop, service control and independent data lanes within the closure bounds. Collector cleanup acknowledgement establishes teardown. Recorder data certification separately requires eligible input and context lane coverage and the earliest applicable cutoff. Core has one contiguous eligible input prefix, capped by active lane coverage, control/hook/materialization watermark, current visit coverage and closing boundary. Resolve read/classification expiry conservatively, including possibly-sensitive keyboard handling. Do not stall unrelated journals waiting for optional UIA/IME results. UIA completions retain original request timing and are emitted in the context owner's completion receipt order with separate child completion QPC. The core does not insert old timestamped rows in a published prefix. If IPC delay exhausts the approved stage or still history deadline, resolve the existing drop/unavailable disposition and record a gap or uncertainty where applicable. Do not widen matching, change timestamps, or substitute a later still/frame. Essential coverage/producer stall that persists beyond existing budgets is fatal on the high path. Explicit overflow alone remains a REL-2 gap with resync when coverage resumes.
 
-The core keeps provisional input/still IDs in their own namespaces and attaches any `event_ref` only after the journal allocates a durable input sequence. `Receiver::advance_stills` advances only on the certified eligible prefix. Checkpoint and fixture Save use exact visit and QPC eligibility. Resume retains existing geometry, monitor and frame approval checks; a previous approval generation cannot back a new epoch's still. WGC, GPU slot selection, normal history, settling, PNG and journal intake remain in the core. No new global inter-stream per-event barrier, extra screen copy or retroactive video timestamp shift is needed. When a standard-source or collector prefix closes, settle or discard only its evidenced pending rows and give unauthorizable, late or uncertified work the existing reason fields. Record selected source intervals, actual registration and transport outcomes, blind or failure stage and uncertified-tail reasons in diagnostics and optional v5 metadata. Retain the standard helper fields. The v5 reader exposes the selected-source evidence when present.
+The core keeps provisional input/still IDs in their own namespaces and attaches any `event_ref` only after the journal allocates a durable input sequence. `Receiver::advance_stills` advances only on the certified eligible prefix. Checkpoint and fixture Save use exact visit and QPC eligibility. Resume retains existing geometry, monitor and frame approval checks; a previous approval generation cannot back a new epoch's still. WGC, GPU slot selection, normal history, settling, PNG and journal intake remain in the core. No new global inter-stream per-event barrier, extra screen copy or retroactive video timestamp shift is needed. When a standard-source or collector prefix closes, settle or discard only its evidenced pending rows and give unauthorizable, late or uncertified work the existing reason fields. Record selected source intervals, actual registration and transport outcomes, blind or failure stage and uncertified-tail reasons in diagnostics and optional v6 metadata. Retain the standard helper fields. The v6 reader exposes the selected-source evidence when present.
 
 ## 6. Remediation amendments and clarifications (2026-11-17)
 
@@ -139,7 +139,8 @@ These follow the M1 remediation plan and the user decisions D-8 and D-9 of 2026-
 
 - Each message is one fixed binary header followed by a payload. The payload is a schema-checked serde encoding of one specific bounded Rust type, decoded with the checks of section 3.2.
 - "No JSON rows" in section 3.2 refers to journal rows: no journal row, or any other output-format record, crosses the wire.
-- Any change to a type in `protocol/src/ipc/elevated` requires an increment of `attachment::VERSION`, so that peers built from different revisions fail the version binding instead of misreading a payload.
+- Any change to a type in `protocol/src/ipc/elevated` requires an increment of `attachment::VERSION`, so that peers built from different revisions fail the version binding instead of misreading a payload. The rule applies from the first release. Within the current development cycle the wire changes share VERSION 2: the `OptionalHid` input producer, `HeldSnapshot.keys`, `CommitEvidence.valid`, `InputEvidence::OptionalUnavailable` and `ContextGap.cause`.
+- Lane receipt: a record with a valid header and length whose payload does not decode is skipped as a counted loss. The input coverage of the visit then closes at the least delivered producer progress, the earliest receipt the record could have had. The count is reported with the Recorder staging loss at the visit's closing boundary, as a `malformed_packet` input loss. A framing error, a record of another connection scope or a contradicting record kind stays a protocol failure and ends the attachment.
 
 ### 6.2 Readiness budget
 
@@ -151,21 +152,41 @@ Each preparation (startup or resume) gets its own 5-second readiness budget from
 - The supervisor's slot deadline for the call is the request deadline plus the 750 ms cleanup bound.
 - At the request deadline a call still running gets the typed `TimedOut` result for its request. The grant stays valid, and no new call is dispatched to that provider kind until the running call returns. This is a recorded loss (G).
 - A call that returns between the request deadline and the slot deadline is discarded as stale; its provider kind becomes available again.
-- A call still running at the slot deadline has defeated cancellation. The supervisor revokes and terminates the collector (section 3.3), which is an admitted source failure and fails the attempt.
+- A call still running at the slot deadline has defeated cancellation. The supervisor revokes and terminates the collector (section 3.3), which is an admitted source failure and fails the attempt. The decision is made at request deadline + 750 ms. Termination follows after the 750 ms cleanup bound if the collector has not exited by then, so the worst case is about request deadline + 1.5 s.
+- Control and status writes run on the collector's owner thread with a lease-bounded (1 s) write deadline. The supervisor also ends the collector when that thread has made no progress for 750 ms outside cleanup, so these writes are effectively bounded at 750 ms.
 
 ### 6.4 Target changes and ineligible foregrounds (D-8 A)
 
-- A foreground or focus change while a grant is Preparing, Armed, Activating, awaiting its held result or refreshing is a transition, not a fault: the grant is revoked.
-- Before admission the selector prepares again for the original candidate while the readiness budget remains. If the budget expires, startup fails without an admitted recording.
-- After admission the epoch stays closed with `ElevationTransition`, and the actual new foreground is classified fresh.
-- An approved foreground whose token is not eligible (different user, different session, protected, or failed linked pair) is suppressed with reason `ineligible_token`, like an unapproved foreground, including the suppression accounting of the M1 specification addendum A6.2.
-- Only host, transport, authentication and protocol failures, lease loss, witness regression, readiness-deadline expiry and failure of required access on the current grant fail the attempt.
+- A foreground or focus change during preparation is a transition, not a fault:
+  - Preparing: when its own proof finds the target changed, or the target's process or token identity no longer verifies, the collector refuses the grant (`Invalidated` with reason foreground, then `Closed`). A Prepare that is stale on arrival is rejected as a transition, and the Recorder drops that grant.
+  - Armed, Activating, awaiting the held result, accepting the resync and refreshing focus: when the target or its focus is no longer current, or the held read comes back stale, the Recorder revokes the grant.
+- Before Start (no session clock yet) the startup candidate stays pending. The selector prepares it again in the same epoch, with a new grant ID and source generation, while its readiness budget remains. If the budget expires, startup fails without an admitted recording.
+- After Start, a preparation for a resume or a source switch is abandoned on such a change: the epoch stays closed with `ElevationTransition`, and the actual new foreground is classified fresh. An open collector-backed epoch whose grant is invalidated for a foreground, focus or late-notice reason is closed through the same source-change path.
+- An approved foreground whose token rules out every source of this release (another user, session or logon, a protected or SYSTEM process, an unsupported integrity or split-token pair, or a linked logon mismatch) is suppressed with reason `ineligible_token`, like an unapproved foreground, including the suppression accounting of the M1 specification addendum A6.2. Only when that foreground is the target of the current grant does the token failure fail the source.
+- Failures that remain fatal: host, transport, authentication and protocol failures, lease expiry, witness loss or regression, native owner loss, readiness-deadline expiry, and a required-access refusal on the current grant (a held read or transition refused as unavailable or hung, or an invalidation for required access). Before Start they fail startup without an admitted recording; after Start they fail the attempt (ELC-5).
 
 ### 6.5 Collector-side approval proof (D-9 A)
 
-- On prepare the collector independently resolves the image of the pinned live target process: it takes the path from the live process handle, opens the file without write or delete sharing, reads its final path by handle and its file ID, and canonicalizes with the same function as the Recorder's resolver.
-- The grant requires equality with the sealed approval key. Any failure is a target-access failure before admission.
+- On prepare, after proving the live foreground target, the collector independently resolves the image of the pinned target process. It takes the Win32 image path from that live process handle (`QueryFullProcessImageNameW`) and passes it to `screen_fix_native_observation::identity::canonical_image`, the same function the Recorder's resolver uses. That function opens the file for read with read sharing only (no write or delete sharing), rejects a directory, and returns the final path by handle (`GetFinalPathNameByHandleW`) with the `\\?\` prefix removed and `\\?\UNC\` written as `\\`.
+- The grant requires exact equality of that canonical path with the sealed approval key the Recorder named, which must itself be in the sealed approval list. No file ID is compared, because the approval key carries no file identity; `GetFileInformationByHandle` serves only to reject directories. The capture target is the pinned live process, not the file, so replacing the file at the same path cannot redirect capture.
+- Any failure (unreadable image path, failed open or canonicalization, mismatch) refuses the grant with an invalidation for required access. The Recorder treats it as a required-access failure (`TargetAccess`): before Start it fails startup without an admitted recording, after Start it fails the attempt.
 - This work runs only on the collector's owner thread, never in callbacks, and never opens a path supplied by the Recorder.
+
+### 6.6 Token checks on the egress path (E3)
+
+- The pinned target's token facts and liveness are queried on prepare, lease renewal, focus refresh and activation, and once per egress batch and grant. A failed query is latched in the grant, and every later record of that grant is refused.
+- The window, thread and desktop binding and the foreground tuple are still checked per record.
+- Deliberate trade-off: if the token changes inside a batch, the rest of that batch can still leave. The window is bounded by one batch (at most the 256 input lane slots).
+
+### 6.7 Collector lost across a system sleep (E4)
+
+- The collector's lease, watchdogs and cleanup bound run on QPC, which includes the sleep, so a collector can be lost across a sleep. When the host is no longer live, a resume mark exists after the host was last seen live, and no collector-backed epoch is open, the loss is a recorded loss (G). It writes an `elevated_source_sleep` health row and resets the selector.
+- The collector is not relaunched in the same attempt. A later approved foreground that requires the collector is suppressed like an unapproved foreground (`elevated_source_unavailable`, M1 specification addendum A6.2).
+- A collector lost while a collector-backed epoch is open remains an admitted source failure.
+
+### 6.8 Grant lower bound
+
+- The collector stamps a grant's `arm` QPC when it prepares the grant. The Arm QPC it reports later, after hook and Raw Input registration, is never earlier. Every use of the prepare-time value (the activation opening check, revocation cuts and the certified prefix) treats it as a conservative lower bound.
 
 ## Windows API references
 

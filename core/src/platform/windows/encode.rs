@@ -59,7 +59,7 @@ pub(super) fn record<S>(
     encoder: &IMFTransform,
     device: Option<&ID3D11Device>,
     state: &mut S,
-    /// Returns true after a system suspend: time asleep is not encoder time.
+    // Returns true after a system suspend: time asleep is not encoder time.
     mut observe_admission: impl FnMut(&mut S) -> Result<bool, ProbeError>,
     mut next_frame: impl FnMut(&mut S) -> Result<Next, ProbeError>,
     mut prefix_drained: impl FnMut(&mut S) -> Result<(), ProbeError>,

@@ -20,11 +20,11 @@ pub(crate) use control::{ClassifiedControlInput, ControlChords, ControlDispositi
 pub(crate) use evidence::NormalizedInput;
 pub(crate) use held::{
     HeldBoundary, HeldIdentity, HeldInput, Holding, HeldSynchronization, PhysicalHeld, PublishedHeld, SyntheticHeldEdge,
-    button_bit, modifier_bit, modifier_vk,
+    button_bit, buttons_in, modifier_bit, modifier_vk, modifiers_in,
 };
-pub(crate) use matching::promoted as has_promotion;
+pub(crate) use matching::{injected_hook, promoted as has_promotion};
 pub(crate) use matching::{CorrelatedInput, Correlation, Discarded, PenPromotion, InputGap, InputMatcher, InputStep, ProvisionalInputChange};
-pub(crate) use normalize::{Action, Button, Key, Modifier, Motion, ScanCode, ScanPrefix, WheelAxis, startup_modifier};
+pub(crate) use normalize::{Action, Button, Key, Modifier, Motion, ScanCode, ScanPrefix, VK_PACKET, WheelAxis, startup_modifier};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingInput {

@@ -20,18 +20,43 @@ pub(crate) struct ScanCode {
     pub code: u8,
 }
 
+impl ScanCode {
+    /// INP-2: the make code with its E0/E1 prefix folded in (0xE0xx, 0xE1xx).
+    pub fn folded(self) -> u16 {
+        let prefix = match self.prefix {
+            ScanPrefix::None => 0,
+            ScanPrefix::E0 => 0xe000,
+            ScanPrefix::E1 => 0xe100,
+        };
+        prefix | u16::from(self.code)
+    }
+}
+
+/// Serialized by the side names of the journal `mods` lists (INP-2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub(crate) enum Modifier {
+    #[serde(rename = "shift_l")]
     LeftShift = 0,
+    #[serde(rename = "shift_r")]
     RightShift = 1,
+    #[serde(rename = "ctrl_l")]
     LeftCtrl = 2,
+    #[serde(rename = "ctrl_r")]
     RightCtrl = 3,
+    #[serde(rename = "alt_l")]
     LeftAlt = 4,
+    #[serde(rename = "alt_r")]
     RightAlt = 5,
+    #[serde(rename = "win_l")]
     LeftWin = 6,
+    #[serde(rename = "win_r")]
     RightWin = 7,
+}
+
+impl Modifier {
+    pub const ALL: [Self; 8] = [Self::LeftShift, Self::RightShift, Self::LeftCtrl, Self::RightCtrl,
+        Self::LeftAlt, Self::RightAlt, Self::LeftWin, Self::RightWin];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -55,8 +80,9 @@ impl Key {
     }
 }
 
+/// Serialized as the button number 1–5 (INP-5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(into = "u8")]
 pub(crate) enum Button {
     Left,
     Right,
@@ -65,7 +91,13 @@ pub(crate) enum Button {
     X2,
 }
 
+impl From<Button> for u8 {
+    fn from(button: Button) -> Self { button as u8 + 1 }
+}
+
 impl Button {
+    pub const ALL: [Self; 5] = [Self::Left, Self::Right, Self::Middle, Self::X1, Self::X2];
+
     pub fn mapped(self, swapped: bool) -> Self {
         match (self, swapped) {
             (Self::Left, true) => Self::Right,
@@ -100,6 +132,13 @@ pub(crate) enum Action {
 }
 
 pub(crate) const MAX_PARTS: usize = 13;
+
+/// `LLKHF_UP`: the low-level keyboard hook's key-release flag.
+pub(crate) const LLKHF_UP: u32 = 0x80;
+/// `VK_PACKET`: a Unicode code unit sent as a key, not a physical key.
+pub(crate) const VK_PACKET: u16 = 0xe7;
+/// `VK_CAPITAL`: Caps Lock.
+pub(crate) const VK_CAPITAL: u16 = 0x14;
 
 pub(crate) fn parts(
     input: &CollectedInput,
@@ -178,16 +217,15 @@ fn absolute_point(input: &CollectedInput, x: i32, y: i32) -> Evidence<PhysicalPo
     if !(0..=65_535).contains(&x) || !(0..=65_535).contains(&y) {
         return Evidence::Unavailable(UnavailableReason::Unsupported);
     }
-    let (left, top, right, bottom) = rect.edges();
-    let map = |raw: i32, start: i32, end: i32| {
-        let extent = i64::from(end) - i64::from(start);
-        (i64::from(start) + (i64::from(raw) * extent / 65_536)) as i32
+    let (left, top, _, _) = rect.edges();
+    let map = |raw: i32, start: i32, extent: u32| {
+        (i64::from(start) + (i64::from(raw) * i64::from(extent) / 65_536)) as i32
     };
-    Evidence::Observed(PhysicalPoint { x: map(x, left, right), y: map(y, top, bottom) })
+    Evidence::Observed(PhysicalPoint { x: map(x, left, rect.width()), y: map(y, top, rect.height()) })
 }
 
 fn raw_key(key: RawKey, fallback_scan: impl FnOnce(u16) -> Option<ScanCode>) -> Option<Key> {
-    if key.virtual_key == 0xe7 {
+    if key.virtual_key == VK_PACKET {
         return normalize_key(key.virtual_key, None, key.flags & 1 == 0);
     }
     if key.make_code == 0xff || key.virtual_key == 0xff {
@@ -207,8 +245,8 @@ fn raw_key(key: RawKey, fallback_scan: impl FnOnce(u16) -> Option<ScanCode>) -> 
 }
 
 fn hook_key(key: HookKey) -> Option<Key> {
-    if key.virtual_key == 0xe7 {
-        return normalize_key(0xe7, None, key.flags & 0x80 == 0);
+    if key.virtual_key == u32::from(VK_PACKET) {
+        return normalize_key(VK_PACKET, None, key.flags & LLKHF_UP == 0);
     }
     if key.virtual_key == 0xff {
         return None;
@@ -216,7 +254,7 @@ fn hook_key(key: HookKey) -> Option<Key> {
     let prefix = if key.flags & 1 == 0 { ScanPrefix::None } else { ScanPrefix::E0 };
     let scan = u8::try_from(key.scan_code).ok().filter(|code| *code != 0)
         .map(|code| ScanCode { prefix, code });
-    normalize_key(u16::try_from(key.virtual_key).ok()?, scan, key.flags & 0x80 == 0)
+    normalize_key(u16::try_from(key.virtual_key).ok()?, scan, key.flags & LLKHF_UP == 0)
 }
 
 fn normalize_key(mut vk: u16, mut scan: Option<ScanCode>, down: bool) -> Option<Key> {

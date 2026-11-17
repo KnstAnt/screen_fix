@@ -431,8 +431,8 @@ Emission:
 - Pending entries are written as gap rows before the next row of the same stream, in ascending first receipt.
 - A gap row's `recv_t_us` is its admission receipt: the maximum of the triggering receipt and the stream's last receipt. Its range fields keep the original loss times.
 - At a pause boundary pending entries precede the pause row. Losses noticed while paused follow the resume row with their original ranges. At close they precede the final health rows.
-- Gap and health rows use reserved capacity. Failure to append one is a journal failure (F) and produces no further health row.
-- The frames stream never records a loss. Video losses are slot rows with a reason.
+- Capacity: before a data row, pending gap rows use the normal data capacity. If it is full they stay pending in the ledger (the data row itself becomes a `queue_overflow` loss), and an idle producer wake offers them again. Gap rows are emitted in reserved capacity before boundary rows and before a health row, by a blocking priority send when a waited flush finds the queue full, and at close in the ingress tail. Health rows always use the reserve. Failure to append one is a journal failure (F) and produces no further health row.
+- The frames stream never records a loss. Video losses are slot rows with a reason (13.14).
 
 Health rows:
 - They are written when the condition occurs, never with a null `recv_t_us`. A condition before the session clock exists goes to diagnostics and the manifest only.
@@ -482,8 +482,9 @@ Rules:
 Implementation notes:
 - Row 16: the PNG worker also owns the still journal. An encoder panic is caught; it is reported once as an L-auxiliary loss with a health row, and this and every later job resolves as `still_dropped` with reason `png_worker_unavailable`. The still journal and the recording continue. A still journal failure, or an exit of the worker outside the encoder, stays F (row 1) with no extra L report.
 - Cursor assets: a panic of the cursor asset owner is caught. The assets it already published keep their inventory entries; later assets are unavailable, and the context owner reports one L-auxiliary loss on its next health poll. A panic after the context loop's last poll keeps the inventory but is not reported.
-- Row 17: the current code has no separate activity-loss report for a clipboard worker exit.
-- Rows 20 and 21 belong to the per-monitor frames lanes introduced with the journal schema stage. Until then the frames stream is written with blocking submission only.
+- Row 7: the collector writes control and status records on its owner thread with a lease-bounded (1 s) write deadline. The collector supervisor ends the collector when that thread has made no progress for 750 ms outside cleanup, so these writes are effectively bounded at 750 ms.
+- Row 17: a clipboard worker exit is reported once as an L-auxiliary loss with a context health row. No replacement worker is started, so no later clipboard events are produced.
+- Rows 20 and 21 belong to the per-monitor frames lanes (13.14).
 
 ### 13.3 Closing certification of the input prefix
 
@@ -496,29 +497,29 @@ Matching outcomes (key, button and wheel clusters): a cluster is a connected com
 
 ### 13.4 Hook-only foreground attribution
 
-The Receiver keeps a bounded foreground timeline fed by the Context owner's ordered transitions. Each entry holds the approval identity, the access classification and the change interval [tick − 16 ms, receipt]. It is pruned below the published prefix.
+There is no separate Receiver-owned timeline. The Context owner's visit history plays that role (`Context::hook_receipt`). It holds the current approved visit and up to 32 ended visits, each with its start and the receipt through which a context sweep verified it unchanged. `Context::prune_visits` drops ended visits whose end lies more than the 16 ms uncertainty before the published input prefix, except the visit of the active key focus.
 
 A hook-only record with receipt r is approved when:
-1. r lies strictly inside a stable segment, with no change interval overlapping [r − 16 ms, r];
-2. that segment's foreground is approved with ordinary access;
-3. the timeline's progress covers r.
+1. one approved visit started at or before r − 16 ms and was verified unchanged through r, so no change lies in [r − 16 ms, r];
+2. that visit has ordinary access (an elevated visit covers only receipts inside its certified visit);
+3. a context sweep has processed notices through r. Until then the receipt is pending.
 
 If condition 3 is not yet met, the record waits within the existing classification wait. Otherwise a failed condition suppresses it as `approval_unknown` (Sensitive).
 
 Keyboard records (keys and VK_PACKET) also require:
 4. one visit and one focus generation covering [r − 16 ms, r];
 5. that generation's classification resolved within the 500 ms classification deadline. Non-text keeps keys, editable follows text rules, and password, possibly sensitive, unresolved or expired goes to the redacted aggregate.
-6. If condition 4 fails, the record is counted into an adjacent open redacted aggregate, or else as a Sensitive `focus_uncertain` suppression.
+6. If condition 4 fails because the focus changed inside the interval while the same approved window stayed in the foreground, the record is counted into an adjacent open redacted aggregate, or else as a Sensitive `focus_uncertain` suppression. Any other change inside the interval makes the receipt unknown (`approval_unknown`).
 
 Origin follows INP-7 precedence: promotion signature, then hook injection flags (`injected`), then device evidence. An injected hook may pair only with a NULL-handle raw packet of the same kind and identity. Injector hints are serialized by hint name. `late` is null for injected hooks.
 
 ### 13.5 Motion and wheel association (D-7 A)
 
 - Every approved hook motion is a sample; ALG section 6.2 sampling still applies.
-- Raw relative packets received in (previous hook sample − W, this sample + W], not yet attributed, are attached as `delta` and `coalesced` when exactly one raw device produced them. Several devices give a null delta with reason `raw_association_ambiguous`; none gives reason `raw_unavailable`. A raw packet received within +W after a hook sample is attributed to that sample, so in dense motion a delta can lag by one sample.
+- Raw relative packets received in (previous hook sample − W, this sample + W], not yet attributed, are attached as `delta` and `coalesced` when exactly one raw device produced them; at most one absolute packet is attached. Packets of several relative devices, or several absolute packets, make the sample's raw evidence unavailable with reason `ambiguous` (the row's correlation is `ambiguous`). Without any raw packet the reason is `not_observed`, or `blind` when the window crosses a recorded gap. A raw packet received within +W after a hook sample is attributed to that sample, so in dense motion a delta can lag by one sample.
 - Unattributed raw deltas go to the per-second raw-motion evidence in `input_health` and are not counted as cursor moves. No delta is attached to two samples.
 - While the pointer hook is missing or lost, raw packets drive sampling.
-- Wheel: in a maximal run of same-axis records without a gap or barrier, pair the k-th raw with the k-th hook when the run's raw records come from one device and the counts are equal. Otherwise hook records are published with a null raw value and reason `wheel_association_ambiguous`.
+- Wheel: in a maximal run of same-axis records without a gap or barrier, pair the k-th raw with the k-th hook when the run's raw records come from one device and the counts are equal. Otherwise each hook record is published with its raw value unavailable for reason `ambiguous` (correlation `ambiguous`), and the run's raw records are absorbed by its first row. A run of one producer only stays unpaired (`not_observed`). A run capped at 32 records is cut only where its raw and hook counts are equal.
 
 ### 13.6 Ordinary-key state across boundaries (I4)
 
@@ -538,8 +539,9 @@ Origin follows INP-7 precedence: promotion signature, then hook injection flags 
 ### 13.8 Focus classification (D-4; clarifies CTX-9 against section 7.1)
 
 - D-4a: a successful read with IsKeyboardFocusable true and neither Value nor Text pattern gives `editable: false` (non-text, keys kept) for every control type.
-- D-4b: a present pattern whose read-only attribute is unavailable gives `editable: null` (`attribute_unavailable`) and a redacted visit. This includes the case where Value pattern presence itself is unavailable and `ValueIsReadOnly` is unreadable.
-- D-4c: a mixed Text read-only attribute with IsPassword known false gives `editable: null` (`mixed`); keys are published with `typing: "unknown"` and no text is inferred.
+- D-4b: a present pattern whose read-only attribute is unavailable gives `editable: null` and a redacted visit. This includes the case where Value pattern presence itself is unavailable and `ValueIsReadOnly` is unreadable.
+- D-4c: a mixed Text read-only attribute with IsPassword known false gives `editable: null`; keys are published with `typing: "unknown"` and no text is inferred.
+- D-4b and D-4c have no journal sub-reason. Both give `editable: null`; the distinction is the text target class: possibly sensitive (redacted) for D-4b, typing unknown for D-4c.
 - D-4d: `HasKeyboardFocus` false marks the read stale; it is reissued once within the classification wait and redacted if the wait expires. `HasKeyboardFocus` unsupported is resolved when the element came from the focused-element query and a native focus snapshot taken from `hwndFocus` confirms the same window.
 - Unchanged: read failure or timeout, IsPassword unknown and password give a redacted visit.
 
@@ -589,3 +591,19 @@ Read corrections (C1):
 - The PNG owner and the cursor asset owner report each file they publish (attempt-relative path named by its digest, byte length, width, height). The manifest lists them as `images` and `cursors`.
 - The reader resolves a still or cursor image only if it is listed, and checks the listed size and dimensions against the file.
 - A complete package requires both lists. Complete packages recorded before this change, without the lists, fail validation; this follows the v6-only reader decision (D-1 A).
+
+### 13.14 Frames stream order and receipts (remediation plan §6.5)
+
+Receipt rule (amended, accepted by the user 2026-11-17). Rows are per monitor, in slot order across all epochs of the attempt. For row k, d_k is the slot decision receipt (kept as `slot_decided_t_us`) and e_k is the slot end, limited by the epoch cutoff when the epoch closes inside the slot.
+- A row that newly selects frame f has `recv_t_us` = the capture receipt of f. If that receipt is below the previous row's `recv_t_us`, f is not selected: it is counted in `frames_rejected` and the slot repeats. This replaces the former attempt failure on a frames order violation. (`frames_rejected` also counts frames that were not available before the decision or not accepted.)
+- A repeat or a row without a frame has the ordering receipt `recv_t_us` = max(previous row's `recv_t_us`, e_k); the first row of the attempt uses e_k. It advances on a static screen and during absence. A repeat keeps the repeated frame's identity and source time.
+- The capture loop rejects a frame whose source time is later than its receipt, counted as `rejected_time_or_epoch`. The WGC `SystemRelativeTime` is converted to session time with a single rounding from the exact QPC-scale difference (`ClockOrigin::wgc_time` in `protocol/src/time.rs`), as receipts are, so a frame stamped at or before its receipt QPC never maps after its receipt. Source ≤ receipt therefore holds without a tolerance, and this check is only a safeguard.
+- So every monitor's receipts are non-decreasing by construction. In normal operation no frame is rejected: WGC delivers a monitor's frames in source order and receipts are stamped in processing order, and every later slot's frame has source time, and so receipt, at or after e_k.
+
+Merge (no loss, no blocking between monitors):
+- Each video worker decides every non-paused slot in real time, including while its monitor is absent and after its own video L fault. Rows go to a bounded per-monitor lane of ceil(T × effective FPS) rows; a row that does not fit stays in the worker's staging. After each enqueue the worker publishes an atomic mark (epoch, receipt, next slot); all its rows below the mark are already in the lane.
+- The merge thread releases the smallest lane head by (`recv_t_us`, monitor, slot) while every other monitor's constraint admits it: the monitor's mark for the current epoch, the opening floor R until that monitor publishes a mark of the new epoch, and no constraint after its closing mark until the next opening. A row the writer cannot take stays at the lane head.
+- Opening: at Start and every resume the controller sends Opening(e, R) to the merge thread and waits up to 1 s for its acknowledgement before any video worker sees epoch e. The merge thread does no file IO, so a missing acknowledgement is a journal failure (F).
+- Row 20 (F): staging that still exceeds its bound after one slot interval of waiting for lane space.
+- Row 21 (F): the merge thread's watchdog reports a worker whose mark does not advance for T = segment duration + IDR allowance + verification allowance + one slot, measured as suspend-excluded elapsed time; an unknown interval restarts the measurement. It applies only while the controller is Recording. It skips a monitor whose full lane still holds rows, because those rows wait for another monitor's mark. It also watches an older epoch's mark that was never closed: at a pause a worker publishes its closing mark only when no staged row remains, so while rows of that epoch still await verification its last mark keeps constraining. On a report the lane is closed at its last mark, later rows of that worker are discarded and the undelivered slot range is recorded in diagnostics and the manifest.
+- Each row also keeps its publication time as `published_t_us`; `recv_t_us` is never taken from publication time.

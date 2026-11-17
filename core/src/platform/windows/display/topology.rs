@@ -14,7 +14,7 @@ use crate::{
 };
 
 use super::{Monitor, enumerate};
-use crate::platform::windows::{ProbeError, clock, mp4::io_error, stage};
+use crate::platform::windows::{ProbeError, clock, io_error, stage};
 
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::platform::windows) struct Output {

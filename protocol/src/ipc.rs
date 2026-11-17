@@ -64,6 +64,13 @@ pub struct EnvironmentState {
     pub swapped_buttons: bool,
 }
 
+impl EnvironmentState {
+    /// At least one change flag is set and every set flag is known.
+    pub const fn valid(&self) -> bool {
+        self.changes != 0 && self.changes & !EnvironmentChange::ALL_BITS == 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "record", rename_all = "snake_case", deny_unknown_fields)]
 /// The helper reads environment changes and Stop from the shared-state atomics.
@@ -152,6 +159,14 @@ pub struct InputRegistration {
     pub touchpad: bool,
     pub multi_axis: bool,
     pub hook_timeout: HookTimeoutEvidence,
+}
+
+impl InputRegistration {
+    /// Raw input and both low-level hooks registered; the optional
+    /// collections and pen HID are judged by the caller's profile.
+    pub const fn required_ready(&self) -> bool {
+        self.raw_keyboard && self.raw_pointer && self.keyboard_hook && self.pointer_hook
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -602,17 +617,14 @@ impl HelperToCore {
 
     fn validate(&self) -> Result<(), PacketError> {
         match self {
-            Self::Environment(state) if state.changes == 0 || state.changes & !EnvironmentChange::ALL_BITS != 0 =>
+            Self::Environment(state) if !state.valid() =>
             {
                 Err(PacketError::InvalidRecord("Input IPC environment flags are invalid."))
             }
             Self::Failed(failure) if !failure.valid() => {
                 Err(PacketError::InvalidRecord("Input IPC failure detail does not match its stage."))
             }
-            Self::Ready(registration)
-                if !(registration.raw_keyboard && registration.raw_pointer
-                    && registration.keyboard_hook && registration.pointer_hook) =>
-            {
+            Self::Ready(registration) if !registration.required_ready() => {
                 Err(PacketError::InvalidRecord("Input helper reported readiness without required registrations."))
             }
             Self::Input(CollectedInput { receipt, foreground_at_receipt, sample: InputSample::HookKey(_) | InputSample::HookPointer(_), .. })

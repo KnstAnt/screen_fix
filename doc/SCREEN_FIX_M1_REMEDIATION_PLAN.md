@@ -622,34 +622,33 @@ Timeline capacity: one entry per transition, pruned below the Receiver's publish
 
 ### 6.5 Frames stream ordering with capture receipts (D-1 option A only)
 
-With `recv_t_us` set to the capture receipt of the selected frame, the frames journal must merge monitors locally (ALG §3.2). The receipt rule and its proof hold under both D-10 options: D-10 changes only when d_k is taken and which frames enter L_k. The frames serializer still uses d_k, so stage R1 depends on D-10. With D-10 = A (chosen), V2b must be implemented before R1 fixes the frames serializer.
+With `recv_t_us` set to the capture receipt of the selected frame, the frames journal must merge monitors locally (ALG §3.2). The receipt rule holds under both D-10 options: D-10 changes only when d_k is taken and which frames are eligible. The frames serializer still uses d_k, so stage R1 depends on D-10. With D-10 = A (chosen), V2b must be implemented before R1 fixes the frames serializer.
 
 **Real-time slot rows.** Every selected monitor's video worker decides every non-paused slot in real time and produces its row at decision time. This includes slots while the monitor is absent (`MonitorMissing`), while capture is unavailable, and after the monitor's own video L fault (`EncoderUnavailable`) (VID-4: "lines also mark slots … while the monitor is unavailable"). A worker therefore never stops producing rows before Stop. Monitor removal and return are capture-epoch changes inside the same admission epoch, and they do not change the set of merge producers.
 
-**Receipt rule.** Rows are defined per monitor, in slot order across all epochs of the attempt. For row k:
+**Receipt rule (amended, accepted by the user 2026-11-17; replaces the earlier `max(prev, min(d_k, L_k))` rule).** Rows are defined per monitor, in slot order across all epochs of the attempt. For row k:
 - d_k is the slot's decision receipt, kept as `slot_decided_t_us`.
-- L_k is the minimum capture receipt over frames that the worker has received before d_k and whose source time lies in a slot after k (+∞ if there is none). The worker knows every frame delivered to it, so L_k is computable at d_k.
-- **Row that newly selects a frame f:** `recv_t_us` = receipt(f), the true capture receipt.
-- **Every other row** (a repeat, or a row without a frame): `recv_t_us` = max(`recv_t_us` of row k−1, min(d_k, L_k)). This is an **ordering receipt**. It advances on a static screen and during absence, so the progress mark never freezes. The first row of the attempt uses min(d_k, L_k).
+- e_k is the end of slot k, limited by the epoch's cutoff when the epoch closes inside the slot.
+- **Row that newly selects a frame f:** `recv_t_us` = receipt(f), the true capture receipt. If receipt(f) is below the previous row's `recv_t_us`, f is not selected: it is counted in `frames_rejected` and the slot repeats (this replaces the former fatal `FRAMES_ORDER`).
+- **Every other row** (a repeat, or a row without a frame): `recv_t_us` = max(`recv_t_us` of row k−1, e_k). This is an **ordering receipt**. It advances on a static screen and during absence, so the progress mark never freezes. The first row of the attempt uses e_k.
 - A repeat keeps the PDF's `obs_id` and `source_t_us` of the repeated frame, but its `recv_t_us` is an ordering receipt (D1 documents this).
+- The capture loop rejects a frame whose source time is later than its receipt (`rejected_time_or_epoch`), so receipt(g) ≥ source(g) holds for every delivered frame.
 
-**Monotonicity proof, within one monitor.**
+**Monotonicity, within one monitor.** Every row's `recv_t_us` is either a max that includes the previous row's value or a frame receipt that is at least the previous row's value (anything else is rejected). So the sequence is non-decreasing by construction.
+
+**Why rejection does not happen in normal operation.**
 1. WGC delivers a monitor's frames in source-time order, and the capture loop stamps receipts in processing order. So source(f) < source(g) implies receipt(f) ≤ receipt(g).
-2. **Invariant I.** For every row i and every frame g delivered to the worker with source in a slot after i: `recv_t_us`(i) ≤ receipt(g). The proof is by induction over i.
-   - If row i newly selects f, then f is in slot i and g is in a later slot. So receipt(f) ≤ receipt(g) by item 1.
-   - Otherwise, `recv_t_us`(i) = max(`recv_t_us`(i−1), min(d_i, L_i)):
-     - the first term is ≤ receipt(g) by induction, because g's slot is after i−1;
-     - for the second term: if g was received before d_i, g is in L_i's set, so L_i ≤ receipt(g); if not, receipt(g) ≥ d_i. Either way min(d_i, L_i) ≤ receipt(g).
-3. **Non-decreasing.**
-   - A row that newly selects g in slot j has `recv_t_us` = receipt(g) ≥ `recv_t_us`(j−1), by invariant I applied to row j−1.
-   - Every other row is a max that includes `recv_t_us`(j−1).
-4. **Pause and resume.**
-   - Slots after a resume at receipt R start at or after R. So every frame in them has receipt ≥ R, and every decision after resume is ≥ R.
-   - Hence the first post-resume row has `recv_t_us` ≥ R, whether it selects a frame or not.
-   - Every row of the closed epoch was decided before the controller completed the pause: the controller waits for every video producer's pause report before it can resume. So all those rows are < R.
-5. **Absence and return.** Rows are produced throughout (real-time slot rows), and items 2–3 hold across capture-epoch changes. A returned monitor's first new frame has source after every earlier slot, so invariant I covers it.
+2. **Invariant I.** For every row i and every frame g delivered to the worker with source in a slot after i: `recv_t_us`(i) ≤ receipt(g).
+   - If row i newly selects f, then f is in slot i and g is in a later slot, so receipt(f) ≤ receipt(g) by item 1.
+   - Otherwise, `recv_t_us`(i) = max(`recv_t_us`(i−1), e_i). The first term is covered by induction. For the second term, e_i ≤ source(g) ≤ receipt(g).
+3. So a frame is rejected only if WGC order or receipt stamping is violated. The counter makes such a violation visible without failing the attempt.
 
-The sequence is non-decreasing, and ties are broken by (`recv_t_us`, monitor, slot). This holds for D-10 A and B. D-10 A only changes d_k and L_k, not the proof.
+**Pause, resume, absence.**
+- Every row of a closed epoch has `recv_t_us` ≤ its cutoff, which is < the next opening R.
+- Slots after a resume start at or after R. So every frame in them has receipt ≥ R, and every e_k is > R. The first post-resume row is therefore ≥ R.
+- Rows are produced throughout an absence (real-time slot rows). A returned monitor's first new frame has source after every earlier slot, so invariant I covers it.
+
+Ties are broken by (`recv_t_us`, monitor, slot). D-10 A changes only d_k and which frames are eligible, not the rule.
 
 **Merge without blocking or deadlock.**
 - **Lanes.** Each monitor's video worker has its own bounded lane to the frames journal owner (single-producer, single-consumer), with capacity reserved per monitor. One monitor's full lane never consumes another monitor's capacity.
@@ -1681,7 +1680,7 @@ The standard source becomes inactive only at the latch. Records with a receipt a
 - **Stills.** One row per trigger with `frame_obs_id`, `seen_obs_id`, `file`, `seen_file` (`seen_file` only when it differs, IMG-2). `file` is `images/<digest>.png`, relative to `raw/`. `still_dropped` keeps its reason fields.
 - **Frames.** `recv_t_us` follows the §6.5 receipt rule:
   - the true capture receipt for rows that newly select a frame;
-  - the ordering receipt max(previous, min(d_k, L_k)) for repeats and frameless rows, with `slot_decided_t_us` kept.
+  - the ordering receipt max(previous, e_k) for repeats and frameless rows, with `slot_decided_t_us` kept.
 
   Rows go through the per-monitor lanes and the non-blocking merge of §6.5, with boundary-owned constraints (Opening and Closing) and real-time slot rows. Publication time is kept as `published_t_us` (extension).
   - This part depends on D-10: R1 is implemented after V2b (D-10 = A). The receipt rule itself holds under both options.
@@ -1702,7 +1701,7 @@ The standard source becomes inactive only at the latch. Records with a receipt a
 - Each per-monitor lane plus its worker staging is sized as `staged_slots + ceil(T × effective fps)`. V3 already doubled `staged_slots` to 2 × (segment pictures + margin), so the factor 2 of the original V1 formula is not applied a second time. T is derived from the V3 verification allowance and the other row-21 terms, with no literals. V1 delivered the staged slot bound; the lane term is implemented here, because the lanes are introduced by this stage (coordinator note after the V1 review).
 - Frames receipts:
   - rows that newly select a frame carry the true capture receipt;
-  - every other frames row carries max(previous, min(d_k, L_k));
+  - every other frames row carries max(previous, e_k);
   - no code path assigns a frames `recv_t_us` from publication time.
 - The controller sends Opening(e, R) to the frames journal owner and receives its acknowledgement before any video worker can observe epoch e.
 - The journal owner sets the Open floor on Opening, sets Closed only on a worker's closing mark, and never lets a monitor stop constraining on absence.
@@ -1869,7 +1868,7 @@ Results go to a separate evidence file. A source review or a successful build is
 - **New `doc/SCREEN_FIX_M1_JOURNAL_SCHEMA.md` (after D-1).** The versioned schema per stream, listing PDF fields and extensions, with the package format version.
   - **Frames.** It states explicitly that for repeated slots and slots without a frame, `recv_t_us` is an **ordering receipt** (§6.5), not an observation time. It exists only to keep the stream's receipt order. Timing analysis must use `slot_decided_t_us` (slot decision), `source_t_us` (frame capture) and `capture_recv_t_us` (frame receipt), never `recv_t_us` of such rows.
   - **Frames.** It states that `recv_t_us` is the true capture receipt only on rows that newly select a frame.
-  - **Frames.** It states that, by design, a repeat or frameless row's `recv_t_us` can be less than its `slot_decided_t_us`, because the ordering receipt is min(d_k, L_k) bounded below by the previous row. Consumers must not treat that difference as an anomaly.
+  - **Frames.** It states that, by design, a repeat or frameless row's `recv_t_us` can be less than its `slot_decided_t_us`, because the ordering receipt is the slot end e_k bounded below by the previous row. Consumers must not treat that difference as an anomaly.
 - **`doc/SCREEN_FIX_M1_SPEC_ADDENDUM.md`.**
   - Record the accepted amendments from D-2, D-3, D-5 and D-6 as explicit amendments.
   - Add a clarification that `checksums.sha256` (DATA-3) and gate 8 start with M2 per PDF §17.

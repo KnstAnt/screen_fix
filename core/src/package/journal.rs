@@ -26,7 +26,8 @@ use crate::protocol::{EventRef, MonitorId, QpcTick, SessionTimeUs, StreamId, Str
 
 use super::{
     diagnostics::Failure,
-    outcome::{DroppedTotal, GapRecord, HealthKind, LossCount, LossEvidence, LossProducer, LossReason, LossScope, SuppressionClass},
+    outcome::{DroppedTotal, GapRecord, HealthKind, LossCount, LossEvidence, LossProducer, LossReason, LossScope, SuppressionClass,
+        UiaOutcome, UiaRead, merge_bounds},
 };
 
 const BUFFER_INTERVAL: Duration = Duration::from_secs(1);
@@ -102,9 +103,13 @@ pub struct StreamSummary {
     pub dropped_by_reason: BTreeMap<LossReason, DroppedTotal>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub suppressed_by_class: BTreeMap<SuppressionClass, u64>,
-    /// Persisted rows that record an unavailable observation, by their reason.
+    /// Persisted `still_dropped` rows, by their reason.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub unavailable_by_reason: BTreeMap<String, u64>,
+    /// Persisted focus and element rows whose UI Automation read has no
+    /// element, by read and outcome.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub uia_unavailable: BTreeMap<UiaRead, BTreeMap<UiaOutcome, u64>>,
     /// Health conditions counted instead of written while the stream was paused.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub paused_health: BTreeMap<HealthKind, u64>,
@@ -169,11 +174,17 @@ pub(crate) struct HealthRecord {
     pub(crate) count: Option<u64>,
 }
 
+/// The kind of a stream's health rows: input health conditions are
+/// `input_health` rows (INP-1, INP-12), like the per-second input counts.
+pub(super) fn health_kind(stream: StreamId) -> &'static str {
+    if stream == StreamId::Input { "input_health" } else { "health" }
+}
+
 impl HealthRecord {
-    fn row(&self) -> Value {
+    fn row(&self, stream: StreamId) -> Value {
         let failure = self.failure.without_report_detail();
         serde_json::json!({
-            "kind": "health",
+            "kind": health_kind(stream),
             "health": self.kind,
             "component": failure.component(),
             "failure": failure,
@@ -186,10 +197,12 @@ impl HealthRecord {
     }
 }
 
+/// A row written after its stream's ingress closed (§6.1): a context health
+/// condition, or the input blind interval of an input activity loss.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct FinalHealth {
-    pub(crate) record: HealthRecord,
-    pub(crate) blind: Option<super::metadata::InputBlind>,
+pub(crate) enum FinalRow {
+    Health(HealthRecord),
+    Blind(super::metadata::InputBlind),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,8 +228,8 @@ impl PendingLoss {
         self.count = self.count.merge(other.count);
         self.first = self.first.min(other.first);
         self.last = self.last.max(other.last);
-        self.source_seq = merge_range(self.source_seq, other.source_seq);
-        self.qpc = merge_range(self.qpc, other.qpc);
+        self.source_seq = merge_bounds(self.source_seq, other.source_seq);
+        self.qpc = merge_bounds(self.qpc, other.qpc);
     }
 
     fn record(&self) -> GapRecord {
@@ -229,14 +242,12 @@ impl PendingLoss {
     }
 }
 
-fn merge_range<T: Ord + Copy>(left: Option<[T; 2]>, right: Option<[T; 2]>) -> Option<[T; 2]> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some([left[0].min(right[0]), left[1].max(right[1])]),
-        (range, None) | (None, range) => range,
-    }
-}
-
 type LedgerKey = (LossReason, Option<LossProducer>);
+
+fn add_count<K: Ord>(totals: &mut BTreeMap<K, u64>, key: K, count: u64) {
+    let total = totals.entry(key).or_default();
+    *total = total.saturating_add(count);
+}
 
 /// The row kinds the manifest health summary reports. The writer tallies them
 /// when appending, so the summary and the reader's scan count the same rows.
@@ -247,7 +258,7 @@ enum RowTally {
     Blind,
     /// A suppression interval with its duration in microseconds.
     Suppressed(u64),
-    Unavailable(Box<str>),
+    Unavailable(Unavailable),
 }
 
 impl RowTally {
@@ -255,24 +266,49 @@ impl RowTally {
         match value.get("kind").and_then(Value::as_str) {
             Some("pause") => Self::Pause,
             Some("blind") => Self::Blind,
-            Some("suppressed_interval") => Self::Suppressed(value.get("end_t_us").and_then(Value::as_i64)
-                .zip(value.get("start_t_us").and_then(Value::as_i64))
-                .map_or(0, |(end, start)| end.saturating_sub(start).max(0) as u64)),
-            _ => unavailable_key(value).map_or(Self::Plain, |key| Self::Unavailable(key.into_boxed_str())),
+            Some("suppressed_interval") => Self::Suppressed(suppressed_us(value)),
+            _ => Unavailable::of(value).map_or(Self::Plain, Self::Unavailable),
         }
     }
 }
 
-/// The reason key of a row that records an unavailable observation, for the
-/// rows whose stream defines an explicit outcome: a dropped still, and focus
-/// or pointer element reads whose UI Automation status is not `ready`.
+/// The duration of a `suppressed_interval` row, as the summary counts it.
+pub(super) fn suppressed_us(value: &Value) -> u64 {
+    value.get("end_t_us").and_then(Value::as_i64).zip(value.get("start_t_us").and_then(Value::as_i64))
+        .map_or(0, |(end, start)| end.saturating_sub(start).max(0) as u64)
+}
+
+/// A row that records an unavailable observation, for the rows whose stream
+/// defines an explicit outcome: a dropped still by its reason, and a focus or
+/// element read whose `uia` value is an outcome instead of an element.
 /// The reader applies the same rule.
-pub(super) fn unavailable_key(value: &Value) -> Option<String> {
-    match value.get("kind").and_then(Value::as_str)? {
-        "still_dropped" => Some(value.get("reason").and_then(Value::as_str).unwrap_or("unspecified").to_owned()),
-        kind @ ("focus" | "pointer_element") => value.get("uia").and_then(Value::as_str)
-            .filter(|status| *status != "ready").map(|status| format!("{kind}:{status}")),
-        _ => None,
+#[derive(Debug)]
+pub(super) enum Unavailable {
+    Still(Box<str>),
+    Uia(UiaRead, UiaOutcome),
+}
+
+impl Unavailable {
+    pub(super) fn of(value: &Value) -> Option<Self> {
+        let read = match value.get("kind").and_then(Value::as_str)? {
+            "still_dropped" => return Some(Self::Still(
+                value.get("reason").and_then(Value::as_str).unwrap_or("unspecified").into())),
+            "focus" => UiaRead::Focus,
+            "element" => UiaRead::Element,
+            _ => return None,
+        };
+        UiaOutcome::deserialize(value.get("uia")?).ok().map(|outcome| Self::Uia(read, outcome))
+    }
+
+    /// Count this row in a stream's unavailable totals.
+    pub(super) fn count(
+        &self, stills: &mut BTreeMap<String, u64>, uia: &mut BTreeMap<UiaRead, BTreeMap<UiaOutcome, u64>>,
+    ) {
+        let total = match self {
+            Self::Still(reason) => stills.entry(reason.to_string()).or_default(),
+            Self::Uia(read, outcome) => uia.entry(*read).or_default().entry(*outcome).or_default(),
+        };
+        *total += 1;
     }
 }
 
@@ -433,8 +469,7 @@ impl JournalIngress {
         if self.paused.is_none() {
             self.emit_pending(receipt, Capacity::Reserved)?;
         }
-        self.entries.try_send(QueuedEntry::priority(Entry::Boundary(receipt, encoded)))
-            .map_err(|_| self.error(JournalStep::Append, None))
+        self.send_reserved(Entry::Boundary(receipt, encoded))
     }
 
     /// Write one health condition in reserved capacity, or count it while
@@ -442,23 +477,20 @@ impl JournalIngress {
     /// stream's last receipt so journal order is preserved.
     pub(crate) fn submit_health(&mut self, health: HealthRecord) -> Result<(), JournalError> {
         if let Some(paused) = &mut self.paused {
-            let count = paused.entry(health.kind).or_default();
-            *count = count.saturating_add(1);
+            add_count(paused, health.kind, 1);
             return Ok(());
         }
         let receipt = self.last_admission.map_or(health.detected, |last| last.max(health.detected));
-        let row = self.encode(receipt, health.row())?;
+        let row = self.encode(receipt, health.row(self.stream))?;
         self.emit_pending(receipt, Capacity::Reserved)?;
-        self.entries.try_send(QueuedEntry::priority(Entry::Health(receipt, row)))
-            .map_err(|_| self.error(JournalStep::Append, None))
+        self.send_reserved(Entry::Health(receipt, row))
     }
 
     /// Account a policy suppression. Suppressions have no times.
     pub(crate) fn record_suppressed(&mut self, class: SuppressionClass, count: u64) {
         if count == 0 { return; }
         self.totals.offered = self.totals.offered.saturating_add(count);
-        let total = self.totals.suppressed.entry(class).or_default();
-        *total = total.saturating_add(count);
+        add_count(&mut self.totals.suppressed, class, count);
     }
 
     /// Record typed loss evidence. An ordinary loss keeps its original range
@@ -493,9 +525,7 @@ impl JournalIngress {
     }
 
     fn ledger_add(&mut self, loss: PendingLoss, admitted: SessionTimeUs) -> Result<(), JournalError> {
-        if self.last_admission.is_some_and(|previous| admitted < previous) {
-            return Err(self.error(JournalStep::Order, None));
-        }
+        self.check_order(admitted)?;
         self.ledger.entry((loss.reason, loss.producer))
             .and_modify(|pending| pending.merge(loss))
             .or_insert(loss);
@@ -506,9 +536,7 @@ impl JournalIngress {
     /// Emit every pending entry, in ascending first loss time, at one admission receipt.
     fn emit_pending(&mut self, admission: SessionTimeUs, capacity: Capacity) -> Result<bool, JournalError> {
         if self.ledger.is_empty() { return Ok(true); }
-        if self.last_admission.is_some_and(|last| admission < last) {
-            return Err(self.error(JournalStep::Order, None));
-        }
+        self.check_order(admission)?;
         let mut gaps: Vec<_> = self.ledger.values().copied().collect();
         gaps.sort_by_key(|gap| (gap.first, gap.last));
         let entry = Entry::Gaps(admission, gaps);
@@ -518,8 +546,7 @@ impl JournalIngress {
                 Err(TrySendError::Full(_)) => return Ok(false),
                 Err(TrySendError::Disconnected(_)) => return Err(self.error(JournalStep::Append, None)),
             },
-            Capacity::Reserved => self.entries.try_send(QueuedEntry::priority(entry))
-                .map_err(|_| self.error(JournalStep::Append, None))?,
+            Capacity::Reserved => self.send_reserved(entry)?,
             Capacity::Blocking => self.entries.send(QueuedEntry::priority(entry))
                 .map_err(|_| self.error(JournalStep::Append, None))?,
         }
@@ -538,9 +565,7 @@ impl JournalIngress {
     }
 
     fn encode(&mut self, receipt: SessionTimeUs, mut value: Value) -> Result<Box<[u8]>, JournalError> {
-        if self.last_admission.is_some_and(|previous| receipt < previous) {
-            return Err(self.error(JournalStep::Order, None));
-        }
+        self.check_order(receipt)?;
         let fields = value.as_object_mut().ok_or_else(|| self.error(JournalStep::Encode, None))?;
         fields.remove("seq");
         fields.insert("recv_t_us".into(), serde_json::json!(receipt));
@@ -582,8 +607,7 @@ impl JournalIngress {
     pub(crate) fn take_paused_health(&mut self) -> BTreeMap<HealthKind, u64> {
         let counts = self.paused.as_mut().map(std::mem::take).unwrap_or_default();
         for (kind, count) in &counts {
-            let total = self.totals.paused_health.entry(*kind).or_default();
-            *total = total.saturating_add(*count);
+            add_count(&mut self.totals.paused_health, *kind, *count);
         }
         counts
     }
@@ -596,9 +620,7 @@ impl JournalIngress {
     /// Close the ingress at its closing boundary. Pending entries are then
     /// admitted at the cutoff, before the stream's final health rows.
     pub(crate) fn seal(mut self, cutoff: SessionTimeUs) -> Result<(), JournalError> {
-        if self.last_admission.is_some_and(|last| cutoff < last) {
-            return Err(self.error(JournalStep::Order, None));
-        }
+        self.check_order(cutoff)?;
         self.sealed = Some(cutoff);
         Ok(())
     }
@@ -642,6 +664,19 @@ impl JournalIngress {
         VerifiedIngress(self)
     }
 
+    /// Admissions are nondecreasing.
+    fn check_order(&self, at: SessionTimeUs) -> Result<(), JournalError> {
+        if self.last_admission.is_some_and(|last| at < last) {
+            return Err(self.error(JournalStep::Order, None));
+        }
+        Ok(())
+    }
+
+    /// Queue a lifecycle entry in the room reserved above the data limit.
+    fn send_reserved(&self, entry: Entry) -> Result<(), JournalError> {
+        self.entries.try_send(QueuedEntry::priority(entry)).map_err(|_| self.error(JournalStep::Append, None))
+    }
+
     fn error(&self, step: JournalStep, source: Option<io::Error>) -> JournalError {
         JournalError { stream: self.stream, step, source }
     }
@@ -674,13 +709,7 @@ impl VerifiedIngress {
     /// queue or the byte budget is full; the caller retries the same row.
     pub(crate) fn try_submit_verified(&mut self, receipt: SessionTimeUs, value: Value) -> Result<bool, JournalError> {
         let ingress = &mut self.0;
-        let tally = RowTally::of(&value);
-        let object = ingress.encode(receipt, value)?;
-        if !ingress.reserve(object.len()) {
-            return Ok(false);
-        }
-        let bytes_held = Arc::clone(&ingress.bytes_held);
-        let record = QueuedRow { receipt, object, tally, bytes_held };
+        let Some(record) = ingress.prepare(receipt, value)? else { return Ok(false) };
         match ingress.entries.try_send(QueuedEntry::priority(Entry::Data(record, None))) {
             Ok(()) => {
                 ingress.totals.offered = ingress.totals.offered.saturating_add(1);
@@ -736,7 +765,7 @@ impl JournalLimits {
 
 pub(crate) struct JournalOwner {
     stream: StreamId,
-    final_health: Option<SyncSender<Vec<FinalHealth>>>,
+    final_rows: Option<SyncSender<Vec<FinalRow>>>,
     thread: JoinHandle<Result<StreamSummary, JournalError>>,
     peaks: Arc<QueuePeaks>,
 }
@@ -750,14 +779,14 @@ impl JournalOwner {
         let reserve = if stream == StreamId::Frames { 0 } else { BOUNDARY_ENTRIES };
         let (entries, pending) = mpsc::sync_channel(row_limit + reserve);
         let (tail, closed) = mpsc::sync_channel(1);
-        let (final_health, health) = mpsc::sync_channel(1);
-        let (final_health, health) = if stream == StreamId::Context {
-            (Some(final_health), Some(health))
+        let (final_rows, finals) = mpsc::sync_channel(1);
+        let (final_rows, finals) = if matches!(stream, StreamId::Context | StreamId::Input) {
+            (Some(final_rows), Some(finals))
         } else {
             (None, None)
         };
         let thread = thread::Builder::new().name(format!("{stream:?}-journal")).spawn(move || {
-            let result = write_stream(stream, path, pending, closed, health);
+            let result = write_stream(stream, path, pending, closed, finals);
             if let Err(error) = &result {
                 on_failure(error);
             }
@@ -769,20 +798,21 @@ impl JournalOwner {
             peaks: Arc::clone(&peaks), last_admission: None, ledger: BTreeMap::new(), totals: IngressTotals::default(),
             paused: None, sealed: None,
         };
-        Ok((ingress, Self { stream, final_health, thread, peaks }))
+        Ok((ingress, Self { stream, final_rows, thread, peaks }))
     }
 
     pub(crate) fn finish(self) -> Result<StreamSummary, JournalError> {
-        self.finish_with_health(Vec::new())
+        self.finish_with(Vec::new())
     }
 
-    pub(crate) fn finish_with_health(self, health: Vec<FinalHealth>) -> Result<StreamSummary, JournalError> {
-        let Self { stream, final_health, thread, peaks } = self;
-        if let Some(send) = &final_health && !health.is_empty() {
-            // If Context has failed, report once to the UI.
-            let _ = send.try_send(health);
+    /// Close the stream after its final rows; only Context and Input take them.
+    pub(crate) fn finish_with(self, rows: Vec<FinalRow>) -> Result<StreamSummary, JournalError> {
+        let Self { stream, final_rows, thread, peaks } = self;
+        if let Some(send) = &final_rows && !rows.is_empty() {
+            // If the stream has failed, report once to the UI.
+            let _ = send.try_send(rows);
         }
-        drop(final_health);
+        drop(final_rows);
         let mut summary = thread.join().map_err(|_| JournalError { stream, step: JournalStep::Close, source: None })??;
         summary.normal_entries_peak = peaks.normal_entries.load(Ordering::Relaxed);
         summary.prepared_bytes_peak = peaks.prepared_bytes.load(Ordering::Relaxed);
@@ -798,12 +828,12 @@ struct JournalFile {
 
 fn write_stream(
     stream: StreamId, path: PathBuf, pending: Receiver<QueuedEntry>, tail: Receiver<IngressTail>,
-    health: Option<Receiver<Vec<FinalHealth>>>,
+    finals: Option<Receiver<Vec<FinalRow>>>,
 ) -> Result<StreamSummary, JournalError> {
     let file = File::create_new(path)
         .map_err(|source| JournalError { stream, step: JournalStep::Create, source: Some(source) })?;
     let mut journal = JournalFile { stream, file: BufWriter::new(file), summary: StreamSummary::default() };
-    let result = journal.drain(pending, tail, health);
+    let result = journal.drain(pending, tail, finals);
     // BufWriter's implicit drop must not attempt another write after failure.
     let _ = journal.file.into_parts();
     result
@@ -812,7 +842,7 @@ fn write_stream(
 impl JournalFile {
     fn drain(
         &mut self, pending: Receiver<QueuedEntry>, tail: Receiver<IngressTail>,
-        health: Option<Receiver<Vec<FinalHealth>>>,
+        finals: Option<Receiver<Vec<FinalRow>>>,
     ) -> Result<StreamSummary, JournalError> {
         let mut buffered = Instant::now();
         let mut disk = buffered;
@@ -871,14 +901,11 @@ impl JournalFile {
         }
         let closed = tail.recv().map_err(|_| self.error(JournalStep::Close, None))?;
         self.close(closed)?;
-        if let Some(receiver) = health {
+        if let Some(receiver) = finals {
             self.flush(Flush::Os)?;
-            if let Ok(health) = receiver.recv() {
-                for entry in health {
-                    self.health(entry)?;
-                }
-            } else {
-                return Ok(self.summary.clone());
+            let Ok(rows) = receiver.recv() else { return Ok(self.summary.clone()) };
+            for row in rows {
+                self.final_row(row)?;
             }
         }
         self.flush(Flush::Os)?;
@@ -896,12 +923,9 @@ impl JournalFile {
             }
         }
         if !unreported_paused_health.is_empty() && let Some(receipt) = admission.or(self.summary.last_receipt) {
-            let receipt = self.summary.last_receipt.map_or(receipt, |last| last.max(receipt));
-            let row = self.encode(&serde_json::json!({
-                "kind": "health", "recv_t_us": receipt, "source_t_us": null,
-                "health": HealthKind::PausedSummary, "counts": unreported_paused_health,
+            self.append_row(receipt, serde_json::json!({
+                "kind": health_kind(self.stream), "health": HealthKind::PausedSummary, "counts": unreported_paused_health,
             }))?;
-            self.append(Some(receipt), &row)?;
             self.summary.health_rows += 1;
         }
         let IngressTotals { offered, suppressed, sensitive, paused_health } = totals;
@@ -928,44 +952,34 @@ impl JournalFile {
                 self.summary.suppressed_interval_rows += 1;
                 self.summary.suppressed_interval_us = self.summary.suppressed_interval_us.saturating_add(*duration);
             }
-            RowTally::Unavailable(reason) => {
-                *self.summary.unavailable_by_reason.entry(reason.to_string()).or_default() += 1;
+            RowTally::Unavailable(unavailable) => {
+                unavailable.count(&mut self.summary.unavailable_by_reason, &mut self.summary.uia_unavailable);
             }
         }
         Ok(())
     }
 
-    fn health(&mut self, health: FinalHealth) -> Result<(), JournalError> {
-        let record = health.record;
-        let at = self.summary.last_receipt.map_or(record.detected, |previous| previous.max(record.detected));
-        let mut row = record.row();
-        row["recv_t_us"] = serde_json::json!(at);
-        row["source_t_us"] = Value::Null;
-        let row = self.encode(&row)?;
-        self.append(Some(at), &row)?;
-        self.summary.health_rows += 1;
-        if let Some(blind) = health.blind {
-            let receipt = at.max(blind.end_t_us);
-            let row = self.encode(&serde_json::json!({
-                "kind": "blind", "recv_t_us": receipt, "source_t_us": null,
-                "start_t_us": blind.start_t_us, "end_t_us": blind.end_t_us, "reason": blind.reason,
-            }))?;
-            self.append(Some(receipt), &row)?;
-            self.summary.blind_rows += 1;
+    fn final_row(&mut self, row: FinalRow) -> Result<(), JournalError> {
+        match row {
+            FinalRow::Health(record) => {
+                self.append_row(record.detected, record.row(self.stream))?;
+                self.summary.health_rows += 1;
+            }
+            FinalRow::Blind(blind) => {
+                self.append_row(blind.end_t_us, serde_json::json!({
+                    "kind": "blind", "start_us": blind.start_t_us, "end_us": blind.end_t_us, "reason": blind.reason,
+                }))?;
+                self.summary.blind_rows += 1;
+            }
         }
         Ok(())
     }
 
     fn gap(&mut self, admission: SessionTimeUs, loss: PendingLoss) -> Result<(), JournalError> {
-        // The admission receipt is the later of the triggering receipt and the last appended row.
-        let receipt = self.summary.last_receipt.map_or(admission, |last| last.max(admission));
         let record = loss.record();
         let mut row = serde_json::to_value(record).map_err(|err| self.error(JournalStep::Encode, Some(err.into())))?;
         row["kind"] = serde_json::json!("gap");
-        row["recv_t_us"] = serde_json::json!(receipt);
-        row["source_t_us"] = Value::Null;
-        let row = self.encode(&row)?;
-        self.append(Some(receipt), &row)?;
+        self.append_row(admission, row)?;
         let total = self.summary.dropped_by_reason.entry(loss.reason).or_default();
         match record.count {
             Some(count) => {
@@ -978,8 +992,13 @@ impl JournalFile {
         Ok(())
     }
 
-    fn encode(&self, row: &Value) -> Result<Vec<u8>, JournalError> {
-        serde_json::to_vec(row).map_err(|err| self.error(JournalStep::Encode, Some(err.into())))
+    /// Append a writer-made row at `at`, raised to the last appended receipt.
+    fn append_row(&mut self, at: SessionTimeUs, mut row: Value) -> Result<(), JournalError> {
+        let receipt = self.summary.last_receipt.map_or(at, |last| last.max(at));
+        row["recv_t_us"] = serde_json::json!(receipt);
+        row["source_t_us"] = Value::Null;
+        let row = serde_json::to_vec(&row).map_err(|err| self.error(JournalStep::Encode, Some(err.into())))?;
+        self.append(Some(receipt), &row)
     }
 
     fn append(&mut self, receipt: Option<SessionTimeUs>, object: &[u8]) -> Result<(), JournalError> {

@@ -16,7 +16,7 @@ use crate::win::{Failure, Result};
 use super::{context::Delivery, grant::Grant};
 
 const CAPACITY: usize = 1024;
-const PRODUCERS: usize = 5;
+const PRODUCERS: usize = ContextProducer::ALL.len();
 
 pub(super) struct Item {
     pub(super) grant: Arc<Grant>,
@@ -143,13 +143,7 @@ impl State {
     }
 
     fn reserve(&mut self, producer: ContextProducer, count: NonZeroU64) -> Result<(NonZeroU64, NonZeroU64)> {
-        let slot = &mut self.positions[match producer {
-            ContextProducer::Notices => 0,
-            ContextProducer::NativeRead => 1,
-            ContextProducer::Automation => 2,
-            ContextProducer::Ime => 3,
-            ContextProducer::TextEdit => 4,
-        }];
+        let slot = &mut self.positions[producer.index()];
         let last = slot.checked_add(count.get()).and_then(NonZeroU64::new).ok_or(Failure::Protocol)?;
         let first = NonZeroU64::new(*slot + 1).ok_or(Failure::Protocol)?;
         *slot = last.get();

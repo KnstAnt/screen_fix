@@ -36,9 +36,9 @@ A required source failure follows the same bounded closure path and retains its 
 
 | Path | Contents |
 | --- | --- |
-| `manifest.json` | v5 attempt, clock and boundaries, selected monitors and geometry, inventories, stream summaries and optional selected-source evidence |
+| `manifest.json` | v6 attempt, clock and boundaries, selected monitors and geometry, inventories, stream summaries and optional selected-source evidence |
 | `raw/input.jsonl`, `raw/context.jsonl` | Typed input and context, controls, blind/gap evidence and independent journal order |
 | `raw/frames.jsonl`, `raw/video/m<monitor>/seg_<segment>.mp4` | Frame and slot index plus published segment media |
 | `raw/stills.jsonl`, `raw/images/`, `raw/cursors/` | Logical still outcomes, durable evidence references and PNG assets |
 
-The read-only v5 package API validates stream, segment and asset relationships when called. Desktop Stop uses the owner-produced index and closed summaries. A complete attempt can include accounted losses. Windows capture, installed trust, hardware profiles, performance and end-to-end operator behavior require verification against the [M1 acceptance criteria](SCREEN_FIX_M1_SPEC_ADDENDUM.md#6-revised-m1-acceptance-mapping).
+The read-only v6 package API validates stream, segment and asset relationships when called. The [M1 journal schema](SCREEN_FIX_M1_JOURNAL_SCHEMA.md) describes the v6 rows. Desktop Stop uses the owner-produced index and closed summaries. A complete attempt can include accounted losses. Windows capture, installed trust, hardware profiles, performance and end-to-end operator behavior require verification against the [M1 acceptance criteria](SCREEN_FIX_M1_SPEC_ADDENDUM.md#6-revised-m1-acceptance-mapping).

@@ -135,17 +135,6 @@ pub enum ImeState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UiaStatus {
-    Ready,
-    TimedOut,
-    Hung,
-    Unavailable,
-    Stale,
-    OutsideApproval,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum TextClassification {
     Password,
     Editable,

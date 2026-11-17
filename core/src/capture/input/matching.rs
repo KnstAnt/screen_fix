@@ -10,7 +10,10 @@ use crate::{
     },
 };
 
-use super::{Action, Button, HeldSynchronization, Motion, PendingInput, ScanCode, WheelAxis, normalize};
+use super::{
+    Action, Button, HeldSynchronization, Motion, PendingInput, ScanCode, WheelAxis, normalize,
+    normalize::{LLKHF_UP, VK_PACKET},
+};
 
 pub(crate) const MATCH_WINDOW_US: i64 = 20_000;
 /// A raw motion packet belongs to the earliest hook sample within the window,
@@ -81,10 +84,6 @@ impl CorrelatedInput {
     /// Every record this row accounts for: its own and the absorbed hooks.
     pub fn records(&self) -> impl Iterator<Item = &PendingInput> {
         std::iter::once(&self.first).chain(&self.partners).chain(&self.absorbed)
-    }
-
-    pub fn into_records(self) -> impl Iterator<Item = PendingInput> {
-        std::iter::once(self.first).chain(self.partners).chain(self.absorbed)
     }
 }
 
@@ -473,35 +472,32 @@ impl InputMatcher {
             }
             match self.slots.get(&order)?.action {
                 Action::Motion(_) => {
-                    let through = SessionTimeUs(order.time.0.saturating_add(MOTION_HORIZON_US));
-                    if !self.covers(through, decision) {
+                    if !self.covers(order, MOTION_HORIZON_US, decision) {
                         return self.undecidable(decision);
                     }
                     self.decide_motion(order, limit);
-                    continue;
                 }
                 Action::Wheel { axis, .. } => {
                     let run = self.wheel_run(order, axis, limit);
-                    let last = run.last().copied().unwrap_or(order);
-                    if !self.covers(SessionTimeUs(last.time.0.saturating_add(MATCH_WINDOW_US)), decision) {
+                    if !self.covers(*run.last().unwrap_or(&order), MATCH_WINDOW_US, decision) {
                         return self.undecidable(decision);
                     }
                     self.decide_wheel(run);
-                    continue;
                 }
-                _ => {}
+                _ => {
+                    let members = self.component(order, limit);
+                    if !self.covers(*members.last().unwrap_or(&order), MATCH_WINDOW_US, decision) {
+                        return self.undecidable(decision);
+                    }
+                    self.decide(members);
+                }
             }
-            let members = self.component(order, limit);
-            let latest = members.last().copied().unwrap_or(order);
-            if !self.covers(SessionTimeUs(latest.time.0.saturating_add(MATCH_WINDOW_US)), decision) {
-                return self.undecidable(decision);
-            }
-            self.decide(members);
         }
     }
 
-    /// Every receipt at or below `through` (capped at a closing limit) is known.
-    fn covers(&self, through: SessionTimeUs, decision: Decision) -> bool {
+    /// Every receipt up to `span_us` past `last` (capped at a closing limit) is known.
+    fn covers(&self, last: Order, span_us: i64, decision: Decision) -> bool {
+        let through = SessionTimeUs(last.time.0.saturating_add(span_us));
         match decision {
             Decision::Ready(bound) => through < bound,
             Decision::Closing(limit) => self.producer_floor().is_some_and(|floor| through.min(limit) < floor),
@@ -553,17 +549,12 @@ impl InputMatcher {
                     Correlation::Discontinuous
                 } else {
                     match (self.slots[&raw].action, self.slots[&hook].action) {
-                        (Action::Key(a), Action::Key(b)) if a.virtual_key != 0xe7 && (a.scan.is_none() || b.scan.is_none()) =>
+                        (Action::Key(a), Action::Key(b)) if a.virtual_key != VK_PACKET && (a.scan.is_none() || b.scan.is_none()) =>
                             Correlation::MissingScan,
                         _ => Correlation::Matched,
                     }
                 };
-                let (first, other) = if raw < hook { (raw, hook) } else { (hook, raw) };
-                let promotion = self.promotion(&[first, other], correlation);
-                let (Some(first_input), Some(partner)) = (self.take_slot(first), self.take_slot(other)) else { return };
-                self.decided.insert(first, CorrelatedInput {
-                    first: first_input, partners: vec![partner], correlation, promotion, cluster: None, absorbed: Vec::new(),
-                });
+                self.decide_pair(raw, hook, correlation, true);
             }
             ([], _) | (_, []) => {
                 for order in members {
@@ -573,8 +564,7 @@ impl InputMatcher {
             _ => {
                 let injected = hooks.iter().all(|hook| injected_hook(&self.slots[hook].packet.sample))
                     && raws.iter().all(|raw| null_handle(&self.slots[raw].packet.sample));
-                let raw_count = u32::try_from(raws.len()).unwrap_or(u32::MAX);
-                let hook_count = u32::try_from(hooks.len()).unwrap_or(u32::MAX);
+                let (raw_count, hook_count) = (len_u32(&raws), len_u32(&hooks));
                 let mut absorbed: Vec<_> = hooks.iter().filter_map(|hook| {
                     self.pen_links.remove(hook);
                     self.take_slot(*hook)
@@ -596,6 +586,16 @@ impl InputMatcher {
         }
     }
 
+    /// One raw/hook pair becomes one row keyed by its earlier record.
+    fn decide_pair(&mut self, raw: Order, hook: Order, correlation: Correlation, promote: bool) {
+        let (first, other) = (raw.min(hook), raw.max(hook));
+        let promotion = if promote { self.promotion(&[first, other], correlation) } else { None };
+        let (Some(first_input), Some(partner)) = (self.take_slot(first), self.take_slot(other)) else { return };
+        self.decided.insert(first, CorrelatedInput {
+            first: first_input, partners: vec![partner], correlation, promotion, cluster: None, absorbed: Vec::new(),
+        });
+    }
+
     /// A record without a partner becomes its own row. A hook record here is
     /// in the hook-only state (stage I3).
     fn unpaired(&mut self, order: Order) {
@@ -607,14 +607,11 @@ impl InputMatcher {
         });
     }
 
-    /// Hook-anchored motion association (stage I2, D-7 A). A raw packet
-    /// belongs to the earliest hook sample within its match window, and a hook
-    /// sample takes every such packet not yet attributed. The relative deltas of
-    /// exactly one device are summed into the sample, and at most one absolute
-    /// packet is attached. Packets of several relative devices, or several
-    /// absolute packets, are never attached: the sample's raw fields are
-    /// unavailable and the packets become raw-motion evidence. A raw packet
-    /// without a hook sample within the window is its own unmatched record.
+    /// Hook-anchored motion association (stage I2, D-7 A): a raw packet belongs
+    /// to the earliest hook sample within its window, which takes every such
+    /// packet. One relative device's deltas are summed and at most one absolute
+    /// packet attached; otherwise the sample's raw fields are unavailable and the
+    /// packets are raw-motion evidence. A raw packet without a hook is unmatched.
     fn decide_motion(&mut self, order: Order, limit: Option<SessionTimeUs>) {
         let within = |other: &Order| limit.is_none_or(|limit| other.time <= limit);
         let hook = if raw_side(order) { self.candidates(order).find(within) } else { Some(order) };
@@ -710,19 +707,11 @@ impl InputMatcher {
         };
         if raws.len() == hooks.len() && raws.iter().all(|raw| device(raw) == device(&raws[0])) {
             for (raw, hook) in raws.into_iter().zip(hooks) {
-                let (first, other) = if raw < hook { (raw, hook) } else { (hook, raw) };
-                let (Some(first_input), Some(partner)) = (self.take_slot(first), self.take_slot(other)) else { continue };
-                self.decided.insert(first, CorrelatedInput {
-                    first: first_input, partners: vec![partner], correlation: Correlation::Matched, promotion: None,
-                    cluster: None, absorbed: Vec::new(),
-                });
+                self.decide_pair(raw, hook, Correlation::Matched, false);
             }
             return;
         }
-        let cluster = Cluster {
-            raw: u32::try_from(raws.len()).unwrap_or(u32::MAX), hooks: u32::try_from(hooks.len()).unwrap_or(u32::MAX),
-            injected: false, excess_hooks: 0,
-        };
+        let cluster = Cluster { raw: len_u32(&raws), hooks: len_u32(&hooks), injected: false, excess_hooks: 0 };
         let mut absorbed: Vec<_> = raws.into_iter().filter_map(|raw| self.take_slot(raw)).collect();
         for hook in hooks {
             let Some(first) = self.take_slot(hook) else { continue };
@@ -737,10 +726,8 @@ impl InputMatcher {
     /// order disagree with this pair's. The crossing makes only this
     /// component ambiguous; it is not propagated to other records.
     fn crosses_pair(&self, raw: Order, hook: Order) -> bool {
-        let low = lower_order(SessionTimeUs(hook.time.0.saturating_sub(MATCH_WINDOW_US)));
-        let high = lower_order(SessionTimeUs(hook.time.0.saturating_add(MATCH_WINDOW_US).saturating_add(1)));
         let action = self.slots[&raw].action;
-        self.slots.range(low..high).any(|(other_raw, candidate)| {
+        self.slots.range(window(hook.time)).any(|(other_raw, candidate)| {
             other_raw.producer == raw.producer && *other_raw != raw && same_order_class(candidate.action, action)
                 && self.candidates(*other_raw).any(|other_hook| other_hook != hook && other_raw.cmp(&raw) != other_hook.cmp(&hook))
         })
@@ -827,9 +814,7 @@ impl InputMatcher {
     }
 
     fn pen_peers(&self, order: Order, down: bool, seek_pointer: bool) -> impl Iterator<Item = Order> + '_ {
-        let low = lower_order(SessionTimeUs(order.time.0.saturating_sub(MATCH_WINDOW_US)));
-        let high = lower_order(SessionTimeUs(order.time.0.saturating_add(MATCH_WINDOW_US).saturating_add(1)));
-        self.slots.range(low..high).filter_map(move |(key, candidate)| {
+        self.slots.range(window(order.time)).filter_map(move |(key, candidate)| {
             let matches = if seek_pointer {
                 promoted_tip(candidate)
             } else {
@@ -843,10 +828,8 @@ impl InputMatcher {
     /// Compatible records within the window, in the same admission epoch and
     /// continuity interval.
     fn candidates(&self, order: Order) -> impl Iterator<Item = Order> + '_ {
-        let low = lower_order(SessionTimeUs(order.time.0.saturating_sub(MATCH_WINDOW_US)));
-        let high = lower_order(SessionTimeUs(order.time.0.saturating_add(MATCH_WINDOW_US).saturating_add(1)));
         let input = &self.slots[&order];
-        self.slots.range(low..high).filter_map(move |(key, other)| {
+        self.slots.range(window(order.time)).filter_map(move |(key, other)| {
             (input.admission == other.admission && compatible(input, other)
                 && !self.separated(order.time, key.time)).then_some(*key)
         })
@@ -903,11 +886,16 @@ fn merge_bounds<T: Ord + Copy>(left: Option<[T; 2]>, right: Option<[T; 2]>) -> O
     }
 }
 
-/// `LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED`, or `LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED`.
-fn injected_hook(sample: &InputSample) -> bool {
+/// `LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED`.
+const LLKHF_INJECTED_ANY: u32 = 0x12;
+/// `LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED`.
+const LLMHF_INJECTED_ANY: u32 = 3;
+
+/// A hook record the system flags as injected, at any integrity level.
+pub(crate) fn injected_hook(sample: &InputSample) -> bool {
     match sample {
-        InputSample::HookKey(key) => key.flags & 0x12 != 0,
-        InputSample::HookPointer(pointer) => pointer.flags & 3 != 0,
+        InputSample::HookKey(key) => key.flags & LLKHF_INJECTED_ANY != 0,
+        InputSample::HookPointer(pointer) => pointer.flags & LLMHF_INJECTED_ANY != 0,
         _ => false,
     }
 }
@@ -924,6 +912,16 @@ fn lower_order(time: SessionTimeUs) -> Order {
     Order { time, qpc: i64::MIN, producer: 0, source: SourceSequence(0), part: 0 }
 }
 
+/// Every order whose receipt lies within the match window of `time`.
+fn window(time: SessionTimeUs) -> std::ops::Range<Order> {
+    lower_order(SessionTimeUs(time.0.saturating_sub(MATCH_WINDOW_US)))
+        ..lower_order(SessionTimeUs(time.0.saturating_add(MATCH_WINDOW_US).saturating_add(1)))
+}
+
+fn len_u32<T>(items: &[T]) -> u32 {
+    u32::try_from(items.len()).unwrap_or(u32::MAX)
+}
+
 fn distinct_producers(first: &PendingInput, other: &PendingInput) -> bool {
     matches!(
         (first.packet.sample.producer(), other.packet.sample.producer()),
@@ -938,13 +936,13 @@ fn compatible(first: &PendingInput, other: &PendingInput) -> bool {
     }
     match (&first.packet.sample, &other.packet.sample) {
         (InputSample::RawKey(raw), InputSample::HookKey(hook)) | (InputSample::HookKey(hook), InputSample::RawKey(raw))
-            if raw.virtual_key == 0xe7 || hook.virtual_key == 0xe7 =>
+            if raw.virtual_key == VK_PACKET || hook.virtual_key == u32::from(VK_PACKET) =>
         {
             // A packet code unit is not a physical scan code. Match only
             // positively injected evidence with an identical native packet.
-            return raw.virtual_key == 0xe7 && hook.virtual_key == 0xe7
-                && raw.device.is_none() && hook.flags & 0x12 != 0
-                && u32::from(raw.make_code) == hook.scan_code && (raw.flags & 1 != 0) == (hook.flags & 0x80 != 0);
+            return raw.virtual_key == VK_PACKET && hook.virtual_key == u32::from(VK_PACKET)
+                && raw.device.is_none() && hook.flags & LLKHF_INJECTED_ANY != 0
+                && u32::from(raw.make_code) == hook.scan_code && (raw.flags & 1 != 0) == (hook.flags & LLKHF_UP != 0);
         }
         // An injected hook pairs only with a NULL-handle raw record of the same
         // kind and identity (INP-7, stage I3).
@@ -965,8 +963,8 @@ fn compatible(first: &PendingInput, other: &PendingInput) -> bool {
 
 fn unqualified(sample: &InputSample) -> bool {
     match sample {
-        InputSample::HookKey(key) => key.flags & 0x12 != 0 || key.virtual_key == 0xe7,
-        InputSample::HookPointer(pointer) => pointer.flags & 3 != 0 && !promoted(pointer.extra_information),
+        InputSample::HookKey(key) => key.flags & LLKHF_INJECTED_ANY != 0 || key.virtual_key == u32::from(VK_PACKET),
+        InputSample::HookPointer(pointer) => pointer.flags & LLMHF_INJECTED_ANY != 0 && !promoted(pointer.extra_information),
         _ => false,
     }
 }

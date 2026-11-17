@@ -1,4 +1,4 @@
-//! Streaming inspection of closed v5 evidence. Inspection never modifies an attempt.
+//! Streaming inspection of closed v6 evidence. Inspection never modifies an attempt.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -14,14 +14,14 @@ use crate::protocol::{
 
 use super::{
     ArtifactKind, ArtifactRef,
-    journal::{MAX_ROW_BYTES, unavailable_key},
+    journal::{MAX_ROW_BYTES, Unavailable, health_kind, suppressed_us},
     metadata::{PackageError, PackageOperation, PackageReader, PackageResult, PackageState,
         SelectedSourceKind, SourceEvidence},
-    outcome::{GapRecord, HealthKind, LossReason},
+    outcome::{GapRecord, HealthKind, LossReason, UiaOutcome, UiaRead},
 };
 
-/// Context is read first: its pause, discontinuity and blind rows bound the
-/// gate 3 and gate 4 checks of the later journals (M1-10).
+/// Context is read first: its pause and discontinuity rows bound the gate 3
+/// and gate 4 checks of the later journals (M1-10).
 const STREAMS: [StreamId; 4] = [StreamId::Context, StreamId::Input, StreamId::Frames, StreamId::Stills];
 
 #[derive(Deserialize)]
@@ -53,9 +53,12 @@ struct RowTallies {
     /// Per reason: the sum of known gap counts and the number of unknown-count gap rows.
     dropped: BTreeMap<LossReason, (u64, u64)>,
     unavailable: BTreeMap<String, u64>,
+    uia: BTreeMap<UiaRead, BTreeMap<UiaOutcome, u64>>,
     health: u64,
     pauses: u64,
     blind: u64,
+    /// `suppressed_interval` rows and their summed duration.
+    suppressed: (u64, u64),
 }
 
 impl RowTallies {
@@ -66,8 +69,9 @@ impl RowTallies {
             .collect();
         // An unknown loss count is excluded from the identity and is visible in the totals.
         summarized == self.dropped && self.unavailable == summary.unavailable_by_reason
-            && self.health == summary.health_rows && self.pauses == summary.pause_rows
+            && self.uia == summary.uia_unavailable && self.health == summary.health_rows && self.pauses == summary.pause_rows
             && self.blind == summary.blind_rows
+            && self.suppressed == (summary.suppressed_interval_rows, summary.suppressed_interval_us)
             && summary.outcome_total().is_none_or(|total| total == summary.offered)
     }
 }
@@ -159,7 +163,7 @@ impl PackageReader {
     /// Incomplete attempts can lack summaries for journals that failed to close.
     /// Gates 1–4 of M1-10 are checked in the same single pass over each journal;
     /// the first failing rule is returned with its gate, stream and row.
-    pub fn validate_v5_artifacts(&self) -> PackageResult<()> {
+    pub fn validate_gates(&self) -> PackageResult<()> {
         let manifest = self.manifest();
         let mut gates = Gates::default();
         let strict = manifest.state == PackageState::Complete && manifest.profile.is_some();
@@ -210,8 +214,8 @@ impl PackageReader {
                 {
                     return Err(error());
                 }
-                if let Some(key) = unavailable_key(&value) {
-                    *tallies.unavailable.entry(key).or_default() += 1;
+                if let Some(unavailable) = Unavailable::of(&value) {
+                    unavailable.count(&mut tallies.unavailable, &mut tallies.uia);
                 }
                 match (stream, envelope.kind.as_deref()) {
                     (_, Some("gap")) => {
@@ -229,7 +233,8 @@ impl PackageReader {
                             None => total.1 += 1,
                         }
                     }
-                    (_, Some("health")) => {
+                    // A per-second `input_health` row carries counts, not a health condition.
+                    (_, Some(kind)) if kind == health_kind(stream) && value.get("health").is_some() => {
                         if envelope.recv_t_us.is_none() || HealthKind::deserialize(&value["health"]).is_err() {
                             return Err(error());
                         }
@@ -293,22 +298,25 @@ impl PackageReader {
                                     reason: "the event reference names no input action row" });
                             }
                         }
+                        // Still files are relative to `raw/`, where the journal lives (D-1).
+                        let file = value["file"].as_str();
                         if envelope.kind.as_deref() == Some("still") {
                             let geometry = GeometryId::deserialize(&value["geometry"]).map_err(|_| error())?;
                             let frame = FrameId::deserialize(&value["frame"]["id"]).map_err(|_| error())?;
                             if frame.monitor != geometry.monitor || !manifest.selected_displays.contains(&frame.monitor) {
                                 return Err(error());
                             }
-                            let file = value["file"].as_str().ok_or_else(error)?;
-                            if value["seen_file"].as_str().is_some_and(|seen| seen != file) {
-                                return Err(error());
-                            }
-                            let size = self.validate_image(file, true)?;
+                            let size = self.validate_image(&format!("raw/{}", file.ok_or_else(error)?), true)?;
                             if value["width"].as_u64() != Some(u64::from(size[0]))
                                 || value["height"].as_u64() != Some(u64::from(size[1]))
                             {
                                 return Err(error());
                             }
+                        }
+                        // IMG-2: a seen image is named only when it differs from the row's image.
+                        if let Some(seen) = value.get("seen_file") {
+                            let seen = seen.as_str().filter(|seen| Some(*seen) != file).ok_or_else(error)?;
+                            self.validate_image(&format!("raw/{seen}"), true)?;
                         }
                     }
                     (StreamId::Context, Some("cursor_asset")) => {
@@ -331,6 +339,10 @@ impl PackageReader {
                     (StreamId::Frames, Some(_)) if strict => return Err(error()),
                     (_, Some("pause")) => tallies.pauses += 1,
                     (_, Some("blind")) => tallies.blind += 1,
+                    (_, Some("suppressed_interval")) => {
+                        tallies.suppressed.0 += 1;
+                        tallies.suppressed.1 = tallies.suppressed.1.saturating_add(suppressed_us(&value));
+                    }
                     _ => {}
                 }
                 gates.row(stream, envelope.seq, envelope.recv_t_us, envelope.kind.as_deref(), &value)?;
@@ -386,6 +398,14 @@ impl PackageReader {
 /// Kinds of input rows that are user actions a still can reference (gate 2).
 const ACTIONS: [&str; 7] = ["key_down", "key_up", "pointer_down", "pointer_up", "pointer_move", "scroll", "pen"];
 
+/// The v6 boundary, loss and health kinds a context journal may hold inside a
+/// pause interval (gate 4), besides `pause`, `resume` and unapproved `foreground`.
+const PAUSE_CONTEXT: [&str; 6] = ["discontinuity", "gap", "health", "recorder_control", "recorder_control_gap", "input_source_loss"];
+
+/// The v6 loss, blind, health and suppression kinds an input journal may hold
+/// inside a pause interval (gate 4).
+const PAUSE_INPUT: [&str; 4] = ["gap", "blind", "input_health", "suppressed_interval"];
+
 /// Evidence of gates 2–4 gathered in the single journal pass (M1-10).
 #[derive(Default)]
 struct Gates {
@@ -421,7 +441,8 @@ impl Gates {
         let time = |field: &str| value[field].as_i64().map(SessionTimeUs);
         match kind {
             Some("gap") => self.excluded.extend(time("first_recv_t_us").zip(time("last_recv_t_us"))),
-            Some("blind" | "discontinuity" | "suppressed_interval") => self.excluded.extend(time("start_t_us").zip(time("end_t_us"))),
+            Some("blind") => self.excluded.extend(time("start_us").zip(time("end_us"))),
+            Some("discontinuity" | "suppressed_interval") => self.excluded.extend(time("start_t_us").zip(time("end_t_us"))),
             _ => {}
         }
         // Gate 4: only boundary, loss and approval-free rows inside a pause interval.
@@ -435,13 +456,12 @@ impl Gates {
                     if let Some(pause) = self.pauses.last_mut() { pause.1 = at; }
                     self.paused = false;
                 }
-                Some("discontinuity" | "blind" | "gap" | "health" | "recorder_control" | "input_source_loss") => {}
-                Some(kind) if kind.ends_with("_gap") => {}
+                Some(kind) if PAUSE_CONTEXT.contains(&kind) => {}
                 Some("foreground") if value["approved"] == false => {}
                 _ if self.paused => return violation(4, "a context row other than a boundary or loss row while paused"),
                 _ => {}
             },
-            StreamId::Input if at.is_some_and(|at| self.paused_at(at)) && !matches!(kind, Some("gap" | "blind" | "health" | "suppressed_interval")) =>
+            StreamId::Input if at.is_some_and(|at| self.paused_at(at)) && !kind.is_some_and(|kind| PAUSE_INPUT.contains(&kind)) =>
                 return violation(4, "an input row inside a pause interval"),
             StreamId::Frames if kind.is_none() && time("pts_us").is_some_and(|slot| self.paused_at(slot)) =>
                 return violation(4, "a frames row for a paused slot"),
@@ -457,8 +477,10 @@ impl Gates {
         }
         // Gate 3: a press open at a pause boundary must be closed there by a synthetic release.
         while let Some(&(cutoff, _)) = self.pauses.get(self.next_pause) && at > cutoff {
+            // The span ends before the cutoff: the pause itself must not excuse it.
+            let before = SessionTimeUs(cutoff.0.saturating_sub(1));
             for (row, opened) in self.presses.values().filter(|(_, opened)| *opened < cutoff) {
-                self.findings.push((*row, *opened, cutoff, "a press stays open across a pause boundary"));
+                self.findings.push((*row, *opened, before, "a press stays open across a pause boundary"));
             }
             self.presses.retain(|_, (_, opened)| *opened >= cutoff);
             self.next_pause += 1;
@@ -466,21 +488,11 @@ impl Gates {
         let Some(kind @ ("key_down" | "key_up" | "pointer_down" | "pointer_up")) = kind else { return Ok(()) };
         let synthetic = value["synthetic"] == true;
         let key = kind.starts_with("key");
-        // Synthetic rows name their held identity; ordinary rows carry it as fields.
-        let (code, device) = if synthetic {
-            let identity = &value["edge"]["identity"];
-            let holding = &identity["holding"];
-            let code = if key { holding["key"]["vk"].to_string() } else {
-                holding.get("button").or_else(|| holding.get("promoted_pen_pointer"))
-                    .map_or_else(String::new, |button| button["logical"].to_string())
-            };
-            (code, identity["device"].as_u64())
-        } else {
-            let device = &value["device"];
-            (if key { value["vk"].to_string() } else { value["button"].to_string() },
-                (device["status"] == "observed").then(|| device["detail"].as_u64()).flatten())
-        };
-        let identity = (if key { "key" } else { "button" }, code, device);
+        // Synthetic and ordinary rows carry the same key, button and device
+        // fields; a touchpad-attributed row keeps its reporting device apart.
+        let device = if value["source_device"].is_null() { &value["device"] } else { &value["source_device"] };
+        let device = (device["status"] == "observed").then(|| device["detail"].as_u64()).flatten();
+        let identity = if key { ("key", value["vk"].to_string(), device) } else { ("button", value["button"].to_string(), device) };
         if kind.ends_with("_down") {
             // An autorepeat or an unknown repeat state (I4) does not open a press.
             let opens = synthetic || value.get("repeat").is_none_or(|repeat| *repeat == false);

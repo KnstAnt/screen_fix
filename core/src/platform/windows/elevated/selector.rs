@@ -660,10 +660,7 @@ impl<'a> Selector<'a> {
                 if matches!(&result, Err(Failure::Cancelled)) && !dispatched
                     && self.pending.as_ref().is_some_and(|pending| !session.source_authorized(pending.epoch))
                 {
-                    self.pending = None;
-                    self.launched = false;
-                    self.withdrawn_dispatch = true;
-                    session.update_elevated_evidence(|evidence| evidence.withdrawn_launches = evidence.withdrawn_launches.saturating_add(1));
+                    self.withdraw_launch(session);
                     return Ok(());
                 }
                 let (authenticated, until) = result?;
@@ -688,12 +685,17 @@ impl<'a> Selector<'a> {
             && self.ticket.as_ref().is_some_and(Ticket::withdraw_undispatched)
         {
             self.ticket.take();
-            self.pending = None;
-            self.launched = false;
-            self.withdrawn_dispatch = true;
-            session.update_elevated_evidence(|evidence| evidence.withdrawn_launches = evidence.withdrawn_launches.saturating_add(1));
+            self.withdraw_launch(session);
         }
         Ok(())
+    }
+
+    /// Drop a launch that was withdrawn before its consent dispatch.
+    fn withdraw_launch(&mut self, session: &WorkerSession) {
+        self.pending = None;
+        self.launched = false;
+        self.withdrawn_dispatch = true;
+        session.update_elevated_evidence(|evidence| evidence.withdrawn_launches = evidence.withdrawn_launches.saturating_add(1));
     }
 
     fn poll_host(&mut self, session: &WorkerSession, active: Option<AdmissionBoundary>) -> Result<()> {
@@ -1012,8 +1014,7 @@ fn keep_earlier(slot: &mut Option<QpcTick>, before: QpcTick) {
 }
 
 fn required_registration(registration: InputRegistration, pen_hid: bool) -> bool {
-    registration.raw_keyboard && registration.raw_pointer && registration.keyboard_hook
-        && registration.pointer_hook && (!pen_hid || registration.pen_hid)
+    registration.required_ready() && (!pen_hid || registration.pen_hid)
 }
 
 fn geometry(topology: &Topology, session: &WorkerSession, foreground: WindowProcess) -> Option<GeometryId> {

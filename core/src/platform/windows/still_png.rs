@@ -4,7 +4,6 @@ use std::{
     collections::{HashMap, VecDeque},
     fs::{self, OpenOptions},
     io,
-    os::windows::ffi::OsStrExt,
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     sync::{
@@ -14,8 +13,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-
-use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
 
 use crate::{
     capture::frame::CaptureColor,
@@ -233,7 +230,9 @@ impl Worker {
                 }
                 let published = matches!(outcome, Outcome::Saved { reused: false, .. });
                 // A slot that gave up the job after its image was published
-                // leaves the file without a row; it is kept and counted.
+                // leaves the file without a row; it is kept and counted. A half
+                // that did reply is not counted here when its paired slot later
+                // falls back, so the counter is a lower bound.
                 if job.reply.try_send(outcome).is_err() && published {
                     counters.unreferenced_images += 1;
                 }
@@ -375,12 +374,6 @@ fn failed(operation: &'static str, error: io::Error) -> Outcome {
 }
 
 fn move_new(source: &Path, destination: &Path) -> io::Result<()> {
-    let wide = |path: &Path| path.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
-    let source = wide(source);
-    let destination = wide(destination);
     // Same-directory move without REPLACE_EXISTING preserves immutability.
-    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    super::move_file(source, destination, false)
 }

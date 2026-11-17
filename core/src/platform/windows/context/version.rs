@@ -9,16 +9,17 @@ use super::identity::MetadataScrubber;
 
 const MAX_VERSION_BYTES: usize = 256 * 1024;
 
-#[derive(serde::Serialize)]
+/// The foreground row's `product`, `version` and `version_string` (D-1).
 pub(super) struct ExecutableVersion {
-    product_name: Option<String>,
-    version: Option<[u16; 4]>,
-    version_string: Option<String>,
+    pub product: Option<String>,
+    /// The fixed file version, dotted (`5.2.4.0`).
+    pub version: Option<String>,
+    pub version_string: Option<String>,
 }
 
 impl ExecutableVersion {
     pub fn read(path: &str, scrubber: &MetadataScrubber) -> Option<Self> {
-        let path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        let path = super::super::wide(path);
         let path = PCWSTR(path.as_ptr());
         let size = unsafe { GetFileVersionInfoSizeW(path, None) } as usize;
         if size == 0 || size > MAX_VERSION_BYTES {
@@ -31,10 +32,10 @@ impl ExecutableVersion {
         let root = query(resource, w!("\\"), size_of::<VS_FIXEDFILEINFO>(), 1)
             .filter(|bytes| bytes.len() >= size_of::<VS_FIXEDFILEINFO>())
             .map(|bytes| unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<VS_FIXEDFILEINFO>()) });
-        let version = root.filter(|fixed| fixed.dwSignature == 0xfeef_04bd).map(|fixed| [
-            (fixed.dwFileVersionMS >> 16) as u16, fixed.dwFileVersionMS as u16,
-            (fixed.dwFileVersionLS >> 16) as u16, fixed.dwFileVersionLS as u16,
-        ]);
+        let version = root.filter(|fixed| fixed.dwSignature == 0xfeef_04bd).map(|fixed| format!("{}.{}.{}.{}",
+            fixed.dwFileVersionMS >> 16, fixed.dwFileVersionMS & 0xffff,
+            fixed.dwFileVersionLS >> 16, fixed.dwFileVersionLS & 0xffff,
+        ));
         let translation = query(resource, w!("\\VarFileInfo\\Translation"), 4, 1).and_then(|data| {
             let language = u16::from_le_bytes(data.get(..2)?.try_into().ok()?);
             let codepage = u16::from_le_bytes(data.get(2..4)?.try_into().ok()?);
@@ -43,7 +44,7 @@ impl ExecutableVersion {
         let text = |name: &'static str| {
             let (language, codepage) = translation?;
             let name = format!("\\StringFileInfo\\{language:04x}{codepage:04x}\\{name}");
-            let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            let name = super::super::wide(&name);
             let text = query(resource, PCWSTR(name.as_ptr()), 2, 2)?;
             if text.len() > 2048 {
                 return None;
@@ -53,7 +54,7 @@ impl ExecutableVersion {
             let text = String::from_utf16(&units).ok()?;
             Some(scrubber.scrub(&text, 4096))
         };
-        Some(Self { product_name: text("ProductName"), version, version_string: text("FileVersion") })
+        Some(Self { product: text("ProductName"), version, version_string: text("FileVersion") })
     }
 }
 

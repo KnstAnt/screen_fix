@@ -9,7 +9,7 @@ pub(in crate::platform::windows) use screen_fix_native_observation::ime::State;
 use crate::protocol::{FocusGeneration, RequestId};
 
 use super::Visit;
-use super::super::{ProbeError, mp4::io_error};
+use super::super::{ProbeError, io_error};
 
 const BUDGET: Duration = Duration::from_millis(50);
 

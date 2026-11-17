@@ -36,7 +36,7 @@ use crate::{
     package::{
         ArtifactKind,
         diagnostics::{DiagnosticContext, DiagnosticSnapshot, FailureComponent, ReportOutcome},
-        journal::{FinalHealth, HealthRecord, JournalError, JournalIngress, JournalLimits, JournalOwner, JournalStep},
+        journal::{FinalRow, HealthRecord, JournalError, JournalIngress, JournalLimits, JournalOwner, JournalStep},
         outcome::HealthKind,
         metadata::{AttemptFaults, AttemptLayout, CaptureDisposition, ImageFile, InputBlind, MetadataOwner, MonitorCapture, MonitorVideo, PackageError, PngCounters, UndeliveredFrames},
     },
@@ -116,6 +116,31 @@ fn stage<T>(result: core::Result<T>, name: &'static str) -> Result<T, ProbeError
 
 pub(crate) fn unavailable(stage: &'static str) -> ProbeError {
     ProbeError { stage, source: None, journal: None, raw_input_registration: None, owner: None }
+}
+
+/// An I/O failure at `stage`. Only an operating-system error carries a native
+/// code; any other I/O error has no source and reports the stage alone.
+fn io_error(stage: &'static str, error: std::io::Error) -> ProbeError {
+    let source = error.raw_os_error().map(|code| core::Error::new(core::HRESULT::from_win32(code as u32), error.to_string()));
+    ProbeError { stage, source, journal: None, raw_input_registration: None, owner: None }
+}
+
+/// A NUL-terminated UTF-16 copy of `value` for a wide Win32 parameter.
+pub(crate) fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    value.as_ref().encode_wide().chain([0]).collect()
+}
+
+/// Write-through `MoveFileExW`. Without `replace` an existing destination
+/// fails the move, so a same-directory move publishes a new file only once.
+pub(crate) fn move_file(source: &std::path::Path, destination: &std::path::Path, replace: bool) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW};
+    let flags = if replace { MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH } else { MOVEFILE_WRITE_THROUGH };
+    let (source, destination) = (wide(source), wide(destination));
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 struct Apartment;
@@ -199,6 +224,24 @@ fn record_with_disk(worker: &WorkerSession, preflight: DiskPreflight, disk: disk
             (Vec::new(), None, None, None, None, Vec::new())
         }
     };
+    // An input activity loss: its health row joins the final context rows and
+    // its blind interval the final input rows (INP-13).
+    let mut input_blinds = Vec::new();
+    let mut input_health = Vec::new();
+    for input in worker.input_failures() {
+        worker.update_standard_evidence(|evidence| { evidence.blind_reason.get_or_insert(input.reason); });
+        let end_t_us = producer_prefix.as_ref().and_then(|prefix| prefix.cutoff)
+            .map(|boundary| boundary.time).or_else(|| worker.session_time()).unwrap_or(input.at);
+        let blind = InputBlind { start_t_us: input.first_missing.min(end_t_us), end_t_us, reason: input.reason };
+        input_health.push(FinalRow::Health(HealthRecord {
+            kind: HealthKind::InputFailure, failure: input.failure, detected: input.at,
+            first_affected: Some(blind.start_t_us), ongoing: true, monitor: None, count: None,
+        }));
+        input_blinds.push(FinalRow::Blind(blind));
+        if let Some(capture) = producer_prefix.as_mut().and_then(|prefix| prefix.capture.as_mut()) {
+            capture.blind.get_or_insert(blind);
+        }
+    }
     let mut streams = BTreeMap::new();
     let mut context_owner = None;
     for (stream, owner) in owners {
@@ -206,7 +249,8 @@ fn record_with_disk(worker: &WorkerSession, preflight: DiskPreflight, disk: disk
             context_owner = Some(owner);
             continue;
         }
-        match owner.finish() {
+        let finished = if stream == StreamId::Input { owner.finish_with(std::mem::take(&mut input_blinds)) } else { owner.finish() };
+        match finished {
             Ok(summary) => { streams.insert(stream, summary); }
             Err(error) => report(&package_journal_error(error).into_error(FailureComponent::Journal)),
         }
@@ -224,35 +268,17 @@ fn record_with_disk(worker: &WorkerSession, preflight: DiskPreflight, disk: disk
         // on the common timeline. It is reported only through diagnostics.
         let mut health: Vec<_> = worker.video_failures_after(0).into_iter().filter(|entry| {
             producer_prefix.as_ref().is_none_or(|prefix| !prefix.video_health.contains(&entry.monitor))
-        }).filter_map(|entry| entry.at.map(|at| FinalHealth { record: video_failure_health(entry.failure, entry.monitor, at), blind: None }))
+        }).filter_map(|entry| entry.at.map(|at| FinalRow::Health(video_failure_health(entry.failure, entry.monitor, at))))
             .collect();
-        health.extend(late_health.into_iter().map(|record| FinalHealth { record, blind: None }));
+        health.extend(late_health.into_iter().map(FinalRow::Health));
         if let Some(error) = worker.fault_outcome().error && let Some(at) = worker.session_time() {
-            health.push(FinalHealth {
-                record: HealthRecord {
-                    kind: HealthKind::AttemptFailure, failure: error.failure(), detected: at, first_affected: None,
-                    ongoing: false, monitor: None, count: None,
-                },
-                blind: None,
-            });
+            health.push(FinalRow::Health(HealthRecord {
+                kind: HealthKind::AttemptFailure, failure: error.failure(), detected: at, first_affected: None,
+                ongoing: false, monitor: None, count: None,
+            }));
         }
-        for input in worker.input_failures() {
-            worker.update_standard_evidence(|evidence| { evidence.blind_reason.get_or_insert(input.reason); });
-            let end_t_us = producer_prefix.as_ref().and_then(|prefix| prefix.cutoff)
-                .map(|boundary| boundary.time).or_else(|| worker.session_time()).unwrap_or(input.at);
-            let blind = InputBlind { start_t_us: input.first_missing.min(end_t_us), end_t_us, reason: input.reason };
-            health.push(FinalHealth {
-                record: HealthRecord {
-                    kind: HealthKind::InputFailure, failure: input.failure, detected: input.at,
-                    first_affected: Some(blind.start_t_us), ongoing: true, monitor: None, count: None,
-                },
-                blind: Some(blind),
-            });
-            if let Some(capture) = producer_prefix.as_mut().and_then(|prefix| prefix.capture.as_mut()) {
-                capture.blind.get_or_insert(blind);
-            }
-        }
-        match owner.finish_with_health(health) {
+        health.extend(input_health);
+        match owner.finish_with(health) {
             Ok(summary) => { streams.insert(StreamId::Context, summary); }
             Err(error) => report(&package_journal_error(error).into_error(FailureComponent::Journal)),
         }
@@ -474,7 +500,7 @@ fn record(
         let mut lanes = lanes.into_iter();
         let still_owner = thread::Builder::new().name("native-png".into())
             .spawn_scoped(scope, move || still_worker.run(layout, stills, worker))
-            .map_err(|error| mp4::io_error("Start the native PNG worker", error).owned_by(FailureComponent::Stills))?;
+            .map_err(|error| io_error("Start the native PNG worker", error).owned_by(FailureComponent::Stills))?;
         // Each selected monitor can report a terminal video failure once.
         // Report writes are independent of admission and capture/video threads.
         let (reports, pending_reports) = mpsc::sync_channel::<RecordingReport>(worker.config().monitors().len() + MAX_INPUT_FAILURES);
@@ -519,7 +545,7 @@ fn record(
                     readiness.push(initialized);
                 }
                 Err(error) => {
-                    startup_error = Some(mp4::io_error("Start the monitor video owner", error).owned_by(FailureComponent::Video));
+                    startup_error = Some(io_error("Start the monitor video owner", error).owned_by(FailureComponent::Video));
                     break;
                 }
             }
@@ -676,9 +702,7 @@ fn clock_error(_: crate::protocol::ClockRangeError) -> ProbeError {
 
 pub(crate) fn displays() -> Result<Vec<crate::platform::Display>, ProbeError> {
     Ok(display::enumerate()?.into_iter().map(|display| {
-        let (left, top, right, bottom) = display.bounds.edges();
-        let label = format!("{} · {}×{}", display.name, i64::from(right) - i64::from(left),
-            i64::from(bottom) - i64::from(top));
+        let label = format!("{} · {}×{}", display.name, display.bounds.width(), display.bounds.height());
         crate::platform::Display { key: display.key, label }
     }).collect())
 }
@@ -687,19 +711,6 @@ pub(crate) fn replace_manifest(
     pending: &std::path::Path, manifest: &std::path::Path,
     before_replace: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::{
-        Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH},
-        core::PCWSTR,
-    };
-
-    let pending: Vec<u16> = pending.as_os_str().encode_wide().chain([0]).collect();
-    let manifest: Vec<u16> = manifest.as_os_str().encode_wide().chain([0]).collect();
     before_replace()?;
-    unsafe {
-        MoveFileExW(
-            PCWSTR(pending.as_ptr()), PCWSTR(manifest.as_ptr()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    }.map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xffff))
+    move_file(pending, manifest, true)
 }

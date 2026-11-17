@@ -28,7 +28,7 @@ pub(crate) fn approved_windows(approved: &ExecutableIdentity) -> Result<Approved
     }
     let mut monitors = Vec::new();
     for monitor in displays {
-        if scan.bounds.iter().any(|bounds| overlaps(*bounds, monitor.bounds)) {
+        if scan.bounds.iter().any(|bounds| bounds.intersects(monitor.bounds)) {
             monitors.push(monitor.key);
         }
     }
@@ -87,12 +87,6 @@ unsafe extern "system" fn read_window(window: HWND, data: LPARAM) -> i32 {
         scan.incomplete = true;
     }
     1
-}
-
-fn overlaps(left: PhysicalRect, right: PhysicalRect) -> bool {
-    let (x1, y1, x2, y2) = left.edges();
-    let (a1, b1, a2, b2) = right.edges();
-    x1 < a2 && a1 < x2 && y1 < b2 && b1 < y2
 }
 
 fn process_candidates(approved: &[ExecutableIdentity]) -> Result<BTreeSet<u32>, CaptureError> {

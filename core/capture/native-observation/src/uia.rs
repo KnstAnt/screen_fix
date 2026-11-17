@@ -24,7 +24,7 @@ use screen_fix_protocol::{
     ipc::elevated::{MAX_METADATA_BYTES, MAX_UIA_ANCESTORS, MAX_UIA_VALUE_UTF16, Metadata, UiaElement},
 };
 
-pub use screen_fix_protocol::ipc::elevated::{TextClassification, UiaStatus as Status};
+pub use screen_fix_protocol::ipc::elevated::{ReadUnavailable, TextClassification};
 
 /// The client transaction timeout never exceeds the request deadline.
 const MAX_CALL: Duration = Duration::from_millis(500);
@@ -90,14 +90,15 @@ pub struct Request {
 pub struct Read {
     pub started: Option<QpcTick>,
     pub completed: Option<QpcTick>,
-    pub status: Status,
+    /// Ok for a completed read; otherwise why the read is unavailable.
+    pub status: Result<(), ReadUnavailable>,
     pub target: TextClassification,
     pub element: Option<Element>,
 }
 
 impl Read {
-    fn outcome(started: Option<QpcTick>, status: Status) -> Self {
-        Self { started, completed: qpc(), status, target: TextClassification::PossiblySensitive, element: None }
+    fn outcome(started: Option<QpcTick>, reason: ReadUnavailable) -> Self {
+        Self { started, completed: qpc(), status: Err(reason), target: TextClassification::PossiblySensitive, element: None }
     }
 }
 
@@ -191,30 +192,30 @@ impl Client {
         Ok(Self { automation, cache, identification, classification, strings, scoped, focus_handler: Some(focus_handler), text_edit, subscription: None, pending_subscription: None, _apartment })
     }
 
-    pub fn read(&mut self, request: Request, scrubber: &MetadataScrubber, invalid: &impl Fn(Request) -> Option<Status>) -> Read {
+    pub fn read(&mut self, request: Request, scrubber: &MetadataScrubber, invalid: &impl Fn(Request) -> Option<ReadUnavailable>) -> Read {
         self.read_inner(request, Some(scrubber), invalid)
     }
 
-    pub fn editable_focus(&mut self, request: Request, invalid: &impl Fn(Request) -> Option<Status>) -> bool {
+    pub fn editable_focus(&mut self, request: Request, invalid: &impl Fn(Request) -> Option<ReadUnavailable>) -> bool {
         self.scoped && matches!(request.query, Query::Focus { .. })
             && self.read_inner(request, None, invalid).target == TextClassification::Editable
     }
 
     fn read_inner(
-        &mut self, request: Request, scrubber: Option<&MetadataScrubber>, invalid: &impl Fn(Request) -> Option<Status>,
+        &mut self, request: Request, scrubber: Option<&MetadataScrubber>, invalid: &impl Fn(Request) -> Option<ReadUnavailable>,
     ) -> Read {
         let started = qpc();
         if Instant::now() >= request.expires {
-            return Read::outcome(started, Status::TimedOut);
+            return Read::outcome(started, ReadUnavailable::TimedOut);
         }
         let Some(window) = request.query.window() else {
-            return Read::outcome(started, Status::Stale);
+            return Read::outcome(started, ReadUnavailable::Stale);
         };
         let root = root_window(window.hwnd());
         if unsafe { IsHungAppWindow(window.hwnd()) }.as_bool()
             || (!root.0.is_null() && unsafe { IsHungAppWindow(root) }.as_bool())
         {
-            return Read::outcome(started, Status::Hung);
+            return Read::outcome(started, ReadUnavailable::Hung);
         }
         if let Some(status) = invalid(request) {
             return Read::outcome(started, status);
@@ -230,21 +231,21 @@ impl Client {
             }
         };
         if Instant::now() >= request.expires {
-            return Read::outcome(started, Status::TimedOut);
+            return Read::outcome(started, ReadUnavailable::TimedOut);
         }
         if let Some(status) = invalid(request) {
             return Read::outcome(started, status);
         }
         if request.query.window() != Some(window) {
-            return Read::outcome(started, Status::Stale);
+            return Read::outcome(started, ReadUnavailable::Stale);
         }
         let element = match element {
             Ok(element) => element,
-            Err(error) => return Read::outcome(started, call_status(&error, Status::Unavailable)),
+            Err(error) => return Read::outcome(started, call_status(&error, ReadUnavailable::Unavailable)),
         };
         match self.matches(&element, window, request, invalid) {
             Ok(true) => {}
-            Ok(false) => return Read::outcome(started, Status::OutsideApproval),
+            Ok(false) => return Read::outcome(started, ReadUnavailable::OutsideApproval),
             Err(status) => return Read::outcome(started, status),
         }
         let native_password = match request.query {
@@ -261,10 +262,10 @@ impl Client {
             match unsafe { element.BuildUpdatedCache(&self.classification) } {
                 Ok(element) => match self.matches(&element, window, request, invalid) {
                     Ok(true) => element,
-                    Ok(false) => return Read::outcome(started, Status::Stale),
+                    Ok(false) => return Read::outcome(started, ReadUnavailable::Stale),
                     Err(status) => return Read::outcome(started, status),
                 },
-                Err(error) => return Read::outcome(started, call_status(&error, Status::Stale)),
+                Err(error) => return Read::outcome(started, call_status(&error, ReadUnavailable::Stale)),
             }
         } else {
             element
@@ -282,7 +283,7 @@ impl Client {
             // D-4d: an element without keyboard focus is a stale read, which
             // the owner re-issues once within the classification wait.
             Query::Focus { .. } if keyboard_focus == Some(false) && password != Some(true) =>
-                return Read::outcome(started, Status::Stale),
+                return Read::outcome(started, ReadUnavailable::Stale),
             // An unsupported property is resolved by the focused-element query
             // when the native snapshot, taken from hwndFocus, shows the same window.
             Query::Focus { native, .. } => keyboard_focus == Some(true) || keyboard_focus.is_none()
@@ -314,9 +315,9 @@ impl Client {
         };
         let Some(scrubber) = scrubber else {
             return if Instant::now() < request.expires && invalid(request).is_none() && request.query.window() == Some(window) {
-                Read { started, completed: qpc(), status: Status::Ready, target, element: None }
+                Read { started, completed: qpc(), status: Ok(()), target, element: None }
             } else {
-                Read::outcome(started, Status::Stale)
+                Read::outcome(started, ReadUnavailable::Stale)
             };
         };
         let allow_strings = password == Some(false)
@@ -350,33 +351,33 @@ impl Client {
             self.ancestors(element.clone(), window, request, invalid, scrubber, &mut fields.ancestor_names);
         }
         if Instant::now() >= request.expires {
-            return Read::outcome(started, Status::TimedOut);
+            return Read::outcome(started, ReadUnavailable::TimedOut);
         }
         if let Some(status) = invalid(request) {
             return Read::outcome(started, status);
         }
         if request.query.window() != Some(window) {
-            return Read::outcome(started, Status::Stale);
+            return Read::outcome(started, ReadUnavailable::Stale);
         }
         if target == TextClassification::Editable && matches!(request.query, Query::Focus { .. })
             && property_bool(&element, UIA_IsTextEditPatternAvailablePropertyId) == Some(true)
         {
             self.pending_subscription = Some((request, element));
         }
-        Read { started, completed: qpc(), status: Status::Ready, target, element: Some(fields) }
+        Read { started, completed: qpc(), status: Ok(()), target, element: Some(fields) }
     }
 
     /// A candidate may be subscribed only after its result is queued for the owner.
     /// Taking it also drops obsolete or unqueued candidates.
     pub fn finish_read(
-        &mut self, returned: bool, invalid: &impl Fn(Request) -> Option<Status>,
+        &mut self, returned: bool, invalid: &impl Fn(Request) -> Option<ReadUnavailable>,
         desired: &Arc<AtomicU64>, revision: &Arc<AtomicU64>, commits: &Arc<CommitQueue>,
     ) {
         self.finish_scoped_read(returned, invalid, desired, revision, commits, None);
     }
 
     pub fn finish_scoped_read(
-        &mut self, returned: bool, invalid: &impl Fn(Request) -> Option<Status>,
+        &mut self, returned: bool, invalid: &impl Fn(Request) -> Option<ReadUnavailable>,
         desired: &Arc<AtomicU64>, revision: &Arc<AtomicU64>, commits: &Arc<CommitQueue>,
         scope: Option<CommitScope>,
     ) {
@@ -402,7 +403,7 @@ impl Client {
         }
     }
 
-    pub fn remove_stale_subscription(&mut self, invalid: &impl Fn(Request) -> Option<Status>) {
+    pub fn remove_stale_subscription(&mut self, invalid: &impl Fn(Request) -> Option<ReadUnavailable>) {
         if self.subscription.as_ref().is_some_and(|subscription| invalid(subscription.request).is_some()) {
             self.remove_subscription();
         }
@@ -421,20 +422,20 @@ impl Client {
 
     /// Limit the next provider call to the request's remaining budget (ALG §7.1).
     /// The total of all calls therefore never exceeds the request deadline.
-    fn budget(&self, request: Request) -> Result<(), Status> {
+    fn budget(&self, request: Request) -> Result<(), ReadUnavailable> {
         let remaining = request.expires.saturating_duration_since(Instant::now()).min(MAX_CALL);
         if remaining < MIN_CALL {
-            return Err(Status::TimedOut);
+            return Err(ReadUnavailable::TimedOut);
         }
         let millis = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
-        unsafe { self.automation.SetTransactionTimeout(millis) }.map_err(|_| Status::Unavailable)
+        unsafe { self.automation.SetTransactionTimeout(millis) }.map_err(|_| ReadUnavailable::Unavailable)
     }
 
     /// Whether the element belongs to the approved window. An exhausted budget
     /// or a provider timeout is reported as such, not as a mismatch.
     fn matches(&self, element: &IUIAutomationElement, window: WindowProcess, request: Request,
-        invalid: &impl Fn(Request) -> Option<Status>,
-    ) -> Result<bool, Status> {
+        invalid: &impl Fn(Request) -> Option<ReadUnavailable>,
+    ) -> Result<bool, ReadUnavailable> {
         if invalid(request).is_some() || !belongs_to(element, window) { return Ok(false); }
         if !self.scoped { return Ok(true); }
         let mut cursor = element.clone();
@@ -449,7 +450,7 @@ impl Client {
             self.budget(request)?;
             cursor = match unsafe { walker.GetParentElementBuildCache(&cursor, &self.identification) } {
                 Ok(parent) => parent,
-                Err(error) if is_timeout(&error) => return Err(Status::TimedOut),
+                Err(error) if is_timeout(&error) => return Err(ReadUnavailable::TimedOut),
                 Err(_) => return Ok(false),
             };
         }
@@ -463,8 +464,8 @@ impl Client {
     /// undetermined when an attribute of a possibly present pattern is
     /// unavailable (D-4b), which also covers an unknown Value pattern presence.
     fn editable(
-        &self, element: &IUIAutomationElement, request: Request, invalid: &impl Fn(Request) -> Option<Status>,
-    ) -> Result<Writability, Status> {
+        &self, element: &IUIAutomationElement, request: Request, invalid: &impl Fn(Request) -> Option<ReadUnavailable>,
+    ) -> Result<Writability, ReadUnavailable> {
         let Some(focusable) = property_bool(element, UIA_IsKeyboardFocusablePropertyId) else {
             return Ok(Writability::Undetermined);
         };
@@ -497,8 +498,8 @@ impl Client {
     }
 
     fn text_writability(
-        &self, text: &IUIAutomationTextPattern, request: Request, invalid: &impl Fn(Request) -> Option<Status>,
-    ) -> Result<Writability, Status> {
+        &self, text: &IUIAutomationTextPattern, request: Request, invalid: &impl Fn(Request) -> Option<ReadUnavailable>,
+    ) -> Result<Writability, ReadUnavailable> {
         self.budget(request)?;
         let Some(range) = after_call(unsafe { text.DocumentRange() }, request, invalid)? else {
             return Ok(Writability::Undetermined);
@@ -527,7 +528,7 @@ impl Client {
 
     /// Optional ancestor names. Any exhausted budget ends the walk.
     fn ancestors(&self, mut element: IUIAutomationElement, window: WindowProcess, request: Request,
-        invalid: &impl Fn(Request) -> Option<Status>, scrubber: &MetadataScrubber, names: &mut Vec<String>,
+        invalid: &impl Fn(Request) -> Option<ReadUnavailable>, scrubber: &MetadataScrubber, names: &mut Vec<String>,
     ) {
         let Ok(walker) = (unsafe { self.automation.ControlViewWalker() }) else { return };
         for _ in 0..MAX_UIA_ANCESTORS {
@@ -662,14 +663,14 @@ impl Writability {
 /// After one provider call: an invalidated request or a provider timeout ends
 /// the read; another failure leaves the attribute undetermined.
 fn after_call<T>(
-    result: windows::core::Result<T>, request: Request, invalid: &impl Fn(Request) -> Option<Status>,
-) -> Result<Option<T>, Status> {
+    result: windows::core::Result<T>, request: Request, invalid: &impl Fn(Request) -> Option<ReadUnavailable>,
+) -> Result<Option<T>, ReadUnavailable> {
     if let Some(status) = invalid(request) {
         return Err(status);
     }
     match result {
         Ok(value) => Ok(Some(value)),
-        Err(error) if is_timeout(&error) => Err(Status::TimedOut),
+        Err(error) if is_timeout(&error) => Err(ReadUnavailable::TimedOut),
         Err(_) => Ok(None),
     }
 }
@@ -679,8 +680,8 @@ fn is_timeout(error: &windows::core::Error) -> bool {
 }
 
 /// A provider timeout is TimedOut; other failures keep the caller's status.
-fn call_status(error: &windows::core::Error, otherwise: Status) -> Status {
-    if is_timeout(error) { Status::TimedOut } else { otherwise }
+fn call_status(error: &windows::core::Error, otherwise: ReadUnavailable) -> ReadUnavailable {
+    if is_timeout(error) { ReadUnavailable::TimedOut } else { otherwise }
 }
 
 fn bounded(value: windows::core::Result<BSTR>, scrubber: &MetadataScrubber) -> Option<String> {

@@ -1,6 +1,7 @@
 //! The metadata owner is the only live publisher of an attempt manifest.
 
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -11,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{ClipboardMode, DeviceCalibration, ResolvedCaptureConfig},
-    protocol::{AttemptId, ClockOrigin, MonitorId, SegmentId, StreamId, UtcAnchor},
+    protocol::{AdmissionEpoch, AttemptId, ClockOrigin, MonitorId, SegmentId, SessionTimeUs, StreamId, UtcAnchor},
     session::AdmissionBoundary,
 };
 
@@ -21,7 +22,9 @@ use super::{
     outcome::{DroppedTotal, LossReason, SuppressionClass},
 };
 
-pub const MANIFEST_VERSION: u16 = 5;
+/// The package format version (D-1 A-v6only): the manifest and every journal
+/// schema. A reader opens only this version.
+pub const MANIFEST_VERSION: u16 = 6;
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 pub type PackageResult<T> = Result<T, PackageError>;
@@ -138,7 +141,7 @@ pub struct SegmentSummary {
     pub monitor: MonitorId,
     pub segment: SegmentId,
     pub frame_count: u64,
-    pub common_start_us: crate::protocol::SessionTimeUs,
+    pub common_start_us: SessionTimeUs,
     pub local_end_100ns: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_bytes: Option<u64>,
@@ -159,7 +162,7 @@ pub struct VideoCapacity {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentEncoding {
-    pub admission_epoch: crate::protocol::AdmissionEpoch,
+    pub admission_epoch: AdmissionEpoch,
     pub first_frame: crate::protocol::FrameId,
     pub first_geometry: crate::protocol::GeometryEpoch,
     pub fps: u32,
@@ -225,7 +228,7 @@ pub struct VideoCounters {
     pub indexed_encoded: u64,
     pub repeated: u64,
     pub changed_frame_arrived_late: u64,
-    pub missing_by_reason: std::collections::BTreeMap<MissingVideoSlot, u64>,
+    pub missing_by_reason: BTreeMap<MissingVideoSlot, u64>,
     /// A newer frame of the same slot was selected.
     #[serde(default)]
     pub frames_superseded: u64,
@@ -270,14 +273,14 @@ pub struct MonitorVideo {
     /// The interval being published: its admission epoch, first slot start,
     /// whether it has video and whether it has a decided slot starting after start + G.
     #[serde(skip)]
-    pub(crate) open_interval: Option<(crate::protocol::AdmissionEpoch, crate::protocol::SessionTimeUs, bool, bool)>,
+    pub(crate) open_interval: Option<(AdmissionEpoch, SessionTimeUs, bool, bool)>,
 }
 
 impl MonitorVideo {
     /// Account one published slot row to the present-and-admitted intervals.
     pub(crate) fn note_interval(
-        &mut self, epoch: crate::protocol::AdmissionEpoch, present: bool, encoded: bool,
-        slot_start: crate::protocol::SessionTimeUs, grace_us: i64,
+        &mut self, epoch: AdmissionEpoch, present: bool, encoded: bool,
+        slot_start: SessionTimeUs, grace_us: i64,
     ) {
         if self.open_interval.is_some_and(|(open, ..)| !present || open != epoch) {
             self.close_interval();
@@ -317,8 +320,12 @@ pub struct PngCounters {
     pub failed_jobs: u64,
     pub queue_wait_max_us: u64,
     pub processing_max_us: u64,
-    /// Images published after their still slot was resolved without them at
-    /// the drain deadline. The files are kept and no row references them.
+    /// A lower bound on image files that no row references: images published
+    /// after their still slot was resolved without them at the drain
+    /// deadline. The files are kept. Not counted: the half of a paired still
+    /// slot that saved its PNG in time when the slot publishes its fallback
+    /// row because the other half did not finish; that file also stays in
+    /// `images` without a referencing row.
     #[serde(default)]
     pub unreferenced_images: u64,
 }
@@ -383,8 +390,8 @@ pub struct MonitorCapture {
     #[serde(default)]
     pub counters: CaptureCounters,
     /// Display properties left null, each with the native code of its failed read.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub unavailable: std::collections::BTreeMap<DisplayField, Option<i32>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unavailable: BTreeMap<DisplayField, Option<i32>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,8 +418,8 @@ pub enum InputBlindReason {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct InputBlind {
-    pub start_t_us: crate::protocol::SessionTimeUs,
-    pub end_t_us: crate::protocol::SessionTimeUs,
+    pub start_t_us: SessionTimeUs,
+    pub end_t_us: SessionTimeUs,
     pub reason: InputBlindReason,
 }
 
@@ -427,8 +434,8 @@ pub enum InputPublication {
 /// inclusive admission cutoff and has no inferred loss count.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct UncertifiedInputTail {
-    pub first_t_us: crate::protocol::SessionTimeUs,
-    pub cutoff_t_us: crate::protocol::SessionTimeUs,
+    pub first_t_us: SessionTimeUs,
+    pub cutoff_t_us: SessionTimeUs,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<InputTailReason>,
 }
@@ -453,18 +460,18 @@ pub enum SelectedSourceKind {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SelectedSourceInterval {
     pub source: SelectedSourceKind,
-    pub epoch: crate::protocol::AdmissionEpoch,
+    pub epoch: AdmissionEpoch,
     /// The elevated collector's source generation, without process or window identifiers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_generation: Option<std::num::NonZeroU64>,
-    pub start_t_us: crate::protocol::SessionTimeUs,
+    pub start_t_us: SessionTimeUs,
     /// Exclusive upper bound on the Recorder's retained source coverage.
-    pub before_t_us: crate::protocol::SessionTimeUs,
+    pub before_t_us: SessionTimeUs,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SourceTail {
-    pub epoch: crate::protocol::AdmissionEpoch,
+    pub epoch: AdmissionEpoch,
     pub tail: UncertifiedInputTail,
 }
 
@@ -483,9 +490,9 @@ pub enum SourceBlindReason {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SourceBlindInterval {
-    pub epoch: crate::protocol::AdmissionEpoch,
-    pub start_t_us: crate::protocol::SessionTimeUs,
-    pub before_t_us: crate::protocol::SessionTimeUs,
+    pub epoch: AdmissionEpoch,
+    pub start_t_us: SessionTimeUs,
+    pub before_t_us: SessionTimeUs,
     pub reason: SourceBlindReason,
 }
 
@@ -543,7 +550,7 @@ pub struct ElevatedSourceEvidence {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SourceRegistration {
-    pub epoch: crate::protocol::AdmissionEpoch,
+    pub epoch: AdmissionEpoch,
     pub observed_qpc: crate::protocol::QpcTick,
     pub registration: crate::protocol::ipc::InputRegistration,
     /// The Armed held-state readiness, without bits (E4).
@@ -612,10 +619,10 @@ pub struct InputCapture {
 /// Loss and suppression totals of one stream in the manifest health summary.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamHealth {
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub dropped_by_reason: std::collections::BTreeMap<LossReason, DroppedTotal>,
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub suppressed_by_class: std::collections::BTreeMap<SuppressionClass, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dropped_by_reason: BTreeMap<LossReason, DroppedTotal>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub suppressed_by_class: BTreeMap<SuppressionClass, u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -637,7 +644,7 @@ pub struct ActivityLoss {
     pub operation: String,
     pub native_code: Option<i32>,
     /// First affected time, or the detection time when the first affected time is unknown.
-    pub first_t_us: Option<crate::protocol::SessionTimeUs>,
+    pub first_t_us: Option<SessionTimeUs>,
 }
 
 /// Frames rows absent because a monitor's video worker was blocked in a
@@ -647,7 +654,7 @@ pub struct ActivityLoss {
 pub struct UndeliveredFrames {
     pub monitor: MonitorId,
     pub first_slot: u64,
-    pub after_t_us: crate::protocol::SessionTimeUs,
+    pub after_t_us: SessionTimeUs,
 }
 
 impl ActivityLoss {
@@ -672,8 +679,8 @@ pub struct HealthSummary {
     pub dropped_stills: u64,
     /// M1 never recovers a prefix (REL-3 is deferred).
     pub recovered_prefix: bool,
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub streams: std::collections::BTreeMap<StreamId, StreamHealth>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub streams: BTreeMap<StreamId, StreamHealth>,
     /// Activity losses reported to the controller, in report order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub activity_losses: Vec<ActivityLoss>,
@@ -685,13 +692,13 @@ pub struct HealthSummary {
     pub undelivered_frames: Vec<UndeliveredFrames>,
 }
 
-fn is_zero(value: &u64) -> bool {
+pub(super) fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
 impl HealthSummary {
     pub(crate) fn new(
-        streams: &std::collections::BTreeMap<StreamId, StreamSummary>, activity_losses: Vec<ActivityLoss>, omitted_health: u64,
+        streams: &BTreeMap<StreamId, StreamSummary>, activity_losses: Vec<ActivityLoss>, omitted_health: u64,
         undelivered_frames: Vec<UndeliveredFrames>,
     ) -> Self {
         let mut health = Self { activity_losses, omitted_health, undelivered_frames, ..Self::default() };
@@ -727,7 +734,7 @@ pub struct AttemptClock {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ClockAnchor {
-    pub admission_epoch: crate::protocol::AdmissionEpoch,
+    pub admission_epoch: AdmissionEpoch,
     pub sample: UtcAnchor,
 }
 
@@ -776,7 +783,7 @@ pub struct AttemptManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub monitor_epochs: Vec<MonitorCapture>,
     pub failed_step: Option<String>,
-    pub streams: std::collections::BTreeMap<StreamId, StreamSummary>,
+    pub streams: BTreeMap<StreamId, StreamSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<HealthSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -996,7 +1003,7 @@ impl MetadataOwner {
     pub(crate) fn finish(
         self,
         failed_step: Option<&'static str>,
-        streams: std::collections::BTreeMap<StreamId, StreamSummary>,
+        streams: BTreeMap<StreamId, StreamSummary>,
         video: Vec<MonitorVideo>,
     ) -> PackageResult<()> {
         let faults = AttemptFaults { failed_step, activity_losses: Vec::new(), omitted_health: 0, undelivered_frames: Vec::new() };
@@ -1012,7 +1019,7 @@ impl MetadataOwner {
     pub(crate) fn finish_recording(
         mut self,
         faults: AttemptFaults,
-        streams: std::collections::BTreeMap<StreamId, StreamSummary>,
+        streams: BTreeMap<StreamId, StreamSummary>,
         video: Vec<MonitorVideo>,
         deadline: impl Fn() -> Option<Instant>,
         authorize_complete: impl FnOnce() -> io::Result<()>,
@@ -1118,7 +1125,7 @@ fn replace_manifest(
     fs::rename(pending, manifest)
 }
 
-/// Read-only view of a v5 attempt.
+/// Read-only view of a v6 attempt.
 pub struct PackageReader {
     layout: AttemptLayout,
     manifest: AttemptManifest,

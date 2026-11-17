@@ -151,7 +151,7 @@ impl State {
             SessionPhase::Finished => return self.hide(window),
         };
         if self.label != Some(label) {
-            let text: Vec<u16> = label.encode_utf16().chain([0]).collect();
+            let text = super::super::wide(label);
             if unsafe { SetWindowTextW(window, text.as_ptr()) } == 0 {
                 return Err(native_error("Update the recording indicator"));
             }

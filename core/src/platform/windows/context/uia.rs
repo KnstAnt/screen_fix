@@ -16,7 +16,7 @@ use screen_fix_native_observation::{
     uia_commits::{Commit, Queue as CommitQueue},
 };
 
-pub(super) use screen_fix_native_observation::uia::{Element, Status, window_at, window_root};
+pub(super) use screen_fix_native_observation::uia::{Element, ReadUnavailable, window_at, window_root};
 
 use crate::{
     capture::context::TextTarget,
@@ -24,7 +24,7 @@ use crate::{
 };
 
 use super::{Visit, hung::Hung, identity::{MetadataScrubber, WindowProcess}};
-use super::super::{ProbeError, clock, mp4::io_error};
+use super::super::{ProbeError, clock, io_error};
 
 pub(super) const DEADLINE: Duration = Duration::from_millis(500);
 const QUEUE: usize = 8;
@@ -49,7 +49,7 @@ pub(super) struct Read {
     pub request: Request,
     pub started: Option<QpcTick>,
     pub completed: Option<QpcTick>,
-    pub status: Status,
+    pub status: Result<(), ReadUnavailable>,
     pub target: TextTarget,
     pub element: Option<Element>,
     pub scoped_dpi: Option<(Option<std::num::NonZeroU32>, Option<i32>)>,
@@ -68,8 +68,8 @@ impl Read {
             status: native.status, target, element: native.element, scoped_dpi: None }
     }
 
-    fn outcome(request: Request, started: Option<QpcTick>, status: Status) -> Self {
-        Self { request, started, completed: clock::qpc().ok(), status, target: TextTarget::PossiblySensitive, element: None, scoped_dpi: None }
+    fn outcome(request: Request, started: Option<QpcTick>, reason: ReadUnavailable) -> Self {
+        Self { request, started, completed: clock::qpc().ok(), status: Err(reason), target: TextTarget::PossiblySensitive, element: None, scoped_dpi: None }
     }
 }
 
@@ -106,21 +106,21 @@ struct Gate {
 }
 
 impl Gate {
-    fn blocked(&self, process: ProcessInstance) -> Option<Status> {
-        let Ok(blocks) = self.blocks.read() else { return Some(Status::Unavailable) };
+    fn blocked(&self, process: ProcessInstance) -> Option<ReadUnavailable> {
+        let Ok(blocks) = self.blocks.read() else { return Some(ReadUnavailable::Unavailable) };
         if blocks.processes.contains(&process) {
-            Some(Status::Hung)
+            Some(ReadUnavailable::Hung)
         } else {
-            blocks.limited.then_some(Status::Unavailable)
+            blocks.limited.then_some(ReadUnavailable::Unavailable)
         }
     }
 
-    fn invalid(&self, request: NativeRequest) -> Option<Status> {
+    fn invalid(&self, request: NativeRequest) -> Option<ReadUnavailable> {
         if request.generation.0 != self.desired.load(Acquire)
             || request.focus_revision != self.revision.load(Acquire)
             || (matches!(request.query, NativeQuery::Pointer { .. }) && request.id.0 != self.pointer_id.load(Acquire))
         {
-            Some(Status::Stale)
+            Some(ReadUnavailable::Stale)
         } else {
             let process = match request.query {
                 NativeQuery::Focus { foreground, .. } => foreground.process,
@@ -173,7 +173,7 @@ impl Worker {
                 let read = if let Some(client) = &mut client {
                     Read::observed(request, client.read(native, &scrubber, &invalid))
                 } else {
-                    Read::outcome(request, None, Status::Unavailable)
+                    Read::outcome(request, None, ReadUnavailable::Unavailable)
                 };
                 let returned = completed.try_send(read).is_ok();
                 if let Some(client) = &mut client {
@@ -201,7 +201,7 @@ impl Worker {
         }
     }
 
-    pub fn blocked(&self, process: ProcessInstance) -> Option<Status> {
+    pub fn blocked(&self, process: ProcessInstance) -> Option<ReadUnavailable> {
         self.gate.blocked(process)
     }
 

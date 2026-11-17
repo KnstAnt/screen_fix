@@ -10,7 +10,7 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    capture::input::{Correlation, HeldInput, Key, Modifier, modifier_bit, modifier_vk},
+    capture::input::{Correlation, HeldInput, Key, Modifier, VK_PACKET, injected_hook, modifier_bit, modifier_vk},
     protocol::ipc::InputSample,
 };
 
@@ -122,7 +122,7 @@ impl KeyboardText {
             } else {
                 Typing::NonText
             }
-        } else if key.virtual_key == 0xe7 {
+        } else if key.virtual_key == VK_PACKET {
             self.dead = None;
             if let Some(unit) = packet_unit(input) {
                 self.packet(unit, &mut commits);
@@ -284,7 +284,8 @@ fn packet_unit(input: &HeldInput) -> Option<u16> {
         return None;
     }
     std::iter::once(&correlated.first).chain(&correlated.partners).find_map(|slot| match slot.packet.sample {
-        InputSample::HookKey(key) if key.flags & 0x12 != 0 && key.virtual_key == 0xe7 => u16::try_from(key.scan_code).ok(),
+        InputSample::HookKey(key) if injected_hook(&slot.packet.sample) && key.virtual_key == u32::from(VK_PACKET) =>
+            u16::try_from(key.scan_code).ok(),
         _ => None,
     })
 }

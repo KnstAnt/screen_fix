@@ -33,7 +33,7 @@ use crate::{
     config::{ClipboardMode, ResolvedCaptureConfig},
     package::metadata::AttemptLayout,
     package::outcome::{LossEvidence, LossProducer, LossReason},
-    protocol::{BoundedList, ClockOrigin, CoarseTime, Evidence, FocusGeneration, GeometryId, PhysicalPoint, PhysicalRect, QpcTick, RequestId, UnavailableReason, WindowId, ipc::{ForegroundAtReceipt, ProcessInstance}},
+    protocol::{BoundedList, ClockOrigin, CoarseTime, Evidence, FocusGeneration, GeometryId, PhysicalPoint, PhysicalRect, QpcTick, RequestId, SessionTimeUs, UnavailableReason, WindowId, ipc::{ForegroundAtReceipt, ProcessInstance}},
 };
 
 use self::{
@@ -70,7 +70,7 @@ pub(super) struct Visit {
     pub started_at: QpcTick,
     pub foreground: WindowProcess,
     pub native: Option<FocusSnapshot>,
-    uia_blocked: Option<uia::Status>,
+    uia_blocked: Option<uia::ReadUnavailable>,
     elevated: Option<(VisitBinding, FocusAtReceipt)>,
 }
 
@@ -113,7 +113,7 @@ pub(super) enum ReceiptFocus {
 }
 
 impl ReceiptFocus {
-    pub fn target(self, origin: ClockOrigin, deadline: crate::protocol::SessionTimeUs) -> TextTarget {
+    pub fn target(self, origin: ClockOrigin, deadline: SessionTimeUs) -> TextTarget {
         match self {
             Self::Classified(_, TextTarget::Password, _) => TextTarget::Password,
             Self::Classified(_, target, Some(at)) if origin.time(at).is_ok_and(|at| at <= deadline) => target,
@@ -171,8 +171,8 @@ pub(super) struct ContextHealth {
 /// An interval with an unapproved or unknown foreground (C5, D-3 A). Its input
 /// is suppressed and counted; no identity is recorded.
 pub(super) struct Suppression {
-    pub start: crate::protocol::SessionTimeUs,
-    pub end: Option<crate::protocol::SessionTimeUs>,
+    pub start: SessionTimeUs,
+    pub end: Option<SessionTimeUs>,
     pub reason: &'static str,
     pub input: u64,
 }
@@ -395,28 +395,25 @@ impl<'a> Context<'a> {
                 failure: Failure::new(FailureComponent::Context, "Executable path canonicalization", None),
                 at, count: Some(unresolved), activity_lost: false });
         }
+        let activity_lost = |operation| ContextHealth { kind: HealthKind::AuxiliaryActivityLoss,
+            failure: Failure::new(FailureComponent::Context, operation, None), at, count: None, activity_lost: true };
         if resolver_lost {
-            self.health.push(ContextHealth { kind: HealthKind::AuxiliaryActivityLoss,
-                failure: Failure::new(FailureComponent::Context, "Executable identity resolution", None),
-                at, count: None, activity_lost: true });
+            self.health.push(activity_lost("Executable identity resolution"));
         }
         if !self.uia_lost && let Some(operation) = self.queries.uia_failure() {
             // One report: no replacement worker is started (ALG §7.1).
             self.uia_lost = true;
-            self.health.push(ContextHealth { kind: HealthKind::AuxiliaryActivityLoss,
-                failure: Failure::new(FailureComponent::Context, operation, None), at, count: None, activity_lost: true });
+            self.health.push(activity_lost(operation));
         }
         if self.clipboard.as_ref().is_some_and(clipboard::Worker::exited) {
             // Row 17: reported once; no replacement worker, so no later
             // clipboard events are produced.
             self.clipboard = None;
             self.clipboard_notices.clear();
-            self.health.push(ContextHealth { kind: HealthKind::AuxiliaryActivityLoss,
-                failure: Failure::new(FailureComponent::Context, "Observe the opt-in clipboard", None), at, count: None, activity_lost: true });
+            self.health.push(activity_lost("Observe the opt-in clipboard"));
         }
         if self.cursor.take_owner_lost() {
-            self.health.push(ContextHealth { kind: HealthKind::AuxiliaryActivityLoss,
-                failure: Failure::new(FailureComponent::Context, "Publish cursor assets", None), at, count: None, activity_lost: true });
+            self.health.push(activity_lost("Publish cursor assets"));
         }
     }
 
@@ -582,8 +579,8 @@ impl<'a> Context<'a> {
             // Notices through `at` were processed and the reads above followed it.
             self.swept = Some(at);
             if foreground_changed {
-                let mut row = approved.and_then(|proof| self.window_row(proof, "foreground_window"))
-                    .unwrap_or_else(|| json!({ "kind": "foreground_window", "approved": false }));
+                let mut row = approved.and_then(|proof| self.window_row(proof, "foreground"))
+                    .unwrap_or_else(|| json!({ "kind": "foreground", "approved": false }));
                 if replaced.is_some() && replaced == approved {
                     row["ghost_replacement"] = json!(true);
                 }
@@ -648,8 +645,7 @@ impl<'a> Context<'a> {
             };
             if let Some(hint) = hint {
                 // Typed hint records name a window only when it is approved (C4).
-                let approved = WindowProcess::read(::windows::Win32::Foundation::HWND(notice.window.0 as usize as *mut _))
-                    .filter(|proof| self.approvals.get(proof.process).is_some());
+                let approved = read_window(notice.window).filter(|proof| self.approvals.get(proof.process).is_some());
                 let mut row = json!({ "kind": "window_hint", "hint": hint, "approved": approved.is_some(),
                     "window": approved.map(|proof| proof.window) });
                 add_win_event_timing(&mut row, notice, receipt)?;
@@ -670,16 +666,14 @@ impl<'a> Context<'a> {
                 }
                 _ => continue,
             };
-            if kind == "window_location" && self.window_rate.iter().any(|(window, last)| *window == notice.window
-                && now.saturating_duration_since(*last) < WINDOW_REFRESH)
-            {
+            if kind == "window_location" && self.location_limited(notice.window, now) {
                 if !self.location_dirty.contains(&notice.window) && self.location_dirty.len() < WINDOW_RATE_CACHE {
                     self.location_dirty.push(notice.window);
                 }
                 continue;
             }
             // The notification callback keeps only top-level windows (CTX-1).
-            let Some(proof) = WindowProcess::read(::windows::Win32::Foundation::HWND(notice.window.0 as usize as *mut _)) else { continue };
+            let Some(proof) = read_window(notice.window) else { continue };
             if notice.thread != 0 && proof.thread.get() != notice.thread {
                 continue;
             }
@@ -690,32 +684,23 @@ impl<'a> Context<'a> {
                 add_win_event_timing(&mut row, notice, receipt)?;
                 row["source_event_tick_ms"] = json!(notice.source_tick);
                 if kind == "window_location" {
-                    self.window_rate.retain(|(window, _)| *window != notice.window);
-                    if self.window_rate.len() == WINDOW_RATE_CACHE {
-                        self.window_rate.pop_front();
-                    }
-                    self.window_rate.push_back((notice.window, now));
+                    self.rate_location(notice.window, now);
                     self.location_dirty.retain(|window| *window != notice.window);
                 }
                 output.push(row);
             }
         }
         // Trailing edge of the location rate limit: one re-read per dropped burst.
-        let due: Vec<_> = self.location_dirty.iter().copied().filter(|dirty| !self.window_rate.iter()
-            .any(|(window, last)| window == dirty && now.saturating_duration_since(*last) < WINDOW_REFRESH)).collect();
+        let due: Vec<_> = self.location_dirty.iter().copied().filter(|dirty| !self.location_limited(*dirty, now)).collect();
         self.location_dirty.retain(|window| !due.contains(window));
         for window in due {
-            let Some(proof) = WindowProcess::read(::windows::Win32::Foundation::HWND(window.0 as usize as *mut _)) else { continue };
+            let Some(proof) = read_window(window) else { continue };
             if let Some(mut row) = self.window_row(proof, "window_location") {
                 if let Some(visit) = self.current.filter(|visit| visit.foreground == proof) {
                     self.observe_visit_geometry(visit, at)?;
                 }
                 row["trailing"] = json!(true);
-                self.window_rate.retain(|(id, _)| *id != window);
-                if self.window_rate.len() == WINDOW_RATE_CACHE {
-                    self.window_rate.pop_front();
-                }
-                self.window_rate.push_back((window, now));
+                self.rate_location(window, now);
                 output.push(row);
             }
         }
@@ -723,8 +708,12 @@ impl<'a> Context<'a> {
             self.pointer_query(point, geometry, origin, at, None)?;
         }
         self.sample_cursor(cursor_notified);
-        let cursor = self.cursor.current_hint();
-        self.queries.poll(now, at, origin, cursor.as_ref(), &mut output);
+        self.ime.poll();
+        let extras = queries::FocusExtras {
+            cursor: self.cursor.current_hint(),
+            ime: self.current.and_then(|visit| self.ime.focus_state(visit.generation)),
+        };
+        self.queries.poll(now, at, origin, Some(&extras), &mut output);
         let mut changes = std::mem::take(&mut self.cursor_completions);
         changes.extend(self.cursor.results());
         for change in changes {
@@ -736,7 +725,6 @@ impl<'a> Context<'a> {
                 self.losses.note(LossReason::StagingPressure, 1, change.received(), change.received());
             }
         }
-        self.ime.poll();
         if let Some(visit) = self.current && let Some(state) = self.ime.focus_state(visit.generation)
             && self.last_ime_focus != Some((visit.generation, state))
         {
@@ -745,6 +733,25 @@ impl<'a> Context<'a> {
         }
         self.started = true;
         Ok(output)
+    }
+
+    fn location_limited(&self, window: WindowId, now: Instant) -> bool {
+        self.window_rate.iter().any(|(id, last)| *id == window && now.saturating_duration_since(*last) < WINDOW_REFRESH)
+    }
+
+    /// Record a location read of `window` for the rate limit.
+    fn rate_location(&mut self, window: WindowId, now: Instant) {
+        self.window_rate.retain(|(id, _)| *id != window);
+        if self.window_rate.len() == WINDOW_RATE_CACHE {
+            self.window_rate.pop_front();
+        }
+        self.window_rate.push_back((window, now));
+    }
+
+    /// A context loss found outside this owner, such as elevated evidence the
+    /// Recorder could not stage; it is admitted with the owner's own losses.
+    pub fn note_loss(&mut self, reason: LossReason, count: u64, first: QpcTick, last: QpcTick) {
+        self.losses.note(reason, count, first, last);
     }
 
     /// Context losses since the last call, clipped to the admission through `at` (C3).
@@ -759,7 +766,7 @@ impl<'a> Context<'a> {
     }
 
     /// Count one suppressed input record at `at` into its suppression interval (C5).
-    pub fn count_suppressed(&mut self, at: crate::protocol::SessionTimeUs) {
+    pub fn count_suppressed(&mut self, at: SessionTimeUs) {
         if let Some(interval) = self.suppressions.iter_mut().rev()
             .find(|interval| interval.start <= at && interval.end.is_none_or(|end| at < end))
         {
@@ -770,7 +777,7 @@ impl<'a> Context<'a> {
     /// Suppression intervals that ended at or before `ready`. A closing
     /// boundary at `close` ends the open interval and takes every interval.
     pub fn take_suppressions(
-        &mut self, ready: Option<crate::protocol::SessionTimeUs>, close: Option<crate::protocol::SessionTimeUs>,
+        &mut self, ready: Option<SessionTimeUs>, close: Option<SessionTimeUs>,
     ) -> Vec<Suppression> {
         if let Some(close) = close && let Some(last) = self.suppressions.last_mut() && last.end.is_none() {
             last.end = Some(close.max(last.start));
@@ -834,7 +841,7 @@ impl<'a> Context<'a> {
             *generation == visit.generation && *observed <= at && self.routes_since.is_some_and(|since| since <= at)
         });
         let geometries = geometry.map_or_else(Vec::new, |(_, bounds, _)| {
-            self.routable.iter().filter(|monitor| overlaps(monitor.bounds, bounds)).map(|monitor| monitor.id).collect()
+            self.routable.iter().filter(|monitor| monitor.bounds.intersects(bounds)).map(|monitor| monitor.id).collect()
         });
         let busy = self.busy.current().filter(|hint| hint.generation == visit.generation)
             .map_or(BusyLevel::Clear, |hint| hint.level);
@@ -844,16 +851,7 @@ impl<'a> Context<'a> {
 
     pub fn poll_clipboard(&mut self, receipt: Receipt, now: QpcTick) -> Vec<Value> {
         let Some(worker) = &self.clipboard else { return Vec::new() };
-        if let Some((count, first, last)) = worker.take_loss() {
-            self.losses.note(LossReason::ClipboardQueue, count, first, last);
-        }
-        for notice in worker.notices() {
-            if self.clipboard_notices.len() < 8 {
-                self.clipboard_notices.push_back(notice);
-            } else {
-                self.losses.note(LossReason::ClipboardQueue, 1, notice.received, notice.received);
-            }
-        }
+        take_clipboard_notices(worker, &mut self.clipboard_notices, &mut self.losses);
         let safe_visit = self.current.filter(|visit| self.queries.clipboard_safe() && visit.clipboard_focus_is_current());
         if let Some(visit) = safe_visit {
             let mut pending = VecDeque::with_capacity(8);
@@ -1036,7 +1034,7 @@ impl<'a> Context<'a> {
             && !self.queries.changed()
     }
 
-    pub fn focus_end(&self, generation: FocusGeneration, clock: ClockOrigin) -> Option<crate::protocol::SessionTimeUs> {
+    pub fn focus_end(&self, generation: FocusGeneration, clock: ClockOrigin) -> Option<SessionTimeUs> {
         let (_, _, ended) = self.previous_visits.iter().find(|(visit, _, _)| visit.generation == generation)?;
         clock.time(*ended).ok()
     }
@@ -1087,7 +1085,7 @@ impl<'a> Context<'a> {
     /// Drop ended visits that can no longer attribute an unpublished receipt:
     /// they ended an uncertainty interval before the published input prefix.
     /// The visit of the active key focus keeps its end for redaction.
-    pub fn prune_visits(&mut self, published: crate::protocol::SessionTimeUs, clock: ClockOrigin, keep: Option<FocusGeneration>) {
+    pub fn prune_visits(&mut self, published: SessionTimeUs, clock: ClockOrigin, keep: Option<FocusGeneration>) {
         self.previous_visits.retain(|(visit, _, ended)| Some(visit.generation) == keep
             || clock.time(*ended).is_ok_and(|ended| ended.0.saturating_add(16_000) >= published.0));
     }
@@ -1206,24 +1204,30 @@ impl<'a> Context<'a> {
         // An identity change during the read gets one re-read; an approved
         // window whose metadata still cannot be read stays approved (C4).
         let Some(window) = WindowMetadata::read(proof, &self.scrubber).or_else(|| WindowMetadata::read(proof, &self.scrubber)) else {
-            return Some(json!({ "kind": kind, "approved": true, "window": proof.window, "process_id": proof.process.pid,
+            return Some(json!({ "kind": kind, "approved": true, "window": proof.window, "pid": proof.process.pid,
                 "metadata": "unavailable" }));
         };
         Some(self.window_evidence_row(proof, identity, kind, window))
     }
 
+    /// A window row with the PDF foreground fields (D-1): `pid`, `exe`, `rect`,
+    /// `monitor`, `product`, `version`, `version_string`, `title` and `class`.
     fn window_evidence_row(
         &self, proof: WindowProcess, identity: &crate::config::ExecutableIdentity,
         kind: &'static str, window: WindowMetadata,
     ) -> Value {
-        let executable_version = self.executable_versions.0.iter().find(|(executable, _)| executable == identity)
+        let version = self.executable_versions.0.iter().find(|(executable, _)| executable == identity)
             .and_then(|(_, version)| version.as_ref());
+        let geometry = window.bounds.and_then(|bounds| self.only_geometry(bounds));
         json!({
-            "kind": kind, "approved": true, "window": proof.window, "process_id": proof.process.pid,
-            "executable": self.scrubber.scrub(identity.executable(), 4096), "executable_version": executable_version,
-            "executable_version_observation": "approved_file_at_startup",
-            "geometry": window.bounds.and_then(|bounds| self.only_geometry(bounds)),
-            "bounds": window.bounds, "dpi": window.dpi, "dpi_awareness": window.dpi_awareness,
+            "kind": kind, "approved": true, "window": proof.window, "pid": proof.process.pid,
+            "exe": self.scrubber.scrub(identity.executable(), 4096),
+            "product": version.and_then(|version| version.product.as_ref()),
+            "version": version.and_then(|version| version.version.as_ref()),
+            "version_string": version.and_then(|version| version.version_string.as_ref()),
+            "version_observation": "approved_file_at_startup",
+            "rect": window.bounds, "monitor": geometry.map(|geometry| geometry.monitor), "geometry": geometry,
+            "dpi": window.dpi, "dpi_awareness": window.dpi_awareness,
             "class": window.class, "title": window.title,
             "metadata_observed_at_read": true,
         })
@@ -1266,7 +1270,7 @@ impl<'a> Context<'a> {
     }
 
     fn only_geometry(&self, bounds: PhysicalRect) -> Option<GeometryId> {
-        let mut candidates = self.routable.iter().filter(|monitor| overlaps(monitor.bounds, bounds));
+        let mut candidates = self.routable.iter().filter(|monitor| monitor.bounds.intersects(bounds));
         let geometry = candidates.next()?.id;
         candidates.next().is_none().then_some(geometry)
     }
@@ -1372,6 +1376,25 @@ fn clipboard_activity(
     })
 }
 
+/// Queue the clipboard owner's notices, at most 8; every notice it or this
+/// queue could not hold is a `clipboard_queue` loss (C3).
+fn take_clipboard_notices(worker: &clipboard::Worker, notices: &mut VecDeque<clipboard::Notice>, losses: &mut Losses) {
+    if let Some((count, first, last)) = worker.take_loss() {
+        losses.note(LossReason::ClipboardQueue, count, first, last);
+    }
+    for notice in worker.notices() {
+        if notices.len() < 8 {
+            notices.push_back(notice);
+        } else {
+            losses.note(LossReason::ClipboardQueue, 1, notice.received, notice.received);
+        }
+    }
+}
+
+fn read_window(window: WindowId) -> Option<WindowProcess> {
+    WindowProcess::read(::windows::Win32::Foundation::HWND(window.0 as usize as *mut _))
+}
+
 fn clipboard_row(read: clipboard::Read, clock: ClockOrigin) -> Value {
     json!({
         "kind": "clipboard_change", "approved": true,
@@ -1392,8 +1415,3 @@ fn clipboard_change_after_visit(notice: clipboard::Notice, visit: Visit, receipt
     i128::from(estimate.0) - i128::from(coarse.uncertainty_us.0) - bracket >= i128::from(started.0)
 }
 
-fn overlaps(a: PhysicalRect, b: PhysicalRect) -> bool {
-    let (a_left, a_top, a_right, a_bottom) = a.edges();
-    let (b_left, b_top, b_right, b_bottom) = b.edges();
-    a_left < b_right && b_left < a_right && a_top < b_bottom && b_top < a_bottom
-}

@@ -52,6 +52,27 @@ impl PhysicalRect {
         let (left, top, right, bottom) = self.edges();
         (left..right).contains(&point.x) && (top..bottom).contains(&point.y)
     }
+
+    /// Positive by construction; up to `u32::MAX` for the widest `i32` span.
+    pub fn width(self) -> u32 {
+        self.0.right.abs_diff(self.0.left)
+    }
+
+    /// Positive by construction; up to `u32::MAX` for the tallest `i32` span.
+    pub fn height(self) -> u32 {
+        self.0.bottom.abs_diff(self.0.top)
+    }
+
+    /// `(width, height)`.
+    pub fn size(self) -> (u32, u32) {
+        (self.width(), self.height())
+    }
+
+    /// Whether the two rectangles share at least one pixel.
+    pub fn intersects(self, other: Self) -> bool {
+        self.0.left < other.0.right && other.0.left < self.0.right
+            && self.0.top < other.0.bottom && other.0.top < self.0.bottom
+    }
 }
 
 impl TryFrom<RectEdges> for PhysicalRect {

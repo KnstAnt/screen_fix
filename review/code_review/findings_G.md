@@ -1,0 +1,86 @@
+# Review findings, area G: elevated collector (`core/capture/elevated/src/`)
+
+- **G1 · medium · bugfix**
+  - **Contract:** UiaOutcome `stale` vs `outside_approval`, and the meaning of element approved:false.
+  - **Where:** runtime/context.rs:357-360, grant.rs:207-209.
+  - **Problem:** `Worker::uia` maps every `uia_query` error to `OutsideApproval`: staleness, scope/lease/cancel, and Supervisor faults alike. As a result, a stale pointer read is journaled as an unapproved element.
+  - **Fix:**
+    - `prove_other` returns `Failure::TargetAccess` for `!approved.contains`.
+    - In `uia()`, map TargetAccess → OutsideApproval and TargetChanged/ScopeClosed/LeaseExpired/Cancelled → Stale; propagate everything else with `?`.
+- **G2 · low · change**
+  - **Where:** owner.rs:242-245, lifetime.rs:138-142.
+  - **Problem:** `send` waits up to LEASE (1 s), but `owner_healthy` cuts at CLEANUP (750 ms).
+  - **Fix:** unify the two bounds.
+- **G3 · low · change (journal reason values)**
+  - **Where:** deadline.rs:66-68.
+  - **Problem:** every expiry is reported as ReadinessDeadline, including lane, lease and egress timeouts. The variant is also used as an internal sentinel.
+  - **Fix:** set the expiry failure per Deadline; use a private sentinel enum.
+- **G4 · low · bugfix (spec §3.2), plausible**
+  - **Where:** runtime/context.rs:252.
+  - **Problem:** `submit` maps `try_send` Disconnected to Transport. A revoke race then becomes a fatal fault.
+  - **Fix:** if `grant.stopped()`, return Busy/Stale.
+- **G5 · low · bugfix (exact grant acknowledgement), plausible**
+  - **Where:** owner.rs:323-327.
+  - **Problem:** when `stopping` is set after a successful prepare, the code returns Ok(false) and sends no status.
+  - **Fix:** send `transition_rejected(visit, Prepare, Stale)`.
+- **G6 · low · none**
+  - **Where:** input.rs:50, context.rs:327-329/648-650, grant.rs:122/422, runtime.rs:152.
+  - **Problem:** `read_floor(false) && check(true)` runs `check(false)` three times on the hot path. `credit` re-checks lifetime and witness, and `send_inner` re-checks the grant.
+  - **Fix:** one `Grant::read_open(held)`.
+- **G7 · low · none (witness: change)**
+  - **Where:** deadline.rs:92-95, owner.rs:439-442, witness.rs:359.
+  - **Problem:**
+    - `wait_any` wakes every 25 ms even when scope_current is None.
+    - `stopped()` sleep-polls.
+    - witness uses `park_timeout(10ms)`.
+  - **Fix:** wait on the handles; use MsgWaitForMultipleObjectsEx in the witness.
+- **G8 · low · none**
+  - **Where:** pipe.rs:174, 279-287.
+  - **Problem:** every operation does CreateEventW plus a Box<Pending> allocation and copies twice.
+  - **Fix:** reuse one Pending per direction.
+- **G9 · low · none**
+  - **Where:** process.rs:97-102/129-137, witness.rs:412-415.
+  - **Problem:** the image-name query is duplicated with different limits; `native_image` keeps a 64 KiB capacity; `normal_capture_desktop` builds a full Process just to read the session.
+  - **Fix:** one image_name helper; use ProcessIdToSessionId.
+- **G10 · low · none**
+  - **Where:** process.rs:252-264.
+  - **Problem:** `Token::fixed<T>` is a safe fn that calls `assume_init` for any T.
+  - **Fix:** make it `unsafe fn` with a Safety section, or bound it by a sealed POD trait.
+- **G11 · low · none**
+  - **Where:** secret.rs:18.
+  - **Problem:** `Secret<N>(pub(crate) [u8;N])` lets callers make Copy copies.
+  - **Fix:** make the field private and add accessors; update wire.rs.
+- **G12 · low · none**
+  - **Where:** pipe/security.rs:19,56-58,107,112 and trust/permissions.rs:18-23,89-111.
+  - **Problem:** the pipe module reaches into trust::permissions. The SID strings are duplicated, and the ACE literals 0|1|0x11 and mask 1 are written out.
+  - **Fix:** move the helpers to `win::acl`, take the failure as a parameter, and use named constants. Strictness stays exactly the same.
+- **G13 · low · none**
+  - **Where:** lifetime.rs:68,78-79,95.
+  - **Problem:** `ticks_per_second` stands in for LEASE, and /4 for HEARTBEAT.
+  - **Fix:** use `ticks(LEASE)` and `ticks(HEARTBEAT)`.
+- **G14 · low · none**
+  - **Where:** grant.rs:21-26,324; context.rs:56-58,67,193-194,227-236,734; lifetime.rs:31,155; outbox.rs:19,146-152.
+  - **Problem:**
+    - The grant phase is a `u8` with constants, and `renew` relies on numeric order.
+    - Read states are bare u8.
+    - Slot and capacity coupling is done by hand.
+    - `PRODUCERS = 5` is matched manually.
+  - **Fix:** repr(u8) enums; derive the counts.
+- **G15 · low · none**
+  - **Where:** grant.rs:112, 465-468.
+  - **Problem:** `visit()` uses `.expect("focus binding lock")`, and `revoke` skips CLOSED on poison.
+  - **Fix:** handle poison; always store CLOSED.
+- **G16 · low · none**
+  - **Problem:** redundant checks.
+    - process.rs:482-484: `unprotected()` runs twice, and again at line 183.
+    - witness.rs:482/503: `normal_desktop` runs twice.
+    - recorder.rs:82: `parent.ensure_live()` is called on the current process.
+    - context.rs:244: a duplicate-request scan that cannot trigger (owner.rs:549 already enforces increasing ids).
+- **G17 · low · none**
+  - **Where:** owner.rs:336-341/345-349, context.rs:206-210.
+  - **Problem:** the startup-failure teardown is written three times.
+  - **Fix:** a helper or guard.
+- **G18 · low · change (diagnostic), plausible**
+  - **Where:** trust/signature.rs:103,107.
+  - **Problem:** REVOKE_WHOLECHAIN combined with CACHE_ONLY_URL_RETRIEVAL may fail on an offline machine with a generic error.
+  - **Fix:** a distinct revocation-unknown failure. Do not relax the check.
