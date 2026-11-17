@@ -71,6 +71,7 @@ pub(super) struct Notifications {
 struct Signals {
     reasons: AtomicU32,
     environment: Arc<AtomicU32>,
+    elevated_environment: Arc<AtomicU32>,
     display_revision: Arc<AtomicU32>,
     session_end: Arc<OnceLock<Instant>>,
     suspended: Mutex<Option<Instant>>,
@@ -84,9 +85,11 @@ impl Signals {
             if self.reasons.fetch_update(AcqRel, Acquire, |before| {
                 (before & bit == 0).then_some(before | bit | (bit << EDGE_SHIFT))
             }).is_ok() {
+                self.elevated_environment.fetch_or(EnvironmentChange::Session.bit(), Release);
                 let _ = self.wake.try_send(());
             }
         } else if self.reasons.fetch_and(!bit, AcqRel) & bit != 0 {
+            self.elevated_environment.fetch_or(EnvironmentChange::Session.bit(), Release);
             let _ = self.wake.try_send(());
         }
     }
@@ -94,11 +97,11 @@ impl Signals {
 
 impl Notifications {
     pub(super) fn spawn(
-        environment: Arc<AtomicU32>, display_revision: Arc<AtomicU32>,
+        environment: Arc<AtomicU32>, elevated_environment: Arc<AtomicU32>, display_revision: Arc<AtomicU32>,
         session_end: Arc<OnceLock<Instant>>, wake: SyncSender<()>,
     ) -> Result<(Self, Receiver<Result<(), CaptureError>>), CaptureError> {
         let signals = Arc::new(Signals {
-            reasons: AtomicU32::new(0), environment, display_revision, session_end,
+            reasons: AtomicU32::new(0), environment, elevated_environment, display_revision, session_end,
             suspended: Mutex::new(None), complete: AtomicBool::new(false), wake,
         });
         let (stop, stopped) = mpsc::sync_channel(1);
@@ -323,6 +326,7 @@ unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM
             if let Some(signals) = signals {
                 let started = *signals.session_end.get_or_init(Instant::now);
                 signals.environment.fetch_or(EnvironmentChange::SessionEnding.bit(), Release);
+                signals.elevated_environment.fetch_or(EnvironmentChange::SessionEnding.bit(), Release);
                 let _ = signals.wake.try_send(());
                 while !signals.complete.load(Acquire) {
                     let remaining = SESSION_END_BUDGET.saturating_sub(started.elapsed());
@@ -340,6 +344,7 @@ unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM
             signals.display_revision.fetch_add(1, Release);
         }
         signals.environment.fetch_or(bits, Release);
+        signals.elevated_environment.fetch_or(bits, Release);
     }
     0
 }

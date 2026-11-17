@@ -16,13 +16,13 @@ use crate::{
     package::{journal::JournalIngress, metadata::UncertifiedInputTail},
     protocol::{
         AdmissionEpoch, BoundedList, DeviceId, Evidence, EventRef, FocusGeneration, GeometryId, MonitorId, ObservationId, PhysicalPoint, QpcTick, SessionTimeUs, UnavailableReason,
-        ipc::{DeviceDescriptor, ForegroundAtReceipt, HelperToCore, InputSample, MAX_INPUT_DEVICES, Producer},
+        ipc::{DeviceDescriptor, ForegroundAtReceipt, HelperToCore, InputSample, MAX_INPUT_DEVICES, Producer, elevated::{InputEvidence, VisitBinding}},
     },
     session::{AdmissionBoundary, hotkey::ControlOutcome, windows::{ControlPrefix, Receipt}},
 };
 
-use super::{ProbeError, ReceiptPrefix, clock, clock_error, gate::{Gate, Selection}, hook_health::HookHealth, input_timing, resync, unavailable};
-use super::super::{context::{ConfirmedText, Context, Visit}, still_rows, stills};
+use super::{ProbeError, ReceiptPrefix, clock, clock_error, devices::Devices, gate::{Gate, Selection}, hook_health::HookHealth, input_timing, resync, unavailable};
+use super::super::{context::{ConfirmedText, Context, Visit}, elevated::InputCertificate, still_rows, stills};
 
 const STALLED_PROGRESS_US: i64 = 250_000;
 const SYNC_RETRY_US: i64 = 100_000;
@@ -44,6 +44,10 @@ pub(super) struct Receiver {
     overflow: bool,
     devices: BTreeMap<DeviceId, DeviceDescriptor>,
     device_inventory_truncated: bool,
+    source: Option<VisitBinding>,
+    source_certificate: Option<InputCertificate>,
+    device_ids: Devices,
+    past_hook_loss: (bool, bool),
 }
 
 impl Receiver {
@@ -55,16 +59,73 @@ impl Receiver {
             devices: BTreeMap::new(), device_inventory_truncated: false,
             hook_health: HookHealth::default(), opened_at: None, sync_after: None, last_sync_attempt: None,
             requires_opening_sync: true, synchronized_qpc: None, sync_visit: None,
+            source: None, source_certificate: None, device_ids: Devices::default(), past_hook_loss: (false, false),
         }
+    }
+
+    pub fn adopt_elevated_certificate(
+        &mut self, certificate: InputCertificate, receipt: Receipt, context: &mut Context<'_>,
+    ) -> bool {
+        if self.source != Some(certificate.visit) || certificate.visit.epoch != receipt.boundary.epoch {
+            return false;
+        }
+        if self.elevated_hook_loss().is_some_and(|before| certificate.before > before) {
+            return false;
+        }
+        self.source_certificate = Some(certificate);
+        context.certify_elevated_input(certificate);
+        true
+    }
+
+    pub fn accept_elevated(
+        &mut self, record: InputEvidence, receipt: Receipt, closing: Option<AdmissionBoundary>,
+        context: &mut Context<'_>,
+    ) -> Result<(), ProbeError> {
+        let Some(certificate) = self.source_certificate else { return Ok(()); };
+        if self.source != Some(certificate.visit) { return Ok(()); }
+        let record = match record {
+            InputEvidence::Input(value) if value.receipt.qpc < certificate.before => HelperToCore::Input(value),
+            InputEvidence::DeviceArrived { receipt, descriptor } if receipt.qpc < certificate.before =>
+                HelperToCore::DeviceArrived { receipt, descriptor },
+            InputEvidence::DeviceRemoved { receipt, id } if receipt.qpc < certificate.before =>
+                HelperToCore::DeviceRemoved { receipt, id },
+            InputEvidence::Environment(state) if state.observed_qpc < certificate.before =>
+                HelperToCore::Environment(state),
+            InputEvidence::Gap(gap) if gap.last_qpc < certificate.before => HelperToCore::Gap(gap),
+            _ => return Ok(()),
+        };
+        self.accept(record, receipt, closing, context)
+    }
+
+    pub fn finish_elevated_delivery(&mut self, receipt: Receipt) -> Result<(), ProbeError> {
+        let Some(certificate) = self.source_certificate else { return Ok(()); };
+        for progress in certificate.producers {
+            // The matcher may consume only the part of each original
+            // producer bound materialized inside this certified delivery.
+            let eligible = progress.before_qpc.min(certificate.before).min(certificate.context_before);
+            let before = receipt.clock.time(eligible).map_err(clock_error)?;
+            self.matcher.progress(progress.producer, before);
+        }
+        Ok(())
     }
 
     pub fn accept(
         &mut self, record: HelperToCore, receipt: Receipt, closing: Option<AdmissionBoundary>,
         context: &mut Context<'_>,
     ) -> Result<(), ProbeError> {
+        let elevated = self.source.is_some();
+        let record = self.device_ids.translate(elevated, record);
+        if self.device_ids.incomplete(elevated) {
+            self.device_inventory_truncated = true;
+            self.gate.note_device_inventory_loss();
+        }
+        let Some(record) = record else { return Ok(()); };
         match record {
             HelperToCore::Input(packet) => {
                 if closing.is_some_and(|closing| packet.receipt.qpc >= closing.qpc) {
+                    return Ok(());
+                }
+                if !elevated && packet.foreground_at_receipt.is_some_and(|proof| !context.ordinary_process(proof.process)) {
                     return Ok(());
                 }
                 let Some(timing) = input_timing(receipt, packet.receipt.qpc, packet.receipt.message_tick_ms)? else {
@@ -88,11 +149,12 @@ impl Receiver {
                 let window_geometry = packet.foreground_at_receipt.map_or(Evidence::Unavailable(UnavailableReason::NotObserved),
                     |proof| context.window_geometry_at(proof, qpc));
                 let requests = &mut self.provisional;
+                let source = self.source;
                 self.matcher.push(packet, timing.epoch, timing.time, receipt.tick_anchor,
                     |vk| scan_from_layout(vk, layout),
                     |point| context.pointer_geometry_at(point, qpc),
                     window_geometry,
-                    |change| requests.stage(change),
+                    |change| requests.stage(change, source),
                 ).map_err(|_| unavailable("The input request ID counter overflowed"))?;
             }
             HelperToCore::Progress(progress) => {
@@ -132,7 +194,44 @@ impl Receiver {
         if let HelperToCore::Input(input) = &record && let Some(modifier) = startup_modifier(input) {
             self.controls.note_startup_change(modifier);
         }
-        self.inventory(record);
+        self.collect_ordinary_inventory(record, true);
+    }
+
+    pub fn collect_ordinary_inventory(&mut self, record: HelperToCore, selected: bool) {
+        if !matches!(&record, HelperToCore::DeviceArrived { .. } | HelperToCore::DeviceRemoved { .. }
+            | HelperToCore::Gap(crate::protocol::ipc::ProducerGap {
+                producer: Producer::DeviceNotifications, ..
+            }))
+        {
+            return;
+        }
+        if let Some(mapped) = self.device_ids.translate(false, record) && selected {
+            self.inventory(mapped);
+        }
+    }
+
+    pub fn select_source(&mut self, source: Option<VisitBinding>) {
+        if self.source == source { return; }
+        self.past_hook_loss = self.hook_loss();
+        self.hook_health = HookHealth::default();
+        self.source = source;
+        self.source_certificate = None;
+        if source.is_some() {
+            self.device_ids.new_elevated_owner();
+        }
+        self.gate.reset_device_inventory();
+        if self.device_ids.incomplete(source.is_some()) {
+            self.device_inventory_truncated = true;
+            self.gate.note_device_inventory_loss();
+        }
+        for descriptor in self.device_ids.current(source.is_some()) {
+            self.gate.note_input_device(descriptor);
+            if self.devices.len() < MAX_INPUT_DEVICES || self.devices.contains_key(&descriptor.id) {
+                self.devices.insert(descriptor.id, descriptor.clone());
+            } else {
+                self.device_inventory_truncated = true;
+            }
+        }
     }
 
     pub fn accept_controls(&mut self, prefix: &ControlPrefix, receipt: Receipt) -> Result<(), ProbeError> {
@@ -186,6 +285,10 @@ impl Receiver {
         self.provisional.advance(SessionTimeUs(through.0.saturating_add(1)), false);
     }
 
+    pub fn open_elevated_stills(&mut self, source: VisitBinding, before: SessionTimeUs) {
+        self.provisional.open_deferred(source, before);
+    }
+
     pub fn advance_stills(&self, through: SessionTimeUs, input_live: bool) {
         if !input_live {
             self.provisional.advance(through, false);
@@ -197,7 +300,7 @@ impl Receiver {
     pub fn poll_pointer_rest(&mut self, context: &mut Context<'_>, receipt: Receipt, observed: QpcTick)
         -> Result<(), ProbeError>
     {
-        self.provisional.poll_pointer_rest(context, receipt, observed)
+        self.provisional.poll_pointer_rest(context, receipt, observed, self.source)
     }
 
     pub fn pen_observation(&self) -> (bool, bool) {
@@ -215,9 +318,12 @@ impl Receiver {
             self.opened_at = Some(admitted_through);
             self.sync_after = Some(admitted_through);
         }
-        while let Some(step) = self.matcher.ready(admitted_through) {
+        while self.elevated_hook_loss().is_none()
+            && let Some(step) = self.matcher.ready(admitted_through)
+        {
             self.consume(step);
         }
+        if self.elevated_hook_loss().is_some() { return; }
         if let Some(bound) = self.matcher.unresolved_before() {
             self.process_samples(|sampler, emit| sampler.advance(bound.min(admitted_through), emit));
         }
@@ -235,13 +341,46 @@ impl Receiver {
         if let Some(state) = resync::read() {
             let qpc = clock::qpc()?;
             let at = receipt.clock.time(qpc).map_err(clock_error)?;
-            self.sync_visit = visit.filter(|&visit| context.confirm_focus(visit));
-            self.matcher.stage_synchronization(qpc, at, state);
-            self.requires_opening_sync = false;
-            self.synchronized_qpc = Some(qpc);
-            self.sync_after = None;
+            self.install_synchronization(qpc, at, state, visit.filter(|&visit| context.confirm_focus(visit)));
         }
         Ok(())
+    }
+
+    pub fn elevated_synchronization(
+        &mut self, receipt: Receipt, completed: QpcTick, snapshot: Option<screen_fix_protocol::ipc::elevated::HeldSnapshot>,
+        visit: Visit,
+    ) -> Result<(), ProbeError> {
+        let at = receipt.clock.time(completed).map_err(clock_error)?;
+        if let Some(snapshot) = snapshot {
+            self.install_synchronization(completed, at, resync::from_snapshot(snapshot), Some(visit));
+        } else {
+            self.requires_opening_sync = false;
+            self.synchronized_qpc = Some(completed);
+            self.controls.note_loss(at);
+        }
+        Ok(())
+    }
+
+    pub fn recovered_synchronization(
+        &mut self, receipt: Receipt, completed: QpcTick, snapshot: screen_fix_protocol::ipc::elevated::HeldSnapshot,
+        visit: Visit,
+    ) -> Result<(), ProbeError> {
+        let at = receipt.clock.time(completed).map_err(clock_error)?;
+        self.sync_visit = Some(visit);
+        self.matcher.stage_synchronization(completed, at, resync::from_snapshot(snapshot));
+        Ok(())
+    }
+
+    pub fn note_native_gap(&mut self) { self.overflow = true; }
+
+    fn install_synchronization(
+        &mut self, qpc: QpcTick, at: SessionTimeUs, state: crate::capture::input::HeldSynchronization, visit: Option<Visit>,
+    ) {
+        self.sync_visit = visit;
+        self.matcher.stage_synchronization(qpc, at, state);
+        self.requires_opening_sync = false;
+        self.synchronized_qpc = Some(qpc);
+        self.sync_after = None;
     }
 
     fn sampled_before(&self) -> Option<SessionTimeUs> {
@@ -267,12 +406,24 @@ impl Receiver {
         receipt: Receipt, through: SessionTimeUs, final_boundary: bool,
     ) -> Result<(), ProbeError> {
         let certified = self.matched_and_sampled_before();
+        let certified = if let Some(before) = self.elevated_hook_loss() {
+            let at = receipt.clock.time(before).map_err(clock_error)?;
+            certified.map(|bound| bound.min(at))
+        } else { certified };
         self.gate.drain(context, output, prefix, &mut self.provisional, receipt, through, certified, final_boundary)
     }
 
-    pub fn uncertified_tail(&self, opened: SessionTimeUs, cutoff: SessionTimeUs) -> Option<UncertifiedInputTail> {
-        let first_t_us = self.matcher.certified_before().unwrap_or(opened).max(opened);
-        (first_t_us <= cutoff).then_some(UncertifiedInputTail { first_t_us, cutoff_t_us: cutoff })
+    pub fn synchronization_qpc(&self) -> Option<QpcTick> {
+        self.synchronized_qpc
+    }
+
+    pub fn uncertified_tail(&self, opened: SessionTimeUs, cutoff: SessionTimeUs, source_before: Option<SessionTimeUs>) -> Option<UncertifiedInputTail> {
+        let first_t_us = self.matcher.certified_before().unwrap_or(opened);
+        let first_t_us = source_before.map_or(first_t_us, |before| before.min(first_t_us)).max(opened);
+        // Ordinary closing admits the cutoff itself. Elevated lane coverage
+        // closes strictly before it, so equality leaves no elevated tail.
+        (first_t_us < cutoff || (source_before.is_none() && first_t_us == cutoff))
+            .then_some(UncertifiedInputTail { first_t_us, cutoff_t_us: cutoff, reason: None })
     }
 
     pub fn certified_through(&self, cutoff: SessionTimeUs) -> bool {
@@ -280,34 +431,54 @@ impl Receiver {
     }
 
     pub fn reopen(&mut self, at: SessionTimeUs, hotkey: bool) {
+        self.matcher.reopen();
         self.opened_at = Some(at);
         self.sync_after = Some(at);
         self.last_sync_attempt = None;
         self.requires_opening_sync = true;
         self.synchronized_qpc = None;
         self.sync_visit = None;
+        self.source_certificate = None;
         self.hook_health.reset_streaks();
         self.provisional.motion = None;
         self.controls.reopen(hotkey);
     }
 
     pub fn interrupt(&mut self, cutoff: SessionTimeUs, boundary: HeldBoundary) {
+        self.interrupt_inner(cutoff, boundary, matches!(boundary, HeldBoundary::Pause | HeldBoundary::Stop).then_some(cutoff));
+    }
+
+    pub fn interrupt_certified(&mut self, cutoff: SessionTimeUs, close_at: SessionTimeUs, boundary: HeldBoundary) {
+        self.interrupt_inner(close_at, boundary, Some(cutoff));
+    }
+
+    fn interrupt_inner(&mut self, close_at: SessionTimeUs, boundary: HeldBoundary, certificate: Option<SessionTimeUs>) {
+        let cutoff = certificate.unwrap_or(close_at);
         if self.matcher.certified_before().is_none_or(|bound| bound <= cutoff) {
             self.controls.note_loss(cutoff);
         }
-        let bound = if matches!(boundary, HeldBoundary::Pause | HeldBoundary::Stop) {
-            self.matcher.certified_before().map(|before| SessionTimeUs(before.0.saturating_sub(1)).min(cutoff))
+        let bound = if certificate.is_some() {
+            self.matcher.certified_before().map(|before| SessionTimeUs(before.min(cutoff).0.saturating_sub(1)))
         } else {
             Some(cutoff)
         };
         if let Some(bound) = bound {
-            while let Some(step) = self.matcher.finish(bound) { self.consume(step); }
+            while self.elevated_hook_loss().is_none()
+                && let Some(step) = self.matcher.finish(bound)
+            { self.consume(step); }
         }
         self.process_samples(|sampler, emit| sampler.finish(emit));
         self.release_controls(Some(cutoff), cutoff, true);
         self.controls.close_interval(cutoff);
         self.physical.invalidate();
-        self.gate.boundary(cutoff, boundary, Selection::All);
+        let hook_before = self.elevated_hook_loss();
+        if let Some(before) = certificate {
+            self.gate.retain_prefix(before, hook_before, &mut self.provisional);
+        }
+        if hook_before.is_some() {
+            self.gate.boundary(close_at, HeldBoundary::HookUnavailable, Selection::All);
+        }
+        self.gate.boundary(close_at, boundary, Selection::All);
         for input in self.matcher.discard() {
             if let Some(observation) = input.observation {
                 self.provisional.resolve(observation, InputResolution::Dropped(DropReason::AdmissionClosed));
@@ -319,12 +490,25 @@ impl Receiver {
         self.overflow || self.gate.overflowed()
     }
 
+    pub fn elevated_hook_cutoff(&self) -> Option<(VisitBinding, QpcTick)> {
+        self.source.zip(self.hook_health.lost_before())
+    }
+
+    pub fn elevated_hook_loss(&self) -> Option<QpcTick> {
+        self.source.and_then(|_| self.hook_health.lost_before())
+    }
+
+    pub fn frame_before(&self) -> Option<SessionTimeUs> {
+        self.matcher.unresolved_before()
+    }
+
     pub fn take_hook_reports(&mut self) -> [Option<Producer>; 2] {
         self.hook_health.take_reports()
     }
 
     pub fn hook_loss(&self) -> (bool, bool) {
-        (self.hook_health.keyboard_lost(), self.hook_health.pointer_lost())
+        (self.past_hook_loss.0 || self.hook_health.keyboard_lost(),
+            self.past_hook_loss.1 || self.hook_health.pointer_lost())
     }
 
     pub fn stalled_producer(&self, at: SessionTimeUs) -> Option<Producer> {
@@ -339,6 +523,19 @@ impl Receiver {
     fn consume(&mut self, step: InputStep) {
         match step {
             InputStep::Record(input) => {
+                // Ordinary handling keeps its original HID and hook boundary order.
+                let elevated = self.source.is_some();
+                if elevated {
+                    self.hook_health.note_correlation(&input);
+                    if self.elevated_hook_loss().is_some() {
+                        for receipt in std::iter::once(&input.first).chain(&input.partners) {
+                            if let Some(id) = receipt.observation {
+                                self.provisional.resolve(id, InputResolution::Dropped(DropReason::AdmissionClosed));
+                            }
+                        }
+                        return;
+                    }
+                }
                 if let InputSample::Hid(report) = &input.first.packet.sample && report.pen_continuity_uncertain() {
                     self.flush_motion();
                     let at = input.first.time.recv_t_us;
@@ -347,10 +544,12 @@ impl Receiver {
                     self.gate.boundary(input.first.time.recv_t_us, HeldBoundary::HidReportUnavailable,
                         Selection::PenDevice(report.device));
                 }
-                let prior_loss = self.hook_loss();
-                self.hook_health.note_correlation(&input);
-                if self.hook_loss() != prior_loss {
-                    self.invalidate(input.first.time.recv_t_us, input.first.time.recv_t_us, HeldBoundary::HookUnavailable);
+                if !elevated {
+                    let prior_loss = (self.hook_health.keyboard_lost(), self.hook_health.pointer_lost());
+                    self.hook_health.note_correlation(&input);
+                    if (self.hook_health.keyboard_lost(), self.hook_health.pointer_lost()) != prior_loss {
+                        self.invalidate(input.first.time.recv_t_us, input.first.time.recv_t_us, HeldBoundary::HookUnavailable);
+                    }
                 }
                 let pointer_lost = self.hook_health.pointer_lost();
                 let normalized = NormalizedInput::new(input, pointer_lost, key_name);
@@ -592,6 +791,7 @@ struct MotionRest {
 struct PrivateRequest {
     envelope: ProvisionalInputObservation,
     decision: Option<SyncSender<stills::Permission>>,
+    deferred_source: Option<VisitBinding>,
     rows: Option<stills::EarlyRows>,
 }
 
@@ -651,7 +851,7 @@ impl ProvisionalRequests {
         });
     }
 
-    fn poll_pointer_rest(&mut self, context: &mut Context<'_>, receipt: Receipt, observed: QpcTick)
+    fn poll_pointer_rest(&mut self, context: &mut Context<'_>, receipt: Receipt, observed: QpcTick, source: Option<VisitBinding>)
         -> Result<(), ProbeError>
     {
         let now = receipt.clock.time(observed).map_err(clock_error)?;
@@ -670,7 +870,7 @@ impl ProvisionalRequests {
         };
         let pointer = context.pointer_query(motion.point, motion.geometry, receipt.clock, observed, None)?;
         endpoint.pointer_rest(stills::Rest { reservation, at: now, admission: motion.admission,
-            geometry: motion.geometry, proof: motion.proof, pointer });
+            geometry: motion.geometry, proof: motion.proof, visit: source, pointer });
         Ok(())
     }
     pub fn choose(&self, input: &crate::capture::input::HeldInput, geometry: Evidence<GeometryId>, proof: ForegroundAtReceipt, kind: ProvisionalInputKind)
@@ -715,18 +915,32 @@ impl ProvisionalRequests {
         }
     }
 
-    fn stage(&mut self, change: ProvisionalInputChange) {
+    fn stage(&mut self, change: ProvisionalInputChange, source: Option<VisitBinding>) {
         match change {
             ProvisionalInputChange::Opened(request) => {
                 let rows = self.rows.as_ref().map(|lane| stills::EarlyRows::reserve(lane, request.time.recv_t_us));
-                let decision = match request.geometry {
-                    Evidence::Observed(id) => self.endpoints.get(&id.monitor).and_then(|owner| owner.open(request)),
-                    _ => None,
-                };
-                self.pending.insert(request.id, PrivateRequest { envelope: request, decision, rows });
+                let decision = if source.is_none() { Self::open(&self.endpoints, request, None) } else { None };
+                self.pending.insert(request.id, PrivateRequest { envelope: request, decision, deferred_source: source, rows });
             }
             ProvisionalInputChange::Dropped(id, reason) => self.resolve(id, InputResolution::Dropped(reason)),
         }
+    }
+
+    fn open_deferred(&mut self, source: VisitBinding, before: SessionTimeUs) {
+        let mut ready: Vec<_> = self.pending.values_mut().filter(|entry| entry.deferred_source == Some(source)
+            && entry.envelope.time.recv_t_us < before).collect();
+        ready.sort_by_key(|entry| (entry.envelope.time.recv_t_us, entry.envelope.id));
+        for entry in ready {
+            entry.deferred_source = None;
+            entry.decision = Self::open(&self.endpoints, entry.envelope, Some(source));
+        }
+    }
+
+    fn open(endpoints: &BTreeMap<MonitorId, stills::Requests>, request: ProvisionalInputObservation, visit: Option<VisitBinding>)
+        -> Option<SyncSender<stills::Permission>>
+    {
+        let Evidence::Observed(geometry) = request.geometry else { return None; };
+        endpoints.get(&geometry.monitor)?.open(request, visit)
     }
 
     pub fn resolve(&mut self, id: ObservationId, resolution: InputResolution) {
@@ -738,7 +952,7 @@ impl ProvisionalRequests {
         }
     }
 
-    fn suppress_synthetic(&mut self, edges: Vec<SyntheticHeldEdge>) {
+    pub(super) fn suppress_synthetic(&mut self, edges: Vec<SyntheticHeldEdge>) {
         self.synthetic_suppressed = self.synthetic_suppressed.saturating_add(edges.len() as u64);
     }
 

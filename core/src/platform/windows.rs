@@ -23,11 +23,10 @@ mod mf;
 mod input;
 pub(crate) use input::on_input_desktop;
 mod input_helper;
+pub(crate) mod elevated;
 pub(crate) mod hotkeys;
 mod context;
 mod clipboard;
-mod export;
-mod drag;
 pub(crate) mod clock;
 
 use std::{collections::BTreeMap, fmt, sync::{atomic::{AtomicBool, Ordering}, mpsc}, thread};
@@ -66,6 +65,7 @@ pub(crate) struct ProbeError {
     stage: &'static str,
     source: Option<core::Error>,
     journal: Option<JournalError>,
+    raw_input_registration: Option<crate::protocol::ipc::RawInputRegistrationMismatch>,
 }
 
 impl fmt::Display for ProbeError {
@@ -89,15 +89,16 @@ impl From<ProbeError> for crate::CaptureError {
         }
         let code = error.source.as_ref().map(|source| source.code().0);
         Self::backend(error.stage, code, error.to_string())
+            .with_raw_input_registration(error.raw_input_registration)
     }
 }
 
 fn stage<T>(result: core::Result<T>, name: &'static str) -> Result<T, ProbeError> {
-    result.map_err(|source| ProbeError { stage: name, source: Some(source), journal: None })
+    result.map_err(|source| ProbeError { stage: name, source: Some(source), journal: None, raw_input_registration: None })
 }
 
 pub(crate) fn unavailable(stage: &'static str) -> ProbeError {
-    ProbeError { stage, source: None, journal: None }
+    ProbeError { stage, source: None, journal: None, raw_input_registration: None }
 }
 
 struct Apartment;
@@ -189,10 +190,12 @@ fn record_with_disk(worker: &WorkerSession, preflight: DiskPreflight, disk: disk
         let mut health: Vec<_> = worker.video_failures_after(0).into_iter().filter(|entry| {
             producer_prefix.as_ref().is_none_or(|prefix| !prefix.video_health.contains(&entry.monitor))
         }).map(|entry| FinalHealth { at: entry.at, failure: entry.failure, monitor: Some(entry.monitor), blind: None }).collect();
-        if let Some(error) = &failure {
+        let source_error = worker.source_failure().map(CaptureError::elevated);
+        if let Some(error) = source_error.as_ref().or(failure.as_ref()) {
             health.push(FinalHealth { at: worker.session_time(), failure: error.failure(), monitor: None, blind: None });
         }
         for input in worker.input_failures() {
+            worker.update_standard_evidence(|evidence| { evidence.blind_reason.get_or_insert(input.reason); });
             let end_t_us = producer_prefix.as_ref().and_then(|prefix| prefix.cutoff)
                 .map(|boundary| boundary.time).or_else(|| worker.session_time()).unwrap_or(input.at);
             let blind = InputBlind { start_t_us: input.at.min(end_t_us), end_t_us, reason: input.reason };
@@ -232,7 +235,19 @@ fn record_with_disk(worker: &WorkerSession, preflight: DiskPreflight, disk: disk
     }
     drop(disk);
     if let Some(operation) = required_finalization_failure {
-        failure.get_or_insert_with(|| unavailable(operation).into());
+        let error = CaptureError::from(unavailable(operation));
+        if failure.is_some() {
+            diagnostics.additional_failures.push(error.failure());
+        } else {
+            failure = Some(error);
+        }
+    }
+    if let Some(source) = worker.source_failure() {
+        if let Some(previous) = failure.replace(CaptureError::elevated(source))
+            && previous.source_failure() != Some(source)
+        {
+            diagnostics.additional_failures.push(previous.failure());
+        }
     }
     if let Some(operation) = worker.controller_failure() {
         failure.get_or_insert_with(|| unavailable(operation).into());
@@ -247,16 +262,29 @@ fn record_with_disk(worker: &WorkerSession, preflight: DiskPreflight, disk: disk
     diagnostics.video = video.iter().map(|monitor| (monitor.monitor, monitor.counters.clone())).collect();
     diagnostics.png = png.clone();
     diagnostics.session_time_us = worker.session_time();
+    diagnostics.source_evidence = worker.source_evidence();
+    metadata.set_source_evidence(diagnostics.source_evidence.clone());
     metadata.set_monitor_capture(monitor_capture, monitor_epochs);
     metadata.set_clock(worker.attempt_clock());
     metadata.set_png(png);
     let publication = metadata.finish_recording(
         failed_step, streams, video, || worker.stop_deadline(), || worker.authorize_complete_publication(),
     ).map_err(package_error);
-    if let Some(error) = failure {
+    if let Some(mut error) = failure {
+        let saved = matches!(&publication, Ok(CaptureDisposition::Failed));
+        diagnostics.failed_manifest_published = Some(saved);
+        if let Err(publication_error) = publication {
+            diagnostics.additional_failures.push(publication_error.failure());
+        }
+        if saved && error.source_failure().is_some_and(|source| source.admitted) {
+            error = error.with_retained_recording(layout.root().to_owned(), frame_count);
+        }
         return Err(error.with_context(diagnostics));
     }
-    let outcome = publication.map_err(|error| error.with_context(diagnostics))?;
+    let outcome = match publication {
+        Ok(outcome) => outcome,
+        Err(error) => return Err(error.with_context(diagnostics)),
+    };
     let root = layout.root().display();
     let mut message = match outcome {
         CaptureDisposition::VideoUnavailable => {
@@ -278,6 +306,11 @@ fn record_with_disk(worker: &WorkerSession, preflight: DiskPreflight, disk: disk
         CaptureDisposition::Pending | CaptureDisposition::Failed =>
             return Err(unavailable("The recording manifest has an unexpected final disposition").into()),
     };
+    if let Some(summary) = diagnostics.source_evidence.as_ref().map(|evidence| evidence.summary()) {
+        if let Some(mode) = summary.mode_label() {
+            message.push_str(&format!("\nCapture source: {mode}."));
+        }
+    }
     if worker.input_failure().is_some() {
         message.push_str("\nInput capture was degraded.");
         if let Some(report) = worker.input_report() {
@@ -320,7 +353,7 @@ pub(super) fn package_journal_error(error: JournalError) -> ProbeError {
         JournalStep::OsFlush => "Flush the journal to disk",
         JournalStep::Close => "Close the journal",
     };
-    ProbeError { stage: step, source: None, journal: Some(error) }
+    ProbeError { stage: step, source: None, journal: Some(error), raw_input_registration: None }
 }
 
 struct RecordedVideo {
@@ -397,7 +430,6 @@ fn record(
         let reports = reporter.is_ok().then_some(reports);
         let mut owners = Vec::new();
         let mut readiness = Vec::new();
-        let mut endpoints = Vec::new();
         let mut still_endpoints = BTreeMap::new();
         let frames = &frames;
         let mut startup_error = None;
@@ -425,8 +457,7 @@ fn record(
         if startup_error.is_none() {
             for ready in readiness {
                 match ready.recv() {
-                    Ok(monitor::Ready { capture, readback, stills }) => {
-                        endpoints.push(readback);
+                    Ok(monitor::Ready { capture, stills }) => {
                         still_endpoints.insert(capture.geometry.id.monitor, stills);
                         monitor_capture.push(capture);
                     }
@@ -499,7 +530,6 @@ fn record(
             // A failed or prematurely closed report worker cannot claim a path.
             worker.set_video_report(failure.monitor, ReportOutcome::Unavailable { native_code: None });
         }
-        drop(endpoints);
         drop(still_rows);
         drop(lanes);
         drop(png);
@@ -531,12 +561,6 @@ impl Drop for TopologyStop<'_> {
     fn drop(&mut self) { self.0.store(true, Ordering::Release); }
 }
 
-pub(crate) fn export_session(folder: &std::path::Path) -> Result<std::path::PathBuf, ProbeError> {
-    let _apartment = Apartment::initialize()?;
-    let _media_foundation = mf::Runtime::initialize()?;
-    export::run(folder)
-}
-
 fn capture_device(adapter: &IDXGIAdapter1) -> Result<ID3D11Device, ProbeError> {
     let mut device: Option<ID3D11Device> = None;
     // An explicit adapter requires DRIVER_TYPE_UNKNOWN.
@@ -551,7 +575,8 @@ fn capture_device(adapter: &IDXGIAdapter1) -> Result<ID3D11Device, ProbeError> {
     let context = stage(unsafe { device.GetImmediateContext() }, "Get the D3D11 context")?;
     let multithread: ID3D11Multithread = stage(context.cast(), "Protect the shared D3D11 context")?;
     // The video encoder uses its own device. Protect contexts used by a native callback.
-    unsafe { multithread.SetMultithreadProtected(true) };
+    // The return value reports the previous protection state.
+    let _ = unsafe { multithread.SetMultithreadProtected(true) };
     Ok(device)
 }
 

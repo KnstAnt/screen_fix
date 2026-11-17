@@ -7,6 +7,7 @@ pub mod diagnostics;
 pub(crate) mod journal;
 mod reader;
 pub use journal::StreamSummary;
+pub use reader::SourceSummary;
 
 use crate::protocol::{AttemptId, MonitorId, SegmentId, StreamId};
 

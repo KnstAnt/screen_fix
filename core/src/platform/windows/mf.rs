@@ -25,9 +25,7 @@ type CreateTrackedSample = unsafe extern "system" fn(*mut Option<IMFTrackedSampl
 type EnumOnAdapter = unsafe extern "system" fn(GUID, u32, *const MFT_REGISTER_TYPE_INFO, *const MFT_REGISTER_TYPE_INFO, *mut c_void, *mut *mut Option<IMFActivate>, *mut u32) -> HRESULT;
 type CreateFile = unsafe extern "system" fn(i32, i32, i32, PCWSTR, *mut Option<IMFByteStream>) -> HRESULT;
 type CreateStreamReader = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut Option<IMFSourceReader>) -> HRESULT;
-type CreateReader = unsafe extern "system" fn(PCWSTR, *mut c_void, *mut Option<IMFSourceReader>) -> HRESULT;
 type CreateWriter = unsafe extern "system" fn(PCWSTR, *mut c_void, *mut c_void, *mut Option<IMFSinkWriter>) -> HRESULT;
-type GetStride = unsafe extern "system" fn(u32, u32, *mut i32) -> HRESULT;
 
 struct Functions {
     startup: Startup,
@@ -40,11 +38,9 @@ struct Functions {
     sample: CreateSample,
     buffer: CreateBuffer,
     enum_on_adapter: Option<EnumOnAdapter>,
-    reader: CreateReader,
     open_file: CreateFile,
     stream_reader: CreateStreamReader,
     writer: CreateWriter,
-    stride: GetStride,
 }
 
 #[derive(Clone, Copy)]
@@ -84,9 +80,7 @@ impl Functions {
             enum_on_adapter: optional!(platform, MFTEnum2, EnumOnAdapter),
             open_file: required!(platform, MFCreateFile, CreateFile),
             stream_reader: required!(read_write, MFCreateSourceReaderFromByteStream, CreateStreamReader),
-            reader: required!(read_write, MFCreateSourceReaderFromURL, CreateReader),
             writer: required!(read_write, MFCreateSinkWriterFromURL, CreateWriter),
-            stride: required!(platform, MFGetStrideForBitmapInfoHeader, GetStride),
         })
     }
 }
@@ -107,6 +101,7 @@ fn functions() -> Result<&'static Functions, ProbeError> {
             stage: error.operation,
             source: Some(error.code.into()),
             journal: None,
+            raw_input_registration: None,
         })
 }
 
@@ -197,16 +192,6 @@ pub(super) fn enum_on_adapter(
     Ok(result)
 }
 
-pub(super) fn source_reader(
-    url: PCWSTR, attributes: Option<&IMFAttributes>,
-) -> Result<IMFSourceReader, ProbeError> {
-    use windows::core::Interface;
-    let api = functions()?;
-    create("Open the Media Foundation video reader", |out| unsafe {
-        (api.reader)(url, attributes.map_or(std::ptr::null_mut(), Interface::as_raw), out)
-    })
-}
-
 pub(super) fn mp4_part_reader(url: PCWSTR) -> Result<IMFSourceReader, ProbeError> {
     use windows::core::Interface;
     let api = functions()?;
@@ -233,11 +218,4 @@ pub(super) fn sink_writer(
     create("Open the Media Foundation video writer", |out| unsafe {
         (api.writer)(url, std::ptr::null_mut(), attributes.map_or(std::ptr::null_mut(), Interface::as_raw), out)
     })
-}
-
-pub(super) fn bitmap_stride(format: u32, width: u32) -> Result<i32, ProbeError> {
-    let api = functions()?;
-    let mut stride = 0;
-    stage(unsafe { (api.stride)(format, width, &mut stride).ok() }, "Read the bitmap stride")?;
-    Ok(stride)
 }

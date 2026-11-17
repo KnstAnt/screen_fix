@@ -114,19 +114,6 @@ pub enum CaptureDisposition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Timeline {
-    pub qpc_at_start: i64,
-    pub qpc_frequency: i64,
-    pub qpc_uncertainty_100ns: i64,
-    pub video_origin_100ns: i64,
-    pub stop_100ns: i64,
-    #[serde(default)]
-    pub common_clock_schema: Option<u32>,
-    #[serde(default)]
-    pub utc_anchors: Vec<UtcAnchor>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Geometry {
     pub display_id: String,
     pub desktop_rect: [i32; 4],
@@ -136,15 +123,6 @@ pub struct Geometry {
     pub content_rect: Option<[u32; 4]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_scale: Option<f64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct VideoSummary {
-    pub monitor: MonitorId,
-    pub segment: SegmentId,
-    pub frame_count: usize,
-    pub timeline: Timeline,
-    pub geometry: Geometry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,7 +215,7 @@ pub struct CaptureCounters {
     pub mismatched_size: u64,
     pub native_pressure: u64,
     pub thumbnail_pressure: u64,
-    #[serde(default, alias = "legacy_video_pressure")]
+    #[serde(default)]
     pub video_pressure: u64,
 }
 
@@ -294,6 +272,112 @@ pub enum InputPublication {
 pub struct UncertifiedInputTail {
     pub first_t_us: crate::protocol::SessionTimeUs,
     pub cutoff_t_us: crate::protocol::SessionTimeUs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<InputTailReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputTailReason {
+    ProducerProgress,
+    ElevatedCoverage,
+    ActivationPending,
+    RequiredHook,
+    SourceFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectedSourceKind {
+    Ordinary,
+    Elevated,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SelectedSourceInterval {
+    pub source: SelectedSourceKind,
+    pub epoch: crate::protocol::AdmissionEpoch,
+    /// The elevated collector's source generation, without process or window identifiers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_generation: Option<std::num::NonZeroU64>,
+    pub start_t_us: crate::protocol::SessionTimeUs,
+    /// Exclusive upper bound on the Recorder's retained source coverage.
+    pub before_t_us: crate::protocol::SessionTimeUs,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SourceTail {
+    pub epoch: crate::protocol::AdmissionEpoch,
+    pub tail: UncertifiedInputTail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceBlindReason {
+    ElevationTransition,
+    ElevatedOpening(crate::protocol::ipc::elevated::runtime::CoverageReason),
+    FocusSuspended,
+    RecorderStaging,
+    SourceFailure,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SourceBlindInterval {
+    pub epoch: crate::protocol::AdmissionEpoch,
+    pub start_t_us: crate::protocol::SessionTimeUs,
+    pub before_t_us: crate::protocol::SessionTimeUs,
+    pub reason: SourceBlindReason,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SourceEvidence {
+    /// The ordinary selected source uses the inherited shared-memory channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standard: Option<StandardSourceEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elevated: Option<ElevatedSourceEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<crate::session::SourceFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_failure: Option<crate::session::SourceFailure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intervals: Vec<SelectedSourceInterval>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncertified_tails: Vec<SourceTail>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blind: Vec<SourceBlindInterval>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StandardSourceEvidence {
+    pub launched: bool,
+    pub registration_reported: bool,
+    pub required_registration_ready: bool,
+    pub stopped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blind_reason: Option<InputBlindReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inactive_transport_failure: Option<InputBlindReason>,
+}
+
+/// Recorder-side milestones from protected launch, lane authentication and native registration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ElevatedSourceEvidence {
+    pub requested: bool,
+    pub authenticated: bool,
+    pub configured: bool,
+    pub stopped: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registrations: Vec<SourceRegistration>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SourceRegistration {
+    pub epoch: crate::protocol::AdmissionEpoch,
+    pub observed_qpc: crate::protocol::QpcTick,
+    pub registration: crate::protocol::ipc::InputRegistration,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -410,14 +494,14 @@ pub struct AttemptManifest {
     pub monitor_epochs: Vec<MonitorCapture>,
     pub failed_step: Option<String>,
     pub streams: std::collections::BTreeMap<StreamId, StreamSummary>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transitional_video: Option<VideoSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub monitor_video: Vec<MonitorVideo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_capture: Option<InputCapture>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_registration: Option<crate::protocol::ipc::InputRegistration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_evidence: Option<SourceEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub png: Option<PngCounters>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -540,7 +624,7 @@ impl MetadataOwner {
                 state: PackageState::Incomplete, capture: CaptureDisposition::Pending,
                 selected_displays: config.monitors().iter().map(|selected| selected.id).collect(),
                 profile: Some(config.into()), clock: None, os: Some(os), monitor_capture: Vec::new(), monitor_epochs: Vec::new(), failed_step: None,
-                streams: Default::default(), transitional_video: None, monitor_video: Vec::new(), input_capture: None, input_registration: None, png: None,
+                streams: Default::default(), monitor_video: Vec::new(), input_capture: None, input_registration: None, source_evidence: None, png: None,
                 disk_preflight: Some(disk),
             },
             layout,
@@ -580,6 +664,14 @@ impl MetadataOwner {
 
     pub(crate) fn set_png(&mut self, png: Option<PngCounters>) {
         self.manifest.png = png;
+    }
+
+    pub(crate) fn set_source_evidence(&mut self, evidence: Option<SourceEvidence>) {
+        self.manifest.source_evidence = evidence.map(|mut evidence| {
+            evidence.failure = evidence.failure.map(crate::session::SourceFailure::without_report_detail);
+            evidence.cleanup_failure = evidence.cleanup_failure.map(crate::session::SourceFailure::without_report_detail);
+            evidence
+        });
     }
 
     pub(crate) fn set_input_capture(
@@ -700,7 +792,7 @@ fn replace_manifest(
     fs::rename(pending, manifest)
 }
 
-/// Read-only view of an M1 attempt. Legacy exports retain their own versioned reader.
+/// Read-only view of a v5 attempt.
 pub struct PackageReader {
     layout: AttemptLayout,
     manifest: AttemptManifest,
@@ -720,7 +812,7 @@ impl PackageReader {
         struct Version { version: u16 }
         let decode_error = |error: serde_json::Error| PackageError::io(PackageOperation::ReadManifest, error.into());
         let version = serde_json::from_slice::<Version>(&bytes).map_err(decode_error)?.version;
-        if version != 4 && version != MANIFEST_VERSION {
+        if version != MANIFEST_VERSION {
             return Err(PackageError::UnsupportedVersion(version));
         }
         let manifest: AttemptManifest = serde_json::from_slice(&bytes).map_err(decode_error)?;
@@ -732,7 +824,10 @@ impl PackageReader {
         {
             return Err(PackageError::InvalidManifest);
         }
-        if manifest.version == MANIFEST_VERSION && manifest.state == PackageState::Complete && manifest.profile.is_some() {
+        if let Some(source) = &manifest.source_evidence {
+            source.validate(manifest.clock.as_ref().and_then(|clock| clock.stop.map(|stop| stop.time)))?;
+        }
+        if manifest.state == PackageState::Complete && manifest.profile.is_some() {
             manifest.validate_recorded_inventory()?;
         }
         let layout = AttemptLayout { id: manifest.attempt_id.clone(), root: root.to_owned() };
@@ -755,18 +850,16 @@ impl PackageReader {
         if artifact.attempt != self.layout.id {
             return Err(PackageError::WrongAttempt);
         }
-        if self.manifest.version == MANIFEST_VERSION {
-            let listed = match artifact.kind {
-                ArtifactKind::Journal(stream) if self.manifest.state == PackageState::Complete => {
-                    self.manifest.streams.contains_key(&stream)
-                }
-                ArtifactKind::VideoSegment { monitor, segment } => self.manifest.monitor_video.iter()
-                    .any(|video| video.monitor == monitor && video.segments.iter().any(|entry| entry.segment == segment)),
-                _ => true,
-            };
-            if !listed {
-                return Err(PackageError::ArtifactNotInventoried(artifact.kind));
+        let listed = match artifact.kind {
+            ArtifactKind::Journal(stream) if self.manifest.state == PackageState::Complete => {
+                self.manifest.streams.contains_key(&stream)
             }
+            ArtifactKind::VideoSegment { monitor, segment } => self.manifest.monitor_video.iter()
+                .any(|video| video.monitor == monitor && video.segments.iter().any(|entry| entry.segment == segment)),
+            _ => true,
+        };
+        if !listed {
+            return Err(PackageError::ArtifactNotInventoried(artifact.kind));
         }
         Ok(self.layout.path(artifact.kind))
     }

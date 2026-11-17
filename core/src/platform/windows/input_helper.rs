@@ -362,16 +362,21 @@ impl HelperError {
             Self::Windows(_, error) => (InputBlindReason::HelperCommunicationFailed, error.raw_os_error()),
             _ => (InputBlindReason::HelperCommunicationFailed, None),
         };
-        let operation = super::ProbeError::from(self).stage;
-        InputFailure {
-            operation, at, reason, failure: Failure::new(FailureComponent::InputHelper, operation, native_code),
-        }
+        let error = super::ProbeError::from(self);
+        let operation = error.stage;
+        let mut failure = Failure::new(FailureComponent::InputHelper, operation, native_code);
+        failure.raw_input_registration = error.raw_input_registration;
+        InputFailure { operation, at, reason, failure }
     }
 }
 
 impl From<HelperError> for super::ProbeError {
     fn from(error: HelperError) -> Self {
         use windows::core::{Error, HRESULT};
+        let raw_input_registration = match &error {
+            HelperError::Reported(failure) => failure.raw_input_registration,
+            _ => None,
+        };
         let (stage, code) = match error {
             HelperError::Missing => ("The installed screen-fix-input-helper.exe is missing", None),
             HelperError::Windows(stage, error) => (stage, error.raw_os_error()),
@@ -415,6 +420,7 @@ impl From<HelperError> for super::ProbeError {
             stage,
             source: code.map(|code| Error::from_hresult(HRESULT::from_win32(code as u32))),
             journal: None,
+            raw_input_registration,
         }
     }
 }

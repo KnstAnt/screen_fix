@@ -27,9 +27,9 @@ pub enum FailureComponent {
     WindowsCapture,
     Video,
     InputHelper,
+    ElevatedSource,
     PackageMetadata,
     Journal,
-    Postprocess,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -38,15 +38,25 @@ pub struct Failure {
     operation: &'static str,
     stream: Option<StreamId>,
     native_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<crate::session::SourceFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) raw_input_registration: Option<crate::protocol::ipc::RawInputRegistrationMismatch>,
 }
 
 impl Failure {
+    pub(crate) fn without_report_detail(mut self) -> Self {
+        self.raw_input_registration = None;
+        self.source = self.source.map(crate::session::SourceFailure::without_report_detail);
+        self
+    }
+
     pub fn new(component: FailureComponent, operation: &'static str, native_code: Option<i32>) -> Self {
-        Self { component, operation, stream: None, native_code }
+        Self { component, operation, stream: None, native_code, source: None, raw_input_registration: None }
     }
 
     pub(crate) fn journal(operation: &'static str, stream: StreamId, native_code: Option<i32>) -> Self {
-        Self { component: FailureComponent::Journal, operation, stream: Some(stream), native_code }
+        Self { component: FailureComponent::Journal, operation, stream: Some(stream), native_code, source: None, raw_input_registration: None }
     }
 }
 
@@ -71,6 +81,12 @@ pub(crate) struct DiagnosticContext {
     pub(crate) png: Option<PngCounters>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) input_registration: Option<crate::protocol::ipc::InputRegistration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source_evidence: Option<super::metadata::SourceEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) failed_manifest_published: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) additional_failures: Vec<Failure>,
 }
 
 impl DiagnosticContext {
@@ -93,6 +109,9 @@ impl DiagnosticContext {
             video: Vec::new(),
             png: None,
             input_registration: None,
+            source_evidence: None,
+            failed_manifest_published: None,
+            additional_failures: Vec::new(),
         }
     }
 }

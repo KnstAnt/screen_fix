@@ -1,7 +1,7 @@
 pub use screen_fix_protocol as protocol;
 
 mod error;
-pub use error::{CaptureError, CaptureErrorKind};
+pub use error::{CaptureError, CaptureErrorKind, RetainedRecording};
 
 pub mod capture;
 pub mod config;

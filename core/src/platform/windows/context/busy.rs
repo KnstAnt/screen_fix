@@ -52,7 +52,8 @@ impl Busy {
     }
 
     pub fn refresh(
-        &mut self, visit: Option<Visit>, process_hung: bool, target: Option<TextTarget>, notices: &[Notice], at: QpcTick, clock: ClockOrigin,
+        &mut self, visit: Option<Visit>, process_hung: bool, target: Option<TextTarget>, notices: &[Notice],
+        scoped_owned_or_disabled: bool, at: QpcTick, clock: ClockOrigin,
     ) -> Option<Option<BusyHint>> {
         let generation = visit.map(|value| value.generation);
         if generation != self.generation {
@@ -67,10 +68,10 @@ impl Busy {
             let now = Instant::now();
             self.consume(visit, notices, now);
             let flags = visit.native.map_or(0, |snapshot| snapshot.gui_flags);
-            let owned_window = owned_by_process(visit.foreground, visit)
+            let local_window_hint = !visit.is_elevated() && (owned_by_process(visit.foreground, visit)
                 || self.owned.iter().any(|window| owned_by_process(*window, visit))
-                || self.dialog.is_some_and(|until| now < until)
-                || unsafe { IsWindowEnabled(visit.foreground.hwnd().0) } == 0;
+                || unsafe { IsWindowEnabled(visit.foreground.hwnd().0) } == 0);
+            let owned_window = scoped_owned_or_disabled || local_window_hint || self.dialog.is_some_and(|until| now < until);
             let menu_loop = flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE | GUI_SYSTEMMENUMODE) != 0;
             let moving = flags & GUI_INMOVESIZE != 0;
             if visit.native.is_some() {
@@ -112,16 +113,18 @@ impl Busy {
             {
                 continue;
             }
-            let window = ::windows::Win32::Foundation::HWND(notice.window.0 as usize as *mut _);
-            let Some(window) = WindowProcess::read(window).filter(|window| window.process == visit.foreground.process) else { continue };
-            if notice.thread != 0 && window.thread.get() != notice.thread {
-                continue;
-            }
-            match notice.event {
-                EVENT_OBJECT_SHOW if owned_by_process(window, visit) && !self.owned.contains(&window) => {
+            if visit.is_elevated() {
+                if notice.window != visit.foreground.window || notice.thread != visit.foreground.thread.get() { continue; }
+            } else {
+                let window = ::windows::Win32::Foundation::HWND(notice.window.0 as usize as *mut _);
+                let Some(window) = WindowProcess::read(window).filter(|window| window.process == visit.foreground.process) else { continue };
+                if notice.thread != 0 && window.thread.get() != notice.thread { continue; }
+                if notice.event == EVENT_OBJECT_SHOW && owned_by_process(window, visit) && !self.owned.contains(&window) {
                     if self.owned.len() == OWNED_WINDOW_LIMIT { self.owned.pop_front(); }
                     self.owned.push_back(window);
                 }
+            }
+            match notice.event {
                 EVENT_SYSTEM_DIALOGSTART => self.dialog = Some(now + HINT_AGE),
                 EVENT_SYSTEM_DIALOGEND => self.dialog = None,
                 EVENT_SYSTEM_MENUSTART | EVENT_SYSTEM_MENUPOPUPSTART => self.menu = Some(now + HINT_AGE),
@@ -133,7 +136,7 @@ impl Busy {
                 _ => {}
             }
         }
-        self.owned.retain(|window| owned_by_process(*window, visit));
+        if !visit.is_elevated() { self.owned.retain(|window| owned_by_process(*window, visit)); }
     }
 }
 

@@ -140,6 +140,10 @@ impl InputMatcher {
         }
     }
 
+    pub fn reopen(&mut self) {
+        *self = Self { next_id: self.next_id, ..Self::new() };
+    }
+
     pub fn progress(&mut self, producer: Producer, before: SessionTimeUs) {
         self.bounds[producer_index(producer)] = Some(before);
     }
@@ -248,7 +252,6 @@ impl InputMatcher {
             };
             let observation = kind.map(|kind| ProvisionalInputObservation {
                 id: ObservationId(id.0),
-                input: id,
                 admission,
                 time,
                 kind,

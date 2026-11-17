@@ -1,7 +1,7 @@
 //! Streaming inspection of closed v5 evidence. Inspection never modifies an attempt.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{self, BufRead, Read},
 };
 
@@ -15,7 +15,8 @@ use crate::protocol::{
 use super::{
     ArtifactKind, ArtifactRef,
     journal::MAX_ROW_BYTES,
-    metadata::{MANIFEST_VERSION, PackageError, PackageOperation, PackageReader, PackageResult, PackageState},
+    metadata::{PackageError, PackageOperation, PackageReader, PackageResult, PackageState,
+        SelectedSourceKind, SourceEvidence},
 };
 
 const STREAMS: [StreamId; 4] = [StreamId::Input, StreamId::Context, StreamId::Frames, StreamId::Stills];
@@ -43,14 +44,92 @@ struct FrameRow {
     reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SourceSummary {
+    pub standard_intervals: usize,
+    pub enhanced_intervals: usize,
+    pub standard_coverage_us: u64,
+    pub enhanced_coverage_us: u64,
+    pub blind_intervals: usize,
+    pub uncertified_tails: usize,
+    pub failure: Option<crate::session::SourceFailure>,
+    pub cleanup_failure: Option<crate::session::SourceFailure>,
+    pub truncated: bool,
+}
+
+impl SourceSummary {
+    pub fn mode_label(&self) -> Option<&'static str> {
+        match (self.standard_intervals != 0, self.enhanced_intervals != 0) {
+            (true, true) => Some("standard and enhanced capture"),
+            (true, false) => Some("standard capture"),
+            (false, true) => Some("enhanced capture"),
+            (false, false) => None,
+        }
+    }
+}
+
+impl SourceEvidence {
+    pub fn summary(&self) -> SourceSummary {
+        let mut summary = SourceSummary {
+            standard_intervals: 0, enhanced_intervals: 0, standard_coverage_us: 0, enhanced_coverage_us: 0,
+            blind_intervals: self.blind.len(), uncertified_tails: self.uncertified_tails.len(),
+            failure: self.failure, cleanup_failure: self.cleanup_failure, truncated: self.truncated,
+        };
+        for interval in &self.intervals {
+            let duration = u64::try_from(interval.before_t_us.0.saturating_sub(interval.start_t_us.0)).unwrap_or(0);
+            match interval.source {
+                SelectedSourceKind::Ordinary => {
+                    summary.standard_intervals += 1;
+                    summary.standard_coverage_us = summary.standard_coverage_us.saturating_add(duration);
+                }
+                SelectedSourceKind::Elevated => {
+                    summary.enhanced_intervals += 1;
+                    summary.enhanced_coverage_us = summary.enhanced_coverage_us.saturating_add(duration);
+                }
+            }
+        }
+        summary
+    }
+
+    pub(super) fn validate(&self, stop: Option<SessionTimeUs>) -> PackageResult<()> {
+        let valid_bound = |start: SessionTimeUs, before: SessionTimeUs| {
+            start.0 >= 0 && start < before && stop.is_none_or(|end| before <= end)
+        };
+        let registrations: BTreeSet<_> = self.elevated.iter()
+            .flat_map(|source| source.registrations.iter().map(|entry| entry.epoch.0)).collect();
+        if self.intervals.iter().any(|interval| {
+            interval.epoch.0 == 0 || !valid_bound(interval.start_t_us, interval.before_t_us)
+                || (interval.source == SelectedSourceKind::Elevated) != interval.source_generation.is_some()
+                || (interval.source == SelectedSourceKind::Elevated && !self.truncated
+                    && !registrations.contains(&interval.epoch.0))
+        }) || self.intervals.windows(2).any(|pair| {
+            pair[0].epoch.0 > pair[1].epoch.0 || pair[0].before_t_us > pair[1].start_t_us
+        }) || self.blind.iter().any(|interval| {
+            interval.epoch.0 == 0 || !valid_bound(interval.start_t_us, interval.before_t_us)
+        }) || self.uncertified_tails.iter().any(|entry| {
+            entry.epoch.0 == 0 || entry.tail.first_t_us.0 < 0 || entry.tail.first_t_us > entry.tail.cutoff_t_us
+                || stop.is_some_and(|end| entry.tail.cutoff_t_us > end)
+        }) || self.elevated.as_ref().is_some_and(|elevated| {
+            (elevated.authenticated && !elevated.requested)
+                || ((elevated.configured || elevated.stopped || !elevated.registrations.is_empty()) && !elevated.authenticated)
+                || elevated.registrations.iter().any(|entry| entry.epoch.0 == 0)
+        }) {
+            return Err(PackageError::InvalidManifest);
+        }
+        Ok(())
+    }
+}
+
 impl PackageReader {
+    /// The source timeline is optional.
+    pub fn source_summary(&self) -> Option<SourceSummary> {
+        self.manifest().source_evidence.as_ref().map(SourceEvidence::summary)
+    }
+
     /// Inspect listed JSONL journals and media references with one bounded line at a time.
     /// MP4 decode/PTS validation is performed by the segment owner before publication.
     /// Incomplete attempts can lack summaries for journals that failed to close.
     pub fn validate_v5_artifacts(&self) -> PackageResult<()> {
-        if self.manifest().version != MANIFEST_VERSION {
-            return Err(PackageError::UnsupportedVersion(self.manifest().version));
-        }
         let manifest = self.manifest();
         let strict = manifest.state == PackageState::Complete && manifest.profile.is_some();
         let mut segments = BTreeMap::new();

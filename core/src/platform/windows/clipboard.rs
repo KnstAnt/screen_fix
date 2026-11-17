@@ -29,7 +29,7 @@ use windows::{
     core::w,
 };
 
-use crate::protocol::{MessageTickMs, QpcTick};
+use crate::{protocol::{MessageTickMs, QpcTick}, session::windows::ActiveSourceProof};
 
 use super::{
     ProbeError, clock, context::{FocusGuard, Visit, identity::WindowProcess},
@@ -40,7 +40,7 @@ const QUEUE: usize = 8;
 const MAX_BYTES: usize = 64 * 1024;
 pub(super) const MAX_AGE: Duration = Duration::from_millis(500);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct Notice {
     pub sequence: u32,
     pub source_tick: MessageTickMs,
@@ -53,12 +53,31 @@ pub(super) struct Notice {
 struct Grant {
     notice: Notice,
     visit: Visit,
-    focus: FocusGuard,
+    focus: Authorization,
+}
+
+enum Authorization {
+    Ordinary(FocusGuard),
+    Elevated { live: Arc<AtomicBool>, until: QpcTick, source: ActiveSourceProof },
+}
+
+pub(super) struct Permit {
+    live: Arc<AtomicBool>,
+    until: QpcTick,
+}
+
+impl Permit {
+    pub fn until(&self) -> QpcTick { self.until }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) { self.live.store(false, Release); }
 }
 
 pub(super) struct Read {
     pub notice: Notice,
     pub visit: Visit,
+    pub started: QpcTick,
     pub completed: QpcTick,
     pub text: String,
 }
@@ -133,9 +152,19 @@ impl Worker {
     }
 
     pub fn grant(&self, notice: Notice, visit: Visit, focus: FocusGuard) {
-        if self.grants.try_send(Grant { notice, visit, focus }).is_ok() {
-            self.thread.thread().unpark();
-        }
+        let _ = self.submit(Grant { notice, visit, focus: Authorization::Ordinary(focus) });
+    }
+
+    pub fn grant_elevated(&self, notice: Notice, visit: Visit, until: QpcTick, source: ActiveSourceProof) -> Option<Permit> {
+        let live = Arc::new(AtomicBool::new(true));
+        let focus = Authorization::Elevated { live: Arc::clone(&live), until, source };
+        self.submit(Grant { notice, visit, focus }).then_some(Permit { live, until })
+    }
+
+    fn submit(&self, grant: Grant) -> bool {
+        if self.grants.try_send(grant).is_err() { return false; }
+        self.thread.thread().unpark();
+        true
     }
 
     pub fn results(&self) -> impl Iterator<Item = Read> + '_ {
@@ -194,6 +223,7 @@ impl ClipboardWindow {
     }
 
     fn read(&self, grant: Grant) -> Option<Read> {
+        let started = clock::qpc().ok()?;
         if !valid(&grant) || unsafe { OpenClipboard(Some(self.0)) }.is_err() {
             return None;
         }
@@ -218,7 +248,7 @@ impl ClipboardWindow {
         }
         drop(clipboard);
         let completed = clock::qpc().ok()?;
-        Some(Read { notice: grant.notice, visit: grant.visit, completed, text })
+        Some(Read { notice: grant.notice, visit: grant.visit, started, completed, text })
     }
 
     fn excluded(&self) -> bool {
@@ -272,12 +302,20 @@ fn read_global<T>(memory: HGLOBAL, max: usize, read: impl FnOnce(&[u8]) -> Optio
     read(unsafe { std::slice::from_raw_parts(pointer, bytes) })
 }
 
-fn valid(grant: &Grant) -> bool {
-    let notice = grant.notice;
-    grant.focus.current() && notice.observed.elapsed() < MAX_AGE
+pub(super) fn notice_current(notice: Notice, visit: Visit) -> bool {
+    notice.observed.elapsed() < MAX_AGE
         && unsafe { GetClipboardSequenceNumber() } == notice.sequence
         && clipboard_owner() == Some(notice.owner)
-        && WindowProcess::foreground() == Some(grant.visit.foreground)
-        && grant.visit.foreground == notice.foreground
-        && grant.visit.clipboard_focus_is_current()
+        && WindowProcess::foreground() == Some(visit.foreground)
+        && visit.foreground == notice.foreground
+}
+
+fn valid(grant: &Grant) -> bool {
+    let authorized = match &grant.focus {
+        Authorization::Ordinary(focus) => focus.current() && grant.visit.clipboard_focus_is_current(),
+        Authorization::Elevated { live, until, source } => live.load(Acquire) && source.current()
+            && clock::qpc().is_ok_and(|now| now < *until)
+            && grant.visit.elevated_clipboard_focus_is_current(),
+    };
+    authorized && notice_current(grant.notice, grant.visit)
 }

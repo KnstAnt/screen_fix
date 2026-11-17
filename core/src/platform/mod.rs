@@ -1,4 +1,5 @@
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "windows")]
+use std::path::Path;
 
 use crate::{CaptureError, config::DisplayKey};
 
@@ -7,6 +8,9 @@ use crate::{config::ResolvedCaptureConfig, session::SessionHandle};
 
 #[cfg(target_os = "windows")]
 pub(crate) mod windows;
+
+#[cfg(target_os = "windows")]
+pub use screen_fix_elevated::restrict_dll_search as restrict_release_dll_search;
 
 pub const VIDEO_RECORDING_AVAILABLE: bool = cfg!(target_os = "windows");
 
@@ -94,15 +98,4 @@ pub fn start_recording_with_hotkeys(
         return Err(CaptureError::backend("Register recorder hotkeys", None, "The recorder hotkey owner is unavailable.".into()));
     }
     controller::spawn(config, hotkeys.claim()?, trigger, windows::record_attempt)
-}
-
-pub fn export_session(_folder: &Path) -> Result<PathBuf, CaptureError> {
-    #[cfg(target_os = "windows")]
-    {
-        windows::export_session(_folder).map_err(Into::into)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        Err(CaptureError::unsupported("Export a session", "Session export is unavailable on this platform."))
-    }
 }

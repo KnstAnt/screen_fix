@@ -582,7 +582,7 @@ impl JournalFile {
             "kind": "health",
             "recv_t_us": at,
             "source_t_us": null,
-            "failure": health.failure,
+            "failure": health.failure.without_report_detail(),
             "monitor": health.monitor,
             "detected_t_us": health.at,
         })).map_err(|err| self.error(JournalStep::Encode, Some(err.into())))?;

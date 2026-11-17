@@ -1,13 +1,11 @@
-use std::{collections::BTreeSet, mem::{size_of, size_of_val}, num::NonZeroU32, os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle}, path::Path, ptr::null_mut};
+use std::{collections::BTreeSet, mem::{size_of, size_of_val}, num::NonZeroU32, os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle}, path::Path};
 
+use screen_fix_elevated::{ForegroundAccess, foreground_access};
+use screen_fix_protocol::ipc::elevated::{ImagePath, runtime::{ApprovalKey, IdentityClaim}};
 use windows::Win32::{Foundation::HWND as NativeWindow, Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute}};
 use windows_sys::Win32::{
     Foundation::{ERROR_NO_MORE_FILES, GetLastError, HWND, INVALID_HANDLE_VALUE, LPARAM, RECT},
-    Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
-    System::{
-        Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS},
-        Threading::OpenProcessToken,
-    },
+    System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS},
     UI::WindowsAndMessaging::{EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible},
 };
 
@@ -18,7 +16,7 @@ use crate::{
     protocol::PhysicalRect,
 };
 
-use super::{context::identity::{ProcessHandle, WindowProcess, canonical_executable, image_name}, display};
+use super::{context::identity::{ProcessHandle, WindowProcess, approved_image_index, approved_index, canonical_executable, image_name}, display};
 
 pub(crate) fn approved_windows(approved: &ExecutableIdentity) -> Result<ApprovedWindows, CaptureError> {
     let displays = display::enumerate()?;
@@ -60,7 +58,7 @@ unsafe extern "system" fn read_window(window: HWND, data: LPARAM) -> i32 {
     };
     let identity = ProcessHandle::open(proof.process.pid)
         .filter(|process| process.instance(proof.process.pid) == Some(proof.process))
-        .ok_or(()).and_then(|process| process.approved_index(scan.approved));
+        .ok_or(()).and_then(|process| approved_index(&process, scan.approved));
     match identity {
         Ok(Some(_)) => {}
         Ok(None) => return 1,
@@ -103,7 +101,7 @@ fn process_candidates(approved: &[ExecutableIdentity]) -> Result<BTreeSet<u32>, 
     let names: BTreeSet<_> = approved.iter().filter_map(|entry| image_name(entry.executable())).collect();
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
-        return Err(error("Windows could not enumerate processes to verify approval and elevation."));
+        return Err(error("Windows could not enumerate processes to verify approval."));
     }
     let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
     let mut entry = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
@@ -136,11 +134,10 @@ pub(super) fn validate_processes(config: &ResolvedCaptureConfig) -> Result<(), C
     let mut found = false;
     for pid in process_candidates(approved)? {
         let process = NonZeroU32::new(pid).and_then(ProcessHandle::open)
-            .ok_or_else(|| error("The identity or elevation of a possible approved application is unknown. Retry after closing it."))?;
-        let approved = process.approved_index(approved)
+            .ok_or_else(|| error("The identity of a possible approved application is unknown. Retry after closing it."))?;
+        let approved = approved_index(&process, approved)
             .map_err(|()| error("The full path of a possible approved application could not be verified."))?;
         if approved.is_some() {
-            check_elevation(&process)?;
             found = true;
         }
     }
@@ -150,34 +147,113 @@ pub(super) fn validate_processes(config: &ResolvedCaptureConfig) -> Result<(), C
     Ok(())
 }
 
-pub(crate) struct ForegroundApproval(WindowProcess);
+#[derive(Clone)]
+pub(crate) struct ForegroundApproval {
+    proof: WindowProcess,
+    elevated: Option<IdentityClaim>,
+}
 
 impl ForegroundApproval {
     pub(crate) fn still_current(&self) -> bool {
-        WindowProcess::foreground() == Some(self.0)
+        screen_fix_native_observation::held::on_input_desktop() && WindowProcess::foreground() == Some(self.proof)
+    }
+
+    pub(crate) fn elevated(&self) -> Option<&IdentityClaim> {
+        self.elevated.as_ref()
+    }
+
+    pub(super) fn window(&self) -> WindowProcess { self.proof }
+
+    pub(crate) fn focus_current(&self, expected: screen_fix_protocol::ipc::FocusAtReceipt) -> bool {
+        screen_fix_native_observation::windows::FocusSnapshot::read(self.proof)
+            .is_some_and(|snapshot| snapshot.matches_identity(expected))
     }
 }
 
+pub(crate) enum Foreground {
+    Ordinary(ForegroundApproval),
+    Elevated(ForegroundApproval),
+    Unapproved,
+    Unknown(CaptureError),
+}
+
 pub(super) fn validate_foreground(config: &ResolvedCaptureConfig) -> Result<ForegroundApproval, CaptureError> {
+    match classify_foreground(config) {
+        Foreground::Ordinary(approval) | Foreground::Elevated(approval) => Ok(approval),
+        Foreground::Unapproved => Err(error("Bring the approved application to the foreground during the countdown, then retry.")),
+        Foreground::Unknown(failure) => Err(failure),
+    }
+}
+
+pub(crate) fn classify_foreground(config: &ResolvedCaptureConfig) -> Foreground {
+    classify_expected_foreground(config, None)
+}
+
+pub(super) fn classify_expected_foreground(config: &ResolvedCaptureConfig, expected: Option<WindowProcess>) -> Foreground {
+    match foreground(config, expected) {
+        Ok(Some(approval)) if approval.elevated.is_some() => Foreground::Elevated(approval),
+        Ok(Some(approval)) => Foreground::Ordinary(approval),
+        Ok(None) => Foreground::Unapproved,
+        Err(failure) => Foreground::Unknown(failure),
+    }
+}
+
+fn foreground(config: &ResolvedCaptureConfig, expected: Option<WindowProcess>) -> Result<Option<ForegroundApproval>, CaptureError> {
     let proof = WindowProcess::foreground()
         .ok_or_else(|| error("The foreground window could not be verified. Bring the approved application forward and retry."))?;
-    if proof.process.pid.get() == std::process::id() {
-        return Err(error("Bring the approved application to the foreground during the countdown, then retry."));
+    if expected.is_some_and(|expected| expected != proof) || proof.process.pid.get() == std::process::id() {
+        return Ok(None);
     }
     let process = ProcessHandle::open(proof.process.pid)
         .filter(|process| process.instance(proof.process.pid) == Some(proof.process))
         .ok_or_else(|| error("The foreground process identity could not be verified."))?;
-    if process.approved_index(config.profile().approved_identities())
-        .map_err(|()| error("The full path of the foreground application could not be verified."))?.is_none()
-    {
-        return Err(error("Bring the approved application to the foreground during the countdown, then retry."));
-    }
-    check_elevation(&process)?;
-    let approval = ForegroundApproval(proof);
+    let image = process.image_path()
+        .ok_or_else(|| error("The full path of the foreground application could not be verified."))?;
+    let approved = config.profile().approved_identities();
+    let Some(index) = approved_image_index(&image, approved)
+        .map_err(|()| error("The full path of the foreground application could not be verified."))? else {
+        return Ok(None);
+    };
+    let access = match foreground_access(proof.process, &image) {
+        Ok(access) => access,
+        Err(failure) => {
+            if expected.is_some() && (failure == screen_fix_elevated::Failure::TargetChanged
+                || !screen_fix_native_observation::held::on_input_desktop()
+                || WindowProcess::foreground() != Some(proof))
+            {
+                return Err(foreground_changed());
+            }
+            return Err(foreground_access_error(failure));
+        }
+    };
+    let elevated = match access {
+        ForegroundAccess::Ordinary => None,
+        ForegroundAccess::Elevated => Some(IdentityClaim {
+            target: proof.into(),
+            approval: ApprovalKey::new(approved[index].executable())
+                .map_err(|_| error("The approved executable path exceeds the elevated capture limit."))?,
+            image: ImagePath::new(&image)
+                .map_err(|_| error("The observed executable path exceeds the elevated capture limit."))?,
+        }),
+    };
+    let approval = ForegroundApproval { proof, elevated };
     if !approval.still_current() {
-        return Err(error("The foreground window changed while approval was being verified. Retry with the approved application in front."));
+        return Err(if expected.is_none() && approval.elevated().is_some() {
+            foreground_access_error(screen_fix_elevated::Failure::TargetChanged)
+        } else {
+            foreground_changed()
+        });
     }
-    Ok(approval)
+    Ok(Some(approval))
+}
+
+fn foreground_changed() -> CaptureError {
+    error("The foreground window changed while approval was being verified. Retry with the approved application in front.")
+}
+
+fn foreground_access_error(failure: screen_fix_elevated::Failure) -> CaptureError {
+    CaptureError::elevated(crate::session::SourceFailure::elevated(
+        crate::session::SourceStage::Foreground, failure, false))
 }
 
 pub(crate) fn resolve_executable(path: &Path) -> Result<ExecutableIdentity, CaptureError> {
@@ -199,26 +275,6 @@ pub(super) fn window_coverage(config: &ResolvedCaptureConfig) -> crate::session:
         }
     }
     crate::session::WindowCoverage { unselected: unselected.len(), incomplete }
-}
-
-fn check_elevation(process: &ProcessHandle) -> Result<(), CaptureError> {
-    let unknown = || error("Application elevation could not be verified. Restart the approved application without administrator rights.");
-    let mut token = null_mut();
-    if unsafe { OpenProcessToken(process.raw().0, TOKEN_QUERY, &mut token) } == 0 {
-        return Err(unknown());
-    }
-    let token = unsafe { OwnedHandle::from_raw_handle(token) };
-    let mut elevation = TOKEN_ELEVATION::default();
-    let mut used = 0;
-    if unsafe { GetTokenInformation(token.as_raw_handle(), TokenElevation, (&mut elevation as *mut TOKEN_ELEVATION).cast(),
-        size_of::<TOKEN_ELEVATION>() as u32, &mut used) } == 0 || used as usize != size_of::<TOKEN_ELEVATION>()
-    {
-        return Err(unknown());
-    }
-    if elevation.TokenIsElevated != 0 {
-        return Err(error("The approved application is running with elevated rights. Restart it without administrator rights."));
-    }
-    Ok(())
 }
 
 fn error(message: &'static str) -> CaptureError {

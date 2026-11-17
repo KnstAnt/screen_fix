@@ -1,4 +1,5 @@
 mod gate;
+mod devices;
 mod hid;
 mod hook_health;
 mod receiver;
@@ -7,7 +8,7 @@ pub(crate) use resync::on_input_desktop;
 mod text;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     ops::ControlFlow,
     sync::mpsc,
     thread,
@@ -18,14 +19,15 @@ use crate::{
     capture::input::HeldBoundary,
     capture::save::{ConfirmationSource, ConfirmedSave, FixtureSaveError, FixtureSaveResult, MonitorRoutingBasis,
         SaveEvidence, SaveRouting},
-    package::{diagnostics::ReportOutcome, journal::{Flush, FlushRequest, JournalIngress, Submit}, metadata::{AttemptLayout, InputCapture, InputPublication}},
-    protocol::{AdmissionEpoch, CoarseTime, MonitorId, MessageTickMs, QpcTick, RecordTime, SessionId, SessionTimeUs, ipc::{ConfigureInput}},
+    package::{diagnostics::ReportOutcome, journal::{Flush, FlushRequest, JournalIngress, Submit}, metadata::{AttemptLayout, InputCapture, InputPublication, InputTailReason, SourceBlindReason, UncertifiedInputTail}},
+    protocol::{AdmissionEpoch, CoarseTime, MonitorId, MessageTickMs, QpcTick, RecordTime, RequestId, SessionId, SessionTimeUs,
+        ipc::{ConfigureInput, elevated::VisitBinding}},
     session::{
-        AdmissionBoundary, PauseReason, hotkey::ControlOutcome, windows::{Admission, ControlPrefix, FixtureNotice, PauseProducer, Receipt, WorkerSession},
+        AdmissionBoundary, PauseReason, SourceFailureReason, hotkey::ControlOutcome, windows::{Admission, ControlPrefix, FixtureNotice, PauseProducer, Receipt, WorkerSession},
     },
 };
 
-use super::{ProbeError, RecordingReport, clock, clock_error, context::{Context, FramePolicy}, input_helper::{HelperError, InputHelper, READY_WAIT}, mp4::io_error, package_journal_error, still_rows, stills, unavailable};
+use super::{ProbeError, RecordingReport, clock, clock_error, context::{Context, FramePolicy}, elevated::{InputCertificate, InputStagingLoss, Selector}, input_helper::{HelperError, InputHelper, READY_WAIT}, mp4::io_error, package_journal_error, still_rows, stills, unavailable};
 
 pub(super) fn with_journal<T>(
     layout: &AttemptLayout,
@@ -141,13 +143,16 @@ fn pump(
     reports: Option<&mpsc::SyncSender<RecordingReport>>,
     executable_versions: super::context::ExecutableVersions,
 ) -> Result<InputPrefix, ProbeError> {
+    let session_id = SessionId::new(layout.id().as_str())
+        .map_err(|_| unavailable("The input helper session identity is invalid"))?;
+    let frequency = clock::frequency()?;
     let mut helper = InputHelper::start(ConfigureInput {
-        session: SessionId::new(layout.id().as_str())
-            .map_err(|_| unavailable("The input helper session identity is invalid"))?,
+        session: session_id.clone(),
         attempt: layout.id().clone(),
-        qpc_frequency: clock::frequency()?,
+        qpc_frequency: frequency,
         pen_hid: session.config().profile().pen_hid(),
     })?;
+    session.update_standard_evidence(|evidence| evidence.launched = true);
     let deadline = Instant::now() + READY_WAIT;
     let registration = loop {
         if let Some(registration) = helper.poll_status()? { break registration; }
@@ -159,6 +164,7 @@ fn pump(
         if matches!(session.admit()?, Admission::Closed(_)) {
             helper.notify(session.take_input_environment())?;
             helper.shutdown(session.stop_deadline(), drop)?;
+            session.update_standard_evidence(|evidence| evidence.stopped = true);
             let _ = ready.try_send(InputStartup::Cancelled);
             return Ok(InputPrefix::cancelled());
         }
@@ -167,15 +173,21 @@ fn pump(
         }
         let _ = session.wait_for_close(Duration::from_millis(5))?;
     };
-    session.input_ready(registration);
-    if !registration.raw_keyboard || !registration.raw_pointer
-        || !registration.keyboard_hook || !registration.pointer_hook
-        || (session.config().profile().pen_hid() && !registration.pen_hid)
-    {
+    let required_ready = registration.raw_keyboard && registration.raw_pointer
+        && registration.keyboard_hook && registration.pointer_hook
+        && (!session.config().profile().pen_hid() || registration.pen_hid);
+    session.input_ready(registration, required_ready);
+    session.update_standard_evidence(|evidence| {
+        evidence.registration_reported = true;
+        evidence.required_registration_ready = required_ready;
+    });
+    if !required_ready {
         return Err(unavailable("The input helper did not confirm all required input registrations"));
     }
     let mut helper = Some(helper);
     let mut retired_helper = None;
+    let mut source = Selector::new(layout.id().clone(), session_id, frequency, session.config(), frame_policy, session)
+        .map_err(|_| unavailable("Start foreground source selection"))?;
     let mut native_context = Context::start(layout, session.config(), topology, executable_versions)?;
     let input_settings = native_context.input_settings();
     let remote = unsafe {
@@ -185,7 +197,7 @@ fn pump(
     ready.try_send(InputStartup::Ready).map_err(|_| unavailable("The recording coordinator is unavailable"))?;
     let mut input_prefix = ReceiptPrefix::default();
     let mut context_prefix = ReceiptPrefix::default();
-    let mut next_legacy_index = 0_u64;
+    let mut next_context_index = 0_u64;
     let mut video_health = Vec::new();
     let mut video_health_seen = 0;
     let mut receiver = receiver::Receiver::new(session.hotkey_keys(), still_endpoints.clone(), still_rows.clone());
@@ -193,6 +205,8 @@ fn pump(
     let mut context_flush = DeferredFlush::default();
     let mut journal_revision = session.journal_flush_revision();
     let mut paused = None;
+    let mut elevated_visit = None;
+    let mut elevated_saves = ElevatedSaves::default();
     let cutoff = 'attempt: loop {
         let cutoff = loop {
             let observed_at = clock::qpc();
@@ -200,9 +214,20 @@ fn pump(
                 let observed_at = observed_at?;
                 let receipt = match session.admit()? {
                     Admission::Starting => {
+                        native_context.discard_paused_notifications();
+                        service_source(&mut source, session, topology, frame_policy, None, helper.is_some());
                         if let Some(child) = &mut helper {
-                            child.notify(session.take_input_environment())?;
-                            child.poll(|record| receiver.countdown(record))?;
+                            if source.switching() || session.source_preparation().is_some() || !source.ordinary_allowed() {
+                                if let Err(error) = child.notify(session.take_input_environment()).and_then(|()|
+                                    child.poll(|record| receiver.collect_ordinary_inventory(record, false)))
+                                {
+                                    note_inactive_helper_failure(session, error, SessionTimeUs(0));
+                                    retire_helper(&mut helper, &mut retired_helper);
+                                }
+                            } else {
+                                child.notify(session.take_input_environment())?;
+                                child.poll(|record| receiver.countdown(record))?;
+                            }
                         }
                         return Ok(ControlFlow::Continue(()));
                     }
@@ -212,19 +237,60 @@ fn pump(
                 if observed_at < receipt.boundary.qpc {
                     return Ok(ControlFlow::Continue(()));
                 }
-                if let Some(timing) = input_timing(receipt, observed_at, None)? {
+                service_source(&mut source, session, topology, frame_policy, Some(receipt.boundary), helper.is_some());
+                let elevated = session.elevated_epoch(receipt.boundary.epoch);
+                // The selector can receive evidence while servicing the peer.
+                // Sample after that work under the controller admission lock.
+                let (receipt, observed_at) = if elevated {
+                    match session.admit()? {
+                        Admission::Open(current) if current.boundary == receipt.boundary => (current, current.qpc),
+                        Admission::Closed(cutoff) => return Ok(ControlFlow::Break(cutoff)),
+                        _ => return Err(unavailable("The elevated input admission changed while servicing the source")),
+                    }
+                } else {
+                    (receipt, observed_at)
+                };
+                let ordinary_live = !elevated && source.ordinary_allowed()
+                    && session.ordinary_source_active(receipt.boundary.epoch);
+                if !ordinary_live {
+                    if let Some(child) = &mut helper
+                        && let Err(error) = child.notify(session.take_input_environment()).and_then(|()|
+                            child.poll(|record| receiver.collect_ordinary_inventory(record, !elevated)))
+                    {
+                        let at = receipt.clock.time(receipt.qpc).map_err(clock_error)?;
+                        note_inactive_helper_failure(session, error, at);
+                        retire_helper(&mut helper, &mut retired_helper);
+                    }
+                    if !elevated { frame_policy.clear(); }
+                }
+                if ordinary_live && let Some(timing) = input_timing(receipt, observed_at, None)? {
                     for event in native_context.poll(receipt, observed_at, frame_policy)? {
-                        send_event(&mut context, event, timing, &mut context_prefix, &mut next_legacy_index)?;
+                        send_event(&mut context, event, timing, &mut context_prefix, &mut next_context_index)?;
                     }
                 }
                 for notice in session.take_fixture_saves() {
-                    let result = route_fixture(&notice, session, layout, &mut native_context, still_endpoints, still_rows, receipt);
-                    let _ = notice.reply.try_send(result);
+                    if elevated {
+                        elevated_saves.fixture(notice);
+                    } else {
+                        let result = if ordinary_live {
+                            route_fixture(&notice, session, layout, &mut native_context, still_endpoints, still_rows, receipt, None)
+                        } else {
+                            Err(FixtureSaveError::UnapprovedContext)
+                        };
+                        let _ = notice.reply.try_send(result);
+                    }
                 }
                 let controls = session.take_hotkeys();
                 let wrote_control = controls.loss.is_some() || controls.notices().next().is_some();
                 receiver.accept_controls(&controls, receipt)?;
-                if let Some(child) = &mut helper {
+                if elevated {
+                    poll_elevated(&mut source, &mut elevated_visit, &mut receiver, &mut native_context,
+                        &mut input, &mut input_prefix, &mut context, &mut context_prefix, &mut next_context_index,
+                        frame_policy, session, receipt, observed_at)?;
+                    if session.stop_requested() {
+                        return Ok(ControlFlow::Continue(()));
+                    }
+                } else if ordinary_live && let Some(child) = &mut helper {
                     let mut accepted = Ok(());
                     let polled = child.notify(session.take_input_environment()).and_then(|()| child.poll(|record| {
                         accepted = std::mem::replace(&mut accepted, Ok(())).and_then(|()| receiver.accept(record, receipt, None, &mut native_context));
@@ -244,8 +310,34 @@ fn pump(
                         receiver.try_synchronize(receipt, at, &native_context)?;
                     }
                 }
+                let certified = source.open_visit().filter(|opened| opened.binding.epoch == receipt.boundary.epoch
+                    && source.current_visit() && session.elevated_active(receipt.boundary.epoch))
+                    .and_then(|opened| source.certified_before().map(|before| (opened.binding, before)));
+                let checkpoint = |id, at| {
+                    if elevated {
+                        let selected = certified.filter(|(_, before)| at < *before
+                            && session.elevated_active(receipt.boundary.epoch) && source.current_visit())
+                            .and_then(|(binding, _)| native_context.checkpoint_context(at, Some(binding)));
+                        if selected.is_none() {
+                            elevated_saves.checkpoint(id, at);
+                        }
+                        selected
+                    } else if ordinary_live && session.ordinary_source_active(receipt.boundary.epoch) {
+                        native_context.checkpoint_context(at, None)
+                    } else {
+                        None
+                    }
+                };
                 publish_controls(controls, receipt, observed_at,
-                    &mut context, &mut context_prefix, &mut next_legacy_index, Some(&native_context))?;
+                    &mut context, &mut context_prefix, &mut next_context_index, checkpoint)?;
+                if elevated {
+                    let certified = certified.filter(|_| session.elevated_active(receipt.boundary.epoch) && source.current_visit());
+                    elevated_saves.poll(certified, receipt, observed_at, session, layout, &mut native_context,
+                        still_endpoints, still_rows, &mut context, &mut context_prefix, &mut next_context_index)?;
+                    if let Some((_, before)) = certified {
+                        receiver.advance_stills(receipt.clock.time(before).map_err(clock_error)?, true);
+                    }
+                }
                 for failed in session.video_failures_after(video_health_seen) {
                     let Some(timing) = input_timing(receipt, observed_at, None)? else { break };
                     let event = serde_json::json!({
@@ -253,29 +345,42 @@ fn pump(
                         "detected_t_us": failed.at, "admitted_100ns": timing.admitted_100ns,
                     });
                     let before = context_prefix.queued;
-                    send_event(&mut context, event, timing, &mut context_prefix, &mut next_legacy_index)?;
+                    send_event(&mut context, event, timing, &mut context_prefix, &mut next_context_index)?;
                     video_health_seen += 1;
                     if context_prefix.queued > before {
                         video_health.push(failed.monitor);
                     }
                 }
                 let watermark = receipt.clock.time(observed_at).map_err(clock_error)?;
-                for text in native_context.take_confirmed_text(observed_at) {
-                    receiver.stage_confirmed(text, receipt);
-                }
-                receiver.publish(&mut native_context, &mut input, &mut input_prefix, receipt, watermark, false)?;
-                receiver.poll_pointer_rest(&mut native_context, receipt, observed_at)?;
-                receiver.advance_stills(watermark, helper.is_some());
-                if let Some(timing) = input_timing(receipt, observed_at, None)? {
-                    for event in native_context.poll_clipboard(receipt, observed_at) {
-                        send_event(&mut context, event, timing, &mut context_prefix, &mut next_legacy_index)?;
+                if ordinary_live {
+                    for text in native_context.take_confirmed_text(observed_at) {
+                        receiver.stage_confirmed(text, receipt);
+                    }
+                    receiver.publish(&mut native_context, &mut input, &mut input_prefix, receipt, watermark, false)?;
+                    if helper.is_some() && let Some(synchronized) = receiver.synchronization_qpc()
+                        && let Some(before) = receiver.unresolved_before()
+                    {
+                        let start = receipt.clock.time(synchronized.max(receipt.boundary.qpc)).map_err(clock_error)?;
+                        session.record_source_coverage(receipt.boundary.epoch, None, start, before.min(watermark));
+                    }
+                    receiver.poll_pointer_rest(&mut native_context, receipt, observed_at)?;
+                    receiver.advance_stills(watermark, helper.is_some());
+                    if let Some(timing) = input_timing(receipt, observed_at, None)? {
+                        for event in native_context.poll_clipboard(receipt, observed_at) {
+                            send_event(&mut context, event, timing, &mut context_prefix, &mut next_context_index)?;
+                        }
                     }
                 }
                 context.offer_gap(watermark).map_err(package_journal_error)?;
                 let revision = session.journal_flush_revision();
                 let closed_segment = journal_revision != revision;
                 journal_revision = revision;
-                input_flush.poll(&mut input, input_prefix.last_time.map_or(watermark, |at| at.max(watermark)), closed_segment)?;
+                let input_flush_at = if elevated {
+                    input_prefix.last_time.unwrap_or(receipt.boundary.time)
+                } else {
+                    input_prefix.last_time.map_or(watermark, |at| at.max(watermark))
+                };
+                input_flush.poll(&mut input, input_flush_at, closed_segment)?;
                 context_flush.poll(&mut context, watermark, closed_segment || wrote_control)?;
                 Ok::<_, ProbeError>(ControlFlow::Continue(()))
             })();
@@ -290,68 +395,110 @@ fn pump(
         let Some(closed) = cutoff.filter(|cutoff| session.pause_pending(*cutoff)) else {
             break 'attempt cutoff;
         };
+        frame_policy.clear();
+        native_context.discard_elevated_clipboard();
+        if let Err(failure) = source.close(closed.qpc) {
+            session.fail_source(source.stage(), failure);
+            source.cancel();
+        }
+        let ordinary = !session.elevated_epoch(closed.epoch);
         let receipt = session.foreground_closing_receipt(closed)?;
+        while !ordinary && source.awaiting_close() && !session.stop_requested() {
+            service_source(&mut source, session, topology, frame_policy, None, helper.is_some());
+            if source.awaiting_close() {
+                thread::park_timeout(Duration::from_millis(2));
+            }
+        }
         let until = Instant::now() + Duration::from_millis(250);
-        while session.pause_pending(closed) && !receiver.certified_through(closed.time)
-            && Instant::now() < until && helper.is_some()
+        while !ordinary && session.pause_pending(closed) && !session.stop_requested()
+            && !source.closing_received(closed.qpc) && Instant::now() < until
         {
+            service_source(&mut source, session, topology, frame_policy, None, helper.is_some());
+            if !source.closing_received(closed.qpc) {
+                thread::park_timeout(Duration::from_millis(2));
+            }
+        }
+        while session.pause_pending(closed) && !receiver.certified_through(closed.time)
+            && Instant::now() < until && helper.is_some() && ordinary
+        {
+            service_source(&mut source, session, topology, frame_policy, None, helper.is_some());
             poll_paused_helper(&mut helper, &mut retired_helper, &mut receiver, &mut native_context,
-                session, reports, receipt, closed, true)?;
+                session, reports, receipt, closed, true, ordinary)?;
             thread::park_timeout(Duration::from_millis(2));
         }
-        let tail = receiver.uncertified_tail(receipt.boundary.time, closed.time);
+        let certified = if ordinary { None } else {
+            Some(drain_elevated_prefix(&mut source, &mut receiver, &mut native_context, receipt, closed, session)?)
+        };
+        let staging_loss = source.take_staging_loss();
+        if staging_loss.is_some() { receiver.note_native_gap(); }
+        let tail = describe_tail(&receiver, &mut source, session, receipt, closed, certified);
         let controls = session.take_hotkeys();
         let mut resume_chord = controls.notices().any(|notice| notice.outcome == ControlOutcome::ResumeRequested);
         receiver.accept_controls(&controls, receipt)?;
-        receiver.interrupt(closed.time, HeldBoundary::Pause);
+        if let Some(certified) = certified {
+            receiver.interrupt_certified(certified, closed.time, HeldBoundary::Pause);
+        } else {
+            receiver.interrupt(closed.time, HeldBoundary::Pause);
+        }
         receiver.publish(&mut native_context, &mut input, &mut input_prefix, receipt, closed.time, true)?;
         for notice in session.take_fixture_saves() {
             let _ = notice.reply.try_send(Err(FixtureSaveError::AdmissionClosed));
         }
+        elevated_saves.close();
         native_context.pause(closed.qpc)?;
         flush_boundary(&mut input, closed.time, session, || {
+            service_source(&mut source, session, topology, frame_policy, None, helper.is_some());
             poll_paused_helper(&mut helper, &mut retired_helper, &mut receiver, &mut native_context,
-                session, reports, receipt, closed, false)
+                session, reports, receipt, closed, false, ordinary)
         })?;
         receiver.finish_still_prefix(closed.time);
         session.mark_input_prefix(closed);
         let timing = input_timing(receipt, closed.qpc, None)?
             .ok_or_else(|| unavailable("The input pause cutoff is invalid"))?;
+        if let Some(loss) = staging_loss {
+            publish_input_staging_loss(&mut context, loss, timing, &mut context_prefix, &mut next_context_index)?;
+        }
         send_boundary_events(&mut context, native_context.close_hung_observation(), timing,
-            &mut context_prefix, &mut next_legacy_index)?;
+            &mut context_prefix, &mut next_context_index)?;
         let ranges = loop {
             let ranges = session.paused_video();
             if ranges.len() == session.config().monitors().len() || !session.pause_pending(closed) { break ranges; }
+            service_source(&mut source, session, topology, frame_policy, None, helper.is_some());
             poll_paused_helper(&mut helper, &mut retired_helper, &mut receiver, &mut native_context,
-                session, reports, receipt, closed, false)?;
+                session, reports, receipt, closed, false, ordinary)?;
             thread::park_timeout(Duration::from_millis(2));
         };
         let reasons = session.pause_interval_reasons(closed);
-        let pause = serde_json::json!({
+        let mut pause = serde_json::json!({
             "kind": "pause", "reasons": reasons, "cutoff_t_us": closed.time,
             "uncertified_input_tail": tail, "paused_slots": ranges,
             "paused_slots_all_monitors": ranges.len() == session.config().monitors().len(),
         });
-        send_boundary_event(&mut context, pause, timing, &mut context_prefix, &mut next_legacy_index)?;
+        if let Some(before) = receiver.elevated_hook_loss() {
+            pause["required_hook_first_uncovered_qpc"] = serde_json::json!(before);
+        }
+        send_boundary_event(&mut context, pause, timing, &mut context_prefix, &mut next_context_index)?;
         publish_controls(controls, receipt, closed.qpc, &mut context, &mut context_prefix,
-            &mut next_legacy_index, None)?;
+            &mut next_context_index, |_, _| None)?;
         flush_boundary(&mut context, closed.time, session, || {
+            service_source(&mut source, session, topology, frame_policy, None, helper.is_some());
             poll_paused_helper(&mut helper, &mut retired_helper, &mut receiver, &mut native_context,
-                session, reports, receipt, closed, false)
+                session, reports, receipt, closed, false, ordinary)
         })?;
         session.finish_pause(closed, PauseProducer::Input);
         let mut discarded_context = 0_u64;
         while session.pause_pending(closed) {
             let at = clock::qpc()?;
             poll_paused_helper(&mut helper, &mut retired_helper, &mut receiver, &mut native_context,
-                session, reports, receipt, closed, false)?;
+                session, reports, receipt, closed, false, ordinary)?;
+            service_source(&mut source, session, topology, frame_policy, None, helper.is_some());
             discarded_context = discarded_context.saturating_add(native_context.discard_paused_notifications());
             if !session.pause_pending(closed) { break; }
             let controls = session.take_hotkeys();
             let wrote_control = controls.loss.is_some() || controls.notices().next().is_some();
             resume_chord |= controls.notices().any(|notice| notice.outcome == ControlOutcome::ResumeRequested);
             publish_controls(controls, receipt, at, &mut context, &mut context_prefix,
-                &mut next_legacy_index, None)?;
+                &mut next_context_index, |_, _| None)?;
             let through = receipt.clock.time(at).map_err(clock_error)?;
             context_flush.poll(&mut context, through, wrote_control)?;
             thread::park_timeout(Duration::from_millis(5));
@@ -364,20 +511,35 @@ fn pump(
         let resumed = Receipt { qpc: opened.boundary.qpc, clock: opened.clock, boundary: opened.boundary, tick_anchor: None };
         let timing = input_timing(resumed, opened.boundary.qpc, None)?
             .ok_or_else(|| unavailable("The input resume boundary is invalid"))?;
-        publish_blind_pause(&mut context, timing, &mut context_prefix, &mut next_legacy_index, closed, &reasons)?;
+        publish_blind_pause(&mut context, timing, &mut context_prefix, &mut next_context_index, closed, &reasons)?;
         send_boundary_event(&mut context, serde_json::json!({
             "kind": "discontinuity", "start_t_us": closed.time, "end_t_us": opened.boundary.time,
             "gap_us": opened.boundary.time.0.saturating_sub(closed.time.0),
             "previous_admission_epoch": closed.epoch, "reasons": reasons,
-        }), timing, &mut context_prefix, &mut next_legacy_index)?;
+        }), timing, &mut context_prefix, &mut next_context_index)?;
         let paused_slots = paused_slot_ranges(&ranges, closed.time, opened.boundary.time);
         send_boundary_event(&mut context, serde_json::json!({
             "kind": "resume", "reasons": reasons, "paused_start_t_us": closed.time,
             "paused_slots": paused_slots, "suppressed_context_notifications": discarded_context,
-        }), timing, &mut context_prefix, &mut next_legacy_index)?;
+        }), timing, &mut context_prefix, &mut next_context_index)?;
         native_context.resume();
         receiver.reopen(opened.boundary.time, resume_chord);
+        if !session.elevated_epoch(opened.boundary.epoch) {
+            receiver.select_source(None);
+        }
+        elevated_visit = None;
     };
+    frame_policy.clear();
+    native_context.discard_elevated_clipboard();
+    elevated_saves.close();
+    let stopped_qpc = cutoff.map_or_else(clock::qpc, |boundary| Ok(boundary.qpc))?;
+    if let Err(failure) = source.stop(session, stopped_qpc, session.stop_deadline()) {
+        if cutoff.is_some() {
+            session.source_finalization_failed(failure);
+        }
+    }
+    let staging_loss = source.take_staging_loss();
+    if staging_loss.is_some() { receiver.note_native_gap(); }
     for notice in session.take_fixture_saves() {
         let _ = notice.reply.try_send(Err(FixtureSaveError::AdmissionClosed));
     }
@@ -389,14 +551,23 @@ fn pump(
         let closed = cutoff.map(|boundary| session.foreground_closing_receipt(boundary)).transpose()?;
         let mut accepted = Ok(());
         let shutdown = child.notify(session.take_input_environment()).and_then(|()| child.shutdown(session.stop_deadline(), |record| {
-            if paused.is_none() && let (Some(receipt), Some(cutoff)) = (closed, cutoff) {
+            if paused.is_none() && let (Some(receipt), Some(cutoff)) = (closed, cutoff)
+                && !session.elevated_epoch(cutoff.epoch)
+            {
                 accepted = std::mem::replace(&mut accepted, Ok(())).and_then(|()| receiver.accept(record, receipt, Some(cutoff), &mut native_context));
             }
         }));
         accepted?;
+        if shutdown.is_ok() {
+            session.update_standard_evidence(|evidence| evidence.stopped = true);
+        }
         if let Err(error) = shutdown {
             if let Some(cutoff) = cutoff {
-                note_helper_failure(session, reports, error, cutoff.time);
+                if session.elevated_epoch(cutoff.epoch) {
+                    note_inactive_helper_failure(session, error, cutoff.time);
+                } else {
+                    note_helper_failure(session, reports, error, cutoff.time);
+                }
             } else {
                 return Err(error.into());
             }
@@ -404,9 +575,16 @@ fn pump(
     }
     let mut uncertified_closing_tail = None;
     if let Some(cutoff) = cutoff.filter(|_| paused.is_none()) {
-        let opened = session.foreground_closing_receipt(cutoff)?.boundary.time;
-        uncertified_closing_tail = receiver.uncertified_tail(opened, cutoff.time);
-        receiver.interrupt(cutoff.time, HeldBoundary::Stop);
+        let receipt = session.foreground_closing_receipt(cutoff)?;
+        let certified = if session.elevated_epoch(cutoff.epoch) {
+            Some(drain_elevated_prefix(&mut source, &mut receiver, &mut native_context, receipt, cutoff, session)?)
+        } else { None };
+        uncertified_closing_tail = describe_tail(&receiver, &mut source, session, receipt, cutoff, certified);
+        if let Some(certified) = certified {
+            receiver.interrupt_certified(certified, cutoff.time, HeldBoundary::Stop);
+        } else {
+            receiver.interrupt(cutoff.time, HeldBoundary::Stop);
+        }
         receiver.publish(&mut native_context, &mut input, &mut input_prefix,
             session.foreground_closing_receipt(cutoff)?, cutoff.time, true)?;
         flush_boundary(&mut input, cutoff.time, session, || Ok(()))?;
@@ -426,23 +604,30 @@ fn pump(
         }
         if paused.is_none() && let Some(timing) = input_timing(receipt, cutoff.qpc, None)? {
             send_boundary_events(&mut context, native_context.close_hung_observation(), timing,
-                &mut context_prefix, &mut next_legacy_index)?;
+                &mut context_prefix, &mut next_context_index)?;
             for event in native_context.finish_cursor(cutoff.qpc, receipt.clock) {
-                send_event(&mut context, event, timing, &mut context_prefix, &mut next_legacy_index)?;
+                send_event(&mut context, event, timing, &mut context_prefix, &mut next_context_index)?;
             }
         }
         if let Some(timing) = input_timing(receipt, stopped.qpc, None)? {
+            if let Some(loss) = staging_loss {
+                publish_input_staging_loss(&mut context, loss, timing, &mut context_prefix, &mut next_context_index)?;
+            }
             let paused_slots = if let Some((closed, reasons, ranges)) = paused {
-                publish_blind_pause(&mut context, timing, &mut context_prefix, &mut next_legacy_index, closed, &reasons)?;
+                publish_blind_pause(&mut context, timing, &mut context_prefix, &mut next_context_index, closed, &reasons)?;
                 Some(paused_slot_ranges(&ranges, closed.time, stopped.time))
             } else { None };
-            send_boundary_event(&mut context, serde_json::json!({
+            let mut stop = serde_json::json!({
                 "kind": "recorder_control", "command": "stop_boundary",
                 "cutoff_t_us": cutoff.time, "stop_t_us": stopped.time, "paused_slots": paused_slots,
-            }), timing, &mut context_prefix, &mut next_legacy_index)?;
+            });
+            if let Some(before) = receiver.elevated_hook_loss() {
+                stop["required_hook_first_uncovered_qpc"] = serde_json::json!(before);
+            }
+            send_boundary_event(&mut context, stop, timing, &mut context_prefix, &mut next_context_index)?;
         }
         publish_controls(final_controls, receipt, stopped.qpc, &mut context, &mut context_prefix,
-            &mut next_legacy_index, None)?;
+            &mut next_context_index, |_, _| None)?;
         input.seal(cutoff.time).map_err(package_journal_error)?;
         context.seal(stopped.time).map_err(package_journal_error)?;
     } else if input_prefix.last_time.is_some() || context_prefix.last_receipt.is_some() {
@@ -482,10 +667,346 @@ fn pump(
     })
 }
 
+fn poll_elevated(
+    source: &mut Selector<'_>, applied: &mut Option<VisitBinding>, receiver: &mut receiver::Receiver, native: &mut Context<'_>,
+    input: &mut JournalIngress, input_prefix: &mut ReceiptPrefix,
+    context: &mut JournalIngress, context_prefix: &mut ReceiptPrefix, next_context_index: &mut u64,
+    frames: &FramePolicy, session: &WorkerSession, receipt: Receipt, observed_at: QpcTick,
+) -> Result<(), ProbeError> {
+    let now = observed_at;
+    let admission = session.active_source(receipt.boundary.epoch);
+    if let Some(opened) = source.open_visit() {
+        match native.elevated_invalidation(opened.binding, opened.focus, opened.completed, receipt) {
+            Ok(Some((before, true))) => {
+                let closed = source.close(before.max(receipt.boundary.qpc));
+                frames.clear();
+                session.require_source_change(receipt.boundary.epoch);
+                if let Err(failure) = closed {
+                    session.fail_source(source.stage(), failure);
+                    source.cancel();
+                }
+            }
+            Ok(Some((before, false))) => source.observe_focus_loss(before),
+            Err(failure) => {
+                frames.clear();
+                session.fail_source(source.stage(), failure);
+                source.cancel();
+            }
+            Ok(None) => {}
+        }
+    }
+    let loss = source.take_loss();
+    let staging_loss = source.take_staging_loss();
+    let context_pressure = source.take_context_pressure();
+    let overflowed = staging_loss.is_some() || context_pressure.is_some();
+    if overflowed { receiver.note_native_gap(); }
+    if let Some(timing) = input_timing(receipt, observed_at, None)? {
+        if let Some(loss) = staging_loss {
+            publish_input_staging_loss(context, loss, timing, context_prefix, next_context_index)?;
+        }
+        if let Some(gap) = context_pressure {
+            send_boundary_event(context, serde_json::json!({
+                "kind": "context_source_gap", "source": "elevated", "reason": "recorder_staging", "gap": gap,
+            }), timing, context_prefix, next_context_index)?;
+        }
+        if let Some((first, last, count)) = source.take_optional_loss() {
+            send_event(context, serde_json::json!({
+                "kind": "context_source_gap", "source": "elevated", "reason": "optional_staging",
+                "first_qpc": first, "last_qpc": last, "count": count,
+            }), timing, context_prefix, next_context_index)?;
+        }
+    }
+    if let Some((binding, before, cause, gap)) = loss {
+        if gap.is_some() {
+            receiver.note_native_gap();
+        }
+        if let Some(timing) = input_timing(receipt, observed_at, None)? {
+            send_boundary_event(context, serde_json::json!({
+                "kind": "input_source_loss", "source": "elevated", "visit": binding,
+                "first_uncovered_qpc": before, "cause": cause, "native_gap": gap,
+            }), timing, context_prefix, next_context_index)?;
+        }
+    }
+    if let Some(interrupted) = source.take_interruption() {
+        let reason = if session.source_failure().is_some() {
+            SourceBlindReason::SourceFailure
+        } else if overflowed {
+            SourceBlindReason::RecorderStaging
+        } else if let Some((_, _, cause, _)) = loss {
+            SourceBlindReason::ElevatedOpening(cause)
+        } else {
+            SourceBlindReason::FocusSuspended
+        };
+        source.note_blind(receipt.boundary.epoch, interrupted, reason);
+        session.source_resynchronizing(receipt.boundary.epoch);
+        frames.clear();
+        if let Some(previous) = applied.take() {
+            let certified = if let Some(certificate) = source.input_certificate(Some(interrupted))
+                .filter(|certificate| certificate.visit == previous)
+                && accept_elevated_certificate(source, certificate, receiver, native, receipt, None)?
+            {
+                receiver.advance(receipt.clock.time(certificate.before).map_err(clock_error)?);
+                let before = close_failed_hooks(source, receiver, native, session, receipt)?
+                    .map_or(certificate.before, |hook| hook.min(certificate.before));
+                let through = receipt.clock.time(before).map_err(clock_error)?;
+                record_elevated_coverage(session, receipt, receiver, certificate, through)?;
+                before
+            } else {
+                receipt.boundary.qpc
+            };
+            let cutoff = receipt.clock.time(certified.max(receipt.boundary.qpc)).map_err(clock_error)?;
+            let through = input_prefix.last_time.map_or(cutoff, |last| last.max(cutoff));
+            let boundary = if loss.is_some() || overflowed { HeldBoundary::InputGap } else { HeldBoundary::FocusChanged };
+            receiver.interrupt_certified(cutoff, through, boundary);
+            receiver.publish(native, input, input_prefix, receipt, through, true)?;
+            receiver.finish_still_prefix(through);
+            native.pause(interrupted)?;
+            if let Some(timing) = input_timing(receipt, observed_at, None)? {
+                send_boundary_events(context, native.close_hung_observation(), timing, context_prefix, next_context_index)?;
+            }
+            receiver.reopen(through, false);
+        }
+    }
+    let live = source.current_visit();
+    if !live && let Some(visit) = source.open_visit() {
+        source.observe_focus_loss(source.certified_before().unwrap_or(visit.completed));
+    }
+    let Some(opened) = source.open_visit().filter(|visit| live && visit.binding.epoch == receipt.boundary.epoch
+        && session.elevated_active(receipt.boundary.epoch)) else {
+        frames.clear();
+        native.discard_elevated_clipboard();
+        return Ok(());
+    };
+    if *applied != Some(opened.binding) {
+        source.note_opening(receipt.boundary, opened);
+        receiver.select_source(Some(opened.binding));
+        let visit = native.activate_elevated(opened.binding, opened.focus, opened.completed)?;
+        receiver.elevated_synchronization(receipt, opened.completed, opened.held, visit)?;
+        *applied = Some(opened.binding);
+        if let Some(timing) = input_timing(receipt, observed_at, None)? {
+            send_boundary_event(context, serde_json::json!({
+                "kind": "input_source_coverage", "source": "elevated", "coverage": opened.coverage,
+                "admission_epoch": opened.binding.epoch, "registration": opened.registration,
+            }), timing, context_prefix, next_context_index)?;
+        }
+    }
+    if let Some((binding, completed, snapshot)) = source.take_recovered()
+        && binding == opened.binding && let Some(visit) = native.visit()
+    {
+        receiver.recovered_synchronization(receipt, completed, snapshot, visit)?;
+    }
+    let rows = match native.poll_elevated_queries(source, now, receipt, &admission) {
+        Ok(rows) if source.current_visit() && session.elevated_active(receipt.boundary.epoch) => rows,
+        Ok(_) => {
+            frames.clear();
+            native.discard_elevated_clipboard();
+            if !source.current_visit() {
+                source.observe_focus_loss(source.certified_before().unwrap_or(opened.completed));
+            }
+            return Ok(());
+        }
+        Err(failure) => {
+            frames.clear();
+            session.fail_source(source.stage(), failure);
+            source.cancel();
+            return Ok(());
+        }
+    };
+    let observed = receipt.clock.time(now).map_err(clock_error)?;
+    let since = receipt.clock.time(opened.coverage.before_qpc).map_err(clock_error)?;
+    let certificate = source.input_certificate(None);
+    let certified = certificate.map(|certificate| receipt.clock.time(certificate.before)).transpose().map_err(clock_error)?;
+    if observed.0.saturating_sub(certified.unwrap_or(since).0) >= 250_000 {
+        frames.clear();
+        session.fail_source(source.stage(), screen_fix_elevated::Failure::Witness);
+        source.cancel();
+        return Ok(());
+    }
+    let (Some(certificate), Some(through)) = (certificate, certified) else {
+        if source.current_visit() && session.elevated_active(receipt.boundary.epoch)
+        {
+            if source.media_open() {
+                frames.publish_elevated(opened.binding, since, observed, since, receipt.boundary, receipt.clock);
+            }
+            if let Some(timing) = input_timing(receipt, now, None)? {
+                for row in rows {
+                    send_event(context, row, timing, context_prefix, next_context_index)?;
+                }
+            }
+        } else {
+            frames.clear();
+        }
+        return Ok(());
+    };
+    if !source.current_visit() {
+        frames.clear();
+        native.discard_elevated_clipboard();
+        source.observe_focus_loss(certificate.before);
+        return Ok(());
+    }
+    if !session.elevated_active(receipt.boundary.epoch) {
+        frames.clear();
+        native.discard_elevated_clipboard();
+        return Ok(());
+    }
+    if !accept_elevated_certificate(source, certificate, receiver, native, receipt, None)? {
+        return Ok(());
+    }
+    receiver.advance(through);
+    if close_failed_hooks(source, receiver, native, session, receipt)?.is_some() {
+        return Ok(());
+    }
+    if !source.current_visit() || !session.elevated_active(receipt.boundary.epoch) {
+        frames.clear();
+        native.discard_elevated_clipboard();
+        return Ok(());
+    }
+    // Materialization follows the actual Recorder receipts in this poll.
+    if let Some(timing) = input_timing(receipt, now, None)? {
+        for row in rows {
+            send_event(context, row, timing, context_prefix, next_context_index)?;
+        }
+    }
+    // A delivered certificate can still contain records awaiting correlation.
+    let frame_before = receiver.frame_before().map_or(since, |before| before.min(through));
+    if source.media_open() {
+        frames.publish_elevated(opened.binding, since, observed, frame_before, receipt.boundary, receipt.clock);
+        receiver.open_elevated_stills(opened.binding, frame_before);
+    }
+    for text in native.take_confirmed_text(now) {
+        receiver.stage_confirmed(text, receipt);
+    }
+    receiver.publish(native, input, input_prefix, Receipt { qpc: now, ..receipt }, through, false)?;
+    if source.media_open() && record_elevated_coverage(session, receipt, receiver, certificate, through)? {
+        source.finish_blind(receipt.boundary, receipt.clock, certificate.opening);
+        source.certified_capture(receipt.boundary.epoch);
+        session.source_enhanced(receipt.boundary.epoch);
+    }
+    let bucket = i64::try_from(receipt.clock.qpc_frequency.0.get() / 1_000_000).unwrap_or(i64::MAX);
+    let last_certified = QpcTick(certificate.before.0.saturating_sub(bucket.saturating_add(1)));
+    receiver.poll_pointer_rest(native, receipt, last_certified)?;
+    Ok(())
+}
+
+fn describe_tail(
+    receiver: &receiver::Receiver, source: &mut Selector<'_>, session: &WorkerSession,
+    receipt: Receipt, cutoff: AdmissionBoundary, certified: Option<SessionTimeUs>,
+) -> Option<UncertifiedInputTail> {
+    if certified.is_some() {
+        if receiver.synchronization_qpc().is_none() {
+            source.note_blind(receipt.boundary.epoch, receipt.boundary.qpc,
+                SourceBlindReason::ElevatedOpening(crate::protocol::ipc::elevated::runtime::CoverageReason::Opening));
+        }
+        source.finish_blind(receipt.boundary, receipt.clock, cutoff.qpc);
+    } else if let Some(synchronized) = receiver.synchronization_qpc()
+        && let (Ok(start), Some(before)) = (receipt.clock.time(synchronized.max(receipt.boundary.qpc)), receiver.unresolved_before())
+    {
+        session.record_source_coverage(cutoff.epoch, None, start, before.min(cutoff.time));
+    }
+    let mut tail = receiver.uncertified_tail(receipt.boundary.time, cutoff.time, certified)?;
+    if certified.is_some() && let Some(before) = session.last_elevated_coverage(cutoff.epoch) {
+        tail.first_t_us = tail.first_t_us.max(before);
+        if tail.first_t_us >= cutoff.time { return None; }
+    }
+    let failure = session.source_failure();
+    tail.reason = Some(if receiver.elevated_hook_loss().is_some()
+        || failure.is_some_and(|failure| failure.reason == SourceFailureReason::RequiredHook)
+    {
+        InputTailReason::RequiredHook
+    } else if failure.is_some() {
+        InputTailReason::SourceFailure
+    } else if certified.is_some() && receiver.synchronization_qpc().is_none() {
+        InputTailReason::ActivationPending
+    } else if certified.is_some() {
+        InputTailReason::ElevatedCoverage
+    } else {
+        InputTailReason::ProducerProgress
+    });
+    session.record_uncertified_tail(cutoff.epoch, tail);
+    Some(tail)
+}
+
+fn record_elevated_coverage(
+    session: &WorkerSession, receipt: Receipt, receiver: &receiver::Receiver,
+    certificate: InputCertificate, through: SessionTimeUs,
+) -> Result<bool, ProbeError> {
+    let opening = receipt.clock.time(certificate.opening.max(receipt.boundary.qpc)).map_err(clock_error)?;
+    let Some(start) = opening.0.checked_add(1).map(SessionTimeUs) else { return Ok(false); };
+    let Some(before) = receiver.unresolved_before().map(|before| before.min(through)).filter(|before| *before > start)
+        else { return Ok(false); };
+    session.record_source_coverage(receipt.boundary.epoch, Some(certificate.visit), start, before);
+    Ok(true)
+}
+
+fn drain_elevated_prefix(
+    source: &mut Selector<'_>, receiver: &mut receiver::Receiver, native: &mut Context<'_>,
+    receipt: Receipt, closing: AdmissionBoundary, session: &WorkerSession,
+) -> Result<SessionTimeUs, ProbeError> {
+    let Some(certificate) = source.input_certificate(Some(closing.qpc))
+        .filter(|_| !source.awaiting_close()) else { return Ok(receipt.boundary.time); };
+    let time = receipt.clock.time(certificate.before).map_err(clock_error)?;
+    let closing = AdmissionBoundary { qpc: certificate.before, time, ..closing };
+    if !accept_elevated_certificate(source, certificate, receiver, native, receipt, Some(closing))? {
+        return Ok(receipt.boundary.time);
+    }
+    receiver.advance(time);
+    let certified = match close_failed_hooks(source, receiver, native, session, receipt)? {
+        Some(before) => receipt.clock.time(before.min(certificate.before)).map_err(clock_error)?,
+        None => time,
+    };
+    if record_elevated_coverage(session, receipt, receiver, certificate, certified)? {
+        source.finish_blind(receipt.boundary, receipt.clock, certificate.opening);
+    }
+    Ok(certified)
+}
+
+fn close_failed_hooks(
+    source: &mut Selector<'_>, receiver: &mut receiver::Receiver, native: &mut Context<'_>,
+    session: &WorkerSession, receipt: Receipt,
+) -> Result<Option<QpcTick>, ProbeError> {
+    let Some((visit, before)) = receiver.elevated_hook_cutoff() else { return Ok(None); };
+    source.cancel_before(visit, before);
+    native.discard_elevated_clipboard();
+    native.truncate_elevated_input(before);
+    if let Some(certificate) = source.input_certificate(Some(before)) {
+        receiver.adopt_elevated_certificate(certificate, receipt, native);
+    }
+    if receiver.take_hook_reports().into_iter().any(|report| report.is_some()) {
+        session.required_elevated_hook_failed(session.stop_requested());
+    }
+    Ok(Some(before))
+}
+
+fn accept_elevated_certificate(
+    source: &mut Selector<'_>, certificate: InputCertificate, receiver: &mut receiver::Receiver,
+    native: &mut Context<'_>, receipt: Receipt, closing: Option<AdmissionBoundary>,
+) -> Result<bool, ProbeError> {
+    if !receiver.adopt_elevated_certificate(certificate, receipt, native) { return Ok(false); }
+    let mut accepted = Ok(());
+    source.take_input(certificate, |record| {
+        accepted = std::mem::replace(&mut accepted, Ok(())).and_then(|()|
+            receiver.accept_elevated(record, receipt, closing, native));
+    });
+    accepted?;
+    receiver.finish_elevated_delivery(receipt)?;
+    Ok(true)
+}
+
+fn service_source(
+    source: &mut Selector<'_>, session: &WorkerSession, topology: &super::display::topology::Topology,
+    frame_policy: &FramePolicy, active: Option<AdmissionBoundary>, ordinary_available: bool,
+) {
+    if let Err(failure) = source.tick(session, topology, active, session.take_elevated_environment(), ordinary_available) {
+        frame_policy.clear();
+        session.fail_source(source.stage(), failure);
+        source.cancel();
+    }
+}
+
 fn poll_paused_helper(
     helper: &mut Option<InputHelper>, retired: &mut Option<InputHelper>, receiver: &mut receiver::Receiver, native: &mut Context<'_>,
     session: &WorkerSession, reports: Option<&mpsc::SyncSender<RecordingReport>>, receipt: Receipt,
-    cutoff: AdmissionBoundary, admitted: bool,
+    cutoff: AdmissionBoundary, admitted: bool, ordinary: bool,
 ) -> Result<(), ProbeError> {
     if let Some(child) = helper {
         let mut accepted = Ok(());
@@ -493,12 +1014,17 @@ fn poll_paused_helper(
             if admitted {
                 accepted = std::mem::replace(&mut accepted, Ok(())).and_then(|()| receiver.accept(record, receipt, Some(cutoff), native));
             } else {
-                receiver.inventory(record);
+                receiver.collect_ordinary_inventory(record, ordinary);
             }
         }));
         accepted?;
         if let Err(error) = result {
-            note_helper_failure(session, reports, error, session.session_time().unwrap_or(cutoff.time));
+            let at = session.session_time().unwrap_or(cutoff.time);
+            if ordinary {
+                note_helper_failure(session, reports, error, at);
+            } else {
+                note_inactive_helper_failure(session, error, at);
+            }
             retire_helper(helper, retired);
         }
     }
@@ -573,23 +1099,43 @@ fn paused_slot_ranges(
 }
 
 fn publish_blind_pause(
-    context: &mut JournalIngress, timing: InputTiming, prefix: &mut ReceiptPrefix, next: &mut u64,
+    context: &mut JournalIngress, timing: InputTiming, prefix: &mut ReceiptPrefix, next_context_index: &mut u64,
     boundary: AdmissionBoundary, reasons: &[PauseReason],
 ) -> Result<(), ProbeError> {
-    if reasons.iter().any(|reason| matches!(reason, PauseReason::LockScreen | PauseReason::SecureDesktop)) {
+    for reason in [
+        reasons.iter().any(|reason| matches!(reason, PauseReason::LockScreen | PauseReason::SecureDesktop)).then_some("secure_desktop"),
+        reasons.contains(&PauseReason::ElevationTransition).then_some("elevation_transition"),
+    ].into_iter().flatten() {
         send_boundary_event(context, serde_json::json!({
-            "kind": "blind", "reason": "secure_desktop",
+            "kind": "blind", "reason": reason,
             "start_t_us": boundary.time, "end_t_us": timing.time.recv_t_us,
-        }), timing, prefix, next)?;
+        }), timing, prefix, next_context_index)?;
     }
     Ok(())
 }
 
 fn send_boundary_event(
     journal: &mut JournalIngress, event: serde_json::Value, timing: InputTiming,
-    prefix: &mut ReceiptPrefix, next: &mut u64,
+    prefix: &mut ReceiptPrefix, next_context_index: &mut u64,
 ) -> Result<(), ProbeError> {
-    send_event_with_priority(journal, event, timing, prefix, next, true)
+    send_event_with_priority(journal, event, timing, prefix, next_context_index, true)
+}
+
+fn publish_input_staging_loss(
+    journal: &mut JournalIngress, loss: InputStagingLoss, timing: InputTiming,
+    prefix: &mut ReceiptPrefix, next_context_index: &mut u64,
+) -> Result<(), ProbeError> {
+    send_boundary_event(journal, serde_json::json!({
+        "kind": "input_source_loss", "source": "elevated", "visit": loss.visit,
+        "first_uncovered_qpc": loss.before, "cause": "recorder_staging", "native_gaps": loss.gaps,
+    }), timing, prefix, next_context_index)
+}
+
+fn note_inactive_helper_failure(session: &WorkerSession, error: HelperError, at: SessionTimeUs) {
+    let failure = error.runtime_failure(at);
+    session.update_standard_evidence(|evidence| {
+        evidence.inactive_transport_failure.get_or_insert(failure.reason);
+    });
 }
 
 fn note_helper_failure(
@@ -605,21 +1151,91 @@ fn note_helper_failure(
     }
 }
 
+#[derive(Default)]
+struct ElevatedSaves {
+    fixtures: VecDeque<FixtureNotice>,
+    checkpoints: VecDeque<(RequestId, QpcTick)>,
+}
+
+impl ElevatedSaves {
+    fn fixture(&mut self, notice: FixtureNotice) {
+        if self.fixtures.len() < crate::session::windows::MAX_FIXTURE_SAVES {
+            self.fixtures.push_back(notice);
+        } else {
+            let _ = notice.reply.try_send(Err(FixtureSaveError::Busy));
+        }
+    }
+
+    fn checkpoint(&mut self, id: RequestId, at: QpcTick) {
+        if self.checkpoints.len() < crate::session::windows::MAX_FIXTURE_SAVES {
+            self.checkpoints.push_back((id, at));
+        }
+    }
+
+    fn poll(
+        &mut self, certified: Option<(VisitBinding, QpcTick)>, receipt: Receipt, observed: QpcTick, session: &WorkerSession,
+        layout: &AttemptLayout, native: &mut Context<'_>, endpoints: &BTreeMap<MonitorId, stills::Requests>,
+        still_rows: &still_rows::Rows, context: &mut JournalIngress, prefix: &mut ReceiptPrefix, next: &mut u64,
+    ) -> Result<(), ProbeError> {
+        let now = receipt.clock.time(observed).map_err(clock_error)?;
+        let expired = |at| receipt.clock.time(at).is_ok_and(|at| now.0.saturating_sub(at.0) >= 250_000);
+        for _ in 0..self.fixtures.len() {
+            let Some(notice) = self.fixtures.pop_front() else { break; };
+            let received = notice.receipt.qpc;
+            let result = if receipt.boundary != notice.receipt.boundary || session.stop_requested() {
+                Err(FixtureSaveError::AdmissionClosed)
+            } else if expired(received) {
+                Err(FixtureSaveError::UnapprovedContext)
+            } else if let Some((binding, _)) = certified.filter(|(_, before)| received < *before) {
+                route_fixture(&notice, session, layout, native, endpoints, still_rows, receipt, Some(binding))
+            } else {
+                self.fixtures.push_back(notice);
+                continue;
+            };
+            let _ = notice.reply.try_send(result);
+        }
+        for _ in 0..self.checkpoints.len() {
+            let Some((id, at)) = self.checkpoints.pop_front() else { break; };
+            let available = certified.filter(|(_, before)| at < *before && !expired(at));
+            if available.is_none() && !expired(at) {
+                self.checkpoints.push_back((id, at));
+                continue;
+            }
+            if let Some(timing) = input_timing(receipt, observed, None)? {
+                let selected = available.and_then(|(binding, _)| native.checkpoint_context(at, Some(binding)));
+                let status = if selected.is_some() { "observed" } else { "unavailable" };
+                send_event(context, serde_json::json!({ "kind": "checkpoint_context", "request_id": id,
+                    "control_receipt_t_us": receipt.clock.time(at).ok(), "save_context": selected, "status": status,
+                }), timing, prefix, next)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        for notice in self.fixtures.drain(..) {
+            let _ = notice.reply.try_send(Err(FixtureSaveError::AdmissionClosed));
+        }
+        self.checkpoints.clear();
+    }
+}
+
 fn route_fixture(
     notice: &FixtureNotice, session: &WorkerSession, layout: &AttemptLayout, native: &mut Context<'_>,
-    endpoints: &BTreeMap<MonitorId, stills::Requests>, rows: &still_rows::Rows, open: Receipt,
+    endpoints: &BTreeMap<MonitorId, stills::Requests>, rows: &still_rows::Rows, open: Receipt, source: Option<VisitBinding>,
 ) -> FixtureSaveResult {
     let received = notice.receipt;
     if received.boundary != open.boundary {
         return Err(FixtureSaveError::AdmissionClosed);
     }
     let signal = &notice.signal;
-    let proof = native.fixture_save_proof(&signal.executable, received.qpc)
+    let (proof, visit) = native.fixture_save_proof(&signal.executable, received.qpc)
         .ok_or(FixtureSaveError::UnapprovedContext)?;
+    if visit != source { return Err(FixtureSaveError::UnapprovedContext); }
     let routing = if let Some(monitors) = &signal.affected_monitors {
         SaveRouting::Monitors { monitors: monitors.clone(), basis: MonitorRoutingBasis::ApplicationGeometry }
     } else {
-        native.checkpoint_context(received.qpc).ok_or(FixtureSaveError::InvalidRouting)?.fallback_routing()
+        native.checkpoint_context(received.qpc, source).ok_or(FixtureSaveError::InvalidRouting)?.fallback_routing()
     };
     let SaveRouting::Monitors { monitors, .. } = &routing else { return Err(FixtureSaveError::InvalidRouting) };
     let targets = monitors.as_slice().to_vec();
@@ -646,7 +1262,7 @@ fn route_fixture(
             rows.note_loss(time);
             continue;
         };
-        if endpoint.confirmed_save(stills::Save { reservation, confirmation, geometry, admission: open.boundary.epoch, proof }) {
+        if endpoint.confirmed_save(stills::Save { reservation, confirmation, geometry, admission: open.boundary.epoch, proof, visit }) {
             admitted += 1;
         }
     }
@@ -665,29 +1281,29 @@ fn publish_controls(
     observed: QpcTick,
     context: &mut JournalIngress,
     prefix: &mut ReceiptPrefix,
-    next: &mut u64,
-    native: Option<&Context<'_>>,
+    next_context_index: &mut u64,
+    mut checkpoint: impl FnMut(RequestId, QpcTick) -> Option<crate::capture::save::SaveWindowContext>,
 ) -> Result<(), ProbeError> {
     let Some(timing) = input_timing(receipt, observed, None)? else { return Ok(()) };
     if let Some(loss) = controls.loss {
         let event = serde_json::json!({
             "kind": "recorder_control_gap",
-            "index": *next,
+            "index": *next_context_index,
             "admitted_100ns": timing.admitted_100ns,
             "dropped": loss.count,
             "first_control_receipt_t_us": receipt.clock.time(loss.first).map_err(clock_error)?,
             "last_control_receipt_t_us": receipt.clock.time(loss.last).map_err(clock_error)?,
         });
-        send_boundary_event(context, event, timing, prefix, next)?;
+        send_boundary_event(context, event, timing, prefix, next_context_index)?;
     }
     for notice in controls.into_notices() {
         let activation = notice.activation;
         let request = matches!(notice.outcome, ControlOutcome::CheckpointRequested)
             .then(|| activation.checkpoint().id);
-        let save_context = request.and_then(|_| native.and_then(|context| context.checkpoint_context(activation.at)));
+        let save_context = request.and_then(|id| checkpoint(id, activation.at));
         let event = serde_json::json!({
             "kind": "recorder_control",
-            "index": *next,
+            "index": *next_context_index,
             "admitted_100ns": timing.admitted_100ns,
             "command": activation.action,
             "outcome": notice.outcome,
@@ -695,7 +1311,7 @@ fn publish_controls(
             "save_context": save_context,
             "control_receipt_t_us": receipt.clock.time(activation.at).map_err(clock_error)?,
         });
-        send_boundary_event(context, event, timing, prefix, next)?;
+        send_boundary_event(context, event, timing, prefix, next_context_index)?;
     }
     Ok(())
 }
@@ -735,14 +1351,14 @@ fn input_timing(
 
 fn send_event(
     journal: &mut JournalIngress, event: serde_json::Value, timing: InputTiming,
-    prefix: &mut ReceiptPrefix, next: &mut u64,
+    prefix: &mut ReceiptPrefix, next_context_index: &mut u64,
 ) -> Result<(), ProbeError> {
-    send_event_with_priority(journal, event, timing, prefix, next, false)
+    send_event_with_priority(journal, event, timing, prefix, next_context_index, false)
 }
 
 fn send_event_with_priority(
     journal: &mut JournalIngress, mut event: serde_json::Value, timing: InputTiming,
-    prefix: &mut ReceiptPrefix, next_legacy_index: &mut u64, lifecycle: bool,
+    prefix: &mut ReceiptPrefix, next_context_index: &mut u64, lifecycle: bool,
 ) -> Result<(), ProbeError> {
     apply_context_envelope(&mut event, timing)?;
     let disposition = if lifecycle {
@@ -752,9 +1368,8 @@ fn send_event_with_priority(
         journal.try_submit(timing.time.recv_t_us, event).map_err(package_journal_error)?
     };
     prefix.advance(timing.received, timing.time.recv_t_us, disposition)?;
-    // Transitional PNG export uses this attempt-wide evidence ID. Journal
-    // sequence is allocated independently by the successful stream writer.
-    *next_legacy_index = next_legacy_index.checked_add(1)
+    // Control rows use this context index. The journal writer allocates its own sequence.
+    *next_context_index = next_context_index.checked_add(1)
         .ok_or_else(|| unavailable("The recording event counter overflowed"))?;
     Ok(())
 }
@@ -762,7 +1377,7 @@ fn send_event_with_priority(
 
 fn send_boundary_events(
     journal: &mut JournalIngress, mut events: Vec<serde_json::Value>, timing: InputTiming,
-    prefix: &mut ReceiptPrefix, next_legacy_index: &mut u64,
+    prefix: &mut ReceiptPrefix, next_context_index: &mut u64,
 ) -> Result<(), ProbeError> {
     let count = events.len();
     for event in &mut events {
@@ -771,7 +1386,7 @@ fn send_boundary_events(
     journal.submit_boundary(timing.time.recv_t_us, events).map_err(package_journal_error)?;
     for _ in 0..count {
         prefix.advance(timing.received, timing.time.recv_t_us, Submit::Queued)?;
-        *next_legacy_index = next_legacy_index.checked_add(1)
+        *next_context_index = next_context_index.checked_add(1)
             .ok_or_else(|| unavailable("The recording event counter overflowed"))?;
     }
     Ok(())

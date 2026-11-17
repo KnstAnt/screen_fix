@@ -70,3 +70,63 @@ impl From<PhysicalRect> for RectEdges {
         rect.0
     }
 }
+
+/// Bounded evidence for a local token verification failure. No token
+/// identifiers or values are stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenIdentityFailure {
+    pub subject: TokenSubject,
+    pub check: TokenIdentityCheck,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_code: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenSubject {
+    Recorder,
+    Foreground,
+    CaptureTarget,
+    Collector,
+    Process,
+    TokenPair,
+    RecorderLinkedToken,
+    ForegroundLinkedToken,
+    CaptureTargetLinkedToken,
+    CollectorLinkedToken,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TokenIdentityCheck {
+    QueryProcessProtection,
+    ProtectedProcess,
+    OpenProcessToken,
+    InvalidTokenHandle,
+    QueryTokenSize { class: TokenFact },
+    ReadToken { class: TokenFact },
+    TokenShape { class: TokenFact },
+    NoInteractiveSession,
+    DifferentSession,
+    NotInteractive,
+    DifferentUser,
+    DifferentLogon,
+    SystemAccount,
+    UnsupportedIntegrity,
+    UnsupportedSplitPair,
+    LinkedLogonMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenFact {
+    Statistics,
+    Elevation,
+    User,
+    LogonSid,
+    Session,
+    ElevationType,
+    Integrity,
+    Groups,
+    LinkedToken,
+}

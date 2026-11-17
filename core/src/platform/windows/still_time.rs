@@ -14,12 +14,14 @@ pub(super) struct Interval {
     pub capture: CaptureEpoch,
     pub admission: AdmissionEpoch,
     pub approval: u64,
+    pub elevated_visit: Option<screen_fix_protocol::ipc::elevated::VisitBinding>,
 }
 
 impl Interval {
-    pub fn contains(self, frame: FrameMetadata) -> bool {
+    pub fn contains(self, frame: &FrameMetadata) -> bool {
         frame.geometry.id == self.geometry && frame.id.epoch == self.capture
             && frame.admission == self.admission && frame.approval_generation == self.approval
+            && frame.elevated_visit() == self.elevated_visit && frame.covered()
     }
 }
 
@@ -76,9 +78,9 @@ pub(super) fn preceding(
 ) -> BeforeSeen<'_> {
     let select = |eligible: &dyn Fn(SessionTimeUs) -> bool| {
         images.history().iter().rev()
-            .find(|frame| interval.contains(frame.metadata) && eligible(frame.metadata.source_t_us))
+            .find(|frame| interval.contains(&frame.metadata) && eligible(frame.metadata.source_t_us))
             .ok_or_else(|| {
-                if images.last_evicted().is_some_and(|frame| interval.contains(frame)) {
+                if images.last_evicted().is_some_and(|frame| interval.contains(&frame)) {
                     Missing::HistoryLost
                 } else {
                     Missing::NoEligibleFrame
@@ -94,12 +96,12 @@ pub(super) fn preceding(
 pub(super) fn next(
     images: &NativeImages, interval: Interval, end: SessionTimeUs,
 ) -> Result<Option<&NativeFrame>, Missing> {
-    if images.last_evicted().is_some_and(|frame| interval.contains(frame) && frame.source_t_us > end) {
+    if images.last_evicted().is_some_and(|frame| interval.contains(&frame) && frame.source_t_us > end) {
         return Err(Missing::HistoryLost);
     }
-    Ok(images.history().iter().find(|frame| interval.contains(frame.metadata) && frame.metadata.source_t_us > end))
+    Ok(images.history().iter().find(|frame| interval.contains(&frame.metadata) && frame.metadata.source_t_us > end))
 }
 
 pub(super) fn latest(images: &NativeImages, interval: Interval, cutoff: SessionTimeUs) -> Option<&NativeFrame> {
-    images.history().iter().rev().find(|frame| interval.contains(frame.metadata) && frame.metadata.source_t_us < cutoff)
+    images.history().iter().rev().find(|frame| interval.contains(&frame.metadata) && frame.metadata.source_t_us < cutoff)
 }

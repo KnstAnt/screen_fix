@@ -7,7 +7,7 @@ pub mod hotkey;
 use crate::{
     CaptureError,
     package::diagnostics::ReportOutcome,
-    protocol::{AdmissionEpoch, ClockOrigin, MonitorId, QpcTick, SessionTimeUs},
+    protocol::{AdmissionEpoch, ClockOrigin, MonitorId, QpcTick, SessionTimeUs, TokenIdentityCheck, TokenIdentityFailure},
 };
 
 #[cfg(target_os = "windows")]
@@ -44,6 +44,7 @@ pub enum PauseReason {
     Sleep,
     SecureDesktop,
     LowDisk,
+    ElevationTransition,
 }
 
 /// Only the source that owns a pause condition may clear that reason. In
@@ -83,6 +84,191 @@ pub struct DiskPreflight {
     pub duration_reserve_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceStage {
+    Foreground,
+    Consent,
+    Readiness,
+    Activation,
+    Capture,
+    Cleanup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceFailureReason {
+    DeploymentRequired,
+    InstalledPath,
+    InstalledPermissions,
+    InstalledSignature,
+    ReleaseMismatch,
+    ProcessIdentity,
+    TokenIdentity,
+    Arguments,
+    Busy,
+    ConsentDenied,
+    ConsentLaunch,
+    ConsentDeadline,
+    ReadinessDeadline,
+    CleanupDeadline,
+    Cancelled,
+    PeerExited,
+    PipeSecurity,
+    PipeConnection,
+    PipePeer,
+    Transport,
+    Protocol,
+    Cryptography,
+    Supervisor,
+    LeaseExpired,
+    Witness,
+    TargetChanged,
+    TargetAccess,
+    ScopeClosed,
+    RequiredRegistration,
+    StandardHelperUnavailable,
+    RequiredHook,
+    NativeProducer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceFailure {
+    pub stage: SourceStage,
+    pub reason: SourceFailureReason,
+    pub admitted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<crate::protocol::ipc::HelperFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_identity: Option<TokenIdentityFailure>,
+}
+
+impl SourceFailure {
+    pub(crate) fn without_report_detail(mut self) -> Self {
+        self.token_identity = None;
+        if let Some(native) = &mut self.native {
+            native.raw_input_registration = None;
+        }
+        self
+    }
+
+    pub fn guidance(self) -> &'static str {
+        use SourceFailureReason::*;
+        match self.reason {
+            DeploymentRequired | InstalledPath | InstalledPermissions | InstalledSignature | ReleaseMismatch =>
+                "Install or repair the matching signed Recorder and collector using the official machine-wide installer.",
+            TokenIdentity => match self.token_identity.map(|detail| detail.check) {
+                Some(TokenIdentityCheck::ProtectedProcess) =>
+                    "The target application uses Windows process protection. Select a supported application.",
+                Some(TokenIdentityCheck::DifferentUser) =>
+                    "Run Screen Fix and the approved application under the same signed-in Windows account.",
+                Some(TokenIdentityCheck::DifferentLogon) =>
+                    "Open Screen Fix and the approved application from the same interactive Windows sign-in.",
+                Some(TokenIdentityCheck::SystemAccount) =>
+                    "Use a signed-in Windows user account for Screen Fix and the approved application.",
+                Some(TokenIdentityCheck::UnsupportedIntegrity) =>
+                    "The approved application runs at a higher integrity level than Screen Fix. Open the approved application normally from the interactive desktop and retry.",
+                Some(TokenIdentityCheck::NoInteractiveSession | TokenIdentityCheck::DifferentSession | TokenIdentityCheck::NotInteractive) =>
+                    "Run Screen Fix and the approved application in the same unlocked interactive Windows session.",
+                Some(TokenIdentityCheck::UnsupportedSplitPair | TokenIdentityCheck::LinkedLogonMismatch) =>
+                    "Windows did not report a supported linked token pair. Reopen the approved application in the same interactive sign-in and retry.",
+                _ => "Windows could not verify the process token. Check the diagnostic report for the failed verification step.",
+            },
+            ConsentDenied =>
+                "Windows elevation consent was declined. Start again and approve the prompt if you want to record the elevated application.",
+            ConsentDeadline =>
+                "Windows elevation consent timed out. Start again and answer the Windows prompt before it expires.",
+            ReadinessDeadline =>
+                "The elevated collector did not become ready in time. Bring the approved application forward and retry.",
+            CleanupDeadline =>
+                "The elevated collector did not finish closing in time. Check the diagnostic report and restart the Recorder before retrying.",
+            TargetChanged | ProcessIdentity | ScopeClosed =>
+                "The approved application or its capture scope changed. Bring the approved window to the foreground and retry.",
+            TargetAccess | Witness =>
+                "The collector could not verify access to the approved window on the interactive desktop. Return to that desktop and retry.",
+            ConsentLaunch | Busy | PeerExited | Supervisor | LeaseExpired | PipeSecurity | PipeConnection | PipePeer
+            | Transport | Protocol | Arguments | Cryptography | RequiredRegistration | RequiredHook | NativeProducer =>
+                "The protected collector or its required input channel failed. Check the diagnostic report and restart the Recorder before retrying.",
+            StandardHelperUnavailable =>
+                "The standard input helper could not resume capture. Restart the Recorder before trying again.",
+            Cancelled => "The protected capture request was cancelled. Start again to request a new capture.",
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn elevated(stage: SourceStage, failure: screen_fix_elevated::Failure, admitted: bool) -> Self {
+        use screen_fix_elevated::Failure;
+        use SourceFailureReason as Reason;
+        let reason = match failure {
+            Failure::DeploymentRequired => Reason::DeploymentRequired,
+            Failure::InstalledPath => Reason::InstalledPath,
+            Failure::InstalledPermissions => Reason::InstalledPermissions,
+            Failure::InstalledSignature => Reason::InstalledSignature,
+            Failure::ReleaseMismatch => Reason::ReleaseMismatch,
+            Failure::ProcessIdentity => Reason::ProcessIdentity,
+            Failure::TokenIdentity(_) => Reason::TokenIdentity,
+            Failure::Arguments => Reason::Arguments,
+            Failure::Busy => Reason::Busy,
+            Failure::ConsentDenied => Reason::ConsentDenied,
+            Failure::ConsentLaunch => Reason::ConsentLaunch,
+            Failure::ConsentDeadline => Reason::ConsentDeadline,
+            Failure::ReadinessDeadline => Reason::ReadinessDeadline,
+            Failure::CleanupDeadline => Reason::CleanupDeadline,
+            Failure::Cancelled => Reason::Cancelled,
+            Failure::PeerExited => Reason::PeerExited,
+            Failure::PipeSecurity => Reason::PipeSecurity,
+            Failure::PipeConnection => Reason::PipeConnection,
+            Failure::PipePeer => Reason::PipePeer,
+            Failure::Transport => Reason::Transport,
+            Failure::Protocol => Reason::Protocol,
+            Failure::Cryptography => Reason::Cryptography,
+            Failure::Supervisor => Reason::Supervisor,
+            Failure::LeaseExpired => Reason::LeaseExpired,
+            Failure::Witness => Reason::Witness,
+            Failure::TargetChanged => Reason::TargetChanged,
+            Failure::TargetAccess => Reason::TargetAccess,
+            Failure::ScopeClosed => Reason::ScopeClosed,
+            Failure::RequiredRegistration => Reason::RequiredRegistration,
+            Failure::StandardHelperUnavailable => Reason::StandardHelperUnavailable,
+            Failure::NativeOwnerLost | Failure::NativeProducer(_) => Reason::NativeProducer,
+        };
+        let native = match failure {
+            Failure::NativeProducer(failure) => Some(failure),
+            _ => None,
+        };
+        let token_identity = match failure {
+            Failure::TokenIdentity(detail) => Some(detail),
+            _ => None,
+        };
+        Self { stage, reason, admitted, native, token_identity }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SourceStatus {
+    #[default]
+    Unselected,
+    Ordinary,
+    AwaitingConsent,
+    AwaitingReadiness,
+    Activating,
+    Enhanced,
+    Unavailable(SourceFailure),
+    FailedPrefix(SourceFailure),
+}
+
+impl SourceStatus {
+    #[cfg(target_os = "windows")]
+    pub(crate) fn failure(self) -> Option<SourceFailure> {
+        match self {
+            Self::Unavailable(failure) | Self::FailedPrefix(failure) => Some(failure),
+            _ => None,
+        }
+    }
+
+
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum StartupStep {
     Windows,
@@ -118,7 +304,9 @@ pub struct SessionStatus {
     pub final_publication_pending: bool,
     pub countdown_seconds: Option<u8>,
     pub startup: StartupStep,
+    pub source: SourceStatus,
     pub ready_video: Vec<ReadyVideo>,
+    pub input_helper_ready: bool,
     pub input_ready: Option<crate::protocol::ipc::InputRegistration>,
     pub windows: Option<crate::platform::WindowsEvidence>,
     pub window_coverage: Option<WindowCoverage>,
@@ -144,7 +332,9 @@ impl Default for SessionStatus {
             final_publication_pending: false,
             countdown_seconds: None,
             startup: StartupStep::Windows,
+            source: SourceStatus::Unselected,
             ready_video: Vec::new(),
+            input_helper_ready: false,
             input_ready: None,
             windows: None,
             window_coverage: None,

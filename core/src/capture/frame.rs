@@ -1,7 +1,9 @@
-use std::num::NonZeroU32;
+use std::{num::NonZeroU32, sync::{Arc, atomic::{AtomicI64, Ordering}}};
+
+use screen_fix_protocol::ipc::elevated::VisitBinding;
 
 use crate::protocol::{
-    AdmissionEpoch, FrameId, GeometryId, MonitorId, PhysicalRect, SegmentId,
+    AdmissionEpoch, ClockOrigin, FrameId, GeometryId, MonitorId, PhysicalRect, QpcTick, SegmentId,
     SessionTimeUs, UncertaintyUs,
 };
 
@@ -36,18 +38,53 @@ impl FrameExtent {
     }
 }
 
+/// Shared retirement bound for unpublished media from one exact visit.
+#[derive(Debug)]
+pub(crate) struct FrameCoverage {
+    pub visit: VisitBinding,
+    clock: ClockOrigin,
+    before: AtomicI64,
+}
+
+impl FrameCoverage {
+    pub fn new(visit: VisitBinding, clock: ClockOrigin) -> Self {
+        Self { visit, clock, before: AtomicI64::new(i64::MAX) }
+    }
+
+    pub fn restrict(&self, before: QpcTick) {
+        let before = self.clock.time(before).map_or(i64::MIN, |time| time.0);
+        self.before.fetch_min(before, Ordering::AcqRel);
+    }
+
+    pub fn before(&self) -> Option<SessionTimeUs> {
+        let before = self.before.load(Ordering::Acquire);
+        (before != i64::MAX).then_some(SessionTimeUs(before))
+    }
+}
+
 /// Metadata for one actual capture. The native image lease belongs to its platform owner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct FrameMetadata {
     pub id: FrameId,
     pub geometry: MonitorGeometry,
     pub admission: AdmissionEpoch,
     pub approval_generation: u64,
+    pub(crate) coverage: Option<Arc<FrameCoverage>>,
     pub source_t_us: SessionTimeUs,
     pub recv_t_us: SessionTimeUs,
     pub source_uncertainty_us: Option<UncertaintyUs>,
     pub color: CaptureColor,
     pub extent: FrameExtent,
+}
+
+impl FrameMetadata {
+    pub(crate) fn elevated_visit(&self) -> Option<VisitBinding> {
+        self.coverage.as_ref().map(|coverage| coverage.visit)
+    }
+
+    pub(crate) fn covered(&self) -> bool {
+        self.coverage.as_ref().and_then(|coverage| coverage.before()).is_none_or(|before| self.source_t_us < before)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, path::PathBuf};
 
 use crate::package::diagnostics::{DiagnosticContext, DiagnosticSnapshot, Failure, FailureComponent};
 
@@ -9,7 +9,12 @@ pub enum CaptureErrorKind {
     BackendFailure,
     PackageFailure,
     JournalFailure,
-    PostprocessFailure,
+}
+
+#[derive(Debug)]
+pub struct RetainedRecording {
+    pub root: PathBuf,
+    pub verified_video_frames: u64,
 }
 
 #[derive(Debug)]
@@ -20,9 +25,11 @@ pub struct CaptureError {
     message: String,
     failure: Failure,
     context: Option<Box<DiagnosticContext>>,
+    retained_recording: Option<RetainedRecording>,
 }
 
 impl CaptureError {
+    #[cfg(target_os = "windows")]
     pub(crate) fn unsupported(operation: &'static str, message: &'static str) -> Self {
         Self {
             kind: CaptureErrorKind::UnsupportedPlatform,
@@ -31,6 +38,7 @@ impl CaptureError {
             message: message.into(),
             failure: Failure::new(FailureComponent::Interface, operation, None),
             context: None,
+            retained_recording: None,
         }
     }
 
@@ -43,6 +51,7 @@ impl CaptureError {
             message: message.into(),
             failure: Failure::new(FailureComponent::Interface, "Record a display", None),
             context: None,
+            retained_recording: None,
         }
     }
 
@@ -54,11 +63,19 @@ impl CaptureError {
     }
 
     #[cfg(target_os = "windows")]
+    pub(crate) fn with_raw_input_registration(
+        mut self, mismatch: Option<crate::protocol::ipc::RawInputRegistrationMismatch>,
+    ) -> Self {
+        self.failure.raw_input_registration = mismatch;
+        self
+    }
+
+    #[cfg(target_os = "windows")]
     pub(crate) fn classified(
         kind: CaptureErrorKind, component: FailureComponent, operation: &'static str,
         native_code: Option<i32>, message: String,
     ) -> Self {
-        Self { kind, operation, native_code, message, failure: Failure::new(component, operation, native_code), context: None }
+        Self { kind, operation, native_code, message, failure: Failure::new(component, operation, native_code), context: None, retained_recording: None }
     }
 
     #[cfg(target_os = "windows")]
@@ -67,7 +84,55 @@ impl CaptureError {
         Self {
             kind: CaptureErrorKind::JournalFailure, operation, native_code, message: error.to_string(),
             failure: Failure::journal(operation, error.stream, native_code), context: None,
+            retained_recording: None,
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn elevated(failure: crate::session::SourceFailure) -> Self {
+        use crate::session::{SourceFailureReason, SourceStage};
+        let (component, operation) = if failure.reason == SourceFailureReason::StandardHelperUnavailable {
+            (FailureComponent::InputHelper, "Resume the standard input helper")
+        } else {
+            let operation = match failure.stage {
+                SourceStage::Foreground => "Verify foreground process access",
+                SourceStage::Consent => "Request Windows elevation consent",
+                SourceStage::Readiness => "Prepare the elevated capture source",
+                SourceStage::Activation => "Activate the elevated capture source",
+                SourceStage::Capture => "Capture the approved elevated application",
+                SourceStage::Cleanup => "Stop the elevated capture source",
+            };
+            (FailureComponent::ElevatedSource, operation)
+        };
+        let mut error = Self::classified(
+            CaptureErrorKind::BackendFailure, component, operation,
+            failure.native.and_then(|native| native.native_code),
+            failure.guidance().into(),
+        );
+        error.failure.source = Some(failure);
+        error
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn with_retained_recording(mut self, root: PathBuf, verified_video_frames: u64) -> Self {
+        self.retained_recording = Some(RetainedRecording { root, verified_video_frames });
+        self
+    }
+
+    pub fn retained_recording(&self) -> Option<&RetainedRecording> {
+        self.retained_recording.as_ref()
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn with_additional_failure(mut self, failure: Failure) -> Self {
+        if let Some(context) = &mut self.context {
+            context.additional_failures.push(failure);
+        }
+        self
+    }
+
+    pub fn source_failure(&self) -> Option<crate::session::SourceFailure> {
+        self.failure.source
     }
 
     pub(crate) fn failure(&self) -> Failure {

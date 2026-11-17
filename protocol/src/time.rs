@@ -93,7 +93,7 @@ impl ClockOrigin {
         self.scale_delta(self.origin_qpc, qpc, 1_000_000).map(SessionTimeUs)
     }
 
-    /// Compatibility precision for the existing video muxer and export reader.
+    /// An offset from session origin in 100 ns units.
     pub fn offset_100ns(self, qpc: QpcTick) -> Result<i64, ClockRangeError> {
         self.delta_100ns(self.origin_qpc, qpc)
     }

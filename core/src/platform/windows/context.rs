@@ -1,8 +1,9 @@
 mod busy;
 mod cursor;
 mod events;
+mod elevated;
 mod frame_policy;
-pub(super) use frame_policy::{ApprovalReadError, FramePolicy};
+pub(super) use frame_policy::{ApprovalReadError, ELEVATED_FRAME_WAIT_US, FrameApproval, FramePolicy};
 mod hung;
 mod ime;
 pub(super) use ime::State as ImeState;
@@ -19,6 +20,7 @@ mod windows;
 use std::{collections::{BTreeMap, VecDeque}, time::{Duration, Instant}};
 
 use serde_json::{Value, json};
+use screen_fix_protocol::ipc::{FocusAtReceipt, elevated::{ReadBinding, VisitBinding}};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_DESTROY, EVENT_OBJECT_FOCUS, EVENT_OBJECT_HIDE, EVENT_OBJECT_IME_CHANGE,
     EVENT_OBJECT_IME_HIDE, EVENT_OBJECT_IME_SHOW, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE,
@@ -29,18 +31,18 @@ use crate::{
     capture::{context::{BusyLevel, InputSettings, TextTarget}, frame::MonitorGeometry, save::SaveWindowContext},
     config::{ClipboardMode, ResolvedCaptureConfig},
     package::metadata::AttemptLayout,
-    protocol::{BoundedList, ClockOrigin, CoarseTime, Evidence, FocusGeneration, GeometryId, PhysicalPoint, PhysicalRect, QpcTick, RequestId, UnavailableReason, WindowId, ipc::ForegroundAtReceipt},
+    protocol::{BoundedList, ClockOrigin, CoarseTime, Evidence, FocusGeneration, GeometryId, PhysicalPoint, PhysicalRect, QpcTick, RequestId, UnavailableReason, WindowId, ipc::{ForegroundAtReceipt, ProcessInstance}},
 };
 
 use self::{
     events::{DISPLAY_CHANGE, Notice, Notifications, SETTINGS_CHANGE},
-    identity::{ApprovedProcesses, MetadataScrubber, WindowProcess},
-    queries::{Classification, Queries},
+    identity::{ApprovedProcesses, MetadataScrubber, ProcessHandle, WindowProcess},
+    queries::{Classification, PointerBackend, Queries},
     windows::{FocusSnapshot, WindowMetadata},
 };
 use crate::session::windows::Receipt;
 
-use super::{ProbeError, clipboard, clock, display, unavailable};
+use super::{ProbeError, clipboard, clock, display, elevated::{InputCertificate, Selector}, unavailable};
 
 const WINDOW_REFRESH: Duration = Duration::from_millis(100);
 const DISPLAY_REFRESH: Duration = Duration::from_secs(1);
@@ -67,22 +69,37 @@ pub(super) struct Visit {
     pub foreground: WindowProcess,
     pub native: Option<FocusSnapshot>,
     uia_blocked: Option<uia::Status>,
+    elevated: Option<(VisitBinding, FocusAtReceipt)>,
 }
 
 impl Visit {
+    pub fn is_elevated(self) -> bool { self.elevated.is_some() }
+
+    pub fn elevated_binding(self) -> Option<VisitBinding> { self.elevated.map(|(binding, _)| binding) }
+
     pub fn receipt_proof(self) -> ForegroundAtReceipt {
         ForegroundAtReceipt {
             window: self.foreground.window,
             process: self.foreground.process,
-            focus: self.native.map(|native| native.focus),
+            focus: self.elevated.map(|(_, focus)| focus).or_else(|| self.native.map(|native| native.focus)),
         }
     }
 
     pub fn clipboard_focus_is_current(self) -> bool {
-        self.uia_blocked.is_none() && WindowProcess::foreground() == Some(self.foreground)
+        self.elevated.is_none() && self.uia_blocked.is_none() && WindowProcess::foreground() == Some(self.foreground)
             && FocusSnapshot::read(self.foreground).is_some_and(|native| native.focus.password_style != Some(true)
                 && !native.hung && self.native.is_some_and(|expected| native.focus == expected.focus))
     }
+
+    pub fn elevated_clipboard_focus_is_current(self) -> bool {
+        let Some((binding, focus)) = self.elevated else { return false; };
+        focus.password_style == Some(false)
+            && screen_fix_elevated::normal_capture_desktop(binding.foreground.thread)
+            && WindowProcess::foreground() == Some(self.foreground)
+            && FocusSnapshot::read(self.foreground).is_some_and(|native| native.matches_identity(focus)
+                && native.focus.password_style != Some(true) && !native.hung)
+    }
+
 }
 
 #[derive(Clone, Copy)]
@@ -117,6 +134,7 @@ impl ReceiptFocus {
 pub(super) struct ConfirmedText {
     pub visit: Visit,
     pub revision: u64,
+    pub source_read: Option<ReadBinding>,
     pub callback_at: QpcTick,
     pub observed_at: QpcTick,
     pub text: String,
@@ -125,6 +143,7 @@ pub(super) struct ConfirmedText {
 pub(super) struct Context<'a> {
     notifications: Notifications,
     queries: Queries,
+    elevated: elevated::Observations,
     ime: ime::Reader,
     last_ime_focus: Option<(FocusGeneration, ImeState)>,
     future_text: Vec<uia_commits::Commit>,
@@ -147,6 +166,7 @@ pub(super) struct Context<'a> {
     unavailable_routes: BTreeMap<crate::protocol::MonitorId, GeometryId>,
     reconfiguring_routes: BTreeMap<crate::protocol::MonitorId, GeometryId>,
     approvals: ApprovedProcesses<'a>,
+    ordinary_access: VecDeque<(ProcessInstance, Instant, bool)>,
     scrubber: MetadataScrubber,
     generation: u64,
     current: Option<Visit>,
@@ -172,7 +192,7 @@ impl<'a> Context<'a> {
         let clipboard = (config.profile().clipboard() == ClipboardMode::OptIn)
             .then(clipboard::Worker::start).transpose()?;
         Ok(Self {
-            notifications: Notifications::start()?, queries, ime: ime::Reader::spawn()?, last_ime_focus: None, future_text: Vec::with_capacity(4),
+            notifications: Notifications::start()?, queries, elevated: elevated::Observations::default(), ime: ime::Reader::spawn()?, last_ime_focus: None, future_text: Vec::with_capacity(4),
             clipboard, cursor: cursor::Tracker::start(layout)?, busy: busy::Busy::default(),
             executable_versions, visit_bounds: None,
             cursor_completions: Vec::with_capacity(16),
@@ -181,7 +201,7 @@ impl<'a> Context<'a> {
             approved_activity: VecDeque::with_capacity(64),
             future_notices: Vec::with_capacity(FUTURE_NOTICE_LIMIT),
             config, topology, topology_seen: None, unavailable_routes: BTreeMap::new(), reconfiguring_routes: BTreeMap::new(),
-            approvals: ApprovedProcesses::new(config.profile())?, scrubber,
+            approvals: ApprovedProcesses::new(config.profile())?, ordinary_access: VecDeque::with_capacity(64), scrubber,
             generation: 0, current: None, previous_visits: VecDeque::with_capacity(32), focus_boundary: None,
             hung: hung::Hung::new(now), observed_foreground_window: WindowId(0),
             observed_foreground: None, next_sweep: now, next_displays: now,
@@ -196,7 +216,9 @@ impl<'a> Context<'a> {
         self.focus_boundary = Some(at);
         self.current = None;
         self.previous_visits.clear();
+        self.ordinary_access.clear();
         self.queries.focus(FocusGeneration(self.generation), None, Instant::now())?;
+        self.elevated = elevated::Observations::default();
         self.ime.focus_changed(None);
         self.last_ime_focus = None;
         self.future_text.clear();
@@ -242,6 +264,51 @@ impl<'a> Context<'a> {
         self.current
     }
 
+    pub fn activate_elevated(&mut self, binding: VisitBinding, focus: FocusAtReceipt, at: QpcTick) -> Result<Visit, ProbeError> {
+        self.generation = self.generation.checked_add(1)
+            .ok_or_else(|| unavailable("The focus generation counter overflowed"))?;
+        let foreground = WindowProcess { window: binding.foreground.window,
+            process: binding.foreground.process, thread: binding.foreground.thread };
+        let visit = Visit { generation: FocusGeneration(self.generation), started_at: at, foreground,
+            native: None, uia_blocked: None, elevated: Some((binding, focus)) };
+        self.current = Some(visit);
+        self.elevated = elevated::Observations::default();
+        self.focus_boundary = Some(at);
+        self.queries.focus(visit.generation, Some(visit), Instant::now())?;
+        Ok(visit)
+    }
+
+    pub fn elevated_invalidation(
+        &mut self, binding: VisitBinding, focus: FocusAtReceipt, after: QpcTick, receipt: Receipt,
+    ) -> Result<Option<(QpcTick, bool)>, screen_fix_elevated::Failure> {
+        if !self.notifications.running() || self.notifications.take_loss() != 0 {
+            return Err(screen_fix_elevated::Failure::Witness);
+        }
+        let mut invalidation: Option<(QpcTick, bool)> = None;
+        for notice in self.notifications.drain() {
+            if notice.receipt < after {
+                continue;
+            }
+            let target = notice.window == binding.foreground.window;
+            let foreground = matches!(notice.event, EVENT_SYSTEM_FOREGROUND | EVENT_SYSTEM_DESKTOPSWITCH | DISPLAY_CHANGE)
+                || (target && notice.object == OBJID_WINDOW && matches!(notice.event, EVENT_OBJECT_DESTROY | EVENT_OBJECT_HIDE));
+            let focus_change = notice.event == EVENT_OBJECT_FOCUS && (notice.thread == 0
+                || notice.thread == focus.thread.get() || notice.thread == binding.foreground.thread.get());
+            if !foreground && !focus_change {
+                if self.future_notices.len() < FUTURE_NOTICE_LIMIT && !target {
+                    self.future_notices.push(notice);
+                }
+                continue;
+            }
+            let interval = receipt.tick_anchor.zip(notice.source_tick).and_then(|(anchor, tick)|
+                clock::message_tick_interval(anchor, receipt.clock.qpc_frequency, CoarseTime::windows_message(tick)));
+            if interval.is_some_and(|(_, latest)| latest < after) { continue; }
+            let before = interval.map_or(after, |(lower, _)| lower.min(notice.receipt));
+            invalidation = Some(invalidation.map_or((before, foreground), |(old, close)| (old.min(before), close || foreground)));
+        }
+        Ok(invalidation)
+    }
+
     pub fn poll(&mut self, receipt: Receipt, at: QpcTick, frame_policy: &FramePolicy) -> Result<Vec<Value>, ProbeError> {
         self.approvals.poll()?;
         let start = receipt.boundary.qpc;
@@ -275,7 +342,7 @@ impl<'a> Context<'a> {
         let foreground_window = WindowId(foreground as usize as u64);
         let observed = WindowProcess::foreground().filter(|proof| proof.window == foreground_window);
         let approved = observed.filter(|proof| !hung::is_ghost(proof.hwnd().0)
-            && self.approvals.get(proof.process).is_some());
+            && self.approvals.get(proof.process).is_some() && self.ordinary_process(proof.process));
         let observed_at = origin.time(clock::qpc()?).map_err(super::clock_error)?;
         frame_policy.publish(approved, observed_at, receipt.boundary, interrupted);
         let now = Instant::now();
@@ -345,7 +412,7 @@ impl<'a> Context<'a> {
                     self.previous_visits.push_back((known, stamp));
                 }
                 self.current = approved.map(|foreground| Visit {
-                    generation: FocusGeneration(self.generation), started_at: stamp, foreground, native, uia_blocked,
+                    generation: FocusGeneration(self.generation), started_at: stamp, foreground, native, uia_blocked, elevated: None,
                 });
                 self.queries.focus(FocusGeneration(self.generation), self.current, now)?;
                 self.ime.focus_changed(self.current);
@@ -386,7 +453,7 @@ impl<'a> Context<'a> {
             Classification::Pending => None,
         };
         let process_hung = self.current.is_some_and(|visit| self.hung.contains(visit.foreground.process));
-        if let Some(change) = self.busy.refresh(self.current, process_hung, target, &notices, at, origin) {
+        if let Some(change) = self.busy.refresh(self.current, process_hung, target, &notices, false, at, origin) {
             output.push(json!({ "kind": "app_busy", "approved": change.is_some(), "hint": change }));
         }
         let cursor_notified = notices.iter().any(|notice| notice.event == EVENT_OBJECT_NAMECHANGE
@@ -503,15 +570,16 @@ impl<'a> Context<'a> {
     }
 
     pub fn fixture_save_proof(&mut self, executable: &crate::config::ExecutableIdentity, at: QpcTick)
-        -> Option<ForegroundAtReceipt>
+        -> Option<(ForegroundAtReceipt, Option<VisitBinding>)>
     {
         let visit = self.current.filter(|visit| visit.started_at <= at)?;
         if self.queries.changed() || WindowProcess::foreground() != Some(visit.foreground)
+            || visit.is_elevated() && (!self.has_certified_elevated_input(visit, at) || !self.confirm_focus(visit))
             || self.approvals.get_at(visit.foreground.process, at)? != executable
         {
             return None;
         }
-        Some(visit.receipt_proof())
+        Some((visit.receipt_proof(), visit.elevated.map(|(binding, _)| binding)))
     }
 
     pub fn save_geometry(&self, monitor: crate::protocol::MonitorId, at: QpcTick) -> Option<GeometryId> {
@@ -519,9 +587,12 @@ impl<'a> Context<'a> {
         self.routable.iter().find(|geometry| geometry.id.monitor == monitor).map(|geometry| geometry.id)
     }
 
-    pub fn checkpoint_context(&self, at: QpcTick) -> Option<SaveWindowContext> {
+    pub fn checkpoint_context(&self, at: QpcTick, source: Option<VisitBinding>) -> Option<SaveWindowContext> {
         let visit = self.current.filter(|visit| visit.started_at <= at)?;
-        if self.queries.changed() {
+        if visit.elevated.map(|(binding, _)| binding) != source
+            || self.queries.changed() || WindowProcess::foreground() != Some(visit.foreground)
+            || visit.is_elevated() && (!self.has_certified_elevated_input(visit, at) || !self.confirm_focus(visit))
+        {
             return None;
         }
         let geometry = self.visit_bounds.filter(|(generation, _, observed)| {
@@ -560,13 +631,7 @@ impl<'a> Context<'a> {
                     continue;
                 }
                 if notice.owner.is_none() {
-                    let received = receipt.clock.time(notice.received).ok();
-                    let matching_input = self.approved_activity.iter().rev().any(|(generation, at)| {
-                        *generation == visit.generation && *at <= notice.received
-                            && received.zip(receipt.clock.time(*at).ok())
-                                .is_some_and(|(change, input)| change.0.saturating_sub(input.0) <= 1_000_000)
-                    });
-                    if !matching_input {
+                    if !clipboard_activity(&self.approved_activity, notice, visit, receipt.clock) {
                         pending.push_back(notice);
                         continue;
                     }
@@ -590,12 +655,7 @@ impl<'a> Context<'a> {
             if safe_visit.is_some_and(|visit| visit.generation == read.visit.generation
                 && visit.foreground == read.notice.foreground)
             {
-                output.push(json!({
-                    "kind": "clipboard_change", "approved": true, "text": read.text,
-                    "sequence": read.notice.sequence, "owner_verified": read.notice.owner.is_some(),
-                    "notification_receipt_t_us": receipt.clock.time(read.notice.received).ok(),
-                    "completed_t_us": receipt.clock.time(read.completed).ok(),
-                }));
+                output.push(clipboard_row(read, receipt.clock));
             }
         }
         output
@@ -605,7 +665,22 @@ impl<'a> Context<'a> {
         &mut self, proof: ForegroundAtReceipt, native_receipt: QpcTick, first: QpcTick,
     ) -> Option<ReceiptFocus> {
         let original = native_receipt.min(first);
+        if let Some(visit) = self.current.filter(|visit| visit.elevated.is_some()) {
+            if visit.receipt_proof() != proof || original < visit.started_at
+                || !self.has_certified_elevated_input(visit, native_receipt.max(first))
+            {
+                return None;
+            }
+            if proof.focus.is_some_and(|focus| focus.password_style == Some(true)) {
+                return Some(ReceiptFocus::Classified(visit, TextTarget::Password, None));
+            }
+            return Some(match self.queries.classification() {
+                Classification::Pending => ReceiptFocus::Pending(visit),
+                Classification::Resolved(target, completed) => ReceiptFocus::Classified(visit, target, completed),
+            });
+        }
         self.approvals.get_at(proof.process, original)?;
+        if !self.ordinary_process(proof.process) { return None; }
         let Some(visit) = self.current.filter(|visit| visit.receipt_proof() == proof && visit.started_at <= original
             && !self.queries.changed()) else {
             let historical = self.previous_visits.iter().rev().find(|(visit, ended)| {
@@ -624,6 +699,9 @@ impl<'a> Context<'a> {
 
     pub fn take_confirmed_text(&mut self, now: QpcTick) -> Vec<ConfirmedText> {
         let visit = self.current;
+        if visit.is_some_and(|visit| visit.elevated.is_some()) {
+            return self.take_elevated_text(now);
+        }
         let mut commits = std::mem::take(&mut self.future_text);
         commits.extend(self.queries.commits());
         let mut confirmed = Vec::new();
@@ -641,7 +719,7 @@ impl<'a> Context<'a> {
                 continue;
             }
             confirmed.push(ConfirmedText {
-                visit, revision: commit.revision, callback_at: commit.receipt, observed_at: now, text: commit.text,
+                visit, revision: commit.revision, source_read: None, callback_at: commit.receipt, observed_at: now, text: commit.text,
             });
         }
         confirmed
@@ -649,18 +727,32 @@ impl<'a> Context<'a> {
 
     pub fn confirm_text(&self, text: &ConfirmedText) -> bool {
         self.current.is_some_and(|visit| visit.generation == text.visit.generation)
-            && self.queries.accepts_commit(text.visit.generation, text.revision)
-            && self.confirm_focus(text.visit)
+            && text.source_read.map_or_else(
+                || self.queries.accepts_commit(text.visit.generation, text.revision),
+                |read| self.queries.accepts_remote_commit(read, text.callback_at),
+            ) && self.confirm_focus(text.visit)
     }
 
-    pub fn ime_for_key(&mut self, visit: Visit, key: RequestId) -> Option<ImeState> {
+    pub fn ime_for_key(
+        &mut self, visit: Visit, key: RequestId, original_qpc: QpcTick, max_wait: Duration,
+    ) -> Option<ImeState> {
         if !self.confirm_focus(visit) {
             return Some(ImeState::Unknown);
         }
-        self.ime.key_state(visit, key)
+        if visit.elevated.is_some() {
+            self.elevated_ime_for_key(key, original_qpc, max_wait)
+        } else {
+            self.ime.key_state(visit, key)
+        }
     }
 
     pub fn confirm_focus(&self, visit: Visit) -> bool {
+        if let Some((binding, focus)) = visit.elevated {
+            return self.current.is_some_and(|current| current.elevated == Some((binding, focus)))
+                && WindowProcess::foreground() == Some(visit.foreground)
+                && FocusSnapshot::read(visit.foreground).is_some_and(|native| native.matches_identity(focus)
+                    && native.focus.password_style.is_none_or(|local| focus.password_style == Some(local)));
+        }
         !self.queries.changed() && self.queries.blocked(visit.foreground.process).is_none()
             && WindowProcess::foreground() == Some(visit.foreground)
             && FocusSnapshot::read(visit.foreground).is_some_and(|native|
@@ -723,6 +815,11 @@ impl<'a> Context<'a> {
     fn observe_visit_geometry(&mut self, visit: Visit, lower_bound: QpcTick) -> Result<(), ProbeError> {
         let bounds = WindowMetadata::read(visit.foreground, &self.scrubber).and_then(|snapshot| snapshot.bounds);
         let measured = clock::qpc()?.max(lower_bound);
+        self.observe_bounds(visit, bounds, measured);
+        Ok(())
+    }
+
+    fn observe_bounds(&mut self, visit: Visit, bounds: Option<PhysicalRect>, measured: QpcTick) {
         if !self.visit_bounds.is_some_and(|(generation, known, _)| generation == visit.generation && Some(known) == bounds) {
             self.visit_bounds = bounds.map(|bounds| (visit.generation, bounds, measured));
         }
@@ -733,16 +830,31 @@ impl<'a> Context<'a> {
         } else {
             self.visit_geometry = None;
         }
-        Ok(())
     }
 
     pub fn pointer_query(
         &mut self, point: PhysicalPoint, geometry: GeometryId, origin: ClockOrigin, at: QpcTick, action_at: Option<QpcTick>,
     ) -> Result<Option<PointerLink>, ProbeError> {
-        if self.point_geometry(point) != Some(geometry) {
+        if self.point_geometry(point) != Some(geometry) { return Ok(None); }
+        let Some(visit) = self.current else { return Ok(None); };
+        let Some(window) = uia::window_at(point).filter(|window| self.approvals.get(window.process).is_some()) else {
+            self.queries.deny_pointer();
             return Ok(None);
-        }
-        self.queries.pointer(point, geometry, self.current, &mut self.approvals, origin, at, action_at)
+        };
+        let Some(root) = uia::window_root(window) else { return Ok(None); };
+        let backend = if self.ordinary_process(window.process) {
+            PointerBackend::Ordinary
+        } else if visit.elevated.is_some() {
+            if window == visit.foreground {
+                PointerBackend::Elevated(None)
+            } else {
+                self.secondary_claim(window).map_or(PointerBackend::Unavailable,
+                    |claim| PointerBackend::Elevated(Some(claim)))
+            }
+        } else {
+            PointerBackend::Unavailable
+        };
+        self.queries.pointer(point, geometry, visit, window, root, backend, origin, at, action_at)
     }
 
     fn point_geometry(&self, point: PhysicalPoint) -> Option<GeometryId> {
@@ -754,17 +866,41 @@ impl<'a> Context<'a> {
     fn window_row(&mut self, proof: WindowProcess, kind: &'static str) -> Option<Value> {
         if hung::is_ghost(proof.hwnd().0) { return None; }
         let identity = self.approvals.get(proof.process)?;
+        if !self.ordinary_process(proof.process) { return None; }
         let window = WindowMetadata::read(proof, &self.scrubber)?;
+        Some(self.window_evidence_row(proof, identity, kind, window))
+    }
+
+    fn window_evidence_row(
+        &self, proof: WindowProcess, identity: &crate::config::ExecutableIdentity,
+        kind: &'static str, window: WindowMetadata,
+    ) -> Value {
         let executable_version = self.executable_versions.0.iter().find(|(executable, _)| executable == identity)
             .and_then(|(_, version)| version.as_ref());
-        Some(json!({
+        json!({
             "kind": kind, "approved": true, "window": proof.window, "process_id": proof.process.pid,
             "executable": self.scrubber.scrub(identity.executable(), 4096), "executable_version": executable_version,
             "executable_version_observation": "approved_file_at_startup",
             "geometry": window.bounds.and_then(|bounds| self.only_geometry(bounds)),
-            "bounds": window.bounds, "dpi": window.dpi, "class": window.class, "title": window.title,
+            "bounds": window.bounds, "dpi": window.dpi, "dpi_awareness": window.dpi_awareness,
+            "class": window.class, "title": window.title,
             "metadata_observed_at_read": true,
-        }))
+        })
+    }
+
+    pub fn ordinary_process(&mut self, proof: ProcessInstance) -> bool {
+        use screen_fix_elevated::{ForegroundAccess, foreground_access};
+        let now = Instant::now();
+        self.ordinary_access.retain(|(_, expires, _)| *expires > now);
+        if let Some((_, _, allowed)) = self.ordinary_access.iter().find(|(process, _, _)| *process == proof) {
+            return *allowed;
+        }
+        let allowed = ProcessHandle::open(proof.pid).filter(|process| process.instance(proof.pid) == Some(proof))
+            .and_then(|process| process.image_path())
+            .is_some_and(|image| foreground_access(proof, &image) == Ok(ForegroundAccess::Ordinary));
+        if self.ordinary_access.len() == 64 { self.ordinary_access.pop_front(); }
+        self.ordinary_access.push_back((proof, now + Duration::from_millis(250), allowed));
+        allowed
     }
 
     fn only_geometry(&self, bounds: PhysicalRect) -> Option<GeometryId> {
@@ -859,6 +995,26 @@ fn add_win_event_timing(row: &mut Value, notice: Notice, receipt: Receipt) -> Re
     row["tick_uncertainty_us"] = json!(coarse.uncertainty_us);
     row["late"] = json!(late);
     Ok(())
+}
+
+fn clipboard_activity(
+    activity: &VecDeque<(FocusGeneration, QpcTick)>, notice: clipboard::Notice, visit: Visit, clock: ClockOrigin,
+) -> bool {
+    let received = clock.time(notice.received).ok();
+    activity.iter().rev().any(|(generation, at)| {
+        *generation == visit.generation && *at <= notice.received
+            && received.zip(clock.time(*at).ok())
+                .is_some_and(|(change, input)| change.0.saturating_sub(input.0) <= 1_000_000)
+    })
+}
+
+fn clipboard_row(read: clipboard::Read, clock: ClockOrigin) -> Value {
+    json!({
+        "kind": "clipboard_change", "approved": true, "text": read.text,
+        "sequence": read.notice.sequence, "owner_verified": read.notice.owner.is_some(),
+        "notification_receipt_t_us": clock.time(read.notice.received).ok(),
+        "completed_t_us": clock.time(read.completed).ok(),
+    })
 }
 
 fn clipboard_change_after_visit(notice: clipboard::Notice, visit: Visit, receipt: Receipt) -> bool {

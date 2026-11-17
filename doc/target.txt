@@ -1,0 +1,7 @@
+Build a tool for screen recording and additional metadata collection.
+
+The software will collect data about how users work on a computer for subsequent AI agent training.
+
+Record continuously and observe user activity. For each event, extract the screen state before and after the event from the recording and store the available event context, such as click coordinates and clipboard information.
+
+A user installs the software on a laptop and works in Adobe Photoshop, After Effects, CAD software, Blender, or another professional creative application. The software should capture keystrokes, active windows, and, as far as possible, the user's actions and what happens on screen.

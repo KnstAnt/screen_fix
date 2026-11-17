@@ -8,8 +8,8 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     io,
     sync::{
-        Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak,
+        atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread,
@@ -22,14 +22,19 @@ use crate::{
     CaptureError,
     capture::save::{FixtureSave, FixtureSaveError, FixtureSaveResult},
     config::ResolvedCaptureConfig,
-    package::{diagnostics::{DiagnosticContext, Failure, ReportOutcome}, metadata::InputBlindReason},
+    package::{diagnostics::{DiagnosticContext, Failure, ReportOutcome}, metadata::{
+        ElevatedSourceEvidence, InputBlindReason, SelectedSourceInterval, SelectedSourceKind, SourceBlindInterval, SourceBlindReason,
+        SourceEvidence, SourceRegistration, SourceTail, StandardSourceEvidence, UncertifiedInputTail,
+    }},
     platform::windows::{ProbeError, clock, hotkeys::ActiveHotkeys, preflight::ForegroundApproval, unavailable},
     protocol::{AdmissionEpoch, ClockOrigin, MessageTickAnchor, MonitorId, QpcFrequency, QpcTick, SaveId, SessionTimeUs},
 };
+use screen_fix_protocol::ipc::{FocusAtReceipt, InputRegistration, elevated::{VisitBinding, runtime::IdentityClaim}};
 
 use super::{
     AdmissionBoundary, CommandError, PauseReason, SessionCommand, SessionHandle, SessionPhase,
-    ReadyVideo, SessionResult, SessionStatus, StartupStep, VideoReport, WindowCoverage,
+    ReadyVideo, SessionResult, SessionStatus, SourceFailure, SourceFailureReason, SourceStage, SourceStatus,
+    StartupStep, VideoReport, WindowCoverage,
     hotkey::{ControlLoss, ControlNotice, ControlOutcome, HotkeyActivation, RecorderAction},
 };
 
@@ -39,7 +44,8 @@ const STOP_BUDGET: Duration = Duration::from_secs(10);
 const SESSION_END_CONTROLLER_BUDGET: Duration = Duration::from_millis(3750);
 const CONTROL_WAIT: Duration = Duration::from_millis(25);
 const MAX_CONTROL_NOTICES: usize = 32;
-const MAX_FIXTURE_SAVES: usize = 8;
+pub(crate) const MAX_FIXTURE_SAVES: usize = 8;
+const MAX_SOURCE_TRACE: usize = 4096;
 pub(crate) const MAX_INPUT_FAILURES: usize = 4;
 
 // The recording worker and all nested owners retain this lease until their
@@ -67,6 +73,87 @@ enum AdmissionCheck {
     Requested,
     Running,
     Finished(Result<ForegroundApproval, CaptureError>),
+}
+
+#[derive(Clone)]
+pub(crate) struct SourcePreparation {
+    pub(crate) epoch: AdmissionEpoch,
+    pub(crate) startup: Option<ForegroundApproval>,
+}
+
+pub(crate) struct SourceDispatch {
+    lifecycle: Weak<Lifecycle>,
+    epoch: AdmissionEpoch,
+    target: IdentityClaim,
+}
+
+impl SourceDispatch {
+    pub(crate) fn target(&self) -> &IdentityClaim { &self.target }
+
+    pub(crate) fn epoch(&self) -> AdmissionEpoch { self.epoch }
+
+    pub(crate) fn stopped(&self) -> bool {
+        self.lifecycle.upgrade().is_none_or(|lifecycle| lifecycle.stop.load(Ordering::Acquire)
+            || lifecycle.session_end_started.get().is_some())
+    }
+
+    pub(crate) fn with_closed_phase<T>(
+        &self, dispatch: impl FnOnce() -> screen_fix_elevated::Result<T>,
+    ) -> screen_fix_elevated::Result<T> {
+        let lifecycle = self.lifecycle.upgrade().ok_or(screen_fix_elevated::Failure::Cancelled)?;
+        let facts = lifecycle.lock();
+        if self.stopped() || !source_preparation_current(&facts, self.epoch)
+            || facts.startup_target.as_ref().is_some_and(|opening| opening.elevated() != Some(&self.target))
+        {
+            return Err(screen_fix_elevated::Failure::Cancelled);
+        }
+        dispatch()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ActiveSourceProof {
+    lifecycle: Weak<Lifecycle>,
+    epoch: AdmissionEpoch,
+}
+
+impl ActiveSourceProof {
+    pub(crate) fn current(&self) -> bool {
+        let Some(lifecycle) = self.lifecycle.upgrade() else { return false; };
+        if lifecycle.stop.load(Ordering::Acquire) || lifecycle.session_end_started.get().is_some() { return false; }
+        let Ok(facts) = lifecycle.facts.try_lock() else { return false; };
+        source_active(&facts, self.epoch)
+    }
+}
+
+fn source_active(facts: &Facts, epoch: AdmissionEpoch) -> bool {
+    source_epoch_active(facts, epoch) && facts.elevated_epoch == Some(epoch)
+}
+
+fn source_epoch_active(facts: &Facts, epoch: AdmissionEpoch) -> bool {
+    facts.status.phase == SessionPhase::Recording && !facts.clock_failed && !facts.source_change
+        && facts.status.pause_reasons.is_empty()
+        && facts.status.opened.is_some_and(|opened| opened.epoch == epoch)
+}
+
+fn source_preparation_current(facts: &Facts, epoch: AdmissionEpoch) -> bool {
+    matches!(facts.status.phase, SessionPhase::Starting | SessionPhase::Paused)
+        && (facts.status.phase != SessionPhase::Paused || facts.status.closed.is_some())
+        && facts.status.pause_reasons.iter().all(|reason| *reason == PauseReason::ElevationTransition)
+        && facts.source_preparation.as_ref().is_some_and(|pending| pending.epoch == epoch)
+}
+
+struct SelectedSource {
+    epoch: AdmissionEpoch,
+    approval: ForegroundApproval,
+    focus: Option<FocusAtReceipt>,
+}
+
+impl SelectedSource {
+    fn current(&self) -> bool {
+        self.approval.still_current()
+            && self.focus.is_none_or(|focus| self.approval.focus_current(focus))
+    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -101,6 +188,21 @@ struct Facts {
     pause_interval_reasons: BTreeSet<PauseReason>,
     last_pause: Option<(AdmissionBoundary, Vec<PauseReason>)>,
     input_prefix: Option<AdmissionBoundary>,
+    source_epoch: u64,
+    elevated_epoch: Option<AdmissionEpoch>,
+    source_change: bool,
+    source_preparation: Option<SourcePreparation>,
+    source_ready: Option<SelectedSource>,
+    startup_target: Option<ForegroundApproval>,
+    source_evidence: SourceEvidence,
+    selected_intervals: Vec<SelectedInterval>,
+
+}
+
+struct SelectedInterval {
+    visit: Option<VisitBinding>,
+    evidence: SelectedSourceInterval,
+    cutoff: Option<SessionTimeUs>,
 }
 
 pub(crate) struct FixtureNotice {
@@ -117,8 +219,10 @@ struct Lifecycle {
     stop: AtomicBool,
     session_end_started: Arc<OnceLock<Instant>>,
     input_environment: Arc<AtomicU32>,
+    elevated_environment: Arc<AtomicU32>,
     display_revision: Arc<AtomicU32>,
     journal_flush_revision: AtomicU64,
+    controller_qpc: AtomicI64,
     hotkey_keys: [u16; 4],
 }
 
@@ -304,6 +408,231 @@ pub(crate) enum Admission {
 }
 
 impl WorkerSession {
+    pub(crate) fn active_source(&self, epoch: AdmissionEpoch) -> ActiveSourceProof {
+        ActiveSourceProof { lifecycle: Arc::downgrade(&self.lifecycle), epoch }
+    }
+
+    pub(crate) fn elevated_active(&self, epoch: AdmissionEpoch) -> bool {
+        let facts = self.lifecycle.lock();
+        !self.lifecycle.stop.load(Ordering::Acquire) && self.lifecycle.session_end_started.get().is_none()
+            && source_active(&facts, epoch)
+    }
+
+    pub(crate) fn ordinary_source_active(&self, epoch: AdmissionEpoch) -> bool {
+        let facts = self.lifecycle.lock();
+        !self.lifecycle.stop.load(Ordering::Acquire) && self.lifecycle.session_end_started.get().is_none()
+            && source_epoch_active(&facts, epoch) && facts.elevated_epoch.is_none()
+    }
+
+    pub(crate) fn source_dispatch(&self, epoch: AdmissionEpoch, target: &IdentityClaim) -> SourceDispatch {
+        SourceDispatch { lifecycle: Arc::downgrade(&self.lifecycle), epoch, target: target.clone() }
+    }
+
+    pub(crate) fn controller_qpc(&self) -> QpcTick {
+        QpcTick(self.lifecycle.controller_qpc.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn elevated_epoch(&self, epoch: AdmissionEpoch) -> bool {
+        self.lifecycle.lock().elevated_epoch == Some(epoch)
+    }
+
+    pub(crate) fn require_source_change(&self, epoch: AdmissionEpoch) {
+        let mut facts = self.lifecycle.lock();
+        if facts.status.opened.is_some_and(|boundary| boundary.epoch == epoch)
+            && matches!(facts.status.phase, SessionPhase::Recording | SessionPhase::Paused)
+        {
+            facts.source_change = true;
+            let _ = self.wake.try_send(());
+        }
+    }
+
+    pub(crate) fn source_preparation(&self) -> Option<SourcePreparation> {
+        let facts = self.lifecycle.lock();
+        facts.source_preparation.as_ref().filter(|pending| !self.lifecycle.stop.load(Ordering::Acquire)
+            && source_preparation_current(&facts, pending.epoch)).cloned()
+    }
+
+    pub(crate) fn source_authorized(&self, epoch: AdmissionEpoch) -> bool {
+        let facts = self.lifecycle.lock();
+        !self.lifecycle.stop.load(Ordering::Acquire)
+            && self.lifecycle.session_end_started.get().is_none()
+            && (source_preparation_current(&facts, epoch)
+                || (facts.status.phase == SessionPhase::Recording && facts.elevated_epoch == Some(epoch)))
+    }
+
+    pub(crate) fn abandon_source_preparation(&self, epoch: AdmissionEpoch) {
+        let mut facts = self.lifecycle.lock();
+        if facts.source_preparation.as_ref().is_some_and(|pending| pending.epoch == epoch) {
+            facts.source_ready = None;
+            facts.source_preparation = None;
+            clear_source_status(&mut facts);
+            let _ = self.wake.try_send(());
+        }
+    }
+
+    pub(crate) fn source_ready(
+        &self, epoch: AdmissionEpoch, approval: ForegroundApproval, focus: Option<FocusAtReceipt>,
+    ) {
+        let mut facts = self.lifecycle.lock();
+        if !self.lifecycle.stop.load(Ordering::Acquire)
+            && source_preparation_current(&facts, epoch)
+        {
+            facts.source_ready = Some(SelectedSource { epoch, approval, focus });
+            let _ = self.wake.try_send(());
+        }
+    }
+
+    pub(crate) fn source_pending(&self, epoch: AdmissionEpoch, status: SourceStatus) {
+        let mut facts = self.lifecycle.lock();
+        if !self.lifecycle.stop.load(Ordering::Acquire) && source_preparation_current(&facts, epoch) {
+            facts.status.source = status;
+        }
+    }
+
+    pub(crate) fn source_enhanced(&self, epoch: AdmissionEpoch) {
+        let mut facts = self.lifecycle.lock();
+        if !self.lifecycle.stop.load(Ordering::Acquire) && source_active(&facts, epoch) {
+            facts.status.source = SourceStatus::Enhanced;
+        }
+    }
+
+    pub(crate) fn update_standard_evidence(&self, update: impl FnOnce(&mut StandardSourceEvidence)) {
+        update(self.lifecycle.lock().source_evidence.standard.get_or_insert_with(StandardSourceEvidence::default));
+    }
+
+    pub(crate) fn update_elevated_evidence(&self, update: impl FnOnce(&mut ElevatedSourceEvidence)) {
+        update(self.lifecycle.lock().source_evidence.elevated.get_or_insert_with(ElevatedSourceEvidence::default));
+    }
+
+    pub(crate) fn elevated_registration(&self, epoch: AdmissionEpoch, observed_qpc: QpcTick, registration: InputRegistration) {
+        let mut facts = self.lifecycle.lock();
+        let registration = SourceRegistration { epoch, observed_qpc, registration };
+        let evidence = facts.source_evidence.elevated.get_or_insert_with(ElevatedSourceEvidence::default);
+        if evidence.registrations.len() < MAX_SOURCE_TRACE {
+            evidence.registrations.push(registration);
+        } else {
+            facts.source_evidence.truncated = true;
+        }
+    }
+
+    pub(crate) fn record_source_coverage(
+        &self, epoch: AdmissionEpoch, visit: Option<VisitBinding>, start: SessionTimeUs, before: SessionTimeUs,
+    ) {
+        let mut facts = self.lifecycle.lock();
+        let before = facts.status.closed.filter(|closed| closed.epoch == epoch)
+            .map_or(before, |closed| before.min(closed.time));
+        if start >= before { return; }
+        if let Some(interval) = facts.selected_intervals.last_mut()
+            && interval.evidence.epoch == epoch && interval.visit == visit
+        {
+            let before = interval.cutoff.map_or(before, |cutoff| before.min(cutoff));
+            interval.evidence.before_t_us = interval.evidence.before_t_us.max(before);
+        } else if facts.selected_intervals.len() < MAX_SOURCE_TRACE {
+            facts.selected_intervals.push(SelectedInterval {
+                visit, cutoff: None,
+                evidence: SelectedSourceInterval {
+                    source: if visit.is_some() { SelectedSourceKind::Elevated } else { SelectedSourceKind::Ordinary },
+                    epoch, source_generation: visit.map(|binding| binding.source_generation), start_t_us: start,
+                    before_t_us: before,
+                },
+            });
+        } else {
+            facts.source_evidence.truncated = true;
+        }
+    }
+
+    pub(crate) fn restrict_source_coverage(&self, visit: VisitBinding, before: QpcTick) {
+        let mut facts = self.lifecycle.lock();
+        let Some(before) = facts.status.clock.and_then(|clock| clock.time(before).ok()) else { return; };
+        if let Some(interval) = facts.selected_intervals.iter_mut().rev().find(|item| item.visit == Some(visit)) {
+            restrict_interval(interval, before);
+        }
+    }
+
+    pub(crate) fn last_elevated_coverage(&self, epoch: AdmissionEpoch) -> Option<SessionTimeUs> {
+        self.lifecycle.lock().selected_intervals.iter().rev()
+            .find(|item| item.evidence.epoch == epoch && item.visit.is_some()
+                && item.evidence.start_t_us < item.evidence.before_t_us)
+            .map(|item| item.evidence.before_t_us)
+    }
+
+    pub(crate) fn record_uncertified_tail(&self, epoch: AdmissionEpoch, tail: UncertifiedInputTail) {
+        let mut facts = self.lifecycle.lock();
+        if let Some(interval) = facts.selected_intervals.last_mut()
+            .filter(|item| item.evidence.epoch == epoch && item.visit.is_none())
+        {
+            restrict_interval(interval, tail.first_t_us);
+        }
+        let evidence = &mut facts.source_evidence;
+        if evidence.uncertified_tails.len() < MAX_SOURCE_TRACE {
+            evidence.uncertified_tails.push(SourceTail { epoch, tail });
+        } else {
+            evidence.truncated = true;
+        }
+    }
+
+    pub(crate) fn record_source_blind(&self, interval: SourceBlindInterval) {
+        push_source_blind(&mut self.lifecycle.lock(), interval);
+    }
+
+    pub(crate) fn source_resynchronizing(&self, epoch: AdmissionEpoch) {
+        let mut facts = self.lifecycle.lock();
+        if !self.lifecycle.stop.load(Ordering::Acquire) && source_active(&facts, epoch) {
+            facts.status.source = SourceStatus::Activating;
+        }
+    }
+
+    pub(crate) fn source_evidence(&self) -> Option<SourceEvidence> {
+        source_evidence(&self.lifecycle.lock())
+    }
+
+    pub(crate) fn fail_classified_source(&self, failure: SourceFailure) -> bool {
+        let mut facts = self.lifecycle.lock();
+        self.stop_for_source_failure(&mut facts, failure)
+    }
+
+    pub(crate) fn fail_source(&self, stage: SourceStage, failure: screen_fix_elevated::Failure) {
+        let mut facts = self.lifecycle.lock();
+        self.stop_for_source_failure(&mut facts, SourceFailure::elevated(stage, failure, false));
+    }
+
+    fn stop_for_source_failure(&self, facts: &mut Facts, mut failure: SourceFailure) -> bool {
+        failure.admitted = facts.status.clock.is_some();
+        let first = self.lifecycle.stop.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok();
+        if first || (failure.admitted && matches!(failure.stage, SourceStage::Activation | SourceStage::Capture | SourceStage::Cleanup)
+            && !matches!(failure.reason, SourceFailureReason::Cancelled | SourceFailureReason::ScopeClosed))
+        {
+            set_source_failure(facts, failure);
+            let _ = self.wake.try_send(());
+        }
+        first
+    }
+
+    pub(crate) fn required_elevated_hook_failed(&self, closing: bool) {
+        let mut facts = self.lifecycle.lock();
+        if closing || self.lifecycle.stop.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            set_source_failure(&mut facts, SourceFailure {
+                stage: SourceStage::Capture, reason: SourceFailureReason::RequiredHook, admitted: true, native: None, token_identity: None,
+            });
+            let _ = self.wake.try_send(());
+        }
+    }
+
+    pub(crate) fn source_finalization_failed(&self, failure: screen_fix_elevated::Failure) {
+        let mut facts = self.lifecycle.lock();
+        if facts.status.clock.is_some() {
+            let failure = SourceFailure::elevated(SourceStage::Cleanup, failure, true);
+            if facts.status.source.failure().is_some_and(|primary| primary != failure) {
+                facts.source_evidence.cleanup_failure.get_or_insert(failure);
+            }
+            set_source_failure(&mut facts, failure);
+        }
+    }
+
+    pub(crate) fn source_failure(&self) -> Option<SourceFailure> {
+        self.lifecycle.lock().status.source.failure()
+    }
+
     fn disk_sample(&self, sample: disk::Sample) {
         self.lifecycle.lock().disk = Some(sample);
         let _ = self.wake.try_send(());
@@ -451,8 +780,10 @@ impl WorkerSession {
         }
     }
 
-    pub(crate) fn input_ready(&self, registration: crate::protocol::ipc::InputRegistration) {
-        self.lifecycle.lock().status.input_ready = Some(registration);
+    pub(crate) fn input_ready(&self, registration: InputRegistration, required_ready: bool) {
+        let mut facts = self.lifecycle.lock();
+        facts.status.input_ready = Some(registration);
+        facts.status.input_helper_ready = required_ready;
     }
 
     pub(crate) fn input_registration(&self) -> Option<crate::protocol::ipc::InputRegistration> {
@@ -572,8 +903,7 @@ impl WorkerSession {
         Ok(Receipt { qpc: cutoff.qpc, clock, boundary, tick_anchor: facts.tick_anchor })
     }
 
-    /// A bounded local wake for pacing or for Native Input polling in the
-    /// transitional backend. It does not assign any event's time.
+    /// A bounded wait between video pacing or input polling iterations.
     pub(crate) fn wait_for_close(&self, timeout: Duration) -> Result<Option<AdmissionBoundary>, ProbeError> {
         let (facts, _) = self.lifecycle.changed.wait_timeout_while(self.lifecycle.lock(), timeout, |facts| {
             matches!(facts.status.phase, SessionPhase::Starting | SessionPhase::Recording)
@@ -682,6 +1012,10 @@ impl WorkerSession {
         self.lifecycle.input_environment.swap(0, Ordering::AcqRel)
     }
 
+    pub(crate) fn take_elevated_environment(&self) -> u32 {
+        self.lifecycle.elevated_environment.swap(0, Ordering::AcqRel)
+    }
+
     pub(crate) fn attempt_clock(&self) -> Option<AttemptClock> {
         let facts = self.lifecycle.lock();
         Some(AttemptClock {
@@ -726,12 +1060,16 @@ pub(crate) fn spawn(
     thread::Builder::new().name("session-controller".into()).spawn(move || {
         let config = endpoint.config.clone();
         let result = run(&controller_lifecycle, incoming, woken, initialized, endpoint, hotkeys, record, lease)
-            .map_err(|error| error.with_context(DiagnosticContext::for_config(&config)));
-        let finished = result.is_ok() || result.as_ref().err()
-            .is_some_and(|error| error.kind == crate::CaptureErrorKind::PostprocessFailure);
+            .map_err(|error| {
+                let facts = controller_lifecycle.lock();
+                let mut context = DiagnosticContext::for_config(&config);
+                context.input_registration = facts.status.input_ready;
+                context.source_evidence = source_evidence(&facts);
+                error.with_context(context)
+            });
         let mut facts = controller_lifecycle.lock();
         facts.status.outcome = result.as_ref().ok().map(|result| result.outcome);
-        facts.status.phase = if finished {
+        facts.status.phase = if result.is_ok() {
             SessionPhase::Finished
         } else {
             SessionPhase::Failed
@@ -755,7 +1093,7 @@ fn run(
 ) -> Result<SessionResult, CaptureError> {
     let frequency = clock::frequency()?;
     let (environment, notifications_ready) = environment::Notifications::spawn(
-        Arc::clone(&lifecycle.input_environment), Arc::clone(&lifecycle.display_revision),
+        Arc::clone(&lifecycle.input_environment), Arc::clone(&lifecycle.elevated_environment), Arc::clone(&lifecycle.display_revision),
         Arc::clone(&lifecycle.session_end_started), endpoint.wake.clone(),
     )?;
     let pause_producer_count = endpoint.config().monitors().len() * 2 + 2;
@@ -784,8 +1122,9 @@ fn run(
                     break;
                 }
                 facts.complete_publication = CompletePublication::Expired;
-                return Err(result.err().unwrap_or_else(|| failure("Finish recording",
-                    "The recording could not finish before its deadline. An active owner may still hold capture or output resources.")));
+                return Err(facts.status.source.failure().map(CaptureError::elevated)
+                    .or_else(|| result.err()).unwrap_or_else(|| failure("Finish recording",
+                        "The recording could not finish before its deadline. An active owner may still hold capture or output resources.")));
             }
             (remaining, remaining.is_zero() && lifecycle.session_end_started.get().is_some())
         };
@@ -803,9 +1142,28 @@ fn run(
         return worker_result?.1;
     }
     lifecycle.apply_session_end_deadlines(&mut facts);
-    let acknowledged = result?;
     let (completed, worker_result) = worker_result?;
+    let acknowledged = match result {
+        Ok(acknowledged) => acknowledged,
+        Err(error) => {
+            if let Err(worker_error) = worker_result
+                && let Some(source) = worker_error.source_failure()
+            {
+                if error.source_failure() == Some(source) {
+                    return Err(worker_error);
+                }
+                if error.source_failure().is_none() {
+                    return Err(worker_error.with_additional_failure(error.failure()));
+                }
+            }
+            return Err(error);
+        }
+    };
     if facts.stop_deadline.is_some_and(|deadline| completed >= deadline) {
+        if let Some(source) = facts.status.source.failure() {
+            let error = worker_result.err().filter(|error| error.source_failure() == Some(source));
+            return Err(error.unwrap_or_else(|| CaptureError::elevated(source)));
+        }
         return Err(failure("Finish recording", "The recording owners finished after the finalization deadline."));
     }
     let message = worker_result?;
@@ -845,8 +1203,12 @@ fn coordinate(
         route_hotkeys(lifecycle, &mut reasons, &mut disk_resume, hotkeys, frequency)?;
         if lifecycle.stop.load(Ordering::Acquire) || worker.is_finished() {
             stop(lifecycle)?;
+            if let Some(failure) = lifecycle.lock().status.source.failure() {
+                return Err(CaptureError::elevated(failure));
+            }
             return Ok(pause_finished);
         }
+        lifecycle.controller_qpc.store(clock::qpc()?.0, Ordering::Release);
         if !subscribed {
             match notifications_ready.try_recv() {
                 Ok(result) => { result?; subscribed = true; }
@@ -898,6 +1260,13 @@ fn coordinate(
             continue;
         }
         update_disk(lifecycle, &mut reasons, &mut disk_resume)?;
+        let handoff = {
+            let facts = lifecycle.lock();
+            facts.source_change || (facts.status.phase == SessionPhase::Paused && facts.elevated_epoch.is_some())
+        };
+        if handoff {
+            pause_command(lifecycle, &mut reasons, SessionCommand::Pause(PauseReason::ElevationTransition))?;
+        }
         {
             let mut facts = lifecycle.lock();
             if facts.status.phase == SessionPhase::Paused {
@@ -918,8 +1287,22 @@ fn coordinate(
         if lifecycle.lock().pause_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(failure("Finish the paused recording prefix", "A recording owner did not finish its pause prefix."));
         }
-        if reasons.is_empty() && let Some(finished) = pause_finished.take() {
-            resume(lifecycle, finished)?;
+        if let Some(finished) = pause_finished {
+            if !handoff && reasons.is_empty() {
+                resume(lifecycle, finished, None)?;
+                pause_finished = None;
+            } else if handoff && reasons.iter().all(|reason| *reason == PauseReason::ElevationTransition) {
+                let selected = {
+                    let mut facts = lifecycle.lock();
+                    prepare_source(&mut facts)?;
+                    facts.source_ready.take()
+                };
+                if let Some(selected) = selected.filter(SelectedSource::current) {
+                    pause_command(lifecycle, &mut reasons, SessionCommand::Resume(PauseReason::ElevationTransition))?;
+                    resume(lifecycle, finished, Some(selected))?;
+                    pause_finished = None;
+                }
+            }
         }
         let mut wait = CONTROL_WAIT;
         if let Some(begin) = countdown {
@@ -933,44 +1316,96 @@ fn coordinate(
                 return Err(startup_disk_error());
             }
             if remaining == 0 && reasons.is_empty() {
-                let checked = {
+                let (checked, selected) = {
                     let mut facts = lifecycle.lock();
-                    match std::mem::take(&mut facts.admission_check) {
-                        AdmissionCheck::Idle => {
-                            facts.admission_check = AdmissionCheck::Requested;
-                            facts.status.startup = StartupStep::VerifyingAdmission;
-                            facts.status.countdown_seconds = None;
-                            lifecycle.changed.notify_all();
-                            None
-                        }
-                        AdmissionCheck::Finished(result) => {
-                            Some((result, facts.status.disk_available_bytes))
-                        }
-                        pending => {
-                            facts.admission_check = pending;
-                            facts.status.countdown_seconds = None;
-                            None
-                        }
+                    if facts.startup_target.is_some() {
+                        prepare_source(&mut facts)?;
+                        (None, facts.source_ready.take())
+                    } else {
+                        let checked = match std::mem::take(&mut facts.admission_check) {
+                            AdmissionCheck::Idle => {
+                                facts.admission_check = AdmissionCheck::Requested;
+                                facts.status.startup = StartupStep::VerifyingAdmission;
+                                facts.status.countdown_seconds = None;
+                                lifecycle.changed.notify_all();
+                                None
+                            }
+                            AdmissionCheck::Finished(result) => Some(result),
+                            pending => {
+                                facts.admission_check = pending;
+                                facts.status.countdown_seconds = None;
+                                None
+                            }
+                        };
+                        (checked, None)
                     }
                 };
-                if let Some((checked, available)) = checked {
+                if let Some(checked) = checked {
                     if lifecycle.stop.load(Ordering::Acquire) {
                         continue;
                     }
-                    let approved = checked?;
-                    if !available.is_some_and(|bytes| bytes >= disk::START_MINIMUM) {
+                    let approved = match checked {
+                        Ok(approved) => approved,
+                        Err(error) => {
+                            let mut facts = lifecycle.lock();
+                            if lifecycle.stop.load(Ordering::Acquire) { continue; }
+                            if let Some(failure) = error.source_failure()
+                                && !commit_startup_source_failure(lifecycle, &mut facts, failure)
+                            {
+                                continue;
+                            }
+                            return Err(error);
+                        }
+                    };
+                    if !lifecycle.lock().status.disk_available_bytes.is_some_and(|bytes| bytes >= disk::START_MINIMUM) {
                         return Err(startup_disk_error());
                     }
                     if !approved.still_current() {
+                        if approved.elevated().is_some() {
+                            let mut facts = lifecycle.lock();
+                            let failure = SourceFailure {
+                                stage: SourceStage::Foreground, reason: SourceFailureReason::TargetChanged,
+                                admitted: false, native: None, token_identity: None,
+                            };
+                            if !commit_startup_source_failure(lifecycle, &mut facts, failure) { continue; }
+                            return Err(CaptureError::elevated(failure));
+                        }
                         return Err(failure("Verify approved foreground",
                             "The approved foreground window changed before recording started. Retry and keep the application in front."));
                     }
-                    start(lifecycle, frequency)?;
+                    if approved.elevated().is_some() {
+                        let mut facts = lifecycle.lock();
+                        facts.startup_target = Some(approved);
+                        prepare_source(&mut facts)?;
+                    } else {
+                        start(lifecycle, frequency, None)?;
+                        countdown = None;
+                    }
+                } else if let Some(selected) = selected {
+                    let live = {
+                        let facts = lifecycle.lock();
+                        facts.startup_target.as_ref().and_then(ForegroundApproval::elevated) == selected.approval.elevated()
+                            && facts.status.disk_available_bytes.is_some_and(|bytes| bytes >= disk::START_MINIMUM)
+                    };
+                    if !live || !selected.current() {
+                        let mut facts = lifecycle.lock();
+                        if lifecycle.stop.load(Ordering::Acquire) { continue; }
+                        if !facts.status.disk_available_bytes.is_some_and(|bytes| bytes >= disk::START_MINIMUM) {
+                            return Err(startup_disk_error());
+                        }
+                        let failure = SourceFailure {
+                            stage: SourceStage::Readiness, reason: SourceFailureReason::TargetChanged,
+                            admitted: false, native: None, token_identity: None,
+                        };
+                        if !commit_startup_source_failure(lifecycle, &mut facts, failure) { continue; }
+                        return Err(CaptureError::elevated(failure));
+                    }
+                    start(lifecycle, frequency, Some(selected))?;
                     countdown = None;
                 }
             } else {
                 let seconds = ((remaining + ticks_per_second - 1) / ticks_per_second) as u8;
-                lifecycle.lock().status.countdown_seconds = Some(seconds);
+                lifecycle.lock().status.countdown_seconds = (remaining != 0).then_some(seconds);
                 if remaining != 0 {
                     // Use a bounded wait and let the next QPC read decide when Start occurs.
                     let nanos = (remaining * 1_000_000_000 + ticks_per_second - 1) / ticks_per_second;
@@ -981,6 +1416,16 @@ fn coordinate(
         sample_anchors(lifecycle)?;
         let _ = wake.recv_timeout(wait);
     }
+}
+
+fn commit_startup_source_failure(lifecycle: &Lifecycle, facts: &mut Facts, failure: SourceFailure) -> bool {
+    if lifecycle.session_end_started.get().is_some()
+        || lifecycle.stop.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err()
+    {
+        return false;
+    }
+    set_source_failure(facts, failure);
+    true
 }
 
 fn startup_disk_error() -> CaptureError {
@@ -1086,18 +1531,91 @@ fn route_hotkeys(
     Ok(())
 }
 
-fn start(lifecycle: &Lifecycle, frequency: QpcFrequency) -> Result<(), CaptureError> {
+fn restrict_interval(interval: &mut SelectedInterval, before: SessionTimeUs) {
+    interval.cutoff = Some(interval.cutoff.map_or(before, |cutoff| cutoff.min(before)));
+    interval.evidence.before_t_us = interval.evidence.before_t_us.min(before);
+}
+
+fn push_source_blind(facts: &mut Facts, interval: SourceBlindInterval) {
+    if interval.start_t_us >= interval.before_t_us { return; }
+    let evidence = &mut facts.source_evidence;
+    if evidence.blind.len() < MAX_SOURCE_TRACE {
+        evidence.blind.push(interval);
+    } else {
+        evidence.truncated = true;
+    }
+}
+
+fn source_evidence(facts: &Facts) -> Option<SourceEvidence> {
+    let mut evidence = facts.source_evidence.clone();
+    evidence.failure = facts.status.source.failure();
+    evidence.intervals.extend(facts.selected_intervals.iter().map(|interval| interval.evidence)
+        .filter(|interval| interval.start_t_us < interval.before_t_us));
+    evidence.blind.sort_by_key(|interval| (interval.start_t_us, interval.before_t_us));
+    (evidence.standard.is_some() || evidence.elevated.is_some() || evidence.failure.is_some() || !evidence.intervals.is_empty()
+        || !evidence.uncertified_tails.is_empty() || !evidence.blind.is_empty() || evidence.truncated).then_some(evidence)
+}
+
+fn clear_source_status(facts: &mut Facts) {
+    if facts.status.source.failure().is_none() {
+        facts.status.source = SourceStatus::Unselected;
+    }
+}
+
+fn set_source_failure(facts: &mut Facts, failure: SourceFailure) {
+    if facts.status.source.failure().is_none() {
+        facts.controller_failure = Some(CaptureError::elevated(failure).operation);
+        facts.status.source = if failure.admitted {
+            SourceStatus::FailedPrefix(failure)
+        } else {
+            SourceStatus::Unavailable(failure)
+        };
+    }
+}
+
+fn prepare_source(facts: &mut Facts) -> Result<(), CaptureError> {
+    if facts.source_preparation.is_none() {
+        facts.source_epoch = facts.source_epoch.checked_add(1)
+            .ok_or_else(|| failure("Prepare a capture source", "The admission epoch overflowed."))?;
+        facts.source_preparation = Some(SourcePreparation {
+            epoch: AdmissionEpoch(facts.source_epoch), startup: facts.startup_target.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn select_source(facts: &mut Facts, epoch: AdmissionEpoch, selected: Option<SelectedSource>) {
+    facts.source_epoch = epoch.0;
+    facts.elevated_epoch = selected.as_ref().filter(|source| source.approval.elevated().is_some()).map(|source| source.epoch);
+    facts.status.source = if facts.elevated_epoch.is_some() {
+        SourceStatus::Activating
+    } else {
+        SourceStatus::Ordinary
+    };
+    facts.startup_target = None;
+    facts.source_preparation = None;
+    facts.source_ready = None;
+    facts.source_change = false;
+}
+
+fn start(lifecycle: &Lifecycle, frequency: QpcFrequency, selected: Option<SelectedSource>) -> Result<(), CaptureError> {
     let mut facts = lifecycle.lock();
     if lifecycle.stop.load(Ordering::Acquire) {
         return Ok(());
     }
     let anchor = clock::utc_anchor()?;
     let origin = ClockOrigin { origin_qpc: anchor.qpc, qpc_frequency: frequency };
-    let boundary = boundary(origin, anchor.qpc, AdmissionEpoch(1))?;
-    facts.tick_anchor = Some(clock::message_tick_anchor()?);
+    let epoch = selected.as_ref().map_or(AdmissionEpoch(1), |source| source.epoch);
+    let boundary = boundary(origin, anchor.qpc, epoch)?;
+    let tick_anchor = clock::message_tick_anchor()?;
+    if lifecycle.stop.load(Ordering::Acquire) || lifecycle.session_end_started.get().is_some() {
+        return Ok(());
+    }
+    facts.tick_anchor = Some(tick_anchor);
     facts.utc_anchors.push(ClockAnchor { admission_epoch: boundary.epoch, sample: anchor });
     facts.status.clock = Some(origin);
     facts.status.opened = Some(boundary);
+    select_source(&mut facts, epoch, selected);
     facts.status.phase = SessionPhase::Recording;
     facts.status.countdown_seconds = None;
     lifecycle.changed.notify_all();
@@ -1119,6 +1637,9 @@ fn stop(lifecycle: &Lifecycle) -> Result<(), CaptureError> {
     shorten(&mut facts.stop_deadline, now + STOP_BUDGET);
     shorten(&mut facts.segment_deadline, now + STOP_BUDGET);
     facts.status.phase = SessionPhase::Stopping;
+    if facts.status.clock.is_none() { clear_source_status(&mut facts); }
+    facts.source_preparation = None;
+    facts.source_ready = None;
     facts.status.countdown_seconds = None;
     let sampled = (|| {
         if let (Some(origin), Some(opened)) = (facts.status.clock, facts.status.opened) {
@@ -1127,6 +1648,13 @@ fn stop(lifecycle: &Lifecycle) -> Result<(), CaptureError> {
             if was_recording {
                 facts.status.closed = Some(stopped);
                 facts.input_prefix = None;
+            } else if let Some(closed) = facts.status.closed
+                && facts.pause_interval_reasons.contains(&PauseReason::ElevationTransition)
+            {
+                push_source_blind(&mut facts, SourceBlindInterval {
+                    epoch: closed.epoch, start_t_us: closed.time, before_t_us: stopped.time,
+                    reason: SourceBlindReason::ElevationTransition,
+                });
             }
             facts.utc_anchors.push(ClockAnchor { admission_epoch: stopped.epoch, sample: clock::utc_anchor()? });
         }
@@ -1154,6 +1682,11 @@ fn pause_command(
     }
     let mut facts = lifecycle.lock();
     facts.status.pause_reasons = reasons.iter().copied().collect();
+    if matches!(command, SessionCommand::Pause(reason) if reason != PauseReason::ElevationTransition) {
+        facts.source_preparation = None;
+        facts.source_ready = None;
+        if facts.status.phase != SessionPhase::Recording { clear_source_status(&mut facts); }
+    }
     if facts.status.phase == SessionPhase::Paused {
         facts.pause_interval_reasons.extend(reasons.iter().copied());
     } else if facts.status.phase == SessionPhase::Recording && !reasons.is_empty()
@@ -1164,6 +1697,7 @@ fn pause_command(
         facts.status.closed = Some(closed);
         facts.utc_anchors.push(ClockAnchor { admission_epoch: closed.epoch, sample: anchor });
         facts.status.phase = SessionPhase::Paused;
+        clear_source_status(&mut facts);
         facts.pause_prefix.clear();
         facts.paused_video.clear();
         facts.input_prefix = None;
@@ -1174,18 +1708,29 @@ fn pause_command(
     Ok(())
 }
 
-fn resume(lifecycle: &Lifecycle, finished: AdmissionBoundary) -> Result<(), CaptureError> {
+fn resume(lifecycle: &Lifecycle, finished: AdmissionBoundary, selected: Option<SelectedSource>) -> Result<(), CaptureError> {
     let mut facts = lifecycle.lock();
-    if facts.status.phase != SessionPhase::Paused || facts.status.closed != Some(finished) {
+    if lifecycle.stop.load(Ordering::Acquire) || facts.status.phase != SessionPhase::Paused || facts.status.closed != Some(finished) {
         return Ok(());
     }
     let origin = facts.status.clock
         .ok_or_else(|| failure("Resume recording", "The session clock is missing."))?;
-    let epoch = finished.epoch.0.checked_add(1).map(AdmissionEpoch)
-        .ok_or_else(|| failure("Resume recording", "The admission epoch overflowed."))?;
+    let epoch = match selected.as_ref() {
+        Some(source) => source.epoch,
+        None => facts.source_epoch.checked_add(1).map(AdmissionEpoch)
+            .ok_or_else(|| failure("Resume recording", "The admission epoch overflowed."))?,
+    };
     let resume_anchor = clock::utc_anchor()?;
     let tick_anchor = clock::message_tick_anchor()?;
-    facts.status.opened = Some(boundary(origin, resume_anchor.qpc, epoch)?);
+    let reopened = boundary(origin, resume_anchor.qpc, epoch)?;
+    if facts.pause_interval_reasons.contains(&PauseReason::ElevationTransition) {
+        push_source_blind(&mut facts, SourceBlindInterval {
+            epoch: finished.epoch, start_t_us: finished.time, before_t_us: reopened.time,
+            reason: SourceBlindReason::ElevationTransition,
+        });
+    }
+    facts.status.opened = Some(reopened);
+    select_source(&mut facts, epoch, selected);
     facts.status.closed = None;
     facts.status.phase = SessionPhase::Recording;
     facts.segment_deadline = None;

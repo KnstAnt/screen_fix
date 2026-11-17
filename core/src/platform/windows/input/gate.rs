@@ -16,7 +16,7 @@ use crate::{
         },
     },
     package::journal::{JournalIngress, Submit},
-    protocol::{AdmissionEpoch, DeviceId, EventRef, Evidence, FocusGeneration, GeometryId, ObservationId, SessionTimeUs, UnavailableReason, ipc::{DeviceDescriptor, DeviceKind, ForegroundAtReceipt, InputSample, MAX_INPUT_DEVICES, Producer}},
+    protocol::{AdmissionEpoch, DeviceId, EventRef, Evidence, FocusGeneration, GeometryId, ObservationId, SessionTimeUs, UnavailableReason, ipc::{DeviceDescriptor, DeviceKind, ForegroundAtReceipt, InputSample, MAX_INPUT_DEVICES, Producer, elevated::VisitBinding}},
     session::windows::Receipt,
 };
 
@@ -197,6 +197,32 @@ impl Gate {
         }
     }
 
+    pub fn retain_prefix(
+        &mut self, before: SessionTimeUs, hook_before: Option<crate::protocol::QpcTick>, requests: &mut ProvisionalRequests,
+    ) {
+        for _ in 0..self.slots.len() {
+            let Some(slot) = self.slots.pop_front() else { break; };
+            match slot {
+                Slot::Input(input) => {
+                    let correlated = &input.input.normalized.correlated;
+                    let promotion_covered = hook_before.is_none_or(|before| correlated.promotion.as_ref()
+                        .is_none_or(|promotion| promotion.pen.receipt.qpc < before && promotion.pointer.receipt.qpc < before));
+                    if promotion_covered && std::iter::once(&correlated.first).chain(&correlated.partners)
+                        .all(|receipt| receipt.time.recv_t_us < before)
+                    {
+                        self.slots.push_back(Slot::Input(input));
+                    } else {
+                        requests.retire_input(input.input, InputResolution::Dropped(DropReason::AdmissionClosed));
+                    }
+                }
+                Slot::Synchronization { at, edges, .. } if at >= before => requests.suppress_synthetic(edges),
+                Slot::Boundary { at, .. } if at >= before => {}
+                slot => self.slots.push_back(slot),
+            }
+        }
+        self.confirmed_text.retain(|(at, _)| *at < before);
+    }
+
     pub fn synchronize(
         &mut self, at: SessionTimeUs, visit: Visit, held_modifiers: u8, released_modifiers: u8,
         edges: Vec<SyntheticHeldEdge>,
@@ -228,6 +254,12 @@ impl Gate {
         self.touchpad_inventory_uncertain = true;
     }
 
+    pub fn reset_device_inventory(&mut self) {
+        self.touchpads.clear();
+        self.touchpad_inventory_uncertain = false;
+        self.hid.reset(None);
+    }
+
     pub fn pen_observation(&self) -> (bool, bool) {
         (self.pen_observed, self.pressure_observed)
     }
@@ -248,7 +280,9 @@ impl Gate {
     }
 
     pub fn stage_confirmed(&mut self, text: ConfirmedText, receipt: Receipt) {
-        if self.confirmed_text.len() >= 16 || text.callback_at < receipt.boundary.qpc {
+        if text.callback_at < receipt.boundary.qpc { return; }
+        if self.confirmed_text.len() >= 16 {
+            self.overflow = true;
             return;
         }
         if let Ok(at) = receipt.clock.time(text.observed_at) {
@@ -262,12 +296,24 @@ impl Gate {
         certified_before: Option<SessionTimeUs>, final_boundary: bool,
     ) -> Result<(), ProbeError> {
         self.resolve_confirmed(requests);
+        let observed = if context.visit().is_some_and(Visit::is_elevated) {
+            receipt.clock.time(receipt.qpc).map_err(super::clock_error)?.max(through)
+        } else {
+            through
+        };
         loop {
             if let Some((at, _)) = self.confirmed_text.front()
                 && self.first_slot().is_none_or(|first| *at < first)
                 && self.overflow_at.is_none_or(|overflow| *at < overflow)
             {
-                let elapsed = through.0.saturating_sub(at.0);
+                if self.confirmed_text.front().is_some_and(|(_, text)| text.source_read.is_some())
+                    && let Some(last) = prefix.last_time.filter(|last| *last > *at)
+                {
+                    let (at, _) = self.confirmed_text.pop_front().expect("confirmed text was present");
+                    output.record_loss_at(1, at, at, last).map_err(package_journal_error)?;
+                    continue;
+                }
+                let elapsed = observed.0.saturating_sub(at.0);
                 if !final_boundary && elapsed < MAX_WAIT_US
                     && (elapsed < FOCUS_CONFIRM_US || certified_before.is_none_or(|prefix| prefix <= *at))
                 {
@@ -275,8 +321,10 @@ impl Gate {
                 }
                 let (at, text) = self.confirmed_text.pop_front().expect("confirmed text was present");
                 self.flush_motion(at, false, receipt, output, prefix)?;
-                if at <= through && elapsed <= MAX_WAIT_US && certified_before.is_some_and(|prefix| prefix > at)
-                    && context.confirm_text(&text)
+                let callback_fresh = text.source_read.is_none() || receipt.clock.time(text.callback_at)
+                    .is_ok_and(|callback| observed.0.saturating_sub(callback.0) <= MAX_WAIT_US);
+                if at <= through && elapsed <= MAX_WAIT_US && callback_fresh
+                    && certified_before.is_some_and(|prefix| prefix > at) && context.confirm_text(&text)
                 {
                     let source = receipt.clock.time(text.callback_at).ok();
                     let generation = Some(text.visit.generation);
@@ -299,7 +347,7 @@ impl Gate {
                 approval = approved_receipt(&classified.input, context);
                 if let Some((proof, focus)) = approval && let Action::Key(key) = correlated.first.action {
                     let at = correlated.first.time.recv_t_us;
-                    let elapsed = through.0.saturating_sub(at.0);
+                    let elapsed = observed.0.saturating_sub(at.0);
                     if elapsed < FOCUS_CONFIRM_US || matches!(focus, ReceiptFocus::Pending(_)) && elapsed < MAX_WAIT_US {
                         if !final_boundary {
                             break;
@@ -311,7 +359,9 @@ impl Gate {
                         && let Some(visit) = focus.visit()
                     {
                         if !final_boundary && elapsed < MAX_WAIT_US {
-                            let Some(state) = context.ime_for_key(visit, correlated.first.id) else { break };
+                            let Some(state) = context.ime_for_key(visit, correlated.first.id,
+                                correlated.first.packet.receipt.qpc, std::time::Duration::from_micros(MAX_WAIT_US as u64))
+                            else { break };
                             ime = state;
                         }
                     }
@@ -419,8 +469,9 @@ impl Gate {
         let mut source_time = first.time.source_t_us;
         let mut modifier_knowledge = None;
         let mut active_pad_contact = false;
+        let report_scope = focus.visit().and_then(Visit::elevated_binding);
         let report_reference = matches!(&first.packet.sample, InputSample::Hid(_))
-            .then(|| self.hid_reference(&first.packet)).flatten();
+            .then(|| self.hid_reference(&first.packet, report_scope)).flatten();
         let approved_promotion = normal.correlated.promotion.as_ref().filter(|link| {
             link.pen.foreground_at_receipt == Some(proof) && promotion_focus(link, proof, context)
         });
@@ -596,8 +647,8 @@ impl Gate {
         let mut row = row;
         if let Some(link) = approved_promotion {
             row["pen_promotion_link"] = json!({
-                "pen_report": self.hid_reference(&link.pen),
-                "pointer_report": self.hid_reference(&link.pointer),
+                "pen_report": self.hid_reference(&link.pen, report_scope),
+                "pointer_report": self.hid_reference(&link.pointer, report_scope),
                 "receipt_gap_us": link.gap_us,
             });
         }
@@ -734,7 +785,7 @@ impl Gate {
         }
     }
 
-    fn hid_reference(&self, input: &crate::protocol::ipc::CollectedInput) -> Option<String> {
+    fn hid_reference(&self, input: &crate::protocol::ipc::CollectedInput, visit: Option<VisitBinding>) -> Option<String> {
         let key = self.reference_key.as_ref()?;
         let mut data = [0_u8; 9];
         data[0] = match input.sample.producer() {
@@ -743,7 +794,18 @@ impl Gate {
             _ => return None,
         };
         data[1..].copy_from_slice(&input.receipt.sequence.0.to_le_bytes());
-        Some(blake3::keyed_hash(key, &data).to_hex().as_str()[..32].to_owned())
+        let mut hash = blake3::Hasher::new_keyed(key);
+        if let Some(visit) = visit {
+            hash.update(b"elevated report\0");
+            hash.update(&visit.epoch.0.to_le_bytes());
+            hash.update(&visit.source_generation.get().to_le_bytes());
+            hash.update(&visit.grant.get().to_le_bytes());
+            hash.update(&visit.focus_generation.0.to_le_bytes());
+            hash.update(&visit.focus_revision.to_le_bytes());
+            hash.update(&visit.resync_revision.get().to_le_bytes());
+        }
+        hash.update(&data);
+        Some(hash.finalize().to_hex().as_str()[..32].to_owned())
     }
 
     fn publish_text(

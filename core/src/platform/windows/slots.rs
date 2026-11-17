@@ -1,11 +1,11 @@
 //! An integer encoding timeline tied to one admission epoch.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    capture::frame::FrameMetadata,
+    capture::frame::{FrameCoverage, FrameMetadata},
     protocol::{AdmissionEpoch, FrameId, GeometryEpoch, MonitorId, SegmentId, SessionTimeUs},
 };
 
@@ -150,8 +150,8 @@ impl Evidence {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct Source {
-    pub metadata: FrameMetadata,
+pub(super) struct Source<'a> {
+    pub metadata: &'a FrameMetadata,
     pub change: Option<f64>,
     pub repeated: bool,
 }
@@ -194,12 +194,16 @@ pub(super) struct Row {
     pub change: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub late: Option<bool>,
+    #[serde(skip)]
+    pub(super) coverage: Option<Arc<FrameCoverage>>,
+    #[serde(skip)]
+    coverage_end: Option<SessionTimeUs>,
 }
 
 impl Row {
     pub(super) fn pending(
         monitor: MonitorId, epoch: AdmissionEpoch, slot: Slot,
-        decided: Option<SessionTimeUs>, source: Option<Source>, changed_arrived_late: Option<bool>,
+        decided: Option<SessionTimeUs>, source: Option<Source<'_>>, changed_arrived_late: Option<bool>,
     ) -> Self {
         Self {
             monitor, slot: slot.index, pts_us: slot.start, slot_decided_t_us: decided,
@@ -214,11 +218,38 @@ impl Row {
             repeated: source.map(|source| source.repeated),
             change: source.filter(|source| !source.repeated).and_then(|source| source.change),
             late: changed_arrived_late,
+            coverage: source.and_then(|source| source.metadata.coverage.clone()), coverage_end: Some(slot.end),
         }
+    }
+
+    pub(super) fn limit_coverage(&mut self, end: SessionTimeUs) { self.coverage_end = Some(end); }
+
+    pub(super) fn revoked(&self) -> bool {
+        self.coverage.as_ref().and_then(|coverage| coverage.before()).is_some_and(|before|
+            self.coverage_end.is_some_and(|end| end > before) || self.source_t_us.is_some_and(|source| source >= before))
     }
 
     pub(super) fn miss(&mut self, reason: Missing) {
         self.reason = Some(reason);
+    }
+
+    pub(super) fn withdraw(&mut self, reason: Missing) {
+        self.miss(reason);
+        self.encoded = false;
+        self.segment = None;
+        self.frame_in_segment = None;
+        self.pts_100ns = None;
+        self.duration_100ns = None;
+        self.obs_id = None;
+        self.frame_id = None;
+        self.source_t_us = None;
+        self.capture_recv_t_us = None;
+        self.geometry_version = None;
+        self.geometry = None;
+        self.repeated = None;
+        self.change = None;
+        self.late = None;
+        self.coverage = None;
     }
 
     pub(super) fn verified(&mut self, segment: SegmentId, index: u64, pts: i64, duration: i64) {

@@ -7,34 +7,25 @@ edition = "2024"
 name = "screen-fix-input-helper"
 path = "src/main.rs"
 
+[features]
+elevated-release = []
+
 [dependencies]
 screen-fix-protocol = { path = "../../../protocol" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-blake3 = { version = "1", features = ["pure"] }
+screen-fix-native-observation = { path = "../native-observation" }
 windows-sys = { version = "0.61", features = [
-    "Win32_Devices_DeviceAndDriverInstallation",
-    "Win32_Devices_HumanInterfaceDevice",
-    "Win32_Devices_Properties",
     "Win32_Foundation",
-    "Win32_Storage_FileSystem",
-    "Win32_Security",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Performance",
-    "Win32_System_Registry",
-    "Win32_System_SystemInformation",
     "Win32_System_Threading",
-    "Win32_UI_Input",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [build-dependencies]
 embed-resource = "3"
 
 # Installer payload from the same workspace release as the adjacent
-# screen-fix.exe. Production packaging consumes this metadata and signs the
-# pair; the development target only embeds the helper's Windows manifest.
+# screen-fix.exe and elevated collector. The protected release embeds
+# matching trust resources; development embeds the ordinary manifest.
 [package.metadata.screen-fix.deployment]
 platform = "windows"
 binary = "screen-fix-input-helper.exe"

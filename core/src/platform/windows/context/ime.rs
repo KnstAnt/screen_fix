@@ -2,31 +2,16 @@
 
 use std::{sync::mpsc::{Receiver, SyncSender, sync_channel}, thread, time::{Duration, Instant}};
 
-use windows_sys::Win32::UI::{
-    Input::{Ime::{ImmGetDefaultIMEWnd, ImmIsIME}, KeyboardAndMouse::HKL},
-    WindowsAndMessaging::{SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW},
-};
+use screen_fix_native_observation::ime::{has_ime, read};
+
+pub(in crate::platform::windows) use screen_fix_native_observation::ime::State;
 
 use crate::protocol::{FocusGeneration, RequestId};
 
-use super::{Visit, identity::WindowProcess, windows::FocusSnapshot};
+use super::Visit;
 use super::super::{ProbeError, mp4::io_error};
 
-const IME_CONTROL: u32 = 0x0283;
-const GET_OPEN_STATUS: usize = 0x0005;
-const GET_CONVERSION_MODE: usize = 0x0001;
-const NATIVE_AND_FULLSHAPE: usize = 0x0001 | 0x0008;
 const BUDGET: Duration = Duration::from_millis(50);
-
-#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(in crate::platform::windows) enum State {
-    NotIme,
-    Closed,
-    PassThrough,
-    Composing,
-    Unknown,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -61,7 +46,7 @@ impl Reader {
         let (returned, results) = sync_channel(2);
         thread::Builder::new().name("context-ime".into()).spawn(move || {
             while let Ok(request) = queued.recv() {
-                let state = read(request);
+                let state = read(request.visit.foreground, request.visit.native, request.expires);
                 let _ = returned.try_send(Outcome { kind: request.kind, state });
             }
         }).map_err(|error| io_error("Start the IME context reader", error))?;
@@ -74,7 +59,7 @@ impl Reader {
         self.focus_result = None;
         self.key_result = None;
         let Some(visit) = visit else { return };
-        if !has_ime(visit) {
+        if !has_ime(visit.native) {
             self.focus_result = Some((visit.generation, State::NotIme));
         } else {
             let request = Request { kind: Kind::Focus(visit.generation), visit, expires: Instant::now() + BUDGET };
@@ -117,7 +102,7 @@ impl Reader {
 
     pub fn key_state(&mut self, visit: Visit, key: RequestId) -> Option<State> {
         self.poll();
-        if !has_ime(visit) {
+        if !has_ime(visit.native) {
             return Some(State::NotIme);
         }
         if let Some((id, state)) = self.key_result.take() && id == key {
@@ -133,47 +118,4 @@ impl Reader {
         self.pending_key = Some(request);
         None
     }
-}
-
-fn has_ime(visit: Visit) -> bool {
-    let Some(focus) = visit.native else { return false };
-    unsafe { ImmIsIME(focus.focus.keyboard_layout as usize as HKL) != 0 }
-}
-
-fn read(request: Request) -> State {
-    fn active(visit: Visit) -> bool {
-        WindowProcess::foreground() == Some(visit.foreground)
-            && FocusSnapshot::read(visit.foreground).map(|current| (current.focus, current.hung))
-                == visit.native.map(|expected| (expected.focus, false))
-    }
-
-    let Some(focus) = request.visit.native.filter(|focus| !focus.hung) else { return State::Unknown };
-    if Instant::now() >= request.expires || !active(request.visit) {
-        return State::Unknown;
-    }
-    let window = unsafe { ImmGetDefaultIMEWnd(focus.focus.window.0 as usize as *mut _) };
-    if window.is_null() {
-        return State::Unknown;
-    }
-    let open = send(window, GET_OPEN_STATUS, request.expires);
-    let conversion = (open == Some(1)).then(|| send(window, GET_CONVERSION_MODE, request.expires)).flatten();
-    if Instant::now() > request.expires || !active(request.visit) {
-        return State::Unknown;
-    }
-    match (open, conversion) {
-        (Some(0), _) => State::Closed,
-        (Some(1), Some(mode)) if mode & NATIVE_AND_FULLSHAPE == 0 => State::PassThrough,
-        (Some(1), Some(_)) => State::Composing,
-        _ => State::Unknown,
-    }
-}
-
-fn send(window: windows_sys::Win32::Foundation::HWND, command: usize, expires: Instant) -> Option<usize> {
-    let remaining = expires.checked_duration_since(Instant::now())?;
-    let timeout = u32::try_from(remaining.as_millis()).ok().filter(|value| *value != 0)?;
-    let mut result = 0;
-    let delivered = unsafe {
-        SendMessageTimeoutW(window, IME_CONTROL, command, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, timeout, &mut result)
-    };
-    (delivered != 0).then_some(result)
 }

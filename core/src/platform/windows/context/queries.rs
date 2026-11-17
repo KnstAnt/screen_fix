@@ -1,6 +1,10 @@
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use screen_fix_protocol::ipc::elevated::{
+    CommitEvidence, PointBinding, Query as RemoteQuery, ReadBinding, ReadEvidence, ReadOutcome, ReadUnavailable, UiaEvidence,
+    runtime::{IdentityClaim, Observation}, ContextEvidence,
+};
 use windows::Win32::{
     Foundation::POINT,
     UI::{HiDpi::{GetAwarenessFromDpiAwarenessContext, GetDpiForWindow, GetWindowDpiAwarenessContext},
@@ -13,10 +17,10 @@ use crate::{
 };
 
 use super::{Visit, hung::Hung,
-    identity::{ApprovedProcesses, MetadataScrubber, WindowProcess},
+    identity::{MetadataScrubber, WindowProcess},
     uia::{self, Query, Read, Request, Status, Worker},
 };
-use super::super::{ProbeError, unavailable};
+use super::super::{ProbeError, elevated::{ContextDelivery, Selector}, unavailable};
 
 const POINTER_REST: Duration = Duration::from_millis(500);
 const POINTER_POLL: Duration = Duration::from_millis(50);
@@ -42,6 +46,12 @@ enum PointerBasis {
     PointerRest,
 }
 
+pub(super) enum PointerBackend {
+    Ordinary,
+    Elevated(Option<IdentityClaim>),
+    Unavailable,
+}
+
 pub(super) struct Queries {
     worker: Worker,
     generation: FocusGeneration,
@@ -49,14 +59,19 @@ pub(super) struct Queries {
     next_id: u64,
     focus: Option<Request>,
     focus_sent: bool,
+    remote_focus: Option<ReadBinding>,
+    remote_edit: Option<(ReadBinding, QpcTick)>,
+    remote: bool,
     classification: Classification,
     pointer: Option<Request>,
     pointer_sent: bool,
+    pointer_backend: PointerBackend,
+    remote_pointer: Option<ReadBinding>,
     last_point: Option<PhysicalPoint>,
     moved_at: Instant,
     pointer_rest_emitted: bool,
     next_pointer_poll: Instant,
-    cached_pointer: Option<(PhysicalPoint, GeometryId, WindowProcess, QpcTick, RequestId)>,
+    cached_pointer: Option<(PhysicalPoint, GeometryId, WindowProcess, WindowProcess, QpcTick, RequestId)>,
     deferred_reads: Vec<Read>,
     denied_target: bool,
 }
@@ -66,9 +81,9 @@ impl Queries {
         let now = Instant::now();
         Ok(Self {
             worker: Worker::start(scrubber)?,
-            generation: FocusGeneration(0), revision: 0, next_id: 0, focus: None, focus_sent: false,
+            generation: FocusGeneration(0), revision: 0, next_id: 0, focus: None, focus_sent: false, remote_focus: None, remote_edit: None, remote: false,
             classification: Classification::Resolved(TextTarget::PossiblySensitive, None),
-            pointer: None, pointer_sent: false, last_point: None, moved_at: now,
+            pointer: None, pointer_sent: false, pointer_backend: PointerBackend::Unavailable, remote_pointer: None, last_point: None, moved_at: now,
             pointer_rest_emitted: true, next_pointer_poll: now, cached_pointer: None, deferred_reads: Vec::new(), denied_target: false,
         })
     }
@@ -79,7 +94,7 @@ impl Queries {
 
     pub fn update_hung(&mut self, hung: &Hung) {
         self.worker.update_hung(hung);
-        if self.cached_pointer.is_some_and(|(_, _, window, _, _)| self.blocked(window.process).is_some()) {
+        if self.cached_pointer.is_some_and(|(_, _, window, _, _, _)| self.blocked(window.process).is_some()) {
             self.cached_pointer = None;
         }
     }
@@ -89,7 +104,7 @@ impl Queries {
     }
 
     pub fn changed(&self) -> bool {
-        self.worker.focus_revision() != self.revision
+        !self.remote && self.worker.focus_revision() != self.revision
     }
 
     pub fn classification(&self) -> Classification {
@@ -105,9 +120,25 @@ impl Queries {
             && matches!(self.classification, Classification::Resolved(TextTarget::Editable, Some(_)))
     }
 
+    pub fn accepts_remote_commit(&self, binding: ReadBinding, callback: QpcTick) -> bool {
+        self.remote_edit.is_some_and(|(read, opened)| read == binding && callback >= opened)
+            && matches!(self.classification(), Classification::Resolved(TextTarget::Editable, Some(_)))
+    }
+
+    pub fn remote_commit(&self, commit: &CommitEvidence, at: QpcTick, clock: ClockOrigin) -> bool {
+        commit.receipt_qpc <= at && self.accepts_remote_commit(commit.binding, commit.receipt_qpc)
+            && clock.time(commit.receipt_qpc).ok().zip(clock.time(at).ok())
+                .is_some_and(|(then, now)| now.0.saturating_sub(then.0) < 500_000)
+    }
+
     pub fn clipboard_safe(&self) -> bool {
         !self.changed() && matches!(self.classification,
             Classification::Resolved(TextTarget::Editable | TextTarget::NonText, Some(_)))
+    }
+
+    pub fn elevated_clipboard_safe(&self, visit: screen_fix_protocol::ipc::elevated::VisitBinding) -> bool {
+        self.remote_edit.is_some_and(|(read, _)| read.visit == visit)
+            && matches!(self.classification(), Classification::Resolved(TextTarget::Editable, Some(_)))
     }
 
     pub fn clipboard_guard(&self) -> uia::FocusGuard {
@@ -119,8 +150,12 @@ impl Queries {
         self.revision = self.worker.focus_revision();
         self.worker.retain_generation(generation);
         self.focus_sent = false;
+        self.remote_focus = None;
+        self.remote_edit = None;
+        self.remote = visit.is_some_and(|visit| visit.elevated.is_some());
         self.cached_pointer = None;
         self.pointer = None;
+        self.remote_pointer = None;
         self.pointer_rest_emitted = true;
         self.classification = if visit.is_some() {
             Classification::Pending
@@ -159,21 +194,20 @@ impl Queries {
         point
     }
 
+    pub fn deny_pointer(&mut self) { self.denied_target = true; }
+
     pub fn pointer(
-        &mut self, point: PhysicalPoint, geometry: GeometryId, visit: Option<Visit>, approvals: &mut ApprovedProcesses<'_>,
-        clock: ClockOrigin, at: QpcTick, action_at: Option<QpcTick>,
+        &mut self, point: PhysicalPoint, geometry: GeometryId, visit: Visit, window: WindowProcess, root: WindowProcess,
+        backend: PointerBackend, clock: ClockOrigin, at: QpcTick, action_at: Option<QpcTick>,
     ) -> Result<Option<PointerLink>, ProbeError> {
-        let Some(window) = uia::window_at(point).filter(|window| approvals.get(window.process).is_some()) else {
-            self.denied_target = true;
-            return Ok(None);
-        };
-        let Some(visit) = visit else { return Ok(None) };
-        if self.changed() || self.generation != visit.generation || self.blocked(window.process).is_some() {
+        if self.changed() || self.generation != visit.generation {
             return Ok(None);
         }
-        if let Some((cached_point, cached_geometry, cached_window, completed, id)) = self.cached_pointer {
+        if !matches!(backend, PointerBackend::Unavailable)
+            && let Some((cached_point, cached_geometry, cached_window, cached_root, completed, id)) = self.cached_pointer
+        {
             let reference = action_at.unwrap_or(at);
-            if cached_point == point && cached_geometry == geometry && cached_window == window
+            if cached_point == point && cached_geometry == geometry && cached_window == window && cached_root == root
                 && completed <= reference
                 && let Some(age) = clock.time(reference).ok().zip(clock.time(completed).ok())
                     .map(|(reference, completed)| reference.0.saturating_sub(completed.0))
@@ -186,7 +220,11 @@ impl Queries {
         if self.pointer.is_some() {
             return Ok(None);
         }
-        let request = self.request(Query::Pointer { point, window, geometry, action_at }, at, Instant::now())?;
+        let mut request = self.request(Query::Pointer { point, window, root, geometry, action_at }, at, Instant::now())?;
+        if self.remote && matches!(backend, PointerBackend::Ordinary) {
+            request.focus_revision = self.worker.focus_revision();
+        }
+        self.pointer_backend = backend;
         self.pointer = Some(request);
         self.worker.retain_pointer(Some(request.id));
         self.pointer_sent = false;
@@ -195,6 +233,22 @@ impl Queries {
     }
 
     pub fn poll(&mut self, now: Instant, at: QpcTick, clock: ClockOrigin, cursor: Option<&Value>, rows: &mut Vec<Value>) {
+        self.poll_local_results(at, clock, cursor, |_| true, rows);
+        if let Some(request) = self.focus {
+            if let Some(status) = self.unfinished_status(request, now) {
+                self.finish(Read { request, started: None, completed: Some(at), status,
+                    target: TextTarget::PossiblySensitive, element: None, scoped_dpi: None }, clock, cursor, rows);
+            } else if !self.focus_sent && at >= request.requested {
+                self.focus_sent = self.worker.submit(request);
+            }
+        }
+        self.poll_local_pointer(now, at, clock, rows);
+    }
+
+    fn poll_local_results(
+        &mut self, at: QpcTick, clock: ClockOrigin, cursor: Option<&Value>,
+        valid: impl Fn(Query) -> bool, rows: &mut Vec<Value>,
+    ) {
         if std::mem::take(&mut self.denied_target) {
             rows.push(json!({ "kind": "pointer_element", "approved": false }));
         }
@@ -202,31 +256,166 @@ impl Queries {
         // just-completed result until its actual completion is in the pass.
         let mut readable = std::mem::take(&mut self.deferred_reads);
         readable.extend(self.worker.results());
-        for read in readable {
+        for mut read in readable {
+            if !valid(read.request.query) {
+                read.status = Status::Stale;
+                read.element = None;
+            }
             if read.completed.is_some_and(|completed| completed > at) {
                 self.deferred_reads.push(read);
             } else {
                 self.finish(read, clock, cursor, rows);
             }
         }
-        if let Some(request) = self.focus {
-            if let Some(status) = self.unfinished_status(request, now) {
-                self.finish(Read {
-                    request, started: None, completed: Some(at), status, target: TextTarget::PossiblySensitive, element: None,
-                }, clock, cursor, rows);
-            } else if !self.focus_sent && at >= request.requested {
-                self.focus_sent = self.worker.submit(request);
-            }
-        }
+    }
+
+    fn poll_local_pointer(&mut self, now: Instant, at: QpcTick, clock: ClockOrigin, rows: &mut Vec<Value>) {
         if let Some(request) = self.pointer {
-            if let Some(status) = self.unfinished_status(request, now) {
-                self.finish(Read {
-                    request, started: None, completed: Some(at), status, target: TextTarget::PossiblySensitive, element: None,
-                }, clock, cursor, rows);
+            let status = match self.pointer_backend {
+                PointerBackend::Ordinary => self.unfinished_status(request, now),
+                PointerBackend::Unavailable => Some(Status::Unavailable),
+                PointerBackend::Elevated(_) => return,
+            };
+            if let Some(status) = status {
+                self.finish(Read { request, started: None, completed: Some(at), status,
+                    target: TextTarget::PossiblySensitive, element: None, scoped_dpi: None }, clock, None, rows);
             } else if !self.pointer_sent && at >= request.requested {
                 self.pointer_sent = self.worker.submit(request);
             }
         }
+    }
+
+    fn finish_unavailable(
+        &mut self, request: Request, status: Status, clock: ClockOrigin, cursor: Option<&Value>, rows: &mut Vec<Value>,
+    ) {
+        self.finish(Read { request, started: None, completed: None, status,
+            target: TextTarget::PossiblySensitive, element: None, scoped_dpi: None }, clock, cursor, rows);
+    }
+
+    pub fn remote_focus_result(
+        &mut self, observation: &ContextDelivery, at: QpcTick, clock: ClockOrigin, rows: &mut Vec<Value>,
+    ) {
+        let (Some(expected), Some(request)) = (self.remote_focus, self.focus) else { return; };
+        let read = match observation {
+            ContextDelivery::Observation(Observation::Item { evidence: ContextEvidence::FocusUia(read), .. })
+                if read.binding == expected => read,
+            ContextDelivery::Rejected(binding, reason) if *binding == expected => {
+                self.finish(Read {
+                    request, started: None, completed: None, status: read_status(*reason),
+                    target: TextTarget::PossiblySensitive, element: None, scoped_dpi: None,
+                }, clock, None, rows);
+                self.remote_focus = None;
+                return;
+            }
+            ContextDelivery::Observation(Observation::Item { evidence: ContextEvidence::Rejected(read), .. })
+                if read.binding == expected => {
+                if let ReadOutcome::Unavailable(reason) = &read.outcome {
+                    self.finish_unavailable(request, read_status(*reason), clock, None, rows);
+                    self.remote_focus = None;
+                }
+                return;
+            }
+            _ => return,
+        };
+        if at >= expected.deadline_qpc || Instant::now() >= request.expires { return; }
+        if let Some(read) = remote_read(request, read, at) {
+            let enabled = read.target == TextTarget::Editable
+                && matches!(request.query, Query::Focus(visit)
+                    if visit.receipt_proof().focus.is_some_and(|focus| focus.password_style == Some(false)));
+            let edit = read.completed.filter(|_| enabled);
+            self.finish(read, clock, None, rows);
+            self.remote_edit = edit.map(|completed| (expected, completed));
+            self.remote_focus = None;
+        }
+    }
+
+    pub fn poll_remote_focus(
+        &mut self, source: &mut Selector<'_>, at: QpcTick, clock: ClockOrigin, rows: &mut Vec<Value>,
+    ) -> screen_fix_elevated::Result<()> {
+        let Some(request) = self.focus else { return Ok(()); };
+        let Query::Focus(visit) = request.query else { return Ok(()); };
+        let Some((binding, expected)) = visit.elevated else { return Ok(()); };
+        let remaining = request.expires.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || self.remote_focus.is_some_and(|read| at >= read.deadline_qpc) {
+            self.finish(Read {
+                request, started: None, completed: None, status: Status::TimedOut,
+                target: TextTarget::PossiblySensitive, element: None, scoped_dpi: None,
+            }, clock, None, rows);
+            self.remote_focus = None;
+        } else if !self.focus_sent {
+            let read = ReadBinding {
+                visit: binding, request: request.id, target: binding.foreground,
+                requested_qpc: at, deadline_qpc: source.read_deadline(at, remaining)?,
+            };
+            if let Some(read) = source.query(read, |read| RemoteQuery::Focus { read, expected }, None)? {
+                self.remote_focus = Some(read);
+                self.focus_sent = true;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn remote_pointer_result(
+        &mut self, delivery: &ContextDelivery, at: QpcTick, clock: ClockOrigin,
+        valid: impl Fn(Query) -> bool, rows: &mut Vec<Value>,
+    ) {
+        let (Some(expected), Some(request)) = (self.remote_pointer, self.pointer) else { return; };
+        let Query::Pointer { point, root, geometry, action_at, .. } = request.query else { return; };
+        let read = match delivery {
+            ContextDelivery::Observation(Observation::Item {
+                evidence: ContextEvidence::PointerUia { point: returned, read }, ..
+            }) if *returned == (PointBinding { point, root: root.into(), geometry, action_qpc: action_at }) && read.binding == expected => read,
+            ContextDelivery::Rejected(read, reason) if *read == expected => {
+                self.finish_unavailable(request, read_status(*reason), clock, None, rows);
+                return;
+            }
+            ContextDelivery::Observation(Observation::Item { evidence: ContextEvidence::Rejected(read), .. })
+                if read.binding == expected => {
+                if let ReadOutcome::Unavailable(reason) = &read.outcome {
+                    self.finish_unavailable(request, read_status(*reason), clock, None, rows);
+                }
+                return;
+            }
+            _ => return,
+        };
+        if at >= expected.deadline_qpc || Instant::now() >= request.expires { return; }
+        if !valid(request.query) {
+            self.finish_unavailable(request, Status::Stale, clock, None, rows);
+        } else if let Some(read) = remote_read(request, read, at) {
+            self.finish(read, clock, None, rows);
+        }
+    }
+
+    pub fn poll_elevated_pointer(
+        &mut self, source: &mut Selector<'_>, visit: Visit, at: QpcTick, clock: ClockOrigin,
+        valid: impl Fn(Query) -> bool, rows: &mut Vec<Value>,
+    ) -> screen_fix_elevated::Result<()> {
+        self.poll_local_results(at, clock, None, &valid, rows);
+        let now = Instant::now();
+        let Some(request) = self.pointer else { return Ok(()); };
+        let Query::Pointer { point, window, root, geometry, action_at } = request.query else { return Ok(()); };
+        if !valid(request.query) && !matches!(self.pointer_backend, PointerBackend::Unavailable) {
+            self.finish_unavailable(request, Status::Stale, clock, None, rows);
+            return Ok(());
+        }
+        let PointerBackend::Elevated(secondary) = &self.pointer_backend else {
+            self.poll_local_pointer(now, at, clock, rows);
+            return Ok(());
+        };
+        let Some((visit, _)) = visit.elevated else { return Ok(()); };
+        let remaining = request.expires.saturating_duration_since(now);
+        if remaining.is_zero() || self.remote_pointer.is_some_and(|read| at >= read.deadline_qpc) {
+            self.finish_unavailable(request, Status::TimedOut, clock, None, rows);
+        } else if !self.pointer_sent {
+            let read = ReadBinding { visit, request: RequestId(0), target: window.into(), requested_qpc: at,
+                deadline_qpc: source.read_deadline(at, remaining)? };
+            let point = PointBinding { point, root: root.into(), geometry, action_qpc: action_at };
+            if let Some(read) = source.query(read, |read| RemoteQuery::Pointer { read, point }, secondary.clone())? {
+                self.remote_pointer = Some(read);
+                self.pointer_sent = true;
+            }
+        }
+        Ok(())
     }
 
     fn unfinished_status(&self, request: Request, now: Instant) -> Option<Status> {
@@ -242,10 +431,18 @@ impl Queries {
     }
 
     fn finish(&mut self, mut read: Read, clock: ClockOrigin, cursor: Option<&Value>, rows: &mut Vec<Value>) {
-        if read.request.generation != self.generation || read.request.focus_revision != self.revision || self.changed() {
+        let local_pointer = matches!(read.request.query, Query::Pointer { .. })
+            && matches!(self.pointer_backend, PointerBackend::Ordinary);
+        if read.request.generation != self.generation || self.changed()
+            || (!self.remote && read.request.focus_revision != self.revision)
+        {
             return;
         }
-        if let Some(status) = self.blocked(read.request.query.process()) {
+        if self.remote && local_pointer && read.request.focus_revision != self.worker.focus_revision() {
+            read.status = Status::Stale;
+            read.element = None;
+        }
+        if (!self.remote || local_pointer) && let Some(status) = self.blocked(read.request.query.process()) {
             read.status = status;
             read.element = None;
         }
@@ -259,23 +456,26 @@ impl Queries {
                 json!({
                     "kind": "focus", "window": visit.foreground.window, "target": read.target, "cursor": cursor,
                     "caret": (read.target == TextTarget::Editable).then(|| visit.native.and_then(|native| native.caret)).flatten(),
-                    "layout": visit.native.map(|native| native.focus.keyboard_layout),
-                    "dpi": unsafe { GetDpiForWindow(visit.foreground.hwnd()) },
-                    "dpi_awareness": unsafe { GetAwarenessFromDpiAwarenessContext(GetWindowDpiAwarenessContext(visit.foreground.hwnd())) }.0,
+                    "layout": visit.receipt_proof().focus.map(|focus| focus.keyboard_layout),
+                    "dpi": if visit.is_elevated() { json!(read.scoped_dpi.and_then(|(dpi, _)| dpi)) }
+                        else { json!(unsafe { GetDpiForWindow(visit.foreground.hwnd()) }) },
+                    "dpi_awareness": if visit.is_elevated() { read.scoped_dpi.and_then(|(_, awareness)| awareness) }
+                        else { Some(unsafe { GetAwarenessFromDpiAwarenessContext(GetWindowDpiAwarenessContext(visit.foreground.hwnd())).0 }) },
                     "element": read.element,
                 })
             }
-            Query::Pointer { point, window, geometry, action_at }
+            Query::Pointer { point, window, root, geometry, action_at }
                 if self.pointer.is_some_and(|request| request.id == read.request.id) =>
             {
                 self.pointer = None;
+                self.remote_pointer = None;
                 self.worker.retain_pointer(None);
                 if matches!(read.status, Status::OutsideApproval) {
                     rows.push(json!({ "kind": "pointer_element", "approved": false }));
                     return;
                 }
                 if authorized_result && let Some(completed) = read.completed {
-                    self.cached_pointer = Some((point, geometry, window, completed, read.request.id));
+                    self.cached_pointer = Some((point, geometry, window, root, completed, read.request.id));
                 }
                 json!({
                     "kind": "pointer_element", "window": window.window,
@@ -285,8 +485,11 @@ impl Queries {
                     "action_to_completion_us": read.completed.and_then(time).zip(action_at.and_then(time))
                         .filter(|(completed, action)| completed >= action)
                         .map(|(completed, action)| completed.0.saturating_sub(action.0)),
-                    "dpi": unsafe { GetDpiForWindow(window.hwnd()) },
-                    "dpi_awareness": unsafe { GetAwarenessFromDpiAwarenessContext(GetWindowDpiAwarenessContext(window.hwnd())) }.0,
+                    "dpi": if local_pointer { json!(unsafe { GetDpiForWindow(window.hwnd()) }) }
+                        else { json!(read.scoped_dpi.and_then(|(dpi, _)| dpi)) },
+                    "dpi_awareness": if local_pointer {
+                        Some(unsafe { GetAwarenessFromDpiAwarenessContext(GetWindowDpiAwarenessContext(window.hwnd())).0 })
+                    } else { read.scoped_dpi.and_then(|(_, awareness)| awareness) },
                 })
             }
             _ => return,
@@ -301,4 +504,62 @@ impl Queries {
         row["uia"] = json!(read.status);
         rows.push(row);
     }
+}
+
+fn read_status(reason: ReadUnavailable) -> Status {
+    match reason {
+        ReadUnavailable::TimedOut => Status::TimedOut,
+        ReadUnavailable::Hung => Status::Hung,
+        ReadUnavailable::Unavailable => Status::Unavailable,
+        ReadUnavailable::Stale => Status::Stale,
+        ReadUnavailable::OutsideApproval => Status::OutsideApproval,
+    }
+}
+
+fn remote_read(request: Request, read: &ReadEvidence<UiaEvidence>, at: QpcTick) -> Option<Read> {
+    let started = read.started_qpc;
+    let completed = read.completed_qpc;
+    if completed.is_some_and(|end| end > at || end >= read.binding.deadline_qpc)
+        || started.is_some_and(|start| start < read.binding.requested_qpc || completed.is_none_or(|end| start > end))
+    {
+        return None;
+    }
+    let (status, target, element, scoped_dpi) = match &read.outcome {
+        ReadOutcome::Observed(evidence) if started.is_some() && completed.is_some() => {
+            use screen_fix_protocol::ipc::elevated::TextClassification;
+            let source = &evidence.element;
+            let native_password = match request.query {
+                Query::Focus(visit) => visit.receipt_proof().focus.and_then(|focus| focus.password_style),
+                Query::Pointer { .. } => None,
+            };
+            let password = if native_password == Some(true) { Some(true) } else { source.password };
+            let focus_safe = matches!(request.query, Query::Pointer { .. }) || native_password == Some(false);
+            let target = match (evidence.target, password, source.editable) {
+                (TextClassification::Password, _, _) | (_, Some(true), _) => TextTarget::Password,
+                (TextClassification::Editable, Some(false), Some(true)) if focus_safe => TextTarget::Editable,
+                (TextClassification::NonText, Some(false), Some(false)) if focus_safe => TextTarget::NonText,
+                _ => TextTarget::PossiblySensitive,
+            };
+            let strings = password == Some(false)
+                && (matches!(request.query, Query::Pointer { .. })
+                    || native_password == Some(false) && target != TextTarget::PossiblySensitive);
+            let permitted = |value: &Option<screen_fix_protocol::ipc::elevated::Metadata>| {
+                value.as_ref().filter(|_| strings).map(|value| value.as_str().to_owned())
+            };
+            let element = uia::Element {
+                name: permitted(&source.name),
+                automation_id: permitted(&source.automation_id),
+                class: permitted(&source.class),
+                framework: source.framework.as_ref().map(|value| value.as_str().to_owned()),
+                control_type: source.control_type, bounds: source.bounds,
+                ancestor_names: source.ancestor_names.as_slice().iter().filter(|_| strings)
+                    .map(|name| name.as_str().to_owned()).collect(),
+                password, editable: source.editable.filter(|_| password == Some(false)),
+            };
+            (Status::Ready, target, Some(element), Some((evidence.dpi, evidence.dpi_awareness)))
+        }
+        ReadOutcome::Observed(_) => return None,
+        ReadOutcome::Unavailable(reason) => (read_status(*reason), TextTarget::PossiblySensitive, None, None),
+    };
+    Some(Read { request, started, completed, status, target, element, scoped_dpi })
 }

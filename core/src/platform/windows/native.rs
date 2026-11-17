@@ -39,6 +39,7 @@ pub(super) struct NativeImages {
     allocation_bytes: u64,
     pool: Vec<Arc<ID3D11Texture2D>>,
     history: VecDeque<NativeFrame>,
+    staged: VecDeque<(Arc<ID3D11Texture2D>, FrameMetadata)>,
     evicted: Option<FrameMetadata>,
 }
 
@@ -57,7 +58,7 @@ impl NativeImages {
             pool.push(Arc::new(texture));
         }
         let context = stage(unsafe { device.GetImmediateContext() }, "Get the native capture GPU context")?;
-        Ok(Self { context, extent, allocation_bytes, pool, history: VecDeque::with_capacity(HISTORY), evicted: None })
+        Ok(Self { context, extent, allocation_bytes, pool, history: VecDeque::with_capacity(HISTORY), staged: VecDeque::with_capacity(HISTORY), evicted: None })
     }
 
     pub fn allocation_bytes(&self) -> u64 {
@@ -93,6 +94,28 @@ impl NativeImages {
         Ok(())
     }
 
+    // Both queues share the existing history capacity and leave the spare
+    // GPU copy destination available even when all extra holds are leased.
+    pub fn staging_full(&self) -> bool { self.staged.len() == HISTORY }
+
+    pub fn stage(&mut self, texture: Arc<ID3D11Texture2D>, metadata: FrameMetadata) {
+        debug_assert!(!self.staging_full());
+        if self.history.len() + self.staged.len() == HISTORY {
+            self.evicted = self.history.pop_front().map(|frame| frame.metadata);
+        }
+        self.staged.push_back((texture, metadata));
+    }
+
+    pub fn staged(&self) -> Option<FrameMetadata> {
+        self.staged.front().map(|(_, metadata)| metadata.clone())
+    }
+
+    pub fn take_staged(&mut self) -> Option<(Arc<ID3D11Texture2D>, FrameMetadata)> {
+        self.staged.pop_front()
+    }
+
+    pub fn clear_staged(&mut self) { self.staged.clear(); }
+
     pub fn remember(&mut self, texture: Arc<ID3D11Texture2D>, metadata: FrameMetadata) {
         if self.history.len() == HISTORY {
             self.evicted = self.history.pop_front().map(|frame| frame.metadata);
@@ -102,6 +125,7 @@ impl NativeImages {
 
     pub fn clear_history(&mut self) {
         self.history.clear();
+        self.clear_staged();
         self.evicted = None;
     }
 
@@ -110,7 +134,7 @@ impl NativeImages {
     }
 
     pub fn last_evicted(&self) -> Option<FrameMetadata> {
-        self.evicted
+        self.evicted.clone()
     }
 
     pub fn lease(&self, id: FrameId) -> Option<NativeFrame> {

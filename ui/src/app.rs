@@ -11,7 +11,7 @@ use screen_fix_core::{
     package::diagnostics::{DiagnosticSnapshot, Failure, FailureComponent, ReportOutcome},
     platform,
     protocol::MonitorId,
-    session::{PauseReason, SessionCommand, SessionHandle, SessionOutcome, SessionPhase, SessionResult, SessionStatus, StartupStep},
+    session::{PauseReason, SessionCommand, SessionHandle, SessionOutcome, SessionPhase, SessionResult, SessionStatus, SourceStatus, StartupStep},
 };
 
 #[cfg(target_os = "windows")]
@@ -164,7 +164,25 @@ impl eframe::App for ScreenFix {
                     }
                     Ok(Err(error)) => {
                         self.last_status = Some(session.status().unwrap_or_else(|| status.clone()));
-                        self.state = recording_error(error.to_string(), error.into_diagnostic().with_output_root(self.folder.clone()), Some(ctx));
+                        let message = match error.source_failure() {
+                            Some(failure) if failure.admitted => {
+                                self.incomplete_pending = true;
+                                if let Some(retained) = error.retained_recording() {
+                                    format!("Recording failed after capture started. Saved the failed attempt with {} verified video frames.\n{}\n{error}",
+                                        retained.verified_video_frames, retained.root.display())
+                                } else {
+                                    format!("Recording failed after capture started. The failed recording manifest could not be confirmed.\n{error}")
+                                }
+                            }
+                            Some(failure) if failure.reason == screen_fix_core::session::SourceFailureReason::TokenIdentity
+                                && failure.stage == screen_fix_core::session::SourceStage::Foreground =>
+                            {
+                                format!("Recording did not start.\n{error}")
+                            }
+                            Some(_) => format!("Elevated capture unavailable. Recording did not start.\n{error}"),
+                            None => error.to_string(),
+                        };
+                        self.state = recording_error(message, error.into_diagnostic().with_output_root(self.folder.clone()), Some(ctx));
                     }
                     Err(TryRecvError::Disconnected) => {
                         self.last_status = Some(session.status().unwrap_or_else(|| status.clone()));
@@ -191,7 +209,7 @@ impl eframe::App for ScreenFix {
             if matches!(result.outcome, SessionOutcome::Complete | SessionOutcome::Cancelled)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        self.close_after_recording &= matches!(self.state, RecordingState::Running { .. });
+        self.close_after_recording &= self.incomplete_pending || matches!(self.state, RecordingState::Running { .. });
 
         #[cfg(target_os = "windows")]
         if matches!(self.state, RecordingState::Idle | RecordingState::Complete(_)) {
@@ -426,7 +444,7 @@ impl ScreenFix {
                             } else {
                                 ui.label(format!("Switch to the approved application. Recording starts in {seconds}…"));
                             }
-                        } else {
+                        } else if !matches!(status.source, SourceStatus::AwaitingConsent | SourceStatus::AwaitingReadiness) {
                             ui.label(match status.startup {
                                 StartupStep::Windows => "Checking Windows compatibility…",
                                 StartupStep::ApprovedApplication => "Checking the approved application and its permissions…",
@@ -443,7 +461,13 @@ impl ScreenFix {
                         if status.input_unavailable.is_some() {
                             ui.label("Recording · input unavailable");
                         } else {
-                            ui.label("Recording");
+                            ui.label(match status.source {
+                                SourceStatus::Ordinary => "Recording · standard capture",
+                                SourceStatus::Enhanced => "Recording · enhanced capture",
+                                SourceStatus::Activating => "Waiting for certified elevated capture…",
+                                SourceStatus::FailedPrefix(_) => "Closing the failed recording prefix…",
+                                _ => "Recording",
+                            });
                         }
                         if !status.video_unavailable.is_empty() {
                             ui.label(format!("Video unavailable on {} monitor(s)", status.video_unavailable.len()));
@@ -458,6 +482,7 @@ impl ScreenFix {
                                 PauseReason::Sleep => "System suspended",
                                 PauseReason::SecureDesktop => "Input desktop unavailable",
                                 PauseReason::LowDisk => "Disk space unavailable or below the recording limit",
+                                PauseReason::ElevationTransition => "Switching capture source",
                             });
                         }
                     }
@@ -468,12 +493,19 @@ impl ScreenFix {
                     SessionPhase::Finished => { ui.label("Recording finished"); }
                     _ => { ui.label("Stopping and finalizing the recording…"); }
                 }
+                if !stopping && matches!(status.phase, SessionPhase::Starting | SessionPhase::Paused) {
+                    match status.source {
+                        SourceStatus::AwaitingConsent => { ui.label("Waiting for Windows elevation consent…"); }
+                        SourceStatus::AwaitingReadiness => { ui.label("Verifying the elevated capture source…"); }
+                        _ => {}
+                    }
+                }
                 if status.phase == SessionPhase::Starting {
                     if let Some(bytes) = status.disk_available_bytes {
                         ui.label(format!("Output volume free space: {:.1} GB", bytes as f64 / 1_000_000_000.0));
                     }
-                    if let Some(registration) = status.input_ready {
-                        ui.label("Input helper, Raw Input and keyboard and mouse hooks ready.");
+                    if let Some(registration) = status.input_ready.filter(|_| status.input_helper_ready) {
+                        ui.label("Standard input helper, Raw Input and keyboard and mouse hooks ready.");
                         if registration.pen_hid {
                             ui.label("Pen HID registration ready. Device and driver evidence will be observed during capture.");
                         }
@@ -576,15 +608,26 @@ impl ScreenFix {
         if self.incomplete_pending {
             if ui.ctx().input(|input| input.viewport().close_requested()) {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.close_after_recording = true;
             }
-            ui.label("Review the incomplete recording and its diagnostic reports before starting another attempt.");
-            if matches!(self.state, RecordingState::Complete(_))
-                && ui.button("Acknowledge incomplete recording").clicked()
+            ui.label("Review the incomplete recording before starting another attempt.");
+            let acknowledge = if self.close_after_recording {
+                "Acknowledge and exit"
+            } else {
+                "Acknowledge incomplete recording"
+            };
+            if matches!(self.state, RecordingState::Complete(_) | RecordingState::Reporting { .. })
+                && ui.button(acknowledge).clicked()
             {
                 #[cfg(target_os = "windows")]
                 if let Some(window) = &mut self.native_window { window.clear_indicator(); }
                 self.incomplete_pending = false;
-                self.state = RecordingState::Idle;
+                if matches!(self.state, RecordingState::Complete(_)) {
+                    self.state = RecordingState::Idle;
+                }
+                if std::mem::take(&mut self.close_after_recording) {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
         }
     }

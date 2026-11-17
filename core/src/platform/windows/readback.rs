@@ -2,9 +2,8 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel},
+        mpsc::{Receiver, SyncSender, TryRecvError, sync_channel},
     },
-    thread::{self, Thread},
     time::Instant,
 };
 
@@ -14,19 +13,17 @@ use windows::Win32::Graphics::{
 };
 
 use crate::{
-    capture::frame::{FrameExtent, FrameMetadata, MonitorGeometry},
-    protocol::{AdmissionEpoch, CaptureEpoch, FrameId, GeometryId, RequestId},
+    capture::frame::{FrameExtent, FrameMetadata},
+    protocol::{AdmissionEpoch, FrameId, GeometryId},
 };
 
 use super::{ProbeError, native::{NativeFrame, NativeImages}, pixels};
 
-const QUEUED_REQUESTS: usize = 8;
 const MAX_JOBS: usize = 256;
 pub(super) const MAX_BYTES: usize = 256_000_000;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Request {
-    pub id: RequestId,
     pub frame: FrameId,
     pub geometry: GeometryId,
     pub admission: AdmissionEpoch,
@@ -36,8 +33,8 @@ pub(super) struct Request {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Rejected {
     Pressure,
-    FrameLost,
     EpochMismatch,
+    ApprovalSuppressed,
     Expired,
     Closed,
     CaptureFailed,
@@ -45,7 +42,6 @@ pub(super) enum Rejected {
 
 pub(super) struct Pixels {
     pub metadata: FrameMetadata,
-    pub geometry: MonitorGeometry,
     bytes: Vec<u8>,
     _job: Reservation,
     _cpu: Bytes,
@@ -62,7 +58,6 @@ impl Pixels {
 }
 
 pub(super) struct Ticket {
-    pub request: RequestId,
     result: Option<Receiver<Result<Pixels, Rejected>>>,
 }
 
@@ -138,34 +133,10 @@ impl Drop for Reservation {
     }
 }
 
-pub(super) struct Requests {
-    send: SyncSender<Work>,
-    owner: Thread,
-    budget: Arc<Budget>,
-}
-
-impl Requests {
-    pub fn try_request(&self, request: Request) -> Result<Ticket, Rejected> {
-        if self.budget.closed.load(Ordering::Acquire) {
-            return Err(Rejected::Closed);
-        }
-        let budget = Reservation::job(&self.budget)?;
-        let (respond, result) = sync_channel(1);
-        let work = Work { request, result: respond, budget };
-        self.send.try_send(work).map_err(|error| match error {
-            TrySendError::Full(_) => Rejected::Pressure,
-            TrySendError::Disconnected(_) => Rejected::Closed,
-        })?;
-        self.owner.unpark();
-        Ok(Ticket { request: request.id, result: Some(result) })
-    }
-}
-
 struct Pending {
     work: Option<Work>,
     expired: bool,
     metadata: FrameMetadata,
-    geometry: MonitorGeometry,
     row_bytes: usize,
     byte_count: usize,
     staging_bytes: Option<Bytes>,
@@ -173,66 +144,18 @@ struct Pending {
 }
 
 pub(super) struct Readbacks {
-    jobs: Receiver<Work>,
     budget: Arc<Budget>,
     staging: Option<(FrameExtent, ID3D11Texture2D)>,
     pending: Option<Pending>,
 }
 
 impl Readbacks {
-    pub fn new(budget: Arc<Budget>) -> (Requests, Self) {
-        let (send, jobs) = sync_channel(QUEUED_REQUESTS);
-        let requests = Requests { send, owner: thread::current(), budget: Arc::clone(&budget) };
-        (requests, Self { jobs, budget, staging: None, pending: None })
+    pub fn new(budget: Arc<Budget>) -> Self {
+        Self { budget, staging: None, pending: None }
     }
 
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
-    }
-
-    pub fn step(
-        &mut self, device: &ID3D11Device, images: &NativeImages, geometry: GeometryId,
-        capture_epoch: CaptureEpoch, admission: AdmissionEpoch, now: Instant,
-    ) -> Result<(), ProbeError> {
-        self.poll(images, now)?;
-        if self.pending.is_some() {
-            return Ok(());
-        }
-        // Rejected jobs are bounded work as well.
-        for _ in 0..2 {
-            let Ok(work) = self.jobs.try_recv() else { break };
-            if self.submit(work, device, images, geometry, capture_epoch, admission, now)? {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    fn submit(
-        &mut self, work: Work, device: &ID3D11Device, images: &NativeImages,
-        geometry: GeometryId, capture_epoch: CaptureEpoch, admission: AdmissionEpoch, now: Instant,
-    ) -> Result<bool, ProbeError> {
-        let request = work.request;
-        if now >= request.deadline {
-            let _ = work.result.try_send(Err(Rejected::Expired));
-            return Ok(false);
-        }
-        if request.frame.monitor != geometry.monitor || request.frame.epoch != capture_epoch
-            || request.geometry.monitor != geometry.monitor || request.admission != admission
-        {
-            let _ = work.result.try_send(Err(Rejected::EpochMismatch));
-            return Ok(false);
-        }
-        let Some(frame) = images.lease(request.frame) else {
-            let reason = if request.geometry == geometry { Rejected::FrameLost } else { Rejected::EpochMismatch };
-            let _ = work.result.try_send(Err(reason));
-            return Ok(false);
-        };
-        if frame.metadata.geometry.id != request.geometry || frame.metadata.admission != request.admission {
-            let _ = work.result.try_send(Err(Rejected::EpochMismatch));
-            return Ok(false);
-        }
-        self.submit_frame(work, device, images, &frame)
     }
 
     /// Submit an exact owner-local lease, even after history eviction.
@@ -246,6 +169,9 @@ impl Readbacks {
         if self.budget.closed.load(Ordering::Acquire) {
             return Ok(Some(Err(Rejected::Closed)));
         }
+        if !frame.metadata.covered() {
+            return Ok(Some(Err(Rejected::ApprovalSuppressed)));
+        }
         if request.frame != frame.metadata.id || request.geometry != frame.metadata.geometry.id
             || request.admission != frame.metadata.admission
         {
@@ -258,16 +184,16 @@ impl Readbacks {
         let (reply, result) = sync_channel(1);
         let work = Work { request, result: reply, budget };
         self.submit_frame(work, device, images, frame)?;
-        Ok(Some(Ok(Ticket { request: request.id, result: Some(result) })))
+        Ok(Some(Ok(Ticket { result: Some(result) })))
     }
 
     fn submit_frame(
         &mut self, work: Work, device: &ID3D11Device, images: &NativeImages, frame: &NativeFrame,
-    ) -> Result<bool, ProbeError> {
+    ) -> Result<(), ProbeError> {
         let extent = frame.metadata.extent;
         let Some(byte_count) = image_bytes(extent) else {
             let _ = work.result.try_send(Err(Rejected::Pressure));
-            return Ok(false);
+            return Ok(());
         };
         let row_bytes = byte_count / extent.height.get() as usize;
         // Both representations count against the same per-monitor limit as
@@ -279,7 +205,7 @@ impl Readbacks {
             Ok(charges) => charges,
             Err(reason) => {
                 let _ = work.result.try_send(Err(reason));
-                return Ok(false);
+                return Ok(());
             }
         };
         if self.staging.as_ref().is_none_or(|(size, _)| *size != extent) {
@@ -295,18 +221,25 @@ impl Readbacks {
         }
         let (_, staging) = self.staging.as_ref().ok_or_else(|| super::unavailable("The still staging texture is unavailable"))?;
         frame.copy_into(images.context(), staging);
-        self.pending = Some(Pending { work: Some(work), expired: false, metadata: frame.metadata,
-            geometry: frame.metadata.geometry, row_bytes, byte_count, staging_bytes: Some(staging_bytes),
+        self.pending = Some(Pending { work: Some(work), expired: false, metadata: frame.metadata.clone(),
+            row_bytes, byte_count, staging_bytes: Some(staging_bytes),
             cpu_bytes: Some(cpu_bytes) });
-        Ok(true)
+        Ok(())
     }
 
-    fn poll(&mut self, images: &NativeImages, now: Instant) -> Result<(), ProbeError> {
+    pub fn poll(&mut self, images: &NativeImages, now: Instant) -> Result<(), ProbeError> {
         let (Some(pending), Some((_, staging))) = (&mut self.pending, &self.staging) else { return Ok(()) };
-        if !pending.expired && let Some(work) = &pending.work && now >= work.request.deadline {
-            let _ = work.result.try_send(Err(Rejected::Expired));
-            // Keep the budget until the GPU stops using staging. Never reuse it early.
-            pending.expired = true;
+        if !pending.expired && let Some(work) = &pending.work {
+            let rejection = if !pending.metadata.covered() {
+                Some(Rejected::ApprovalSuppressed)
+            } else {
+                (now >= work.request.deadline).then_some(Rejected::Expired)
+            };
+            if let Some(reason) = rejection {
+                let _ = work.result.try_send(Err(reason));
+                // Keep staging charged until the GPU releases it.
+                pending.expired = true;
+            }
         }
         let mut bytes = Vec::new();
         let mut allocation_failed = false;
@@ -336,11 +269,13 @@ impl Readbacks {
         pending.staging_bytes.take();
         if !pending.expired && let Some(work) = pending.work.take() {
             let cpu = pending.cpu_bytes.take().expect("a mapped image has a CPU budget");
-            let result = if allocation_failed {
+            let result = if !pending.metadata.covered() {
+                Err(Rejected::ApprovalSuppressed)
+            } else if allocation_failed {
                 Err(Rejected::Pressure)
             } else {
                 Ok(Pixels {
-                    metadata: pending.metadata, geometry: pending.geometry,
+                    metadata: pending.metadata.clone(),
                     bytes, _job: work.budget, _cpu: cpu,
                 })
             };
@@ -358,9 +293,6 @@ impl Readbacks {
     pub fn cancel_epoch(&mut self, reason: Rejected) {
         self.staging = None;
         if let Some(work) = self.pending.take().filter(|pending| !pending.expired).and_then(|pending| pending.work) {
-            let _ = work.result.try_send(Err(reason));
-        }
-        while let Ok(work) = self.jobs.try_recv() {
             let _ = work.result.try_send(Err(reason));
         }
     }

@@ -13,7 +13,7 @@ use crate::{
     PhysicalRect, QpcTick, SessionId, SourceSequence, WindowId,
 };
 
-pub const SCHEMA_VERSION: u16 = 6;
+pub const SCHEMA_VERSION: u16 = 7;
 pub const MAX_PACKET_BYTES: usize = 8192;
 pub const MAX_HID_REPORT_BYTES: usize = 1024;
 pub const MAX_HID_FIELDS: usize = 32;
@@ -127,6 +127,33 @@ pub enum HelperFailureStage {
 pub struct HelperFailure {
     pub stage: HelperFailureStage,
     pub native_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_input_registration: Option<RawInputRegistrationMismatch>,
+}
+
+impl HelperFailure {
+    fn valid(self) -> bool {
+        self.raw_input_registration.is_none()
+            || (self.stage == HelperFailureStage::RawInputRegistration && self.native_code.is_none())
+    }
+}
+
+/// The first required registration that could not be verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawInputRegistrationMismatch {
+    pub usage_page: u16,
+    pub usage: u16,
+    pub expected_flags: u32,
+    pub observed: RawInputRegistrationObservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RawInputRegistrationObservation {
+    Missing,
+    WrongWindow { flags: u32 },
+    WrongFlags { flags: u32 },
 }
 
 /// Inclusive bounds for the producer's missing sequence and receipt-time interval.
@@ -508,6 +535,9 @@ impl HelperToCore {
             {
                 Err(PacketError::InvalidRecord("Input IPC environment flags are invalid."))
             }
+            Self::Failed(failure) if !failure.valid() => {
+                Err(PacketError::InvalidRecord("Input IPC failure detail does not match its stage."))
+            }
             Self::Ready(registration)
                 if !(registration.raw_keyboard && registration.raw_pointer
                     && registration.keyboard_hook && registration.pointer_hook) =>
@@ -596,3 +626,5 @@ fn decode<T: DeserializeOwned>(packet: &[u8], direction: u8) -> Result<T, Packet
 
 #[cfg(target_os = "windows")]
 pub mod shared;
+
+pub mod elevated;

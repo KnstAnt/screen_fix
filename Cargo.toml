@@ -1,4 +1,4 @@
 [workspace]
 resolver = "3"
-members = ["protocol", "core", "core/capture/input", "ui"]
+members = ["protocol", "core", "core/capture/input", "core/capture/native-observation", "core/capture/elevated", "ui"]
 default-members = ["ui"]

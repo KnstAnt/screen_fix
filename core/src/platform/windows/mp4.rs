@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     fs,
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
@@ -8,10 +9,13 @@ use windows::{Win32::Media::MediaFoundation::*, core::PCWSTR};
 
 use super::{ProbeError, mf, stage, unavailable};
 
+const REVOKED: &str = "The elevated video prefix was revoked before publication";
+
 pub(super) fn io_error(stage: &'static str, error: std::io::Error) -> ProbeError {
     ProbeError {
         stage,
         journal: None,
+        raw_input_registration: None,
         source: Some(windows::core::Error::new(
             windows::core::HRESULT::from_win32(error.raw_os_error().unwrap_or(1) as u32),
             error.to_string(),
@@ -57,11 +61,32 @@ impl Recording {
         stage(unsafe { self.writer.WriteSample(self.stream, sample) }, "Write an H.264 sample to the MP4")
     }
 
+    pub(super) fn discard(self) -> Result<(), ProbeError> {
+        drop(self.writer);
+        remove_part(&self.pending)
+    }
+
     pub(super) fn finish(
         self, expected: &mut [super::slots::Row], size: [u32; 2],
-        deadline: impl Fn() -> Option<std::time::Instant>,
+        deadline: impl Fn() -> Option<std::time::Instant>, authorized: impl Fn(Option<i64>) -> bool,
+    ) -> Result<Option<(i64, u64)>, ProbeError> {
+        let pending = self.pending.clone();
+        match self.finish_verified(expected, size, deadline, &authorized) {
+            Ok(published) => Ok(Some(published)),
+            Err(error) if error.stage == REVOKED => { remove_part(&pending)?; Ok(None) }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn finish_verified(
+        self, expected: &mut [super::slots::Row], size: [u32; 2],
+        deadline: impl Fn() -> Option<std::time::Instant>, authorized: &impl Fn(Option<i64>) -> bool,
     ) -> Result<(i64, u64), ProbeError> {
+        let decoded_end = Cell::new(None);
         let check = || {
+            if !authorized(decoded_end.get()) {
+                return Err(unavailable(REVOKED));
+            }
             if deadline().is_some_and(|limit| std::time::Instant::now() >= limit) {
                 return Err(unavailable("The MP4 publication deadline expired"));
             }
@@ -75,6 +100,7 @@ impl Recording {
             .map_err(|error| io_error("Flush the finalized MP4", error))?;
         check()?;
         let end = verify_decoded_frames(&self.pending, expected, size, &check)?;
+        decoded_end.set(Some(end));
         let bytes = fs::metadata(&self.pending).map_err(|error| io_error("Inspect the verified MP4 extent", error))?.len();
         if bytes == 0 {
             return Err(unavailable("The verified MP4 file is empty"));
@@ -83,12 +109,15 @@ impl Recording {
             check()?;
             match fs::rename(&self.pending, &self.path) {
                 Ok(()) => {
-                    if let Err(timeout) = check() {
-                        // This encoder still owns both names. Leave the
-                        // verified bytes as a part without indexing the segment.
-                        fs::rename(&self.path, &self.pending)
-                            .map_err(|error| io_error("Return the late published MP4 to its part path", error))?;
-                        return Err(timeout);
+                    if let Err(error) = check() {
+                        if error.stage == REVOKED {
+                            remove_part(&self.path)?;
+                        } else {
+                            // This owner can still withdraw a late publication.
+                            fs::rename(&self.path, &self.pending)
+                                .map_err(|error| io_error("Return the late published MP4 to its part path", error))?;
+                        }
+                        return Err(error);
                     }
                     return Ok((end, bytes));
                 }
@@ -101,6 +130,14 @@ impl Recording {
             }
         }
         unreachable!()
+    }
+}
+
+fn remove_part(path: &Path) -> Result<(), ProbeError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error("Remove the revoked MP4 part", error)),
     }
 }
 

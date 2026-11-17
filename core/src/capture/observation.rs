@@ -25,7 +25,6 @@ pub enum ObservationTrigger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProvisionalInputObservation {
     pub id: ObservationId,
-    pub input: RequestId,
     pub admission: AdmissionEpoch,
     pub time: RecordTime,
     pub kind: ProvisionalInputKind,

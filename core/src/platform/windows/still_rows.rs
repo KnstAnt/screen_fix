@@ -13,7 +13,7 @@ use std::{
 
 use serde_json::Value;
 
-use crate::{package::journal::JournalIngress, protocol::SessionTimeUs};
+use crate::{capture::frame::FrameCoverage, package::journal::JournalIngress, protocol::SessionTimeUs};
 
 use super::{ProbeError, package_journal_error, unavailable};
 
@@ -65,8 +65,37 @@ struct SharedSlot {
     expired: bool,
 }
 
+#[derive(Clone)]
+pub(super) struct StillCoverage {
+    pub visit: Arc<FrameCoverage>,
+    pub last: SessionTimeUs,
+}
+
+impl StillCoverage {
+    pub fn allows(&self) -> bool { self.visit.before().is_none_or(|before| self.last < before) }
+}
+
+struct Completed {
+    row: Value,
+    coverage: Option<StillCoverage>,
+}
+
+impl Completed {
+    fn publishable(mut self) -> Value {
+        if self.coverage.as_ref().is_some_and(|coverage| !coverage.allows()) {
+            self.row["kind"] = serde_json::json!("still_dropped");
+            for field in ["source_t_us", "frame_obs_id", "seen_obs_id", "file", "seen_file", "width", "height", "frame", "settled_confirmed_t_us"] {
+                self.row[field] = Value::Null;
+            }
+            self.row["reason"] = serde_json::json!("elevated_frame_uncertified");
+            self.row["outcome"] = serde_json::json!({ "kind": "dropped", "reason": "elevated_frame_uncertified" });
+        }
+        self.row
+    }
+}
+
 pub(super) struct Reservation {
-    result: SyncSender<Option<Value>>,
+    result: SyncSender<Option<Completed>>,
     shared: Arc<Mutex<SharedSlot>>,
 }
 
@@ -85,14 +114,18 @@ impl Reservation {
     }
 
     pub fn finish(self, row: Value) {
-        let _ = self.result.try_send(Some(row));
+        self.finish_frame(row, None);
+    }
+
+    pub fn finish_frame(self, row: Value, coverage: Option<StillCoverage>) {
+        let _ = self.result.try_send(Some(Completed { row, coverage }));
     }
 }
 
 struct Slot {
     at: SessionTimeUs,
     deadline: Instant,
-    result: Receiver<Option<Value>>,
+    result: Receiver<Option<Completed>>,
     shared: Arc<Mutex<SharedSlot>>,
     _charge: Charge,
 }
@@ -253,7 +286,7 @@ impl Merge {
                             if finishing { "still_owner_closed" } else { "still_ordered_deadline" }
                         );
                     }
-                    fallback
+                    fallback.map(|row| Completed { row, coverage: None })
                 }
             };
             self.ordered.pop_first();
@@ -261,7 +294,7 @@ impl Merge {
                 if key.0 < self.last {
                     self.budget.omit(key.0);
                 } else {
-                    journal.try_submit(key.0, row).map_err(package_journal_error)?;
+                    journal.try_submit(key.0, row.publishable()).map_err(package_journal_error)?;
                     self.last = key.0;
                 }
             }

@@ -1,19 +1,13 @@
 //! IMG-8 observation uses HWND ownership and native hung signals without
 //! calling the application's UI thread.
 
-use std::{panic::{AssertUnwindSafe, catch_unwind}, time::{Duration, Instant}};
+use std::time::{Duration, Instant};
 
+use screen_fix_native_observation::hung::{self, CandidateEvidence};
 use serde_json::{Value, json};
-use windows::{
-    Win32::{Foundation::HWND as NativeWindow, System::LibraryLoader::{GetModuleHandleW, GetProcAddress}},
-    core::{PCSTR, w},
-};
-use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM},
-    UI::WindowsAndMessaging::{
-        EnumWindows, GA_ROOT, GetAncestor, GetClassNameW, GetWindowThreadProcessId, IsHungAppWindow,
-    },
-};
+use windows_sys::Win32::Foundation::HWND;
+
+pub(super) use hung::is_ghost;
 
 use crate::{
     capture::context::BusyReasons,
@@ -24,8 +18,6 @@ use super::identity::{ApprovedProcesses, WindowProcess};
 
 const REFRESH: Duration = Duration::from_secs(1);
 const ACTIVE_LIMIT: usize = 64;
-const CANDIDATE_LIMIT: usize = 512;
-type GhostLookup = unsafe extern "system" fn(HWND) -> HWND;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Observation {
@@ -39,24 +31,14 @@ pub(super) struct Hung {
     next_scan: Instant,
     coverage_limited: bool,
     ghost_unknown: bool,
-    ghost_to_original: Option<GhostLookup>,
-    original_to_ghost: Option<GhostLookup>,
+    probe: hung::Probe,
 }
 
 impl Hung {
     pub fn new(now: Instant) -> Self {
-        // These optional user32 exports are private. They resolve only from
-        // the already loaded system DLL. Neither is needed for ordinary HWND
-        // checks and class evidence alone never attributes a Ghost.
-        let user32 = unsafe { GetModuleHandleW(w!("user32.dll")) }.ok();
-        let lookup = |name: &'static [u8]| {
-            unsafe { GetProcAddress(user32?, PCSTR(name.as_ptr())) }
-                .map(|address| unsafe { std::mem::transmute::<_, GhostLookup>(address) })
-        };
         Self {
             active: Vec::with_capacity(ACTIVE_LIMIT), next_scan: now, coverage_limited: false,
-            ghost_unknown: false, ghost_to_original: lookup(b"HungWindowFromGhostWindow\0"),
-            original_to_ghost: lookup(b"GhostWindowFromHungWindow\0"),
+            ghost_unknown: false, probe: hung::Probe::new(),
         }
     }
 
@@ -84,17 +66,21 @@ impl Hung {
         if now >= self.next_scan {
             self.next_scan = now + REFRESH;
         }
-        let mut candidates = Vec::with_capacity(CANDIDATE_LIMIT);
-        // The callback is synchronous, does not retain the reference and
-        // collects only bounded native evidence. Approval happens below.
-        let complete = unsafe { EnumWindows(Some(read_window), (&mut candidates as *mut Vec<Candidate>) as LPARAM) } != 0;
+        let (candidates, complete) = hung::candidates();
         let mut scan = Scan {
             approvals, tracker: self,
             observations: Vec::with_capacity(ACTIVE_LIMIT), foreground,
             foreground_ghost_known: false, ghost_unknown: false, limited: !complete,
         };
         for candidate in candidates {
-            scan.observe_candidate(candidate);
+            match self.probe.observe_candidate(candidate) {
+                CandidateEvidence::Window { window, ghost } => {
+                    scan.foreground_ghost_known |= ghost && scan.foreground.0 == candidate.window as usize as u64;
+                    scan.observe(window, ghost);
+                }
+                CandidateEvidence::UnknownGhost => scan.ghost_unknown = true,
+                CandidateEvidence::Changed => {}
+            }
         }
         let mut next = scan.observations;
         let mut limited = scan.limited;
@@ -112,11 +98,11 @@ impl Hung {
                 continue;
             }
             let hwnd = window.hwnd();
-            let owner = native_owner(hwnd.0);
+            let owner = hung::native_owner(hwnd.0);
             let proof = WindowProcess::read(hwnd);
             let gone = owner != Some((window.process.pid.get(), window.thread.get()))
                 || proof.is_some_and(|proof| proof != window);
-            if !gone && (!complete || proof.is_none() || unsafe { IsHungAppWindow(hwnd.0) } != 0) {
+            if !gone && (!complete || proof.is_none() || hung::is_hung(hwnd.0)) {
                 // Prefer an existing interval over an untracked new one if
                 // the sample is truncated. Do not report a false recovery.
                 if next.len() == ACTIVE_LIMIT {
@@ -151,6 +137,30 @@ impl Hung {
         true
     }
 
+    pub fn observe_scoped(&mut self, window: WindowProcess, direct: bool, ghost: bool, rows: &mut Vec<Value>) {
+        let previous = self.active.iter().find(|item| item.window == window).copied();
+        let observed = (direct || ghost).then_some(Observation { window, direct, ghost });
+        if previous == observed { return; }
+        let mut next = self.active.clone();
+        next.retain(|item| item.window != window);
+        if let Some(observed) = observed {
+            if next.len() == ACTIVE_LIMIT {
+                rows.push(json!({ "kind": "app_hung_coverage", "complete": false, "source": "elevated" }));
+                return;
+            }
+            next.push(observed);
+            if previous.is_none() { rows.push(hung_row(observed, true, "detected")); }
+            if ghost && previous.is_none_or(|previous| !previous.ghost) {
+                rows.push(json!({ "kind": "app_hung_ghost", "active": true, "association": "confirmed",
+                    "window": window.window, "process": window.process }));
+            }
+        } else if let Some(previous) = previous {
+            rows.push(hung_row(previous, false, "responsive"));
+        }
+        self.busy_changes(&next, rows);
+        self.active = next;
+    }
+
     pub fn close(&mut self) -> Vec<Value> {
         let mut rows = self.active.iter().map(|old| hung_row(*old, false, "observation_ended")).collect();
         self.busy_changes(&[], &mut rows);
@@ -176,23 +186,6 @@ impl Hung {
             }
         }
     }
-
-    fn ghost_original(&self, ghost: HWND) -> Option<WindowProcess> {
-        let reverse = self.ghost_to_original?;
-        let owner = native_owner(ghost)?;
-        let original = unsafe { reverse(ghost) };
-        let proof = WindowProcess::read(NativeWindow(original))?;
-        let pair_matches = |forward: GhostLookup| unsafe { forward(original) == ghost };
-        if original == ghost || !top_level(original) || is_ghost(original)
-            || self.original_to_ghost.is_some_and(|forward| !pair_matches(forward))
-            || unsafe { reverse(ghost) } != original || native_owner(ghost) != Some(owner)
-            || !is_ghost(ghost) || !top_level(ghost) || unsafe { IsHungAppWindow(ghost) } == 0
-            || WindowProcess::read(NativeWindow(original)) != Some(proof)
-        {
-            return None;
-        }
-        Some(proof)
-    }
 }
 
 struct Scan<'tracker, 'approvals, 'profile> {
@@ -206,26 +199,6 @@ struct Scan<'tracker, 'approvals, 'profile> {
 }
 
 impl Scan<'_, '_, '_> {
-    fn observe_candidate(&mut self, candidate: Candidate) {
-        let hwnd = candidate.window;
-        if native_owner(hwnd) != Some(candidate.owner) || !top_level(hwnd) || unsafe { IsHungAppWindow(hwnd) } == 0 {
-            return;
-        }
-        if is_ghost(hwnd) {
-            if let Some(window) = self.tracker.ghost_original(hwnd) {
-                self.foreground_ghost_known |= self.foreground.0 == hwnd as usize as u64;
-                self.observe(window, true);
-            } else {
-                self.ghost_unknown = true;
-            }
-        } else if let Some(window) = WindowProcess::read(NativeWindow(hwnd))
-            && candidate.owner == (window.process.pid.get(), window.thread.get())
-            && !is_ghost(hwnd) && unsafe { IsHungAppWindow(hwnd) } != 0
-        {
-            self.observe(window, false);
-        }
-    }
-
     fn observe(&mut self, window: WindowProcess, ghost: bool) {
         if self.approvals.get(window.process).is_none() || WindowProcess::read(window.hwnd()) != Some(window) {
             return;
@@ -246,44 +219,6 @@ impl Scan<'_, '_, '_> {
             self.observations.push(Observation { window, direct: !ghost, ghost });
         }
     }
-}
-
-struct Candidate {
-    window: HWND,
-    owner: (u32, u32),
-}
-
-unsafe extern "system" fn read_window(hwnd: HWND, data: LPARAM) -> i32 {
-    let candidates = unsafe { &mut *(data as *mut Vec<Candidate>) };
-    let keep_going = catch_unwind(AssertUnwindSafe(|| {
-        if !top_level(hwnd) || unsafe { IsHungAppWindow(hwnd) } == 0 {
-            return true;
-        }
-        if candidates.len() == CANDIDATE_LIMIT {
-            return false;
-        }
-        if let Some(owner) = native_owner(hwnd) {
-            candidates.push(Candidate { window: hwnd, owner });
-        }
-        true
-    })).unwrap_or(false);
-    if keep_going { 1 } else { 0 }
-}
-
-pub(super) fn is_ghost(window: HWND) -> bool {
-    let mut class = [0_u16; 7];
-    let length = unsafe { GetClassNameW(window, class.as_mut_ptr(), class.len() as i32) };
-    length == 5 && class[..5] == [b'G' as u16, b'h' as u16, b'o' as u16, b's' as u16, b't' as u16]
-}
-
-fn top_level(window: HWND) -> bool {
-    !window.is_null() && unsafe { GetAncestor(window, GA_ROOT) } == window
-}
-
-fn native_owner(window: HWND) -> Option<(u32, u32)> {
-    let mut pid = 0;
-    let thread = unsafe { GetWindowThreadProcessId(window, &mut pid) };
-    (thread != 0 && pid != 0).then_some((pid, thread))
 }
 
 fn hung_row(observed: Observation, active: bool, reason: &str) -> Value {

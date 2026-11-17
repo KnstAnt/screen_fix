@@ -16,7 +16,7 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::{CaptureError, session::{SessionHandle, SessionOutcome, SessionPhase, windows::Control}};
+use crate::{CaptureError, session::{SessionHandle, SessionOutcome, SessionPhase, SourceStatus, windows::Control}};
 
 const TIMER: usize = 1;
 
@@ -130,9 +130,18 @@ impl State {
         let Some(control) = &self.control else { return self.hide(window); };
         let Some(status) = control.status() else { return Ok(()); };
         let label = match status.phase {
+            SessionPhase::Starting | SessionPhase::Paused if status.source == SourceStatus::AwaitingConsent =>
+                "Screen Fix: waiting for Windows consent",
+            SessionPhase::Starting | SessionPhase::Paused if status.source == SourceStatus::AwaitingReadiness =>
+                "Screen Fix: verifying enhanced capture",
             SessionPhase::Starting => "Screen Fix: preparing recording",
+            SessionPhase::Recording if status.source == SourceStatus::Activating =>
+                "Screen Fix: waiting for certified input",
+            SessionPhase::Recording if matches!(status.source, SourceStatus::FailedPrefix(_)) =>
+                "Screen Fix: finishing a failed recording",
             SessionPhase::Recording if status.input_unavailable.is_some() || !status.video_unavailable.is_empty() =>
                 "Screen Fix: recording incomplete",
+            SessionPhase::Recording if status.source == SourceStatus::Enhanced => "Screen Fix: RECORDING (enhanced)",
             SessionPhase::Recording => "Screen Fix: RECORDING",
             SessionPhase::Paused => "Screen Fix: PAUSED",
             SessionPhase::Stopping => "Screen Fix: finishing recording",

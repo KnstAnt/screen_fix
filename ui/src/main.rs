@@ -1,28 +1,16 @@
 mod app;
 
-use screen_fix_core::{package::diagnostics::FailureComponent, platform};
+use screen_fix_core::package::diagnostics::FailureComponent;
 
 fn main() -> std::process::ExitCode {
-    let mut args = std::env::args_os().skip(1);
-    if let Some(command) = args.next() {
-        if command == "--export" {
-            if let Some(folder) = args.next() {
-                if args.next().is_none() {
-                    return match platform::export_session(std::path::Path::new(&folder)) {
-                        Ok(output) => {
-                            println!("{}", output.display());
-                            std::process::ExitCode::SUCCESS
-                        }
-                        Err(error) => {
-                            let message = error.to_string();
-                            eprintln!("{}", app::with_report(&message, error.into_diagnostic().with_output_root(std::path::PathBuf::from(&folder)).write()));
-                            std::process::ExitCode::FAILURE
-                        }
-                    };
-                }
-            }
-        }
-        eprintln!("Usage: screen-fix --export <completed-session-directory>");
+    #[cfg(all(target_os = "windows", feature = "elevated-release"))]
+    if let Err(error) = screen_fix_core::platform::restrict_release_dll_search() {
+        eprintln!("{error}");
+        return std::process::ExitCode::FAILURE;
+    }
+
+    if std::env::args_os().nth(1).is_some() {
+        eprintln!("Usage: screen-fix");
         return std::process::ExitCode::FAILURE;
     }
 

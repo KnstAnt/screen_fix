@@ -23,7 +23,7 @@ use crate::{
     session::windows::{PauseProducer, WorkerSession},
 };
 
-use super::{ProbeError, package_journal_error, readback::Pixels, still_rows::{Merge, Rows}};
+use super::{ProbeError, package_journal_error, readback::Pixels, still_rows::{Merge, Rows, StillCoverage}};
 
 const JOBS: usize = 12;
 const MAX_NEW_IMAGES: usize = 6;
@@ -48,6 +48,7 @@ pub(super) enum Dropped {
     RateLimit,
     WorkerClosed,
     Deadline,
+    ApprovalSuppressed,
 }
 
 #[derive(Debug)]
@@ -60,6 +61,7 @@ pub(super) enum Outcome {
 struct Job {
     offered_at: Instant,
     pixels: Pixels,
+    coverage: Option<StillCoverage>,
     priority: Priority,
     exempt: bool,
     reply: SyncSender<Outcome>,
@@ -93,7 +95,7 @@ impl Drop for Inbox {
 }
 
 impl Inbox {
-    pub fn request(&self, pixels: Pixels, priority: Priority, exempt: bool) -> Result<Ticket, Dropped> {
+    pub fn request(&self, pixels: Pixels, priority: Priority, exempt: bool, coverage: Option<StillCoverage>) -> Result<Ticket, Dropped> {
         let offered_at = Instant::now();
         self.0.offered.fetch_add(1, Ordering::Relaxed);
         let (reply, result) = sync_channel(1);
@@ -113,7 +115,7 @@ impl Inbox {
                 let _ = evicted.reply.try_send(Outcome::Dropped(Dropped::LowerPriority));
             }
         }
-        jobs.push_back(Job { offered_at, pixels, priority, exempt, reply });
+        jobs.push_back(Job { offered_at, pixels, coverage, priority, exempt, reply });
         self.0.peak.fetch_max(jobs.len(), Ordering::Relaxed);
         drop(jobs);
         self.0.wake.notify_one();
@@ -215,7 +217,10 @@ impl Worker {
         let expired = || session.stop_deadline().is_some_and(|deadline| Instant::now() >= deadline);
         if expired() { return Outcome::Dropped(Dropped::Deadline); }
         let pixels = &mut job.pixels;
-        let metadata = pixels.metadata;
+        let metadata = pixels.metadata.clone();
+        let coverage = &job.coverage;
+        let authorized = || metadata.covered() && coverage.as_ref().is_none_or(StillCoverage::allows);
+        if !authorized() { return Outcome::Dropped(Dropped::ApprovalSuppressed); }
         let mut hash = blake3::Hasher::new();
         hash.update(b"screen-fix-still\0v1\0packed-bgra8\0");
         hash.update(&metadata.extent.width.get().to_le_bytes());
@@ -236,6 +241,7 @@ impl Worker {
             Ok(meta) if !meta.is_file() || meta.len() == 0 => {
                 return failed("check_image_path", io::Error::from(io::ErrorKind::InvalidData));
             }
+            Ok(_) if !authorized() => return Outcome::Dropped(Dropped::ApprovalSuppressed),
             Ok(_) if expired() => return Outcome::Dropped(Dropped::Deadline),
             Ok(_) => return Outcome::Saved { reference, reused: true },
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -271,7 +277,13 @@ impl Worker {
         drop(file);
         let result = result.and_then(|()| {
             if expired() { return Err(Outcome::Dropped(Dropped::Deadline)); }
-            move_new(&temporary, &image).map_err(|error| failed("publish_image", error))
+            if !authorized() { return Err(Outcome::Dropped(Dropped::ApprovalSuppressed)); }
+            move_new(&temporary, &image).map_err(|error| failed("publish_image", error))?;
+            if !authorized() {
+                fs::remove_file(&image).map_err(|error| failed("remove_revoked_image", error))?;
+                return Err(Outcome::Dropped(Dropped::ApprovalSuppressed));
+            }
+            Ok(())
         });
         if let Err(outcome) = result {
             let _ = fs::remove_file(&temporary);

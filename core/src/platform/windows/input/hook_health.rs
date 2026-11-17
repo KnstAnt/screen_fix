@@ -1,6 +1,6 @@
 use crate::{
     capture::input::{Action, CorrelatedInput, Correlation},
-    protocol::{SessionTimeUs, ipc::{InputSample, Producer}},
+    protocol::{QpcTick, SessionTimeUs, ipc::{InputSample, Producer}},
 };
 
 const TRANSITIONS_WITHOUT_HOOK: u8 = 20;
@@ -14,7 +14,8 @@ pub(super) struct HookHealth {
 #[derive(Default)]
 struct Channel {
     latest_callback: Option<SessionTimeUs>,
-    first_miss: Option<SessionTimeUs>,
+    first_miss: Option<(SessionTimeUs, QpcTick)>,
+    lost_before: Option<QpcTick>,
     transitions: u8,
     unavailable: bool,
     report: bool,
@@ -46,8 +47,8 @@ impl HookHealth {
             channel.clear_streak();
             return;
         }
-        let first_miss = channel.first_miss.unwrap_or(at);
-        if channel.latest_callback.is_some_and(|last| last >= first_miss) {
+        let first_miss = channel.first_miss.unwrap_or((at, first.packet.receipt.qpc));
+        if channel.latest_callback.is_some_and(|last| last >= first_miss.0) {
             channel.clear_streak();
             return;
         }
@@ -55,6 +56,7 @@ impl HookHealth {
         channel.transitions += 1;
         if channel.transitions >= TRANSITIONS_WITHOUT_HOOK {
             channel.unavailable = true;
+            channel.lost_before = Some(first_miss.1);
             channel.report = true;
         }
     }
@@ -66,6 +68,10 @@ impl HookHealth {
 
     pub fn pointer_lost(&self) -> bool { self.pointer.unavailable }
     pub fn keyboard_lost(&self) -> bool { self.keyboard.unavailable }
+
+    pub fn lost_before(&self) -> Option<QpcTick> {
+        self.keyboard.lost_before.into_iter().chain(self.pointer.lost_before).min()
+    }
 
     pub fn take_reports(&mut self) -> [Option<Producer>; 2] {
         [
