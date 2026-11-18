@@ -1,0 +1,38 @@
+[package]
+name = "screen-fix-input-helper"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "screen-fix-input-helper"
+path = "src/main.rs"
+
+[features]
+elevated-release = []
+
+[dependencies]
+screen-fix-protocol = { path = "../../../protocol" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+screen-fix-native-observation = { path = "../native-observation" }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
+[build-dependencies]
+embed-resource = "3"
+
+# Installer payload from the same workspace release as the adjacent
+# screen-fix.exe and elevated collector. The protected release embeds
+# matching trust resources; development embeds the ordinary manifest.
+[package.metadata.screen-fix.deployment]
+platform = "windows"
+binary = "screen-fix-input-helper.exe"
+install-root = "ProgramFiles"
+install-subdirectory = "screen_fix"
+launch-from = "recorder-executable-directory"
+execution-level = "asInvoker"
+ui-access = false
+release-signing = "Authenticode"
+release-signing-required = true

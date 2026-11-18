@@ -1,69 +1,100 @@
-# screen_fix
+# screen_fix · Intercall Recorder M1
 
-Record a Windows display and its input events for an AI training dataset.
-Windows recording requires Windows 10 version 2004 or later and compatible
-D3D11 hardware H.264 encoding. The Linux and macOS builds provide the UI shell.
+The Windows desktop recorder collects approved on-screen activity, input and context into a local attempt. M1 is the capture core. The workspace contains the desktop Recorder, the standard input helper and the separately elevated capture application.
 
-## Build and record
+## Entry points
 
-On Windows x64, with the Rust MSVC toolchain and Windows build tools installed:
+| Package | Entry point | Responsibility |
+| --- | --- | --- |
+| `screen-fix` | `ui/src/main.rs`, no arguments | Opens the desktop recorder. `ui/src/app.rs` submits commands and renders session status. |
+| `screen-fix-input-helper` | `core/capture/input/src/main.rs` | The recorder launches the helper with its own restricted IPC handles. Launching the helper directly does not start a recording. |
+| `screen-fix-elevated-capture` | `core/capture/elevated/src/main.rs` | Accepts a single authenticated launch from an installed Recorder and supplies target-scoped native input and context evidence. Direct invocation does not start capture. |
+| `screen-fix-core` | `core/src/platform/mod.rs` | Owns the production session entry, package API, and native capture, encoding, context, and writing. |
+| `screen-fix-protocol` | `protocol/src/lib.rs` | Defines portable time, evidence, identities, and bounded IPC records. |
 
-```powershell
-cargo build --release --target x86_64-pc-windows-msvc
-.\target\x86_64-pc-windows-msvc\release\screen-fix.exe
-```
+### Ordinary development and portable use
 
-Select a display and use **Browse…** to choose an existing output directory,
-or paste the path. Click **Start recording**, then **Stop recording** to close
-the session. The recorder creates a new subdirectory for each session and
-displays the saved video path when export completes.
-
-Keyboard and mouse data are recorded locally. Enable **Save clipboard text**
-before Start if needed. The option resets when a session starts. Clipboard
-text is limited to 128 KiB per block. Delayed clipboard reads may extend Stop.
-On failure, the app shows diagnostics and attempts to write a local report.
-
-For the UI shell, build with `x86_64-unknown-linux-gnu` or
-`aarch64-apple-darwin` and the corresponding SDK and system libraries.
-
-## Session output
-
-| File | Contents |
-|---|---|
-| `video.mp4` | Finalized H.264 recording |
-| `frames.jsonl` | WGC observation time, admission time, and verified video PTS and duration |
-| `events.jsonl` | Raw input and foreground context, plus clipboard changes when enabled |
-| `manifest.json` | Completion marker, package index, display geometry, counts, and timeline |
-| `export/events.jsonl` | Before, after, and presented frame references, or reasons for missing frames |
-| `export/clicks.jsonl`, `export/drags.jsonl` | Button intervals, input references, baseline, and changed frame links |
-| `export/*.png` | Images shared by events that reference the same observation |
-
-Times ending in `_100ns` use 100 ns units. Admission is relative to session
-Start. PTS is relative to video start. The manifest relates the two origins
-and records Stop. Physical cursor position is observed at read time.
-An unfinished session may contain files without a final manifest.
-
-The cursor is excluded from video. Its observed position is kept in the input
-log. Identical pre-encode NV12 pixels share an image, regardless of timestamps.
-Each button interval keeps the real frame just before the press when available.
-During the hold and at the first frame after release, only images that differ
-from that baseline are selected. Older version 2 sessions lack the required
-fingerprints.
-
-To export a completed version 3 session again on Windows:
+Build the two ordinary Windows executables together:
 
 ```powershell
-.\target\x86_64-pc-windows-msvc\release\screen-fix.exe --export "<session-directory>"
+cargo build --release -p screen-fix -p screen-fix-input-helper
 ```
 
-The command prints the new `export-<id>` directory. Source files and earlier
-exports are preserved. A directory ending in `.pending` is unpublished.
+Keep `screen-fix-input-helper.exe` beside `screen-fix.exe` and run the desktop normally. The Recorder and standard helper run asInvoker with UIAccess disabled. They use the launch token, which can already be high when the built-in Windows Administrator starts the Recorder normally. The workspace sets the desktop as its default member. Development and portable builds support ordinary recording. A foreground eligible for the standard source under that token can be recorded directly. An approved foreground that requires the separate collector returns deployment-required status. The source ZIP carries the Rust code and release authoring. Windows executables, signatures and an MSI are absent. `Cargo.lock` is tracked, so builds use the locked dependency resolution. The recording backend is Windows-only.
 
-## Project documentation
+### Official protected installation
 
-- [Project goal](doc/target.txt)
-- [MVP specification and acceptance criteria](doc/SCREEN_FIX_SPEC.md)
-- [Architecture, implementation status, and known gaps](doc/SCREEN_FIX_ARCHITECTURE.md)
-- [Historical video pipeline review](doc/SCREEN_FIX_VIDEO_STATIC_REVIEW.md)
+Use the signed x64 MSI to install the matching Recorder, standard helper and elevated collector under the 64-bit Program Files `screen_fix` directory on the local Windows installation volume. Administrator authorization is required for machine-wide installation. The installer gives Users read and execute access and reserves mutation for SYSTEM, Administrators and TrustedInstaller. Launch the Recorder normally. It makes no request to elevate itself. Windows elevation consent applies to the separate collector when the actual approved foreground requires protected capture.
 
-The current source package has not been built or exercised on Windows.
+The [Windows deployment instructions](deploy/windows/README.md) specify WiX authoring, matching release resources and publisher pin, required release inputs and image/MSI signing. The Recorder verifies the installed files, access controls, signer, release identity and live peer before accepting protected capture. Supported targets are approved instances on the Recorder's unlocked interactive desktop with the same interactive account and logon context, including linked UAC split tokens. Cross-user credentials, other sessions/desktops, SYSTEM and protected targets are outside this mode.
+
+## Recording an attempt
+
+1. Open the application to be recorded and select its executable under **Approve an executable…**. Use the approved application in the foreground when the countdown ends. The M1 stub selects one executable in the desktop UI and gates public evidence by foreground and receipt. An empty approval list grants no approval.
+2. Choose the output folder, displays and capture pace. Clipboard and pen-HID collection are opt-in. Keep each selected window on a selected display when its screen evidence is required.
+3. Open **Recorder hotkeys** if a default cannot register. Start, Pause/Resume, Checkpoint request and Stop default to Ctrl+Alt+F9/F10/F11/F12. Windows reserves F12 for debugger use. Choose an unused function key from the actual F1–F24 choices, for example F8 if it is free, then wait for registration or use **Retry hotkey registration**. Start requires successful registration of all four bindings. The hotkey for a checkpoint creates a request. A still tied to a save needs successful-save evidence through the trusted fixture API in M1. Stop does not initiate a save.
+4. Click **Start recording** or use its registered chord, then switch to the approved app. Keep it in front when the countdown ends. Startup checks the Windows environment, target eligibility, storage, selected displays, encoders and standard helper registration. An approved foreground eligible for the standard source can start without a UAC request, including a same-sign-in elevated target within the Recorder’s existing high-integrity access. When Windows requests consent for the elevated collector, respond and return to the same approved window instance. The Recorder first shows consent/readiness and then waits for certified coverage from the collector before showing **enhanced capture**. A failed collector preparation appears as **Elevated capture unavailable**. A token verification failure during foreground approval reports that recording did not start and gives the reason. Denial and other failed preparations require a new attempt.
+5. Use **Pause recording** or the Pause/Resume chord to close admission. Bring the approved target into the foreground and use **Resume recording** or the chord for a manual or low-disk pause, once disk space permits. Lock, sleep, secure-desktop and source-transition reasons clear under their own conditions. A source switch closes the old visit first. A collector-backed visit requires fresh authorization and synchronization. Keep private information outside open capture intervals.
+6. Use **Stop recording** or its chord to finish the attempt, including during countdown, consent, readiness or pause. Stop before admission cancels startup. If a required protected source fails after admission, the Recorder closes the provable prefix and shows a failed result. When the failed manifest is confirmed, the result gives the attempt directory and verified video-frame count. Review the displayed reason and local diagnostic path when available.
+
+A click-through, non-activating native indicator shows recording status on the foreground window's monitor even when the main recorder window is minimized. It uses the existing UI message loop timer and a nonblocking controller snapshot. M1 does not exclude recorder windows from capture: the indicator can appear in video and stills. Full own-window exclusion remains M3.
+
+For developer verification of save-linked stills (M1-08), build the desktop with `cargo build -p screen-fix --features fixture-save`. While recording, the main window then shows **Confirm fixture save** and **Confirm final fixture save**. Each calls the trusted in-process `SessionHandle::confirm_fixture_save` seam for the approved executable, routed by the approved window geometry, and shows the returned save ID or error. The feature is off by default, and builds without it contain no save producer.
+
+Core tests use `cargo test -p screen-fix-core`. The package flag is required because the workspace default member is the desktop crate. The current source tree contains no test modules or fixture packages yet.
+
+To exit during startup or recording, close the main window to request Stop. Complete or cancelled attempts can close automatically. Review an incomplete result, then choose **Acknowledge and exit** if closing or **Acknowledge incomplete recording** to allow a new attempt. An indicator failure stops recording and reports the UI failure without discarding the backend result. Diagnostic reports use the selected output directory.
+
+Stop allows up to 10 seconds for normal finalization. If the deadline expires before the owner is authorized to publish the complete manifest, the recorder reports a timeout and the attempt stays incomplete. If authorization was obtained in time, the recorder shows **Final publication pending** while Windows finishes the atomic replacement. The same attempt stays active and holds the recording lease. The final result reflects the Windows response, with a native error in diagnostics if publication fails. An already recorded required-source failure remains the primary reason if Stop later times out. The retained failed-attempt path and verified-frame count require confirmed manifest publication. Windows shutdown and suspend retain their shorter waits.
+
+The desktop passes a frozen config to the controller thread in `core/src/session/windows.rs`. The coordinator in `core/src/platform/windows.rs` starts the package, launches monitor owners, and starts standard input through `input.rs` and `input_helper.rs`. The controller selects standard-source evidence or an authenticated collector-backed visit through `platform/windows/elevated/`. The input owner routes the selected receipts through matching, held state, context, UIA and the text publication gate. The capture owner holds native, cursor-free pixels and sends independently paced video samples to its monitor encoder. Early still requests also reach the capture owner through bounded lanes. Approved image results go from retained native frames through staging/readback and the PNG owner to the still journal. Optional custom cursor PNGs have their own bounded asset owner. WGC, encoding, image publication and all writing remain in the Recorder.
+
+Executable version resources are an optional snapshot of approved files read by the startup coordinator before capture starts. Window records label this provenance as `approved_file_at_startup`; it does not prove the version of a loaded process image. During capture, alternative executable path spellings are resolved by one separate owner with 64 bounded pending requests. Unknown approval remains private. An asynchronous positive result admits only receipts at or after its QPC confirmation boundary. Resolution failure or a pending wait exceeding two seconds is diagnosed; no replacement owner is started while the old one still holds a native call. Executable selection uses the existing setup worker, so path resolution does not block the desktop UI.
+
+## Output and inspection
+
+The selected output directory contains `attempts/attempt_<id>/`:
+
+```text
+manifest.json
+raw/input.jsonl
+raw/context.jsonl
+raw/frames.jsonl
+raw/stills.jsonl
+raw/video/m<monitor>/seg_<segment>.mp4
+raw/images/<digest>.png
+raw/cursors/<digest>.png
+```
+
+The manifest and journals use package format v6, and the reader opens v6 only. The [M1 journal schema](doc/SCREEN_FIX_M1_JOURNAL_SCHEMA.md) lists every row kind and field per stream, marked as PDF or extension, with the loss and health vocabularies and the validation rules.
+
+| Evidence | How to join it |
+| --- | --- |
+| Clock | `manifest.clock` records the QPC origin and frequency, measured UTC FILETIME brackets labelled by admission epoch, and both the actual Stop and last admitted cutoff. UTC is sampled at Start, at intervals of up to 60 seconds while the attempt is active, and at Stop, including while paused. When stopped from pause, the cutoff remains the time admission closed. Interpolate UTC within the same continuous interval. Context records describe pauses and discontinuities. |
+| Selected displays and actual modes | `selected_displays` is the request. `monitor_capture` holds the last known mode and aggregate counters. `monitor_epochs` records activated capture and geometry versions. Context records describe missing/reconfiguring displays and topology. A segment lists its own resolution, effective FPS, hardware/software selection, configured bitrates and opening capture/geometry identities. |
+| Event timing | Journal `recv_t_us` orders rows by logical receipt, with `seq` breaking ties. `source_t_us` is null when the provider has no session-clock timestamp. Raw Input, hook and WinEvent ticks carry `tick_ms` and `tick_uncertainty_us`, with `late` null when unclassifiable or based on an injected hook. Context rows triggered by a matching WinEvent carry `win_event_recv_t_us` for the native callback receipt used by the lateness check. Their `recv_t_us` describes the context poll. UIA completion and cursor observation retain separate times. |
+| Profile and input | The manifest records stub revision, approved identity count, requested options, helper registration, bounded observed devices/settings and unavailable evidence. Device descriptors are observed across the attempt, including devices that may have been removed. Missing calibration is explicit. |
+| Selected input source | Optional `source_evidence` records accepted source coverage, observed protected launch/attachment/configuration/registration/stop stages, and blind or uncertified intervals. `input_registration` and `input_capture.registration` record standard helper registration. |
+| Key transitions | Approved native `key_down` and `key_up` rows carry `vk`, `scan` (the make code with its E0/E1 prefix folded in; the prefix is also in `scan_prefix`) and `key`, with separate `raw_input` and `keyboard_hook` witnesses. A missing witness is `null`. `VK_PACKET` scan fields are `null` because the units belong to `text_commit`. `mods` lists the sides held after the transition (`shift_l`, `ctrl_r`, …) among the known sides in `mods_known`; a side missing from `mods_known` is unknown. `repeat` is `null` when the press state is unknown. Synthetic edges carry `synthetic: true` and their `boundary`, with both witnesses `null` and empty `mods` and `mods_known`. |
+| Pointer, pen and blind rows | `pointer_down`, `pointer_up`, `pointer_move` and `scroll` carry `pos`, `pos_recv`, `monitor`, `delta` and `warp` as evidence objects, `held` (buttons 1–5 after the row), `mods` and `coalesced`; button rows add `button` and `button_physical`. `pen` rows lift `xy`, `tip`, `in_range`, `pressure`, `tilt` and the other INP-11 values from the decoded HID report and keep the per-field evidence in `fields`. `blind` rows (`reason`, `start_us`, `end_us`) and `input_health` rows are in `input.jsonl`. |
+| Windows, focus and elements | An approved `foreground` row carries `pid`, `exe`, `product`, `version`, `version_string`, `rect`, `monitor`, `title` and `class`; an unapproved one is only `approved: false`. `focus` carries `uia`, `caret` and `ime`; `element` carries `trigger`, `pos` and `uia`. `uia` is the element (`control` by name, `framework`, `editable`, `password`, `name`, `rect`, …) or the read outcome, such as `"timeout"`. |
+| Hung applications | In `context.jsonl`, pair `app_hung` boundaries by `process`, `window`, and `thread_id`. A verified Ghost continues the original window’s interval. An unresolved Ghost produces an unattributed `app_hung_ghost` marker with `association: "unknown"`. `app_hung_coverage` indicates limited observation. Process-scoped `app_busy` rows with `scope: "process_hung"` report the hung contribution to busy state. Pause and Stop end observation without establishing recovery. Settled images and hung evidence cannot establish operation completion. |
+| Encoded frames | Join `monitor` and `segment` to the MP4; the index carries `frame_in_segment`, decoded-local `pts_100ns` and duration. `pts_us` is the slot start, `slot_decided_t_us` the slot decision, and `source_t_us` and `capture_recv_t_us` the frame's capture time and receipt. `recv_t_us` is the capture receipt only on a row that newly selects a frame. On a repeated or frameless row it is an ordering receipt that keeps the stream order and can be earlier than `slot_decided_t_us`; use the other times for timing. On repetition, `obs_id` and the native frame identity are reused. A skipped slot has an explicit `reason` and no encoded sample reference. |
+| Native stills and cursor assets | `stills.jsonl` has one row per trigger. `event_ref` locates the causal input journal row by stream and sequence. `frame_obs_id` and `frame.id` identify the actual source even if it has no corresponding video sample; pre-motion and pre-action rows add `seen_obs_id`, and `seen_file` only when the seen image differs. A `still` row's `file` is `images/<digest>.png`, relative to `raw/`, and rows can share the same PNG. A `still_dropped` row gives its `reason`. `geometry`, admission and save fields preserve selection provenance. In `context.jsonl`, an available `cursor_asset` references the optional cursor PNG and XOR mask by attempt-relative path, independently of screen pixels. |
+| Controls and loss | `context.jsonl` contains recorder controls, checkpoint request IDs and pause/resume/Stop evidence. `input.jsonl` contains blind intervals and the synthetic edges of held-state boundaries. Every journal has its own sequence and receipt order. A loss is a `gap` row with `reason`, `producer`, `count` and `count_known` (`count` is `null` when unknown), the original receipt bounds `first_recv_t_us` and `last_recv_t_us`, and native sequence or QPC bounds when known; the row's own `recv_t_us` is its admission receipt. Privacy-sensitive losses are only counted in the manifest. Health conditions are `health` rows, or `input_health` rows in the input stream. |
+| Health summary | `manifest.health` sums the persisted rows across streams as `pauses`, `gaps`, `blind_intervals` and `dropped_stills`, with `recovered_prefix: false`. It adds unapproved-foreground suppression intervals and their duration, per-stream `dropped_by_reason` and `suppressed_by_class`, activity losses, omitted health conditions and undelivered frames. Each `manifest.streams` summary keeps the stream's own row, gap, health, pause, blind and unavailable counts. |
+| Measurements | Closed journals report rows, loss, reserved entry/byte peaks and flush counts and latency. Capture reports native allocation and pressure counters. Video reports slot outcomes and repetitions. PNG records pressure, deduplication, and maximum queue and processing duration. These are producer measurements and buffer accounting, not end-to-end acceptance measurements. |
+
+`package::metadata::PackageReader::open` loads the manifest. `artifact_for_uri` resolves canonical attempt-relative paths, and `open_artifact` checks identity, kind/inventory and file shape. The reader exposes a summary when source evidence is present. The callable `PackageReader::validate_gates` (`core/src/package/reader.rs`, formerly `validate_v5_artifacts`) is a read-only, platform-independent API for later package inspection. It reads each listed journal once (context first) and checks the M1-10 acceptance gates 1–4 and the index part of gate 2. Gate 1: every row parses, `seq` increases by one, `recv_t_us` never decreases, and gap and health rows are well formed; row counts, last receipts and gap totals reconcile with the stream summary and the manifest `health` block. Gate 2 (index part): listed segment files exist with their published size; encoded frames rows name a listed segment with consecutive frame indexes and increasing PTS, within its frame count; still and cursor references point to inventoried PNGs whose header, size and dimensions match the manifest `images`/`cursors` lists; still `event_ref` values name an input action row. Gate 3: every key or button press outside pause, blind, gap, discontinuity and suppression intervals is released, presses open at a pause boundary are closed there by a synthetic release, and a release without a press carries `press_unavailable`. Gate 4: inside a pause interval the context journal holds only boundary, loss, health and unapproved-foreground rows, input rows are only gap, blind, health or suppression rows, no frames row belongs to a paused slot and no still is triggered. A complete package is checked strictly: every stream summary is present, each monitor's slots are contiguous and fully counted, and each segment's frame count and extent match its frames rows. The first failing rule is returned. Gate 2–4 violations name their gate, stream and row; parse, order and reconciliation failures name the stream and row. The API does not run on the desktop or Stop path. The gate 2 decode comparison is a separate Windows check and not part of it: during recording the per-monitor segment verifier decodes each finalized segment and checks its timing and dimensions before the MP4 is published (a rejected or overdue verification leaves the `.part` file and marks the slots `segment_unverified`). No separate function decodes a closed package afterwards. Stop joins admitted producer work and reconciles inventory and closed stream summaries before atomic manifest publication. It does not reopen and decode the entire completed attempt.
+
+A `complete` v6 attempt has certified required closure, including usable video from every selected monitor. It can contain accounted losses or degraded encoding modes. Cancellation, approval suppression, unverified required streams and finalization failures can leave an `incomplete` attempt. Pending and part files are not published artifact references. A timeout before authorization can leave the initial incomplete manifest and physical files from the closed prefix.
+
+## Current limits
+
+- Pen pressure is recorded only when observed through the selected native HID path. Vendor tablet mode and per-application settings are unknown/unavailable. No Wintab context is opened. The touchpad SPI and contact-report paths are present. Per-device Precision Touchpad Feature Type is explicitly unavailable because blocking Feature IO on the Raw Input owner has no deadline. No MIDI path is required by M1.
+- The 300 MiB per 4K monitor figure is a measurement target. Native texture and queue counters do not include the complete GPU/driver footprint.
+- M2–M6 cover task/file workflows, production application adapters, full privacy/review, delivery views, upload and server services. The stub and fixture routes here do not implement those services.
+
+The [Windows technical specification](<doc/Intercall Recorder technical spec v1 Windows.pdf>) and the [M1 specification addendum](doc/SCREEN_FIX_M1_SPEC_ADDENDUM.md) define the capture scope. The [M1 architecture](doc/SCREEN_FIX_M1_ARCHITECTURE_ADDENDUM.md), [M1 algorithms](doc/SCREEN_FIX_M1_ALGORITHMS_ADDENDUM.md), and [elevated capture specification addendum](doc/SCREEN_FIX_ELEVATED_COMPONENT_SPEC_ADDENDUM.md) describe ownership, publication and protected capture.
+
+The included source revisions were reviewed statically. Windows compilation, execution, signing, installation and hardware validation remain unverified.

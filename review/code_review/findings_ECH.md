@@ -1,0 +1,91 @@
+# Review findings, areas E, H, C (verbatim essentials)
+
+## E: package and capture model
+- **E1 · medium · change.** journal.rs:3-6,36,478-487,549,676-678.
+  - Every lifecycle entry (submit_boundary, submit_health, emit_pending(Reserved)) shares one fixed reserve of 24 slots.
+  - When the reserve is full, send_reserved returns JournalStep::Append, the same error as a dead writer, so the caller raises F.
+  - Fix: give "reserve full" its own error; keep a gap batch pending (Ok(false)) when full, as Capacity::Normal does, or size the reserve from a documented bound; fix the module doc.
+- **E2 · medium · bugfix (schema §8 gate 3).** reader.rs:479-487,514-517.
+  - The pause-cutoff sweep runs only when an input row with recv > cutoff arrives. On a Stop while paused, no row may pass the last cutoff, so the open press reaches finish with span (opened, MAX) and the pause excuses it.
+  - Fix: at the start of Gates::finish(Input), run the same sweep over pauses[next_pause..] before adding the still-open presses.
+- **E3 · low · bugfix (schema §2/§7/§8).** reader.rs:28-32,47,221,237,339,346.
+  - (a) Envelope.recv_t_us is Option: make it required.
+  - (b) The gap/health arms come before `(Frames, Some(_)) if strict`: move the strict-frames arm first.
+  - (c) FrameRow.reason is Option<String>: type it Option<MissingVideoSlot>.
+  - (d) A non-frames row without a kind passes: reject it.
+- **E4 · low · none (duplication).**
+  - The range merge is triplicated: LossEvidence::merge, PendingLoss::merge, InputGap::merge (outcome.rs:269-292,316-321; journal.rs:216-243,513-516).
+  - matching.rs:117-125/879-884 keeps a private merge_bounds copy.
+  - record_loss re-implements GapRecord::is_valid.
+  - Fix: use one LossRange::merge, import outcome::merge_bounds, validate with is_valid.
+- **E5 · low · none.**
+  - The injected-hook predicate (flags & 0x12 / &3) is duplicated in evidence.rs:196-204, held.rs:109-120,157 and gate.rs:989-990; matching::injected_hook exists, so make it pub(crate) and reuse it.
+  - Magic numbers: 0x80 LLKHF_UP, 0xe7 VK_PACKET, 0x14 VK_CAPITAL, the promotion signature 0xff51_5700/0x80/0x7f, the AutoHotkey range, and the AltGr 20_000 (= MATCH_WINDOW_US) in held.rs. Use named consts.
+- **E6 · low · none.** diagnostics.rs:149-152 capture_fps duplicates CapturePace::frames_per_second().
+- **E7 · low · none.**
+  - reader.rs:369,373: a bad file/seen_file/png/xor_mask is reported as InvalidManifest/InvalidArtifact without stream and row. Return InvalidJournal{stream,row}.
+  - JournalError (journal.rs:60-76) has no Error::source().
+- **E8 · low · none.** package.rs:5-9, capture/mod.rs:3-7, capture/input.rs:50-72: the pub modules outcome, capture::{input,frame,context,observation}, InputOrigin and PointerEvidence are used only in-crate. Make them pub(crate); ui uses only package::diagnostics and capture::save.
+- **E9 · low · none.**
+  - sampling.rs:109-115: MotionSampler::finish is an alias of flush; drop it.
+  - normalize.rs:167-169,177-179: the impossible `next == parts.len()` guards should become a const assert that MAX_PARTS == 13.
+- **E10 · low · none.** held.rs:333-336: the doc comment on modifiers_and_buttons describes published(); move it.
+
+## H: native observation crates
+- **H1 · medium · bugfix (E4).** raw.rs:140-145, raw_loop.rs:405-414,420-426.
+  - The Environment record claims a fresh registration check, but check_registration skips the check if one ran <5 s ago, and the queue-full retry re-stamps the QPC.
+  - Fix: verify_now() unconditionally on the environment path; store the check QPC in Evidence and use it as observed_qpc.
+- **H2 · medium · bugfix (E3, no Losses::default without flush).** raw_loop.rs:316-318. On a scope-serial change, the flush_loss result is ignored and `output.losses = Losses::default()` runs. Remove the reset.
+- **H3 · medium · bugfix (INP-14/15, M1-05).** input/src/windows.rs:119-145, raw_loop.rs:55-59,75.
+  - In the standard helper, an OptionalUnavailable notice that meets a full channel is dropped via losses.drop_record (Losses::lose ignores it).
+  - Notices are not in RawResult, so they are lost at stop.
+  - Fix: keep pending notices in the helper Output, retry them in flush_pending, return them in RawResult/RawExit, and offer them in the final drain.
+- **H4 · low-med · bugfix.** raw_loop.rs:356-385.
+  - For a device first seen in WM_INPUT, device::descriptor runs twice, and the first DeviceArrived has no hid evidence.
+  - The comment "parsing starts with next packet" is wrong, and devices.assign duplicates identify.
+  - Fix: fetch the descriptor once, observe_device before offering, keep the path for worker.request, use the id from identify, delete the comment.
+- **H5 · low · bugfix (C3 bounds).** native-observation lib.rs:37-50.
+  - The LossCounter take/note ordering can return (n,0,0) or an inverted range, and the comment is wrong. context.rs:188-197 merges by min/max, so a 0 pins first_qpc to 0.
+  - Fix: note writes the bounds before count.fetch_add(Release); take swaps count first (Acquire); never emit 0 or an inverted range.
+- **H6 · low · bugfix.** raw.rs:292-299: Drop for RawWindow does not remove the optional touchpad/multi-axis registrations. Remove each one that succeeded.
+- **H7 · low · none (unsafe).**
+  - raw.rs:539-544: native_copy<T: Copy> is safe but does read_unaligned from arbitrary bytes. Make it an unsafe fn with a # Safety section, or bound T by a private POD marker.
+  - uia_commits.rs:253-256: array_parts reads rgsabound before checking cDims==1.
+- **H8 · low · none.** raw_loop.rs:139-169, input/src/windows.rs:119-171, elevated runtime/input.rs: flush-loss/notices/environment-merge is triplicated. Add Losses::flush(send) and one PendingStatus helper in loss.rs.
+- **H9 · low · none.**
+  - Focus read is duplicated in windows.rs:215-246 and raw.rs:426-450.
+  - Process creation FILETIME is read in raw.rs:391-405, identity.rs:63-75 and elevated process.rs:61-69.
+  - The integrity RID is read in held.rs:110-139 and elevated process.rs:279-291.
+  - Fix: shared helpers in native-observation.
+- **H10 · low · change.** identity.rs:135-167: MetadataScrubber replaces USERNAME/COMPUTERNAME as substrings anywhere ("dev" mangles "Device"). Use token/path-segment boundaries.
+- **H11 · low · none.**
+  - Magic numbers: ime.rs:291-294 WM_IME_CONTROL etc.; device.rs:201 `kind != 7` (REG_MULTI_SZ); raw.rs:453,456 MOUSE_MOVE_ABSOLUTE/MOUSE_VIRTUAL_DESKTOP.
+  - HID usage pairs are repeated (raw.rs:304-306, device.rs:99, hid.rs:39-43,101-104,144,240,248); use OptionalCollection::usage().
+  - uia.rs:173-174 hard-codes 250/500 ms; use MAX_CALL.
+  - uia.rs:168-170 maps every CoInitializeEx failure to E_FAIL; propagate the HRESULT.
+- **H12 · low · none.** events.rs:192-226: the WinEvent workers busy-wait (PeekMessage + park 5 ms). Use MsgWaitForMultipleObjectsEx.
+- **H13 · low · none.** hooks.rs:46-60: the KEYBOARD/POINTER static rings have no single-owner guard. Add an AtomicBool claim.
+- **Minor redundancy:** the double invalid(request) check at uia.rs:384/388; raw.is_null() after CreateFileW at identity.rs:114.
+
+## C: input platform
+- **C1 · HIGH · bugfix (plan §A1 rule 5, ALG §13.1, PRIV-5).** receiver.rs:324-330,431-437,445-449,691-693.
+  - Key packets from ElevatedWindow/ForegroundInaccessible, drain_after_latch and note_uncertified are recorded as Ordinary timed gaps, which gives near per-key timing in an elevated or unapproved window.
+  - Fix: send LossEvidence::sensitive(reason, producer, 1) for key samples (pass the sample to note_packet_lost); keep the held invalidation and the blind interval.
+- **C2 · HIGH · bugfix (per_second doc, PRIV-5).** gate.rs:933-937, 239-242. Action::AltGrCompanion goes through suppress_at(NotPublishable), which is per second even in password fields. Use note_suppressed (totals only), or classify by focus target.
+- **C3 · medium · change (the plan is self-contradictory: line 884 vs rule 5).** gate.rs:382 (Gate::push keys_sensitive=false) and receiver.rs:1057-1066 (SampleLoss key samples) are timed losses before classification. Make key losses sensitive; keep ranges for pointer/HID.
+- **C4 · low · bugfix (schema §2.3).** gate.rs:291-301: at 32 pending health records, note_health adds the count to the last record whatever its kind. Merge into the same kind, else overflow.
+- **C5 · low · none.** receiver.rs:119,151-158: the check_stall receipt is unused by input.rs:350-351. Return Option<Producer> or use it.
+- **C6 · low · none.** input.rs:1297: note_staging_loss uses receiver.note_text_loss for malformed elevated records. Add a generic note_loss.
+- **C7 · low · change(minor).** receiver.rs:540-549 vs 504-511: device map insertion is duplicated, and inventory() skips gate.note_input_device when the manifest cap is hit. Use one helper that always informs the gate and caps only the manifest insert.
+- **C8 · low · none.**
+  - gate.rs:988-992 copies injected_hook.
+  - HID usage pairs are hand-coded (gate.rs:1295, text.rs:287, input.rs:769, gate.rs:448,1072, hid.rs:135-137); use HidReport::is_pen() and OptionalCollection.
+  - hid.rs:174,177 compares `kind == "pen"` strings; use an enum.
+- **C9 · low · none.** unique/number/switch are duplicated in hid.rs:237-243,280-285 and touchpad.rs:497-518; gate.rs:1079-1083 hand-writes hid normalize. Share them pub(super).
+- **C10 · low · none.** input.rs:1254-1267 publish_blind_pause hard-codes the pause labels; the policy is duplicated in session/windows.rs:1703-1708 pause_blind_reason. Use a typed label and one mapping fn.
+- **C11 · low · none.** touchpad.rs:446 `.take(MAX_HID_FIELDS)` is redundant; gate.rs:354-361 has unreachable Sensitive arms.
+- **C12 · low · none.** input.rs:116 ReceiptPrefix::last_time can be private.
+- **C13 · low · none.**
+  - pump is ~630 lines, plus poll_elevated, gate drain and publish.
+  - The first-error accumulator `std::mem::replace(&mut accepted, Ok(())).and_then` is copied 6x (input.rs:292-305,340-344,660-668,905-909,1128-1133,1155-1163); service_source(...) is repeated 7x.
+  - Magic numbers: 250_000 (input.rs:961,1369), 10 s flush_boundary (:1217), 16 confirmed-text cap (gate.rs:504), the bucket adjust (input.rs:1028-1029).

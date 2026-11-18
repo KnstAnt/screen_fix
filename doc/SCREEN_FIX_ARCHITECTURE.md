@@ -1,95 +1,44 @@
-# screen_fix MVP architecture
+# screen_fix capture architecture
 
-The [MVP specification](SCREEN_FIX_SPEC.md) governs this design. The user starts capture on a selected display, works in ordinary applications, stops, and receives local video, raw input, context, and frame exports. Minimum OS is Windows 10 version 2004 (build 19041), including later Windows releases and Windows 11. The guarantee covers normal operation. Detected failures follow the specification's reporting contract.
+The [specification](SCREEN_FIX_SPEC.md) describes the M1 capture scope. Use the [M1 architecture addendum](SCREEN_FIX_M1_ARCHITECTURE_ADDENDUM.md) for detailed ownership and extension boundaries, the [M1 algorithms](SCREEN_FIX_M1_ALGORITHMS_ADDENDUM.md) for capture and ordering, and the [elevated capture specification addendum](SCREEN_FIX_ELEVATED_COMPONENT_SPEC_ADDENDUM.md) for protected scope and attachment.
 
-## Implementation status
+## 1. Process and owner boundaries
 
-This design records both the intended contract and the current source-level implementation. The packaged revision has not been built or exercised on Windows.
+| Owner | State and responsibility |
+| --- | --- |
+| Recorder UI and controller | The egui/eframe UI submits commands and shows typed status. A dedicated controller owns the attempt, QPC origin, admission epochs, independent pause reasons and final outcome. |
+| Standard input helper | Produces Raw Input, hook and supported device evidence. The Recorder launches it with its existing token through restricted inherited IPC with a parent-lifetime job. |
+| Elevated collector | Runs on demand for an approved foreground requiring the collector, under one authenticated attachment. Owns scoped native input and context reads, its foreground/desktop witness and independent lifetime enforcement. Its control, input and context transport has separate bounded lanes. |
+| Receiver and Context | The Recorder selects one source into shared matching, held-state and privacy logic. The Context owner manages visit and focus revisions, native read routing, geometry and evidence order. Clipboard content is owned by an opt-in worker within the Recorder. |
+| Monitor capture and video owners | Each monitor has a WGC/D3D11 capture owner, native history and readback resources. The video owner processes paced samples and owns its encoder, segment finalization and index reconciliation. |
+| Image and package owners | Bounded still and cursor asset work, PNG publication, individual journal writers and manifest publication run in the Recorder. Package inspection operates on closed artifacts. |
 
-- The egui/eframe UI selects an attached display and an existing destination folder. Browse opens the Windows folder picker through `rfd`. Manual path entry is also supported.
-- The recording worker owns WGC, D3D11 conversion, the hardware encoder, the MP4 writer, and frame indexing. A separate Win32 input worker feeds a separate journal writer through a 4,096-event queue. The optional clipboard read runs in that writer. Delayed rendering can extend Stop or, if the queue fills during recording, fail the session with diagnostics.
-- Start, admission, and Stop are ordered under a mutex using `Instant`. The manifest stores a QPC anchor, frequency, uncertainty, video start offset, and Stop offset. The current format does not persist a separate gate operation sequence. Event and frame records have their own identifiers.
-- The recorder targets 30 fps and selects the newer queued frame when two are available. PTS is derived from monotonic admission time. The prior frame is held to compute duration, and missed slots are skipped. D3D11 conversion uses up to 16 NV12 textures, tracked samples, and a fence wait before releasing the WGC frame.
-- After Stop, the recorder checks decoded frame count, ordering, PTS, duration, and end time against the submitted index. The timing tolerance is 1 ms. It publishes the source manifest before exporting PNGs. Repeat export reads manifest version 3 and writes a new derived directory.
-- The current diagnostic file contains the application version, platform name, stage, and available technical details. Explicit timestamp, OS build, and profile fields remain gaps against the specification. Windows-provided descriptions can use the OS language.
-- Foreground titles and process names are observed when the notification is handled. Clipboard sequence numbers describe the value observed when the notice is read, so multiple queued notices can refer to the same clipboard version.
+Use typed value messages across process and owner boundaries. Keep COM objects, GPU resources and writable files with their owners. Place platform calls in the Windows layers and shared time and wire records in the protocol crate. Queues are bounded and ownership of time-sensitive input does not depend on optional native reads or file I/O. The Recorder and collectors use common native observation code. The high process owns neither screen pixels nor recording storage.
 
-## 1. Ownership and execution
+## 2. Admission, transition and Stop
 
-| Owner | State and resources | Output |
-|---|---|---|
-| Session coordinator | Start/Stop, UI state, session boundaries, directory, and manifest | Admission boundaries and final status |
-| Win32 message thread | Raw Input, focus and clipboard notifications, observations and sequence numbers | Input and context events |
-| Video owner | WGC, D3D11, texture pool, encoder, and MP4 | Video and saved frame index |
-| Input journal writer | Event file, buffers, counter, and optional clipboard text read | Closed events.jsonl and completion acknowledgment |
-| Export | Closed package reader, decoder, and image writer | Event-to-image mapping and PNGs |
+1. **Prepare.** Freeze the capture settings, check the Windows environment, storage, selected monitors, encoding profile and standard helper readiness. Identify the actual foreground at the countdown boundary. An approved foreground within the Recorder’s existing access uses the standard source without UAC. The asInvoker Recorder may already run at high integrity after a normal built-in Administrator launch.
+2. **Attach when required.** Protected recording verifies the three matching role-bound signed images and installation protection. Both processes verify the live peer and approved target. The collector remains closed through grant preparation and required registration and held readiness. After the controller opens its epoch, exact activation and a fresh held sample precede collector evidence eligibility.
+3. **Admit and publish.** Honor the current epoch, approved visit, original QPC and exclusive coverage. The Recorder certifies evidence only as far as its independently received input and context bounds and the safe cutoff allow. Frame, still and journal owners enforce the visit restriction pending publication. Checkpoint context and confirmed Save routing require current scope and original receipt within the same visit's proof.
+4. **Pause or hand off.** A detected transition from the standard source to the collector clears frame approval and latches the old epoch closed. The controller preserves the attempt and clock. A configured idle collector can prepare only against the currently selected live foreground. Resume or a source switch requires fresh selected-source readiness and resynchronization. Retire old matching, context and media scope.
+5. **Stop and drain.** Cancel unpublished source preparations and close active admission. If already paused, keep its earlier cutoff. Service outstanding source and writer work within the existing bounds. Collector cleanup acknowledgement and data certification advance separately. Only the supported retired prefix can drain. Preserve staging-loss and uncertified-tail evidence, finalize required streams and publish the manifest under the existing deadline and ownership rules.
 
-One process. Control, Win32 input, video, and log writes execute independently. Send values through bounded channels. The video worker writes the frame index directly. The input journal uses an independent bounded queue. Queue overflow reporting must not depend on free space in the affected queue. COM objects, GPU surfaces, and file descriptors remain with their owners. Move blocking enrichment outside the input pump. Report missing values when attribution to the source observation cannot be established.
+A required source failure follows the same bounded closure path and retains its first substantive cause. The Recorder presents failure and any confirmed retained package, with a bounded local report in the selected output directory when available. Automatic repair and worker restart remain deferred.
 
-Use `windows` for platform implementation and `serde` and `serde_json` for the package format. Use standard-library threads, queues, and buffers. Keep system APIs inside Windows modules. Session and matching logic operate on Rust values. Use `redb` if a session index is added. Follow the specification's rules for dependency maturity, integration, and build cost.
+## 3. Video, stills and timeline
 
-## 2. Session protocol
+- A monitor capture thread owns its GPU context, source-frame leases and retained history. Video pacing selects eligible samples on the common session clock and retains native capture time and receipt. Repeats reuse a source identity. Missing slots have explicit dispositions. A segment records its local PTS mapping, geometry and effective encoding mode.
+- Startup selects the supported hardware path or the approved software path before admission. Encoding and muxing remain isolated from capture. Keep surfaces alive until the consumer releases them. Reconcile the closed segment with indexed timing before publication.
+- The still path reserves native frames for bounded observation work, verifies geometry and admission, and reads back selected native pixels for PNG. The selection and manifest preserve evidence even when no corresponding video slot exists.
+- Journal receipt, source QPC and encoder PTS describe separate events. Session time continues through pauses. The manifest records the QPC origin and frequency, UTC correlation brackets by admission epoch, and the actual Stop and last-admitted cutoff.
 
-1. **Prepare.** Verify the monitor, directory, source registrations, and hardware video profile. Create a unique session directory. Prepare sources and writers. Show preparation status, then recording status. Initialize WGC during preparation and start capture after admission opens so the first frame of a static screen can enter the session. Register focus notifications during preparation and read the initial focus after opening. Include time to first frame in profile verification.
-2. **Open.** The coordinator uses a small shared gate with Prepared, Open, and Closed states. State transitions and observation admission are serialized. The critical section reads QPC and decides admission. GPU work, I/O, serialization, and queue waits take place outside it. Each admission applies to one observation in one session.
-3. **Admit.** The interval is `[start, stop)` on the logical key (QPC, gate operation order). Preserve boundary and admission keys. Video time is the numeric projection. Read admission time inside the gate. Timestamp input and context when observed by the process. Retain WGC compositor time separately. Exclude frames with compositor time before Start and data delivered after closing, even if the OS generated it earlier. Admit before expensive processing and before queueing. Overflow of a required queue after admission makes the session incomplete.
-4. **Stop and drain.** Close admission and stop sources. Each source finishes admitted operations, closes its channel, and reports its count or error. Drain queues, reconcile counts, and close journals. Drain the encoder and finalize MP4. Publish the source manifest after successful completion. Export runs afterward and has a separate outcome. Keep successfully recorded sources when export fails and distinguish recording status from dataset export status.
+## 4. Package and verification
 
-### Detected failure diagnostics
+| Path | Contents |
+| --- | --- |
+| `manifest.json` | v6 attempt, clock and boundaries, selected monitors and geometry, inventories, stream summaries and optional selected-source evidence |
+| `raw/input.jsonl`, `raw/context.jsonl` | Typed input and context, controls, blind/gap evidence and independent journal order |
+| `raw/frames.jsonl`, `raw/video/m<monitor>/seg_<segment>.mp4` | Frame and slot index plus published segment media |
+| `raw/stills.jsonl`, `raw/images/`, `raw/cursors/` | Logical still outcomes, durable evidence references and PNG assets |
 
-The owner returns a typed error with its stage and available Windows code. The coordinator ends the affected operation. For a recording failure it closes admission and releases resources without attempting continuation. Show a clear description and the path to a local report with time, app and OS versions, stage, available profile information, and error code. Exclude captured data. If the file cannot be written, show available diagnostics for copying. If the process terminates abruptly, the report and message may be unavailable. Report export failure separately from source recording status.
-
-## 3. Video and timeline
-
-- Path: selected display WGC → D3D11 → GPU NV12 → verified hardware H.264 MFT → MP4. Keep surfaces alive while the encoder uses them and reuse a bounded pool. A reusable NV12 staging surface provides a pre-encode content fingerprint. Read active pixel bytes and skip row padding. This readback runs during capture and must be included in performance acceptance. Verify the hardware path for the Windows version, adapter, and driver. Reject Start with a reason if the required profile is unavailable.
-- Convert compositor and observation times to integer 100 ns units relative to session QPC. Preserve raw time and its provenance. Check conversion range. Use sequence numbers for equal times within a stream. Equal cross-stream times do not establish causality.
-- Nominal cadence defines selection intervals on the admission timeline. Process them in order and save the latest eligible observation within each interval, when available. Stop closes the final partial interval. Presentation of a new observation begins at or after its compositor time. If there is no new observation, extend or repeat the last saved frame while preserving its original time. Before the first frame the screen state is unknown. Clip final coverage at Stop. Measure selection delay and coverage on changing screens.
-- The index distinguishes `observation_id` from encoded samples. Each sample records normalized PTS, duration, and its observation. Match decoded frames by presentation time, accounting for container timebase and reordering. Each indexed sample must match one decoded sample unambiguously. The initial measurement profile is one SDR display, 1080p, nominal 30 fps.
-
-### Video pipeline contract
-
-- Bind the selected adapter to the hardware MFT through LUID and the DXGI device manager. Verify BGRA/NV12/H.264 negotiation and GPU conversion. A negotiation failure rejects Start with diagnostics.
-- Keep the WGC lease until GPU reading is complete or equivalent command ordering is guaranteed. The NV12 surface is separately owned. Return it to the pool only after confirmed release by the consumer. Submission or encoded output alone does not establish release.
-- The async MFT accepts input on NeedInput and provides output on HaveOutput. At normal Stop, submit admitted samples, signal end of input, and drain through DrainComplete. Finalize MP4 after all output arrives. Detected failure follows the diagnostic path.
-- Agree on SPS/PPS and a decodable stream start with the MP4 sink. The first profile may require an MFT with B-frames demonstrably disabled. If reordering is supported, preserve DTS separately from PTS and pass samples in decode order.
-- A provisional index links observations to encoder samples. After closing MP4, reconcile timestamps, durations, start offset, and timescale with the actual container. Publish the manifest only after unambiguous reconciliation and index closure. The vertical slice also verifies decoded-frame correspondence.
-- Stop before the first usable sample produces a distinct result, “Recording stopped before the first frame.” No successful package is published.
-
-See the historical [video pipeline static review](SCREEN_FIX_VIDEO_STATIC_REVIEW.md).
-
-## 4. Data and export
-
-| File | Contents |
-|---|---|
-| `manifest.json` | Format version, session ID, boundaries, profile, display geometry and physical-to-video transform, package contents, and stream counts |
-| `events.jsonl` | Stream ID and sequence, observation time, typed input or context, and reasons for unavailable fields |
-| `frames.jsonl` | Saved WGC observations and video sample mapping with PTS, duration, and repeat marker |
-| `video.mp4` | Finalized video |
-| `export/` | Event/image index, missing-side reasons, and PNGs reused by observation |
-
-Preserve raw mouse motion, button, and scroll packets. Store observed physical pointer position separately from relative motion. Mark clicks outside the selected display as lacking a video coordinate. Window metadata describes observed focus. Log clipboard changes only when enabled. Store text only when the version matches the observation. If it changed, record a missing value.
-
-For discrete events, choose the last saved real observation strictly before and the first strictly after the boundary. Use only observations with uniquely resolvable PTS. For drags use press and release. Mark gestures that started before capture or remained unfinished as incomplete and preserve raw input. Equal timestamps belong to neither strict side.
-
-Expose presented screen state separately on sample intervals `[PTS, PTS + duration)` in session time, clipped at Stop. A static screen can have known presentation coverage with no strict after frame. Preserve this distinction. A repeat never replaces a strict observation. Window association and temporal proximity do not establish that the effect of an action is visible.
-
-Match sorted events and observations by time. Deduplicate selected samples by observation and extract them during sequential decoding. Repeated references to one observation reuse its PNG. Repeat export does not modify the source package.
-
-### Content-aware PNG export
-
-Disable cursor capture in WGC before opening a recording. Windows 10 version 2004 or later is required for this property. Preserve pointer coordinates and button edges in the raw event log. Compute BLAKE3 from the visible NV12 bytes before H.264 encoding, ignoring row padding. Identical fingerprints share a PNG even if observation times differ. Keep observation PTS and image PTS separate. This compares exact pixels in the output profile and does not attempt perceptual matching.
-
-Pair presses and releases by device and button. Export the nearest real observation strictly before the press as the baseline when available. Include distinct observations from the half-open hold interval and the first real observation strictly after release only if their fingerprints differ from the baseline. If the baseline is unavailable, report the missing comparison. If the release is unavailable, omit the after side. Write button intervals without confirmed movement to `clicks.jsonl` and confirmed drags to `drags.jsonl`. Preserve incomplete-boundary markers. Button edges do not generate separate PNGs in the discrete-event export. Keyboard, wheel, focus, and clipboard events retain their discrete mappings.
-
-Version 3 sessions persist fingerprints and support this export policy. Older sessions may include the cursor and lack pre-encode fingerprints. The content-aware exporter rejects them with a diagnostic.
-
-## 5. Acceptance and open checks
-
-| Goal | Check |
-|---|---|
-| Completeness | A known sequence of keyboard, mouse, scroll, and focus events has no recorder-induced loss. Accepted counters and sequences match the closed log. |
-| Boundaries | Exercise input and video near Start and Stop with delayed consumers. Drain admitted work, reject new work after closing, and publish success after all required files are closed. |
-| Dataset | Exercise a static screen, delayed redraw, drag, equal timestamps, and missing sides at the boundaries. Resolve every exported reference to a decoded frame. |
-| Performance | On Windows 10/11 with Blender and one target Adobe or CAD application, compare recording on and off. Measure app responsiveness, CPU/GPU, RAM/VRAM, disk writes, frame intervals, queue depth, and text readability. |
-
-First verify the hardware vertical slice and PTS correspondence. Then connect capture, journals, and export. Use measurements to approve profile limits, queue sizes, input timing accuracy, and resource budgets. The design itself does not establish that these checks pass.
+The read-only v6 package API validates stream, segment and asset relationships when called. The [M1 journal schema](SCREEN_FIX_M1_JOURNAL_SCHEMA.md) describes the v6 rows. Desktop Stop uses the owner-produced index and closed summaries. A complete attempt can include accounted losses. Windows capture, installed trust, hardware profiles, performance and end-to-end operator behavior require verification against the [M1 acceptance criteria](SCREEN_FIX_M1_SPEC_ADDENDUM.md#6-revised-m1-acceptance-mapping).

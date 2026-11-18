@@ -1,0 +1,51 @@
+[package]
+name = "screen-fix-native-observation"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+context = [
+    "dep:serde",
+    "dep:windows",
+    "dep:windows-core",
+    # `WNDCLASSW` and `RegisterClassW` (events.rs) carry GDI handle types.
+    "windows-sys/Win32_Graphics_Gdi",
+    "windows-sys/Win32_System_StationsAndDesktops",
+    "windows-sys/Win32_UI_Accessibility",
+    "windows-sys/Win32_UI_Input_Ime",
+]
+
+[target.'cfg(target_os = "windows")'.dependencies]
+screen-fix-protocol = { path = "../../../protocol" }
+blake3 = { version = "1", features = ["pure"] }
+serde = { version = "1", features = ["derive"], optional = true }
+windows-core = { version = "0.62.2", optional = true }
+windows = { version = "0.62.2", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Devices_Properties",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

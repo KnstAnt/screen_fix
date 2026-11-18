@@ -1,0 +1,81 @@
+# Review findings, area B: stills and the platform shell
+
+Paths below are relative to `core/src/platform/`.
+
+- **B1 · medium · bugfix (ALG §13.12: one readback/PNG job serves every slot of the same held frame).**
+  - Where: windows/stills.rs:1327 (also `retain` 907-917, `reclaim` 957-996).
+  - Problem: `while !readbacks.fits(&frame) && self.reclaim(priority,false) {}` evicts lower-priority slots that hold the same frame. That frees no bytes, so it over-evicts with `retention_lower_priority`. `retain()` has the same problem when a frame is shared.
+  - Fix: `reclaim` excludes victims holding the target `FrameId`. Better: count only victims whose `Rc::strong_count == 1`.
+- **B2 · medium · bugfix (ALG §4 retention order, §13.12 IMG-7 reclaim).**
+  - Where: stills.rs:1363-1369 `select_next` uses `Selected::from(..,holds)` without reclaim. Callers: 788, 810, 1053, 1283.
+  - Problem: `Next` gets `retention_capacity` even when Idle/Settled holds could be released.
+  - Fix:
+    - `finish_scroll` and `publish_private` call `self.retain(.., Priority::Next)`.
+    - `work()` and `scroll_step` collect indices first, then call `retain` outside the borrow.
+- **B3 · medium · bugfix (schema §6: `frame_obs_id` is a PDF field; `geometry_evidence` on every approved fallback).**
+  - Where:
+    - stills.rs:1371-1379 `dropped_trigger`
+    - stills.rs:102-106 `EarlyRows::approve`
+    - stills.rs:342-362 `Public::row`
+    - used at input.rs:1455 and input/receiver.rs:1234
+  - Problem: three json! builders disagree.
+    - The `dropped_trigger` fallbacks lack `geometry_evidence`.
+    - No fallback has `frame_obs_id`.
+    - Paired pre-row fallbacks lack `seen_obs_id`.
+    - Trigger and role values are hand-typed strings, although Trigger/Role enums exist.
+  - Fix: one `fallback_row(trigger, role, at, geometry, admission, event, reason)` that emits the full shape with nulls. Make Trigger/Role `pub(super)` and use them from input.rs and receiver.rs.
+- **B4 · medium · bugfix (schema §8 inventory check, ALG §13.13).**
+  - Where: still_png.rs:348-352 with 306-312.
+  - Problem: authorization fails after the rename, and `remove_file` also fails. The revoked PNG stays at its digest path and is not in `self.images`. A later same-digest job reuses it (`reused: true`), so a row references a non-inventoried PNG and the reader fails.
+  - Fix:
+    - Keep a `revoked: HashSet<ImageDigest>`. On a hit, retry the removal or return `Failed{operation:"remove_revoked_image"}`.
+    - Count leftover files.
+- **B5 · low · change (plausible).**
+  - Where: still_rows.rs:98-108, 381-386.
+  - Problem: further unreferenced-image paths are not counted: rows withdrawn as `elevated_frame_uncertified` after the PNG was published, and still rows lost as LateRow or Dropped. ALG does not say whether a published image of a later-uncertified elevated frame may remain.
+  - Fix: report those rows back to the counters, or document the acceptance.
+- **B6 · low · bugfix (plausible).**
+  - Where: windows.rs:284-286 vs 249-254.
+  - Problem: `required_finalization_failure` is reported after the context journal closes, so an attempt whose primary F is a finalization failure has no `attempt_failure` health row.
+  - Fix: report it before the journal-finish loop.
+- **B7 · low · bugfix (ALG §8.2).**
+  - Where: still_time.rs:82-88.
+  - Problem: `preceding` returns HistoryLost for an evicted frame that would not satisfy the predicate.
+  - Fix: check `eligible(frame)`, as `next()` does.
+- **B8 · low · change.**
+  - Where: preflight.rs:135-143.
+  - Problem: `validate_processes` fails if any same-named candidate cannot be opened, even after a verified approved process was found. A process exiting between the snapshot and the open can fail an admitted start (`verify_startup`, windows.rs:556).
+  - Fix: return the error only if `!found`.
+- **B9 · low · none.**
+  - Where: stills.rs `State::Done(Value)` 324, `WorkStage::Done` 396, `Public::row` 343, `dropped(&'static str)` (~40 sites), `readback_failure` 1385.
+  - Problem: outcomes are stringly typed and re-parsed.
+  - Fix: a `SlotOutcome` enum plus a `DropReason` enum, serialized only in `row`.
+- **B10 · low · none.**
+  - `overlaps` is duplicated (preflight.rs:92, context.rs:1418).
+  - The wide-string helper is duplicated at about 8 sites: os.rs:122, still_png.rs:380, windows.rs:697-698, input_helper.rs:77, mp4.rs:77, mp4.rs:248, elevated/launcher.rs:319, and elevated crate win.rs:111.
+  - Two `MoveFileExW` wrappers map errors differently: windows.rs:705 uses `code & 0xffff`, still_png.rs:384 uses `last_os_error`.
+  - The "stills not saved" count is computed twice with different definitions (windows.rs:349-351 vs metadata.rs:712).
+  - Fix: `PhysicalRect::intersects`, one `wide()`, one `move_file()`.
+- **B11 · low · none.**
+  - Sleep polling: clipboard.rs:120-154 (5 ms), still_png.rs:252-254 (5 ms), hotkeys.rs:343 (8 ms).
+  - Fix: use `MsgWaitForMultipleObjectsEx` with an event; give hotkeys a timeout below 250 ms.
+- **B12 · low · none.**
+  - Problem: visibility is wider than needed.
+    - preflight `classify_foreground` is pub(crate) but used only locally.
+    - `Foreground` is pub(crate) but used only by elevated/selector.
+    - `windows::displays` is pub(crate) but used only by platform/mod.rs.
+- **B13 · low · none.**
+  - Where: stills.rs:1027-1029.
+  - Problem: `publish_private` re-checks geometry and proof that its only sender has already checked (receiver.rs:1276-1286).
+  - Fix: drop it, or make it a `debug_assert`.
+- **B14 · low · none.**
+  - Where: input_helper.rs:404.
+  - Problem: `From<HelperError>` maps `UnexpectedExit(code)` to `None`.
+  - Fix: keep the code.
+- **B15 · low · bugfix if confirmed (S0 rule).**
+  - Where: still_rows.rs:317-322.
+  - Problem: the lane-stall exclusion uses a raw `Instant` and is permanent, so it counts sleep.
+  - Fix: use `awake_elapsed` and restart on a suspend sequence change.
+- **B16 · low · none.**
+  - Magic numbers in hotkeys.rs:242,258,281,287: VK 0x6f+n, 0x7b, 0x11/0x12/0xa2/0xa4, and the `ToUnicodeEx` flag 0x4.
+  - stills.rs:513 vs 546: the save drain `0..8` duplicates `sync_channel(8)`. Use the windows_sys VK constants and a `SAVE_QUEUE` const.

@@ -1,0 +1,43 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <?define Servicing = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464" ?>
+  <?define DirectoryAcl = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;$(Servicing))(A;OICI;GRGX;;;BU)" ?>
+  <?define ImageAcl = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;$(Servicing))(A;;GRGX;;;BU)" ?>
+  <Package Name="Screen Fix" Manufacturer="$(Publisher)" Version="$(ProductVersion)"
+           UpgradeCode="{2278A80C-A0CC-432D-A56B-14E3138B35FD}" Scope="perMachine"
+           InstallerVersion="500">
+    <Launch Condition="Installed OR (VersionNT64 AND WindowsBuild &gt;= 19041)"
+            Message="Screen Fix requires 64-bit Windows 10 version 2004 or later." />
+    <MajorUpgrade Schedule="afterInstallInitialize" DowngradeErrorMessage="A newer Screen Fix version is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="ProductDirectory" Name="screen_fix">
+        <Component Id="ProductPermissions" Guid="{25877C00-A973-4106-9870-91542DD069DA}" Bitness="always64">
+          <CreateFolder>
+            <PermissionEx Sddl="$(DirectoryAcl)" />
+          </CreateFolder>
+        </Component>
+        <Component Id="Recorder" Guid="{A7FE3935-5DD3-4957-80A8-A05616502549}" Bitness="always64">
+          <File Id="RecorderImage" Name="screen-fix.exe" Source="$(Payload)/screen-fix.exe" KeyPath="yes">
+            <PermissionEx Sddl="$(ImageAcl)" />
+          </File>
+        </Component>
+        <Component Id="OrdinaryHelper" Guid="{AB5CE49D-93A6-4035-B540-FFC3E4B87140}" Bitness="always64">
+          <File Id="OrdinaryImage" Name="screen-fix-input-helper.exe" Source="$(Payload)/screen-fix-input-helper.exe" KeyPath="yes">
+            <PermissionEx Sddl="$(ImageAcl)" />
+          </File>
+        </Component>
+        <Component Id="ElevatedCollector" Guid="{B5B328B0-AD72-40AE-B537-29F562C4CA99}" Bitness="always64">
+          <File Id="ElevatedImage" Name="screen-fix-elevated-capture.exe" Source="$(Payload)/screen-fix-elevated-capture.exe" KeyPath="yes">
+            <PermissionEx Sddl="$(ImageAcl)" />
+          </File>
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <Feature Id="ProtectedRelease" Title="Screen Fix" Level="1" Absent="disallow">
+      <ComponentRef Id="ProductPermissions" />
+      <ComponentRef Id="Recorder" />
+      <ComponentRef Id="OrdinaryHelper" />
+      <ComponentRef Id="ElevatedCollector" />
+    </Feature>
+  </Package>
+</Wix>
