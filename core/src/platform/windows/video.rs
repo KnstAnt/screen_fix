@@ -11,6 +11,7 @@ use std::{
 use windows::Win32::Media::MediaFoundation::*;
 
 use crate::{
+    devlog::devlog,
     CaptureError,
     capture::frame::{FrameCoverage, FrameMetadata},
     config::SelectedMonitor,
@@ -723,6 +724,8 @@ fn lose_video(
     summary.unavailable = true;
     unavailable_video.store(true, Ordering::Release);
     let code = error.source.as_ref().map(|source| source.code().0);
+    devlog!("video", "lost m{} stage={:?} kind={:?} hresult={:?}", id.0, error.stage, error.kind,
+        code.map(|code| format!("{:#010x}", code as u32)));
     if let Some(failure) = worker.video_failed(id, Failure::new(FailureComponent::Video, error.stage, code))
         && reports.is_none_or(|reports| reports.try_send(RecordingReport::Video(failure)).is_err())
     {
@@ -1037,6 +1040,7 @@ impl Video<'_> {
         self.skip_outstanding(if self.summary.unavailable { slots::Missing::EncoderUnavailable } else { slots::Missing::EncoderSkipped })?;
         if self.preserve_rotation_part {
             if let Some(segment) = self.current.take() {
+                devlog!("video", "segment interrupted during IDR rotation m{} s{} left unpublished", self.id.0, segment.id.0);
                 if self.elevated {
                     segment.mux.discard()?;
                 }
@@ -1317,6 +1321,8 @@ impl Video<'_> {
                     id, start: pending.row.pts_us, offset: pts, encoding, mux: mp4::Recording::open(&media, &path)?,
                     index: Vec::new(), pending: None, coverage: pending.row.coverage.clone(),
                 });
+                devlog!("video", "segment opened m{} s{} start_us={} epoch={} software={software}",
+                    self.id.0, id.0, pending.row.pts_us.0, pending.row.admission_epoch.0);
             } else if self.current.is_none() {
                 return Err(unavailable("The first encoded frame is not an IDR"));
             }
@@ -1371,9 +1377,11 @@ impl Video<'_> {
             }
         }
         if let Some(segment) = self.current.take() {
+            let segment_id = segment.id.0;
             let closed = match segment.close(self.id, self.geometry.clone(), self.worker, self.clock) {
                 Ok(closed) => closed,
                 Err(error) => {
+                    devlog!("video", "segment close failed m{} s{segment_id} stage={:?} kind={:?}", self.id.0, error.stage, error.kind);
                     // Only the Stop deadline makes an unclosed segment a
                     // required finalization failure; any other close
                     // failure loses this monitor's video (§6.2 rows 9 and 2).
@@ -1385,12 +1393,14 @@ impl Video<'_> {
             };
             match closed {
                 Closed::Resolved(rows) => {
+                    devlog!("video", "segment closed m{} s{segment_id} resolved rows={}", self.id.0, rows.len());
                     let last = self.last_row(&rows);
                     self.resolve_all(rows)?;
                     self.frames.request_flush(last);
                     self.worker.request_journal_flush();
                 }
                 Closed::Part { pending, part, suppressed } => {
+                    devlog!("video", "segment closed m{} s{segment_id} part handed to verifier", self.id.0);
                     self.resolve_all(suppressed)?;
                     self.hand_off(pending, part)?;
                 }
@@ -1500,6 +1510,8 @@ impl Video<'_> {
         let mut lost = None;
         match verdict.outcome {
             Ok(Some(published)) => {
+                devlog!("video", "segment published m{} s{} frames={} bytes={}", self.id.0, verdict.segment.0,
+                    entry.summary.frame_count, published.bytes);
                 for (row, (pts, duration)) in entry.index.iter_mut().zip(published.timing) {
                     row.pts_100ns = Some(pts);
                     row.duration_100ns = Some(duration);
@@ -1511,12 +1523,15 @@ impl Video<'_> {
                 self.resolve_all(entry.index)?;
             }
             Ok(None) => {
+                devlog!("video", "segment revoked m{} s{}", self.id.0, verdict.segment.0);
                 let before = entry.coverage.as_ref().and_then(|coverage| coverage.before())
                     .ok_or_else(|| unavailable("Revoked video media has no coverage cutoff"))?;
                 withdraw_revoked(&mut entry.index, before);
                 self.resolve_all(entry.index)?;
             }
             Err(error) => {
+                devlog!("video", "segment verification failed m{} s{} stage={:?} kind={:?}", self.id.0, verdict.segment.0,
+                    error.stage, error.kind);
                 if error.kind() == ProbeKind::PublicationDeadline {
                     self.required_finalization_failure.get_or_insert(mp4::DEADLINE);
                 }

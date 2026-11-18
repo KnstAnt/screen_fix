@@ -448,6 +448,13 @@ impl Public {
     /// The row of this slot. A seen slot is the second half of its trigger's
     /// row, which `still_rows` joins to the before half (IMG-2).
     fn row(&self, outcome: &SlotOutcome) -> serde_json::Value {
+        let row = self.row_value(outcome);
+        crate::devlog::devlog!("stills", "slot m{} trigger={} role={} trigger_t_us={} kind={} reason={}",
+            self.geometry.monitor.0, row["trigger"], row["role"], self.at.0, row["outcome"]["kind"], row["reason"]);
+        row
+    }
+
+    fn row_value(&self, outcome: &SlotOutcome) -> serde_json::Value {
         let (saved, file, reason) = match outcome {
             SlotOutcome::Saved { image, .. } => (true, image.as_deref(), serde_json::Value::Null),
             SlotOutcome::Dropped { reason } => (false, None, serde_json::json!(reason)),
@@ -476,7 +483,7 @@ impl Public {
 
     /// The approved fallback row of this slot's reservation (schema §6).
     fn fallback(&self, reason: DropReason) -> serde_json::Value {
-        let mut row = self.row(&SlotOutcome::dropped(reason));
+        let mut row = self.row_value(&SlotOutcome::dropped(reason));
         row["geometry_evidence"] = serde_json::json!(Evidence::Observed(self.geometry));
         row
     }
@@ -689,7 +696,7 @@ impl Stills {
             }
             let at = save.confirmation.time().recv_t_us;
             let approval = policy.for_receipt(save.proof, admission, save.visit, at, now);
-            if save.visit.is_some() && approval.is_err() && now.0.saturating_sub(at.0) < ELEVATED_FRAME_WAIT_US {
+            if approval.is_err() && now.0.saturating_sub(at.0) < ELEVATED_FRAME_WAIT_US {
                 self.deferred_save = Some(save);
                 break;
             }
@@ -722,7 +729,9 @@ impl Stills {
                 Command::Rest(rest) => (Some(rest.proof), rest.visit),
             };
             let approval = proof.map_or(Ok(None), |proof| policy.for_receipt(proof, admission, visit, at, now));
-            if visit.is_some() && approval.is_err() && now.0.saturating_sub(at.0) < ELEVATED_FRAME_WAIT_US {
+            // A contended or newer-than-`now` read is transient for every source;
+            // an elevated one also waits for its certificate. Retry it later.
+            if approval.is_err() && now.0.saturating_sub(at.0) < ELEVATED_FRAME_WAIT_US {
                 self.deferred = Some(command);
                 return false;
             }

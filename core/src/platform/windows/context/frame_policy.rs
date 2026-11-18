@@ -10,6 +10,7 @@ use crate::{
 use crate::session::AdmissionBoundary;
 
 use super::identity::WindowProcess;
+use crate::devlog::devlog;
 
 const MAX_AGE_US: i64 = 50_000;
 pub(in crate::platform::windows) const ELEVATED_FRAME_WAIT_US: i64 = 250_000;
@@ -65,6 +66,8 @@ impl FramePolicy {
                 approval.observed = observed;
                 return;
             }
+            devlog!("approval", "new approval: since_us={} interrupted={} same_window={}", observed.0, interrupted,
+                state.approval.as_ref().is_some_and(|(previous, _)| *previous == window));
             state.approval = state.generation.checked_add(1).map(|generation| (window, FrameApproval {
                 generation, epoch: boundary.epoch, since: observed.max(boundary.time), observed, certified_before: None, coverage: None,
             }));
@@ -72,6 +75,9 @@ impl FramePolicy {
                 state.generation = approval.generation;
             }
         } else {
+            if state.approval.is_some() {
+                devlog!("approval", "approval cleared: foreground not approved at_us={}", observed.0);
+            }
             state.approval = None;
         }
     }
@@ -123,19 +129,28 @@ impl FramePolicy {
             Err(TryLockError::WouldBlock) => return Err(ApprovalReadError::Contended),
             Err(TryLockError::Poisoned(_)) => return Ok(None),
         };
-        let Some((window, approval)) = &state.approval else { return Ok(None); };
+        let Some((window, approval)) = &state.approval else {
+            devlog!("approval", "receipt approval none: no current approval at_us={} now_us={}", at.0, now.0);
+            return Ok(None);
+        };
         if window.window != proof.window || window.process != proof.process || approval.epoch != epoch
             || approval.elevated_visit() != visit || at < approval.since || now < at
         {
+            devlog!("approval", "receipt approval none: same_window={} same_process={} same_epoch={} same_visit={}                 at_us={} since_us={} observed_us={} now_us={} generation={}",
+                window.window == proof.window, window.process == proof.process, approval.epoch == epoch,
+                approval.elevated_visit() == visit, at.0, approval.since.0, approval.observed.0, now.0, approval.generation);
             return Ok(None);
         }
         if now < approval.observed {
             return Err(ApprovalReadError::NewerThanReceipt);
         }
         if now.0.saturating_sub(approval.observed.0) > MAX_AGE_US {
+            devlog!("approval", "receipt approval none: stale observation at_us={} observed_us={} now_us={}",
+                at.0, approval.observed.0, now.0);
             return Ok(None);
         }
         if approval.coverage.as_ref().and_then(|coverage| coverage.before()).is_some_and(|before| at >= before) {
+            devlog!("approval", "receipt approval none: after coverage at_us={}", at.0);
             return Ok(None);
         }
         if approval.certified_before.is_some_and(|before| at >= before) {
@@ -187,6 +202,12 @@ impl FrameApproval {
     pub fn contains_source(&self, at: SessionTimeUs) -> bool {
         self.since <= at && at <= self.observed && self.certified_before.is_none_or(|before| at < before)
             && self.coverage.as_ref().and_then(|coverage| coverage.before()).is_none_or(|before| at < before)
+    }
+
+    /// An ordinary approval that admits `at` once a later foreground
+    /// observation confirms it.
+    pub fn awaits_source(&self, at: SessionTimeUs) -> bool {
+        self.coverage.is_none() && self.certified_before.is_none() && self.since <= at && self.observed < at
     }
 
     pub fn can_stage(&self, at: SessionTimeUs, receipt: SessionTimeUs) -> bool {

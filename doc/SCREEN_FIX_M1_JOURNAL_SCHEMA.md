@@ -295,7 +295,7 @@ One row per trigger. `recv_t_us` is the trigger receipt. A pre-motion or pre-act
 | Field | Mark | Content |
 | --- | --- | --- |
 | `kind` | PDF | `still` or `still_dropped`. |
-| `source_t_us` | PDF | Capture time of the chosen frame, or `null`. |
+| `source_t_us` | PDF | Present time (WGC `SystemRelativeTime`) of the chosen frame, or `null`. |
 | `monitor`, `trigger` | PDF | `trigger`: `start`, `pre_motion`, `pointer_rest`, `pre_action`, `next`, `settled`, `observe`, `checkpoint`, `final`. |
 | `frame_obs_id` | PDF | Sequence of the chosen frame, or `null`. |
 | `event_ref` | PDF | Causal input row `{stream: "input", seq}`, or `null`. |
@@ -321,7 +321,7 @@ One row per decided, non-paused slot per selected monitor, without `kind`. The s
 | --- | --- | --- |
 | `monitor` | PDF | Monitor id. |
 | `obs_id` | PDF | Sequence of the selected or repeated frame; absent without a frame. |
-| `source_t_us` | PDF | Capture time of that frame; `null` without a frame. |
+| `source_t_us` | PDF | Present time (WGC `SystemRelativeTime`) of that frame; `null` without a frame. |
 | `recv_t_us` | PDF | Capture receipt or ordering receipt (below). |
 | `pts_us` | PDF | Slot start on the session clock. |
 | `encoded` | PDF | Whether the slot has an encoded sample. |
@@ -332,7 +332,7 @@ One row per decided, non-paused slot per selected monitor, without `kind`. The s
 | `slot`, `slot_decided_t_us`, `published_t_us`, `admission_epoch` | ext | Always present. |
 | `reason` | ext | Missing-slot reason, on rows without an encoded sample. |
 | `pts_100ns`, `duration_100ns` | ext | Decoded-local sample time; encoded rows only. |
-| `frame_id`, `capture_recv_t_us`, `geometry` | ext | Frame identity, its capture receipt and monitor geometry; absent without a frame. |
+| `frame_id`, `capture_recv_t_us`, `geometry` | ext | Frame identity, its capture receipt (max of the dequeue and the present time) and monitor geometry; absent without a frame. |
 | `late` | ext | Repeat rows with a frame: whether a changed frame of this slot arrived after the decision. |
 
 `reason` values (`MissingVideoSlot`): `before_first_frame`, `approval_suppressed`, `capture_unavailable`, `monitor_missing`, `conversion_pressure`, `queue_pressure`, `encoder_unavailable`, `segment_unpublished`, `encoder_skipped`, `timeline_pending`, `segment_unverified`.
@@ -340,7 +340,7 @@ One row per decided, non-paused slot per selected monitor, without `kind`. The s
 **`recv_t_us` of frames rows (plan §6.5, amended).** Let e_k be the end of slot k, limited by the epoch cutoff.
 - `recv_t_us` is the true capture receipt only on a row that newly selects a frame (`repeated: false`). It then equals `capture_recv_t_us`.
 - On a repeated row or a row without a frame, `recv_t_us` is an **ordering receipt**: max(`recv_t_us` of the monitor's previous row, e_k), or e_k for the monitor's first row. It only keeps the stream's receipt order and is not an observation time. An `approval_suppressed` row withdrawn after it selected a frame keeps that withheld frame's receipt as its ordering receipt.
-- Timing analysis uses `slot_decided_t_us` (slot decision), `source_t_us` (frame capture) and `capture_recv_t_us` (frame receipt), never `recv_t_us` of a repeated or frameless row.
+- Timing analysis uses `slot_decided_t_us` (slot decision), `source_t_us` (frame present time; it can be later than the dequeue, ALG §13.14) and `capture_recv_t_us` (frame receipt), never `recv_t_us` of a repeated or frameless row.
 - By design, a repeated or frameless row's `recv_t_us` can be less than its `slot_decided_t_us`, because the ordering receipt is the slot end bounded below by the previous row. Consumers must not treat that difference as an anomaly.
 
 A repeated row keeps the `obs_id`, `source_t_us`, `frame_id` and `capture_recv_t_us` of the repeated frame. Monitors are merged by (`recv_t_us`, `monitor`, `slot`).

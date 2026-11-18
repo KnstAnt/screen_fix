@@ -5,6 +5,7 @@ pub use error::{CaptureError, CaptureErrorKind, Remedy, RetainedRecording};
 
 pub mod capture;
 pub mod config;
+pub(crate) mod devlog;
 pub mod platform;
 pub mod package;
 pub mod session;

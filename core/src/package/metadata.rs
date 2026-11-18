@@ -913,6 +913,8 @@ impl MetadataOwner {
             let root = attempts.join(format!("attempt_{}", id.as_str()));
             match fs::create_dir(&root) {
                 Ok(()) => {
+                    // Development-only and not inventoried (`dev-log` feature).
+                    crate::devlog::open(&root);
                     layout = Some(AttemptLayout { id, root });
                     break;
                 }
@@ -1080,6 +1082,8 @@ impl MetadataOwner {
             // A successful replacement is final (C6): no deadline is checked after it.
             self.publish(&check_deadline)?;
         }
+        crate::devlog::devlog!("package", "manifest published state={:?} capture={:?} failed_step={:?} validation_ok={}",
+            self.manifest.state, self.manifest.capture, self.manifest.failed_step, validation.is_ok());
         validation?;
         Ok(self.manifest.capture)
     }

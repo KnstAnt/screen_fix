@@ -18,6 +18,7 @@ use windows::{
 };
 
 use crate::{
+    devlog::devlog,
     capture::frame::{CaptureColor, FrameExtent, FrameMetadata},
     package::{diagnostics::{Failure, FailureComponent}, metadata::{CaptureCounters, MonitorCapture}, outcome::HealthKind},
     protocol::{AdmissionEpoch, CaptureEpoch, FrameId, FrameSequence, GeometryEpoch, GeometryId, MonitorId, SessionTimeUs},
@@ -43,6 +44,12 @@ const STILL_DRAIN_WAIT: Duration = Duration::from_secs(3);
 /// The interval between device-removal checks of the capture GPU.
 const DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
+/// The largest lead of a WGC present timestamp over its dequeue that is
+/// accepted as a present time: two refresh intervals at 48 Hz.
+const MAX_PRESENT_LEAD_US: i64 = 42_000;
+/// How long after a frame's content time an ordinary approval may still be
+/// observed through it: several context polls (2-5 ms each).
+const MAX_APPROVAL_CATCH_UP_US: i64 = 20_000;
 
 /// The capture pacing interval: one frame period at the configured pace.
 pub(super) fn capture_interval(worker: &WorkerSession) -> Duration {
@@ -116,6 +123,71 @@ pub(super) fn run(
         stop.0 = None;
     }
     Completion { outcome: result, counters, epochs }
+}
+
+/// The admission check that rejected a dequeued frame (`dev-log` only).
+#[derive(Clone, Copy, Debug)]
+enum Reject {
+    AdmissionClosed,
+    BeforeBoundary,
+    NegativeSource,
+    BeforeGeometry,
+    NonMonotonic,
+    SourceAfterReceipt,
+}
+
+/// Development log of frame admission: the first rejections in full, then
+/// one line of per-condition counts per second. Inert without `dev-log`.
+#[derive(Default)]
+struct AdmissionLog {
+    detailed: u32,
+    counts: [u64; 6],
+    window_start: Option<Instant>,
+    accepted: bool,
+}
+
+impl AdmissionLog {
+    const DETAILED: u32 = 20;
+    const WINDOW: Duration = Duration::from_secs(1);
+
+    fn reject(&mut self, reason: Reject, detail: impl FnOnce() -> String) {
+        if !crate::devlog::ENABLED {
+            return;
+        }
+        self.counts[reason as usize] += 1;
+        if self.detailed < Self::DETAILED {
+            self.detailed += 1;
+            devlog!("monitor", "frame rejected #{} {reason:?}: {}", self.detailed, detail());
+        }
+        let now = Instant::now();
+        let start = *self.window_start.get_or_insert(now);
+        if now.duration_since(start) >= Self::WINDOW {
+            self.summarize();
+            self.window_start = Some(now);
+        }
+    }
+
+    fn accept(&mut self, detail: impl FnOnce() -> String) {
+        if crate::devlog::ENABLED && !std::mem::replace(&mut self.accepted, true) {
+            devlog!("monitor", "first frame accepted by time admission: {}", detail());
+        }
+    }
+
+    fn summarize(&mut self) {
+        if self.counts.iter().any(|&count| count != 0) {
+            let [closed, boundary, negative, geometry, monotonic, after] = std::mem::take(&mut self.counts);
+            devlog!("monitor", "frames rejected since last summary: AdmissionClosed={closed} BeforeBoundary={boundary} \
+                NegativeSource={negative} BeforeGeometry={geometry} NonMonotonic={monotonic} SourceAfterReceipt={after}");
+        }
+    }
+}
+
+impl Drop for AdmissionLog {
+    fn drop(&mut self) {
+        if crate::devlog::ENABLED {
+            self.summarize();
+        }
+    }
 }
 
 struct StopOnError<'a>(Option<&'a WorkerSession>);
@@ -193,6 +265,7 @@ fn capture(
         let mut last_source = None;
         let mut geometry_after = None;
         let mut next_device_check = Instant::now();
+        let mut admission_log = AdmissionLog::default();
         loop {
             let open = match worker.admit()? {
                 Admission::Closed(Some(cutoff)) if worker.pause_pending(cutoff) => {
@@ -468,6 +541,7 @@ fn capture(
             let receipt = match worker.admit()? {
                 Admission::Open(receipt) if receipt.boundary == open.boundary => receipt,
                 Admission::Closed(_) => {
+                    admission_log.reject(Reject::AdmissionClosed, || format!("received_qpc={}", received.0));
                     counters.rejected_time_or_epoch = counters.rejected_time_or_epoch.saturating_add(1);
                     borrowed.close()?;
                     continue;
@@ -478,27 +552,67 @@ fn capture(
             let clock = receipt.clock;
             let source_offset = clock.wgc_offset_100ns(wgc_time_100ns).map_err(clock_error)?;
             let geometry_offset = geometry_after.map(|at| clock.offset_100ns(at)).transpose().map_err(clock_error)?;
-            if received < receipt.boundary.qpc
-                || source_offset < 0 || geometry_offset.is_some_and(|offset| source_offset < offset)
-                || last_source.is_some_and(|previous| wgc_time_100ns <= previous)
-            {
+            let before_boundary = received < receipt.boundary.qpc;
+            let negative_source = source_offset < 0;
+            let before_geometry = geometry_offset.is_some_and(|offset| source_offset < offset);
+            let non_monotonic = last_source.is_some_and(|previous| wgc_time_100ns <= previous);
+            let detail = |source_time: Option<SessionTimeUs>, recv_time: Option<SessionTimeUs>| format!(
+                "wgc_time_100ns={wgc_time_100ns} received_qpc={} boundary_qpc={} qpc_frequency={} source_offset_100ns={source_offset} \
+                 geometry_offset_100ns={geometry_offset:?} source_time_us={:?} recv_time_us={:?} source_minus_recv_us={:?} \
+                 last_source_100ns={last_source:?}",
+                received.0, receipt.boundary.qpc.0, clock.qpc_frequency.0, source_time.map(|time| time.0),
+                recv_time.map(|time| time.0), source_time.zip(recv_time).map(|(source, recv)| source.0 - recv.0));
+            if before_boundary || negative_source || before_geometry || non_monotonic {
+                let reason = if before_boundary {
+                    Reject::BeforeBoundary
+                } else if negative_source {
+                    Reject::NegativeSource
+                } else if before_geometry {
+                    Reject::BeforeGeometry
+                } else {
+                    Reject::NonMonotonic
+                };
+                admission_log.reject(reason, || detail(clock.wgc_time(wgc_time_100ns).ok(), clock.time(received).ok()));
                 counters.rejected_time_or_epoch = counters.rejected_time_or_epoch.saturating_add(1);
                 borrowed.close()?;
                 continue;
             }
             let source_time = clock.wgc_time(wgc_time_100ns).map_err(clock_error)?;
-            let recv_time = clock.time(received).map_err(clock_error)?;
-            // A frame is received after its source time. The frames ordering
-            // receipts rely on it (§6.5), so a contradicting sample is rejected.
-            if source_time > recv_time {
+            let dequeued_time = clock.time(received).map_err(clock_error)?;
+            // WGC stamps a frame with its DWM present (vblank) time, which can
+            // lead the dequeue by up to a refresh interval. The frame's receipt is
+            // therefore max(dequeue, source), so source <= receipt holds (§6.5).
+            // A lead beyond `MAX_PRESENT_LEAD_US` is not a present time and is rejected.
+            let recv_time = dequeued_time.max(source_time);
+            if source_time.0 - dequeued_time.0 > MAX_PRESENT_LEAD_US {
+                admission_log.reject(Reject::SourceAfterReceipt, || detail(Some(source_time), Some(dequeued_time)));
                 counters.rejected_time_or_epoch = counters.rejected_time_or_epoch.saturating_add(1);
                 borrowed.close()?;
                 continue;
             }
-            let approval_at = clock.time(receipt.qpc).map_err(clock_error)?;
-            let approval = frame_policy.current(receipt.boundary.epoch, approval_at)
-                .filter(|approval| approval.contains_source(source_time) || approval.can_stage(source_time, approval_at));
+            admission_log.accept(|| detail(Some(source_time), Some(dequeued_time)));
+            // The content was composed no later than the dequeue or the present
+            // time, so the approval must cover that point. It usually leads the
+            // latest foreground observation by less than one context poll; an
+            // ordinary approval not yet observed through it is awaited briefly.
+            let content_time = source_time.min(dequeued_time);
+            let mut approval_at = clock.time(receipt.qpc).map_err(clock_error)?;
+            let approval = loop {
+                let waiting = approval_at.0 - content_time.0 < MAX_APPROVAL_CATCH_UP_US;
+                match frame_policy.try_current(receipt.boundary.epoch, approval_at) {
+                    Ok(Some(approval)) if approval.contains_source(content_time) || approval.can_stage(content_time, approval_at) =>
+                        break Some(approval),
+                    // A contended or newer-than-`approval_at` read is transient.
+                    Ok(Some(approval)) if approval.awaits_source(content_time) && waiting => {}
+                    Err(_) if waiting => {}
+                    _ => break None,
+                }
+                thread::park_timeout(APPROVAL_POLL);
+                approval_at = clock.time(super::clock::qpc()?).map_err(clock_error)?;
+            };
             let Some(approval) = approval else {
+                devlog!("monitor", "frame rejected by approval: content_time_us={} approval_at_us={}",
+                    content_time.0, approval_at.0);
                 counters.rejected_approval = counters.rejected_approval.saturating_add(1);
                 borrowed.close()?;
                 scheduled = now + interval;
@@ -723,6 +837,7 @@ fn deliver_converted(
         match video.send.try_send(frame) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
+                devlog!("monitor", "video pressure: video queue full source_t_us={}", metadata.source_t_us.0);
                 counters.video_pressure = counters.video_pressure.saturating_add(1);
                 if let Some(timeline) = timeline {
                     video.evidence.queue_pressure(timeline.containing(metadata.source_t_us)?);
@@ -734,6 +849,7 @@ fn deliver_converted(
         }
     } else if approved {
         // The converted picture could not be read back as encoder input.
+        devlog!("monitor", "video pressure: no encoder input for converted frame source_t_us={}", metadata.source_t_us.0);
         counters.video_pressure = counters.video_pressure.saturating_add(1);
         if let Some(timeline) = timeline {
             video.evidence.capture_pressure(timeline.containing(metadata.source_t_us)?);
@@ -766,6 +882,8 @@ fn submit_video(
         *pending_video = Some((sample, metadata.clone(), now + CONVERSION_DEADLINE));
         *converted_slot = Some(slot);
     } else {
+        devlog!("monitor", "video pressure: conversion busy source_t_us={} pending_age_ms={:?}", metadata.source_t_us.0,
+            pending_video.as_ref().map(|pending| (now + CONVERSION_DEADLINE).saturating_duration_since(pending.2).as_millis()));
         counters.video_pressure = counters.video_pressure.saturating_add(1);
         video.evidence.capture_pressure(slot);
     }

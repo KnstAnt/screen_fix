@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+# `dev-log` writes a development `dev.log` into each attempt directory. It is
+# on by default only for manual testing: remove it from `default` (or build
+# with `--no-default-features`) for production.
+default = ["dev-log"]
+dev-log = ["screen-fix-core/dev-log"]
 elevated-release = []
 # Developer-only trusted fixture Save producer (M1-08). Off by default.
 fixture-save = []

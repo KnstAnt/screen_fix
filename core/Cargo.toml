@@ -3,6 +3,11 @@ name = "screen-fix-core"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Development-only `dev.log` in each attempt directory. To be removed or
+# disabled for production.
+dev-log = []
+
 [dependencies]
 screen-fix-protocol = { path = "../protocol" }
 serde = { version = "1", features = ["derive"] }

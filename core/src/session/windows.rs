@@ -23,6 +23,7 @@ use crate::package::metadata::{AttemptClock, ClockAnchor};
 
 use crate::{
     CaptureError,
+    devlog::devlog,
     capture::save::{FixtureSave, FixtureSaveError, FixtureSaveResult},
     config::ResolvedCaptureConfig,
     package::{diagnostics::{DiagnosticContext, Failure, FailureComponent, ReportOutcome}, journal::HealthRecord, outcome::HealthKind, metadata::{
@@ -345,8 +346,12 @@ impl Lifecycle {
     }
 
     /// Latch Stop. True when this call set the latch first.
-    fn latch_stop(&self) -> bool {
-        !self.stop.swap(true, Ordering::AcqRel)
+    fn latch_stop(&self, reason: &'static str) -> bool {
+        let first = !self.stop.swap(true, Ordering::AcqRel);
+        if first {
+            devlog!("session", "stop requested: {reason}");
+        }
+        first
     }
 
     fn apply_session_end_deadlines(&self, facts: &mut Facts) {
@@ -366,7 +371,7 @@ pub(crate) struct Control {
 
 impl Control {
     pub(crate) fn stop_for_indicator_failure(&self) {
-        request_stop(&self.lifecycle, &self.wake);
+        request_stop(&self.lifecycle, &self.wake, "indicator failure");
     }
 
     pub(crate) fn status(&self) -> Option<SessionStatus> {
@@ -406,7 +411,7 @@ impl Control {
 
     pub(super) fn submit(&self, command: SessionCommand) -> Result<(), CommandError> {
         if command == SessionCommand::Stop {
-            request_stop(&self.lifecycle, &self.wake);
+            request_stop(&self.lifecycle, &self.wake, "user stop command");
             return Ok(());
         }
         if !matches!(command, SessionCommand::Pause(PauseReason::User) | SessionCommand::Resume(PauseReason::User)) {
@@ -429,8 +434,8 @@ impl Control {
     }
 }
 
-fn request_stop(lifecycle: &Lifecycle, wake: &SyncSender<()>) {
-    lifecycle.latch_stop();
+fn request_stop(lifecycle: &Lifecycle, wake: &SyncSender<()>, reason: &'static str) {
+    lifecycle.latch_stop(reason);
     // A full wake slot already guarantees that the controller wakes up.
     let _ = wake.try_send(());
 }
@@ -698,7 +703,7 @@ impl WorkerSession {
     /// True when this failure set the Stop latch first.
     fn stop_for_source_failure(&self, facts: &mut Facts, mut failure: SourceFailure) -> bool {
         failure.admitted = facts.status.clock.is_some();
-        let first = self.lifecycle.latch_stop();
+        let first = self.lifecycle.latch_stop("source failure");
         if first || (failure.admitted && matches!(failure.stage, SourceStage::Activation | SourceStage::Capture | SourceStage::Cleanup)
             && !matches!(failure.reason, SourceFailureReason::Cancelled | SourceFailureReason::ScopeClosed))
         {
@@ -710,7 +715,7 @@ impl WorkerSession {
 
     pub(crate) fn required_elevated_hook_failed(&self, closing: bool) {
         let mut facts = self.lifecycle.lock();
-        if closing || self.lifecycle.latch_stop() {
+        if closing || self.lifecycle.latch_stop("required elevated hook failed") {
             set_source_failure(&mut facts, SourceFailure {
                 stage: SourceStage::Capture, reason: SourceFailureReason::RequiredHook, admitted: true, native: None, token_identity: None,
             });
@@ -978,7 +983,7 @@ impl WorkerSession {
     }
 
     pub(crate) fn request_stop(&self) {
-        request_stop(&self.lifecycle, &self.wake);
+        request_stop(&self.lifecycle, &self.wake, "worker request or attempt failure");
     }
 
     pub(crate) fn wait_for_start(&self) -> Result<Option<RecordingStart>, ProbeError> {
@@ -1229,6 +1234,9 @@ pub(crate) fn spawn(
         } else {
             SessionPhase::Failed
         };
+        devlog!("session", "phase -> {:?} outcome={:?} error_operation={:?}", facts.status.phase,
+            facts.status.outcome, result.as_ref().err().map(CaptureError::operation));
+        crate::devlog::close();
         drop(facts);
         controller_lifecycle.changed.notify_all();
         let _ = complete.try_send(result);
@@ -1256,6 +1264,7 @@ fn run(
     let mut worker = RecordingWorker::spawn(endpoint, record, lease)?;
     let result = coordinate(lifecycle, &session, &commands, &wake, &ready, frequency, &mut worker, &environment, notifications_ready, &hotkeys);
     if let Err(error) = &result {
+        devlog!("session", "controller failed: operation={:?}", error.operation());
         record_fault(&mut lifecycle.lock(), FaultReport::attempt(error));
         // A failed controller still closes admission and releases startup
         // waiters. A failed QPC sample may prevent a certified prefix.
@@ -1425,10 +1434,11 @@ fn coordinate(
     let mut subscribed = false;
     loop {
         if lifecycle.session_end_started.get().is_some() {
-            lifecycle.latch_stop();
+            lifecycle.latch_stop("session end");
         }
         route_hotkeys(lifecycle, &mut reasons, &mut disk_resume, hotkeys, frequency)?;
         if lifecycle.stop_requested() || worker.finished() {
+            devlog!("session", "stopping: stop_requested={}", lifecycle.stop_requested());
             stop(lifecycle)?;
             if let Some(failure) = lifecycle.lock().status.source.failure() {
                 return Err(CaptureError::elevated(failure));
@@ -1781,7 +1791,7 @@ fn startup_target_changed(lifecycle: &Lifecycle, facts: &mut Facts, stage: Sourc
 }
 
 fn commit_startup_source_failure(lifecycle: &Lifecycle, facts: &mut Facts, failure: SourceFailure) -> bool {
-    if lifecycle.session_end_started.get().is_some() || !lifecycle.latch_stop() {
+    if lifecycle.session_end_started.get().is_some() || !lifecycle.latch_stop("startup source failure") {
         return false;
     }
     set_source_failure(facts, failure);
@@ -1886,7 +1896,7 @@ fn route_hotkeys(
                     }
                 }
                 RecorderAction::Stop => {
-                    lifecycle.latch_stop();
+                    lifecycle.latch_stop("stop hotkey");
                     ControlOutcome::StopRequested
                 }
             }
@@ -2018,6 +2028,7 @@ fn start(lifecycle: &Lifecycle, frequency: QpcFrequency, selected: Option<Select
     select_source(&mut facts, epoch, selected);
     facts.status.phase = SessionPhase::Recording;
     facts.status.countdown_seconds = None;
+    devlog!("session", "phase Starting -> Recording opened={boundary:?} qpc_frequency={}", frequency.0);
     lifecycle.changed.notify_all();
     Ok(())
 }
@@ -2089,6 +2100,8 @@ fn stop(lifecycle: &Lifecycle) -> Result<(), CaptureError> {
         facts.clock_failed = true;
         record_fault(&mut facts, FaultReport::attempt(error));
     }
+    devlog!("session", "phase -> Stopping was_recording={was_recording} stop={:?} closed={:?} sampled={}",
+        facts.status.stop, facts.status.closed, sampled.is_ok());
     lifecycle.changed.notify_all();
     sampled
 }
@@ -2130,6 +2143,7 @@ fn pause_command(
         facts.pause_interval_reasons.clone_from(reasons);
         let started = clock::qpc().map_err(controller_error)?;
         facts.pause_started = Some((started, lifecycle.power.snapshot().sequence));
+        devlog!("session", "phase Recording -> Paused closed={closed:?} reasons={reasons:?}");
         lifecycle.changed.notify_all();
     }
     Ok(())
@@ -2171,6 +2185,7 @@ fn resume(lifecycle: &Lifecycle, finished: AdmissionBoundary, selected: Option<S
     facts.last_pause = Some((finished, facts.pause_interval_reasons.iter().copied().collect()));
     facts.utc_anchors.push(ClockAnchor { admission_epoch: epoch, sample: resume_anchor });
     facts.tick_anchor = Some(tick_anchor);
+    devlog!("session", "phase Paused -> Recording finished={finished:?} opened={reopened:?}");
     lifecycle.changed.notify_all();
     Ok(())
 }

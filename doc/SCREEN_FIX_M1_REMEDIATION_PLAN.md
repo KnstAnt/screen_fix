@@ -633,12 +633,12 @@ With `recv_t_us` set to the capture receipt of the selected frame, the frames jo
 - **Row that newly selects a frame f:** `recv_t_us` = receipt(f), the true capture receipt. If receipt(f) is below the previous row's `recv_t_us`, f is not selected: it is counted in `frames_rejected` and the slot repeats (this replaces the former fatal `FRAMES_ORDER`).
 - **Every other row** (a repeat, or a row without a frame): `recv_t_us` = max(`recv_t_us` of row k−1, e_k). This is an **ordering receipt**. It advances on a static screen and during absence, so the progress mark never freezes. The first row of the attempt uses e_k.
 - A repeat keeps the PDF's `obs_id` and `source_t_us` of the repeated frame, but its `recv_t_us` is an ordering receipt (D1 documents this).
-- The capture loop rejects a frame whose source time is later than its receipt (`rejected_time_or_epoch`), so receipt(g) ≥ source(g) holds for every delivered frame.
+- A frame's receipt is max(dequeue, source), because the WGC source time is the DWM present time and can lead the dequeue by about one refresh (amended 2026-11-18, ALG §13.14). So receipt(g) ≥ source(g) holds for every delivered frame by construction. A source more than 42 ms after the dequeue is rejected (`rejected_time_or_epoch`).
 
 **Monotonicity, within one monitor.** Every row's `recv_t_us` is either a max that includes the previous row's value or a frame receipt that is at least the previous row's value (anything else is rejected). So the sequence is non-decreasing by construction.
 
 **Why rejection does not happen in normal operation.**
-1. WGC delivers a monitor's frames in source-time order, and the capture loop stamps receipts in processing order. So source(f) < source(g) implies receipt(f) ≤ receipt(g).
+1. WGC delivers a monitor's frames in source-time order, and the capture loop dequeues them in processing order. Both terms of max(dequeue, source) are non-decreasing, so source(f) < source(g) implies receipt(f) ≤ receipt(g).
 2. **Invariant I.** For every row i and every frame g delivered to the worker with source in a slot after i: `recv_t_us`(i) ≤ receipt(g).
    - If row i newly selects f, then f is in slot i and g is in a later slot, so receipt(f) ≤ receipt(g) by item 1.
    - Otherwise, `recv_t_us`(i) = max(`recv_t_us`(i−1), e_i). The first term is covered by induction. For the second term, e_i ≤ source(g) ≤ receipt(g).
