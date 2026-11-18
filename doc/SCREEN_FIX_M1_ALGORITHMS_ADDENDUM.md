@@ -115,7 +115,7 @@ No-image availability is a normal wait, not a capture error. A healthy unchanged
 
 Four history references and one settled-candidate reference are the baseline. Additional pending requests may retain older frames, but count unique retained image bytes, not reference count. Maintain independent hard bounds for retained bytes and number of jobs.
 
-Initial pending-still targets remain IMG-3: 256 MB per monitor (decimal bytes, 256,000,000) and 256 jobs. Count pinned pending images as well as CPU pixel buffers conservatively; do not use the CPU queue limit to justify unlimited GPU pinning. Temporary readback duplication counts until one representation is released.
+IMG-3's pending-still targets are 256 MB per monitor (decimal bytes, 256,000,000) and 256 jobs; M1 uses tighter bounds: one PNG worker with a 12-job queue and at most 6 new images per second (spec addendum A7.10). Count pinned pending images as well as CPU pixel buffers conservatively; do not use the CPU queue limit to justify unlimited GPU pinning. Temporary readback duplication counts until one representation is released.
 
 The pool may grow only to its explicit configured limit. Do not allocate one full-resolution copy per logical trigger. When an image is already retained, add a request reference. Do not overwrite an image while any lease remains.
 
@@ -149,7 +149,7 @@ Correlation quality, closing certification, hook-only attribution, motion and wh
 
 ### 6.2 Sampling and foreground evidence
 
-Keep all key/button transitions except PDF control/password exclusions. Keep all motion samples while a button is held or a configured stroke is active. Otherwise emit the first sample immediately, retain the latest sample in each 1/60 s sampling window, and flush the last pending sample on idle, transition or boundary. Report thinning/coalescing counts.
+Keep all key/button transitions except PDF control/password exclusions. Keep all motion samples while a button is held or a configured stroke is active (configured stroke tools come from app packs in M2; M1 applies the held-button rule, spec addendum A7.10). Otherwise emit the first sample immediately, retain the latest sample in each 1/60 s sampling window, and flush the last pending sample on idle, transition or boundary. Report thinning/coalescing counts.
 
 Foreground approval must be established for the event's receipt context, not from a later UIA result. Capture a lightweight foreground identity with normal input receipt processing; hook callbacks remain copy-only. If a hook-only event's receipt-time foreground cannot be established from available ordered context evidence, conservatively suppress it as approval-unknown rather than attribute it to a later foreground. A pointer or other non-key record needs only the approved process instance in the foreground at its receipt. A key also needs a known, classified focus, and its privacy follows the actual focused window (section 13.4). Do not log unapproved window details.
 

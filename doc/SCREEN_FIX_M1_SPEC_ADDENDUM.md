@@ -156,6 +156,14 @@ These amendments record the decisions taken during the round-2 refactor and the 
 - The `revocation_unknown` guidance states that Windows could not confirm non-revocation from its cached revocation data and asks to retry after Windows refreshes it (`source_failure_guidance` in `core/src/session.rs`).
 - Two trust checks became stricter when their copies were merged, accepted as fail-closed: a null security descriptor (DACL) is rejected in `core/capture/elevated/src/trust/permissions.rs`, and an empty process image path is a failure in `core/capture/elevated/src/process.rs`.
 - Audit findings H12 (a single integrity-RID check) and C15 (a single `overflow_at` policy) were left unchanged by user decision.
+- The M1 user interface stays the minimal M1-01 control window and recording indicator. The PDF's mockup interface (one window and a tray icon with the task list, pre-flight, floating bar, review and upload; PDF p. 2) is the v1 product and is built with the milestones that own its screens (PDF §17 build order: M2 tasks and pre-flight, M3 review and own-window exclusion, M4 upload). M1 does not change the product name, layout or visual style to match the mockups.
+
+**A7.10 Documented M1 narrowings (user decision, 2026-11-18).** These record deliberate M1 limits that were previously only in the remediation plan or the progress log.
+- **Encoder selection (amends the "startup" wording of A2 and M1-04).** The encoder is selected at Start and again at a monitor format change (resolution or size), using the same capability probe. After a format change, the remaining attempt may continue on the software 15 fps path. This is capability selection, not encoder recovery: an encoder failure still loses that monitor's video for the attempt (§6.2 row 9, ALG §13.10).
+- **INP-6 stroke tools are deferred to M2.** M1 keeps every motion sample while a button is held. The "configured stroke tool is active" condition depends on app-pack profiles, which arrive in M2.
+- **Gate 3 does not check pen continuity.** The reader's gate 3 checks key and button press boundaries only, as the PDF defines it. Pen tip and contact transitions (`pen` rows, `contact_transition`) are not checked for open strokes at a pause or Stop (schema §8).
+- **IMG-3 queue limits are narrower.** M1 runs one PNG worker (within IMG-3's "at most 4 threads", C2) with a queue of 12 jobs and at most 6 new images per second (`core/src/platform/windows/still_png.rs`). This is stricter than IMG-3's target bounds of 256 MB and 256 jobs. Overflow drops the lowest IMG-7 priority and writes a `still_dropped` record, as IMG-3 requires.
+- **REL-4 has no duration reserve.** M1 requires at least 20 GB free to start, pauses with `low_disk` below 5 GB, and resumes only on Resume with more than 6 GB free. The duration term of the pre-flight requirement (5 GB plus the task's expected hours × GB per monitor) needs the M2 task model, so the manifest records `disk_preflight.duration_reserve_bytes: null`.
 
 ## 3. Implementation contracts
 
@@ -346,6 +354,7 @@ The following is an implementation checklist, not a list of completed work.
 - Do not equate implemented instrumentation with completed hardware tests.
 - Existing restrictions on running builds, formatters and tests still apply until separately authorized.
 - For the elevated amendment, examine positive identity, trusted deployment, per-source registration, transitions, scoped reads and retained-prefix closure through real entry points. Record runtime, release-signing and hardware evidence separately.
+- Gates 1–4 run on a real attempt with the read-only verifier `cargo run --release -p screen-fix-core --example verify_attempt -- <attempt_dir>` (`package::verify_attempt`). It runs `PackageReader::validate_gates` and then the gate 2 decode comparison of each published segment (`verify_segment_decoding`, software decoding), and exits 0 on pass, 1 on a finding and 2 when the package cannot be opened. Under A7.6, `core/src/package/tests.rs` checks a complete synthetic attempt strictly, with one negative test per gate; its segment files are placeholders, so the decode part is not run there.
 
 ## 6. Revised M1 acceptance mapping
 

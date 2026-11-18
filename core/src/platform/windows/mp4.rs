@@ -285,6 +285,15 @@ fn remove_part(path: &Path) -> Result<(), ProbeError> {
     }
 }
 
+/// The decode part of gate 2 for a published segment (M1-10): it decodes in
+/// software and compares each picture with the `(PTS, duration)` of its
+/// `encoded:true` frames row, in 100 ns, within 1 ms. It only reads the file.
+pub(crate) fn verify_segment_decoding(path: &Path, expected: &[(i64, i64)], size: [u32; 2]) -> Result<(), ProbeError> {
+    let _apartment = super::com_apartment()?;
+    let _runtime = mf::Runtime::initialize()?;
+    verify_decoded_frames(path, &mut expected.to_vec(), size, &|| Ok(()), None).map(drop)
+}
+
 fn verify_decoded_frames(
     path: &Path, expected: &mut [(i64, i64)], size: [u32; 2],
     check: &impl Fn() -> Result<(), ProbeError>, decoder: Option<&IMFDXGIDeviceManager>,

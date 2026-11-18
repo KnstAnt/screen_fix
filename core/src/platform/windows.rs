@@ -19,6 +19,7 @@ mod video;
 mod encode;
 mod encoder;
 mod mp4;
+pub(crate) use mp4::verify_segment_decoding;
 mod mf;
 mod input;
 pub(crate) use input::on_input_desktop;

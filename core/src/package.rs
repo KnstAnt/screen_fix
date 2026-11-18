@@ -15,8 +15,10 @@ pub(crate) mod row;
 pub(crate) mod source;
 #[cfg(test)]
 mod tests;
+mod verify;
 pub use journal::StreamSummary;
 pub use reader::SourceSummary;
+pub use verify::{SegmentDecode, Verification, verify_attempt};
 
 use crate::protocol::{AttemptId, MonitorId, SegmentId, StreamId};
 

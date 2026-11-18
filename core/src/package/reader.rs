@@ -55,6 +55,22 @@ struct FrameRow {
     reason: Option<MissingVideoSlot>,
 }
 
+/// A monitor's slot range that a resume row names as paused.
+#[derive(Deserialize)]
+struct PausedSlots {
+    monitor: MonitorId,
+    first_paused_slot: u64,
+    end_slot_exclusive: Option<u64>,
+}
+
+/// The frames rows of one monitor seen so far.
+#[derive(Default)]
+struct MonitorSlots {
+    /// The next slot: contiguous except across a paused range.
+    next: u64,
+    rows: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SourceSummary {
     pub standard_intervals: usize,
@@ -194,7 +210,7 @@ impl PackageReader {
         open_artifact(artifact.kind, self.artifact_path(artifact)?)
     }
 
-    fn artifact_path(&self, artifact: &ArtifactRef) -> PackageResult<PathBuf> {
+    pub(super) fn artifact_path(&self, artifact: &ArtifactRef) -> PackageResult<PathBuf> {
         if artifact.attempt != *self.layout.id() {
             return Err(PackageError::WrongAttempt);
         }
@@ -232,7 +248,8 @@ impl PackageReader {
     }
 
     /// Inspect listed JSONL journals and media references with one bounded line at a time.
-    /// MP4 decode/PTS validation is performed by the segment owner before publication.
+    /// MP4 decode/PTS validation is performed by the segment owner before
+    /// publication, and again by `verify_attempt`.
     /// Incomplete attempts can lack summaries for journals that failed to close.
     /// Gates 1–4 of M1-10 are checked in the same single pass over each journal;
     /// the first failing rule is returned with its gate, stream and row.
@@ -307,8 +324,10 @@ struct JournalScan<'a> {
     /// A complete attempt with a profile: every inventory rule applies.
     strict: bool,
     segments: BTreeMap<(MonitorId, SegmentId), SegmentProgress<'a>>,
-    /// The next slot of each monitor's frames rows.
-    monitor_slots: BTreeMap<MonitorId, u64>,
+    monitor_slots: BTreeMap<MonitorId, MonitorSlots>,
+    /// The paused slot ranges `[first, end)` of each monitor, from the
+    /// context journal's resume rows, which are read before the frames.
+    paused_slots: BTreeMap<MonitorId, BTreeMap<u64, u64>>,
     gates: Gates,
 }
 
@@ -337,7 +356,7 @@ impl<'a> JournalScan<'a> {
         }
         Ok(Self {
             reader, strict: manifest.state == PackageState::Complete && manifest.profile.is_some(),
-            segments, monitor_slots: BTreeMap::new(), gates: Gates::default(),
+            segments, monitor_slots: BTreeMap::new(), paused_slots: BTreeMap::new(), gates: Gates::default(),
         })
     }
 
@@ -396,6 +415,14 @@ impl<'a> JournalScan<'a> {
                     self.check_still_row(kind, &value, envelope.seq, error)?;
                 }
                 (StreamId::Context, Some(RowKind::CursorAsset)) => self.check_cursor_asset(&value, error)?,
+                (StreamId::Context, Some(RowKind::Resume)) => {
+                    let ranges = Option::<Vec<PausedSlots>>::deserialize(&value["paused_slots"]).map_err(|_| error())?;
+                    for range in ranges.into_iter().flatten() {
+                        if let Some(end) = range.end_slot_exclusive {
+                            self.paused_slots.entry(range.monitor).or_default().insert(range.first_paused_slot, end);
+                        }
+                    }
+                }
                 _ => {}
             }
             self.gates.row(stream, envelope.seq, envelope.recv_t_us, kind, &value)?;
@@ -411,8 +438,9 @@ impl<'a> JournalScan<'a> {
         self.gates.finish(stream)
     }
 
-    /// A frames row: a selected monitor, the next slot of that monitor and,
-    /// when encoded, the next frame of its listed segment.
+    /// A frames row: a selected monitor, the next slot of that monitor (or
+    /// the end of a paused range that starts there) and, when encoded, the
+    /// next frame of its listed segment.
     fn check_frame_row(&mut self, value: &Value, error: impl Fn() -> PackageError + Copy) -> PackageResult<()> {
         let row = FrameRow::deserialize(value).map_err(|_| error())?;
         if !self.reader.manifest.selected_displays.contains(&row.monitor)
@@ -422,11 +450,13 @@ impl<'a> JournalScan<'a> {
         {
             return Err(error());
         }
-        let next = self.monitor_slots.entry(row.monitor).or_default();
-        if self.strict && row.slot != *next {
+        let slots = self.monitor_slots.entry(row.monitor).or_default();
+        let resumed = || self.paused_slots.get(&row.monitor).and_then(|ranges| ranges.get(&slots.next)) == Some(&row.slot);
+        if self.strict && row.slot != slots.next && !resumed() {
             return Err(error());
         }
-        *next = next.checked_add(1).ok_or_else(error)?;
+        slots.next = row.slot.checked_add(1).ok_or_else(error)?;
+        slots.rows += 1;
         if !row.encoded {
             if row.reason.is_none() || row.segment.is_some() || row.frame_in_segment.is_some()
                 || row.pts_100ns.is_some() || row.duration_100ns.is_some()
@@ -534,7 +564,7 @@ impl<'a> JournalScan<'a> {
         if self.strict && (self.segments.values().any(|progress| {
             progress.frames != progress.summary.frame_count || progress.end_100ns != progress.summary.local_end_100ns
         }) || self.reader.manifest.monitor_video.iter().any(|video| {
-            self.monitor_slots.get(&video.monitor) != Some(&video.slots)
+            self.monitor_slots.get(&video.monitor).map(|slots| slots.rows) != Some(video.slots)
         })) {
             return Err(PackageError::InvalidJournal { stream: StreamId::Frames, row: 0 });
         }
