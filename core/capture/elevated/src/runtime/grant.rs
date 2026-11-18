@@ -1,6 +1,6 @@
 use std::{
     num::NonZeroU64,
-    sync::{Arc, Mutex, atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering::{Acquire, AcqRel, Release}}},
+    sync::{Arc, Mutex, PoisonError, atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::{Acquire, AcqRel, Release}}},
     time::Duration,
 };
 
@@ -13,17 +13,32 @@ use screen_fix_protocol::{
 };
 
 use crate::{deadline::Cancellation, process::Process, win::{Failure, Result}};
-use super::{lifetime::{LEASE, Lifetime, qpc}, witness::{Foreground, Snapshot, Target, View}};
+use super::{AtomicState, State, lifetime::{LEASE, Lifetime, qpc}, witness::{Foreground, Snapshot, Target, View}};
 
 pub(super) const INPUT_HOLDBACK: Duration = Duration::from_millis(32);
 pub(super) const ESSENTIAL_PROGRESS: Duration = Duration::from_millis(500);
 
-const PREPARING: u8 = 0;
-const ARMED: u8 = 1;
-const OPENING: u8 = 2;
-const ACTIVE: u8 = 3;
-const SUSPENDED: u8 = 4;
-const CLOSED: u8 = 5;
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Preparing,
+    Armed,
+    Opening,
+    Active,
+    Suspended,
+    Closed,
+}
+
+impl Phase {
+    /// The phases from activation on, which bind the lease to the visit epoch.
+    fn activated(self) -> bool { !matches!(self, Self::Preparing | Self::Armed) }
+}
+
+impl State for Phase {
+    const ALL: &'static [Self] = &[Self::Preparing, Self::Armed, Self::Opening, Self::Active, Self::Suspended, Self::Closed];
+
+    fn raw(self) -> u8 { self as u8 }
+}
 
 struct Focus {
     binding: VisitBinding,
@@ -57,7 +72,7 @@ pub(super) struct Grant {
     witness: View,
     focus: Mutex<Focus>,
     session_stop: Arc<Cancellation>,
-    phase: AtomicU8,
+    phase: AtomicState<Phase>,
     lower_qpc: AtomicI64,
     expires_qpc: AtomicI64,
     hook_revision: AtomicU64,
@@ -101,7 +116,7 @@ impl Grant {
         };
         let grant = Arc::new(Self {
             target, expires_qpc, hook_revision, focus: Mutex::new(focus), arm: qpc()?, parent, witness, lifetime, session_stop,
-            stop: Cancellation::new()?, phase: AtomicU8::new(PREPARING), lower_qpc: AtomicI64::new(0),
+            stop: Cancellation::new()?, phase: AtomicState::new(Phase::Preparing), lower_qpc: AtomicI64::new(0),
             scope_serial: AtomicU64::new(1), input_paused: AtomicBool::new(false), token_failed: AtomicBool::new(false),
         });
         grant.check(true)?;
@@ -109,7 +124,9 @@ impl Grant {
     }
 
     pub(super) fn visit(&self) -> VisitBinding {
-        self.focus.lock().expect("focus binding lock").binding
+        // The binding is replaced whole, so a poisoned lock still holds a
+        // complete one; the scope checks fail closed on poison.
+        self.focus.lock().unwrap_or_else(PoisonError::into_inner).binding
     }
 
     pub(super) fn expected_focus(&self, visit: VisitBinding) -> Option<FocusAtReceipt> {
@@ -119,7 +136,7 @@ impl Grant {
 
     pub(super) fn qualify_egress(&self, visit: VisitBinding, held: bool) -> bool {
         if self.evidence_cancel(visit).is_none() { return false; }
-        let checked = self.read_floor(held).and_then(|_| self.check(true));
+        let checked = self.read_open(held);
         if matches!(checked, Err(Failure::TargetChanged | Failure::TokenIdentity(_) | Failure::ProcessIdentity))
             && !self.witness.dirty()
             && let Ok(now) = qpc()
@@ -172,7 +189,16 @@ impl Grant {
         None
     }
 
+    /// The scope check. A detailed check also proves the target binding and
+    /// native focus, then repeats the scope check.
     pub(super) fn check(&self, detailed: bool) -> Result<QpcTick> {
+        let now = self.check_scope()?;
+        if !detailed { return Ok(now); }
+        self.check_target()?;
+        self.check_scope()
+    }
+
+    fn check_scope(&self) -> Result<QpcTick> {
         let now = qpc()?;
         self.session_stop.check()?;
         self.stop.check()?;
@@ -181,16 +207,17 @@ impl Grant {
         if self.loss(now).is_some() || Foreground::read() != Some(self.target.window) {
             return Err(Failure::TargetChanged);
         }
-        if detailed {
-            if self.token_failed.load(Acquire) { return Err(Failure::TargetChanged); }
-            self.target.bound()?;
-            let expected = self.focus.lock().map_err(|_| Failure::Supervisor)?.native;
-            if expected.is_some_and(|focus| self.native_focus() != Some(focus)) {
-                return Err(Failure::TargetChanged);
-            }
-            return self.check(false);
-        }
         Ok(now)
+    }
+
+    fn check_target(&self) -> Result<()> {
+        if self.token_failed.load(Acquire) { return Err(Failure::TargetChanged); }
+        self.target.bound()?;
+        let expected = self.focus.lock().map_err(|_| Failure::Supervisor)?.native;
+        if expected.is_some_and(|focus| self.native_focus() != Some(focus)) {
+            return Err(Failure::TargetChanged);
+        }
+        Ok(())
     }
 
     /// Query the pinned target's token facts and liveness (E3).
@@ -205,7 +232,7 @@ impl Grant {
     ) -> Result<Target> {
         self.check(false)?;
         if !approved.contains(&claim.approval) {
-            return Err(Failure::TargetChanged);
+            return Err(Failure::TargetAccess);
         }
         let target = Target::prove(local, claim, &self.parent)?;
         self.check(false)?;
@@ -222,13 +249,13 @@ impl Grant {
 
     pub(super) fn arm(&self) -> Result<()> {
         self.check(true)?;
-        self.transition(PREPARING, ARMED)
+        self.transition(Phase::Preparing, Phase::Armed)
     }
 
     pub(super) fn suspend_focus(&self) -> Result<bool> {
         let focus = self.focus.lock().map_err(|_| Failure::Supervisor)?;
-        if self.phase.load(Acquire) == SUSPENDED { return Ok(false); }
-        self.transition(ACTIVE, SUSPENDED)?;
+        if self.phase.load() == Phase::Suspended { return Ok(false); }
+        self.transition(Phase::Active, Phase::Suspended)?;
         focus.abort.cancel();
         Ok(true)
     }
@@ -236,7 +263,7 @@ impl Grant {
     pub(super) fn refresh_focus(
         &self, previous: VisitBinding, next: VisitBinding, lease: Lease,
     ) -> Result<(FocusAtReceipt, QpcTick)> {
-        if self.phase.load(Acquire) != SUSPENDED || previous != self.visit()
+        if self.phase.load() != Phase::Suspended || previous != self.visit()
             || next != (VisitBinding { focus_generation: next.focus_generation, focus_revision: next.focus_revision, ..previous })
             || next.focus_generation.0 <= previous.focus_generation.0 || next.focus_revision <= previous.focus_revision
             || lease.epoch != Some(next.epoch)
@@ -261,7 +288,7 @@ impl Grant {
         if focus.binding != previous || self.witness.dirty() || self.witness.revision() != next.focus_revision {
             return Err(Failure::TargetChanged);
         }
-        self.transition(SUSPENDED, OPENING)?;
+        self.transition(Phase::Suspended, Phase::Opening)?;
         self.lower_qpc.store(now.0, Release);
         *focus = Focus { binding: next, native: Some(native), abort, progress: Coverage::default(), delivered_held: None };
         self.hook_revision.store(next.focus_revision, Release);
@@ -279,21 +306,35 @@ impl Grant {
             return Err(Failure::Protocol);
         }
         self.lower_qpc.store(now.0, Release);
-        self.transition(ARMED, OPENING)?;
+        self.transition(Phase::Armed, Phase::Opening)?;
         Ok(now)
     }
 
+    /// The lower bound of readable evidence while reads are open. A held
+    /// read is also open during the opening phase.
     pub(super) fn read_floor(&self, held: bool) -> Result<QpcTick> {
-        let phase = self.phase.load(Acquire);
-        if phase != ACTIVE && !(held && phase == OPENING) {
-            return Err(Failure::TargetChanged);
-        }
-        self.check(false)?;
-        if self.input_paused.load(Acquire) { return Err(Failure::ScopeClosed); }
+        self.read_scope(held)?;
         Ok(QpcTick(self.lower_qpc.load(Acquire)))
     }
 
-    pub(super) fn opening(&self) -> bool { self.phase.load(Acquire) == OPENING }
+    /// Reads are open and the detailed check passes; returns its time.
+    pub(super) fn read_open(&self, held: bool) -> Result<QpcTick> {
+        self.read_scope(held)?;
+        self.check_target()?;
+        self.check_scope()
+    }
+
+    fn read_scope(&self, held: bool) -> Result<QpcTick> {
+        let phase = self.phase.load();
+        if phase != Phase::Active && !(held && phase == Phase::Opening) {
+            return Err(Failure::TargetChanged);
+        }
+        let now = self.check_scope()?;
+        if self.input_paused.load(Acquire) { return Err(Failure::ScopeClosed); }
+        Ok(now)
+    }
+
+    pub(super) fn opening(&self) -> bool { self.phase.load() == Phase::Opening }
 
     pub(super) fn deliver_held(&self, visit: VisitBinding, request: RequestId, sample: QpcTick) {
         if let Ok(mut focus) = self.focus.lock() && focus.binding == visit
@@ -312,21 +353,21 @@ impl Grant {
 
     pub(super) fn finish_opening(&self, sample: QpcTick) -> Result<()> {
         let floor = self.read_floor(true)?;
-        if sample < floor || sample > self.check(true)? || self.phase.load(Acquire) != OPENING {
+        if sample < floor || sample > self.check(true)? || self.phase.load() != Phase::Opening {
             return Err(Failure::TargetChanged);
         }
         self.lower_qpc.store(sample.0, Release);
-        self.transition(OPENING, ACTIVE)
+        self.transition(Phase::Opening, Phase::Active)
     }
 
     pub(super) fn renew(&self, lease: Lease) -> Result<()> {
         if lease.epoch.is_some_and(|epoch| epoch != self.visit().epoch)
-            || self.phase.load(Acquire) >= OPENING && lease.epoch != Some(self.visit().epoch)
+            || self.phase.load().activated() && lease.epoch != Some(self.visit().epoch)
         {
             return Err(Failure::TargetChanged);
         }
         let now = qpc()?;
-        if self.phase.load(Acquire) == SUSPENDED {
+        if self.phase.load() == Phase::Suspended {
             if self.loss(now).is_some_and(|(reason, _)| reason != Revocation::Focus) {
                 return Err(Failure::TargetChanged);
             }
@@ -343,7 +384,7 @@ impl Grant {
     }
 
     pub(super) fn hook_open(&self) -> bool {
-        self.phase.load(Acquire) == ACTIVE && !self.input_paused.load(Acquire)
+        self.phase.load() == Phase::Active && !self.input_paused.load(Acquire)
             && !self.witness.dirty() && self.witness.revision() == self.hook_revision.load(Acquire)
             && self.stop.check().is_ok() && self.session_stop.check().is_ok()
             && qpc().is_ok_and(|now| now.0 < self.expires_qpc.load(Acquire)
@@ -364,7 +405,7 @@ impl Grant {
 
     pub(super) fn input_loss(&self, visit: VisitBinding, loss: InputLoss) {
         if let Ok(mut focus) = self.focus.lock() && focus.binding == visit
-            && self.phase.load(Acquire) == ACTIVE && focus.abort.check().is_ok()
+            && self.phase.load() == Phase::Active && focus.abort.check().is_ok()
         {
             focus.progress.input_loss = Some(loss);
             self.input_paused.store(true, Release);
@@ -381,7 +422,7 @@ impl Grant {
         let revision = previous.resync_revision.get().checked_add(1).and_then(NonZeroU64::new).ok_or(Failure::Supervisor)?;
         let next = VisitBinding { resync_revision: revision, ..previous };
         let abort = Arc::new(Cancellation::new()?);
-        self.transition(ACTIVE, OPENING)?;
+        self.transition(Phase::Active, Phase::Opening)?;
         self.lower_qpc.store(now.0, Release);
         *focus = Focus { binding: next, native: focus.native, abort, progress: Coverage::default(), delivered_held: None };
         self.bump_scope()?;
@@ -390,7 +431,7 @@ impl Grant {
     }
 
     pub(super) fn essential_stalled(&self, now: QpcTick) -> Result<bool> {
-        if self.phase.load(Acquire) != ACTIVE || self.input_paused.load(Acquire) {
+        if self.phase.load() != Phase::Active || self.input_paused.load(Acquire) {
             return Ok(false);
         }
         let floor = self.lower_qpc.load(Acquire);
@@ -416,7 +457,7 @@ impl Grant {
         let Ok(Some(witness)) = self.witness.read() else { return };
         if let Ok(mut focus) = self.focus.lock()
             && focus.binding == visit && focus.abort.check().is_ok()
-            && self.phase.load(Acquire) == ACTIVE && !self.witness.dirty() && self.witness.revision() == visit.focus_revision
+            && self.phase.load() == Phase::Active && !self.witness.dirty() && self.witness.revision() == visit.focus_revision
             && witness.revision == visit.witness_revision
             && witness.focus_revision == visit.focus_revision
             && self.lifetime.check(now).is_ok()
@@ -462,15 +503,29 @@ impl Grant {
     }
 
     pub(super) fn revoke(&self) {
-        if let Ok(focus) = self.focus.lock() {
-            self.phase.store(CLOSED, Release);
-            focus.abort.cancel();
-        }
+        // Closing does not depend on the health of the lock.
+        let focus = self.focus.lock().unwrap_or_else(PoisonError::into_inner);
+        self.phase.store(Phase::Closed);
+        focus.abort.cancel();
+        drop(focus);
         self.stop.cancel();
     }
 
-    fn transition(&self, from: u8, to: u8) -> Result<()> {
-        self.phase.compare_exchange(from, to, AcqRel, Acquire).map(|_| ()).map_err(|_| Failure::TargetChanged)
+    /// Revokes a grant whose startup failed and joins its already started
+    /// workers under the cleanup deadline. The workers are joined even when
+    /// that deadline cannot be set; the error is returned after the join.
+    pub(super) fn abandon(&self, join: impl FnOnce()) -> Result<()> {
+        self.revoke();
+        let cleanup = qpc().and_then(|now| self.lifetime.enter_cleanup(now));
+        join();
+        if cleanup.is_ok() {
+            self.lifetime.end_cleanup();
+        }
+        cleanup
+    }
+
+    fn transition(&self, from: Phase, to: Phase) -> Result<()> {
+        if self.phase.transition(from, to) { Ok(()) } else { Err(Failure::TargetChanged) }
     }
 }
 

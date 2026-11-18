@@ -126,19 +126,19 @@ impl Shared {
     }
 }
 
-pub(crate) enum LaunchStatus {
+pub(super) enum LaunchStatus {
     AwaitingConsent,
     Authenticating,
     Complete { authenticating: bool, result: Result<(Authenticated, Instant)> },
 }
 
-pub(crate) struct Ticket {
+pub(super) struct Ticket {
     shared: Arc<Shared>,
 }
 
 impl Ticket {
     /// A controller must close capture admission before asking Windows for consent.
-    pub(crate) fn start(attempt: AttemptId, session: SessionId, source: SourceDispatch) -> Result<Self> {
+    pub(super) fn start(attempt: AttemptId, session: SessionId, source: SourceDispatch) -> Result<Self> {
         let flight = Flight::acquire()?;
         let consent_until = Instant::now() + CONSENT;
         let shared = Arc::new(Shared {
@@ -157,7 +157,7 @@ impl Ticket {
         Ok(Self { shared })
     }
 
-    pub(crate) fn poll(&mut self) -> LaunchStatus {
+    pub(super) fn poll(&mut self) -> LaunchStatus {
         let mut state = self.shared.lock();
         match *state {
             State::Pending(phase) => match phase.check(Instant::now()) {
@@ -188,7 +188,7 @@ impl Ticket {
         }
     }
 
-    pub(crate) fn cancel(&mut self) {
+    fn cancel(&mut self) {
         self.shared.permit.cancel();
         let prior = std::mem::replace(&mut *self.shared.lock(), State::Taken);
         drop(prior);

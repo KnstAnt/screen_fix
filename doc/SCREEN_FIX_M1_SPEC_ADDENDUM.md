@@ -182,7 +182,7 @@ All values below are MiB (1,048,576 bytes). BGRA8 uses width * height * 4 bytes.
 
 This subtotal is not a peak memory limit. Each additional retained 4K BGRA frame adds 31.64 MiB. Pending-job retention must be included in the actual allocation limit. Staging placement must not be assumed to be entirely dedicated VRAM.
 
-Three FP16 WGC frames instead of BGRA8 add 94.92 MiB at 4K, before extra tone-mapping workspace. One 4K NV12 encoder surface adds approximately 11.87 MiB; the actual number of surfaces is implementation-dependent.
+Three FP16 WGC frames instead of BGRA8 add 94.92 MiB at 4K, before extra tone-mapping workspace. One 4K NV12 encoder surface adds approximately 11.87 MiB. Each monitor's converter allocates up to nine on demand (three held by slot selection, two queued to the video worker, three encoder inputs in flight and one in conversion), approximately 106.8 MiB at 4K; encoder-internal surfaces are implementation-dependent.
 
 An independent 200 ms BGRA queue would require at least six frames at 30 FPS or twelve at 60 FPS: 189.84 or 379.69 MiB at 4K, without scheduling margin. Overlapping retention reasons can share frames; do not count them as mandatory independent copies. This future privacy cost is not silently included in the M1 subtotal.
 

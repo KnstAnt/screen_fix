@@ -4,7 +4,7 @@ use std::{
     cell::UnsafeCell,
     ptr::{null, null_mut},
     time::Instant,
-    sync::{Arc, atomic::{AtomicUsize, Ordering}},
+    sync::{Arc, Mutex, PoisonError, atomic::{AtomicUsize, Ordering}},
 };
 
 use windows_sys::Win32::{
@@ -23,7 +23,7 @@ use windows_sys::Win32::{
             ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
             PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE,
         },
-        Threading::WaitForSingleObject,
+        Threading::{ResetEvent, WaitForSingleObject},
     },
 };
 
@@ -72,9 +72,17 @@ impl Drop for Name {
 pub(crate) struct Pipe {
     handle: Arc<Handle>,
     server: bool,
+    /// The idle operation of each direction, kept for reuse. Connect and the
+    /// reads share the read direction.
+    reader: Mutex<Option<Box<Pending>>>,
+    writer: Mutex<Option<Box<Pending>>>,
 }
 
 impl Pipe {
+    fn new(handle: Handle, server: bool) -> Self {
+        Self { handle: Arc::new(handle), server, reader: Mutex::default(), writer: Mutex::default() }
+    }
+
     pub(crate) fn bootstrap(name: &Name, medium: &Sid, server_logon: &Sid) -> Result<Self> {
         Self::server(name, security::Owner::Bootstrap { user: medium, server_logon })
     }
@@ -95,7 +103,7 @@ impl Pipe {
         };
         let handle = unsafe { Handle::take(raw, Failure::PipeConnection)? };
         owner.verify(&handle)?;
-        Ok(Self { handle: Arc::new(handle), server: true })
+        Ok(Self::new(handle, true))
     }
 
     pub(crate) fn client(name: &Name, deadline: Deadline<'_>) -> Result<Self> {
@@ -108,7 +116,7 @@ impl Pipe {
             if raw != INVALID_HANDLE_VALUE {
                 let handle = unsafe { Handle::take(raw, Failure::PipeConnection)? };
                 deadline.check()?;
-                return Ok(Self { handle: Arc::new(handle), server: false });
+                return Ok(Self::new(handle, false));
             }
             if !matches!(last_error(), ERROR_FILE_NOT_FOUND | ERROR_PIPE_BUSY) {
                 return Err(Failure::PipeConnection);
@@ -119,7 +127,7 @@ impl Pipe {
 
     pub(crate) fn accept(&mut self, peer: &Process, deadline: Deadline<'_>) -> Result<()> {
         if !self.server { return Err(Failure::PipeConnection) }
-        self.perform(Operation::Connect, 0, &[], deadline)?;
+        self.perform(Operation::Connect, 0, &[], &mut [], deadline)?;
         peer.ensure_live()?;
         let mut pid = 0;
         if unsafe { GetNamedPipeClientProcessId(self.handle.raw(), &mut pid) } == 0 || pid != peer.pid() {
@@ -130,31 +138,27 @@ impl Pipe {
 
     pub(crate) fn write(&self, frame: &[u8], deadline: Deadline<'_>) -> Result<()> {
         if frame.is_empty() || frame.len() > LIMIT { return Err(Failure::Protocol) }
-        let outcome = self.perform(Operation::Write, frame.len(), frame, deadline)?;
+        let outcome = self.perform(Operation::Write, frame.len(), frame, &mut [], deadline)?;
         if outcome.transferred != frame.len() { return Err(Failure::Transport) }
         Ok(())
     }
 
     pub(crate) fn read_message(&self, buffer: &mut [u8], deadline: Deadline<'_>) -> Result<usize> {
         if !self.server || buffer.is_empty() || buffer.len() > LIMIT { return Err(Failure::Protocol) }
-        let outcome = self.perform(Operation::Read, buffer.len(), &[], deadline)?;
-        let transferred = outcome.transferred;
+        let transferred = self.perform(Operation::Read, buffer.len(), &[], buffer, deadline)?.transferred;
         if transferred == 0 || transferred > buffer.len() {
             return Err(Failure::Transport);
         }
-        buffer[..transferred].copy_from_slice(&outcome.buffer[..transferred]);
         Ok(transferred)
     }
 
     pub(crate) fn read_exact(&self, mut buffer: &mut [u8], deadline: Deadline<'_>) -> Result<()> {
         if self.server || buffer.len() > LIMIT { return Err(Failure::Protocol) }
         while !buffer.is_empty() {
-            let outcome = self.perform(Operation::Read, buffer.len(), &[], deadline)?;
-            let transferred = outcome.transferred;
+            let transferred = self.perform(Operation::Read, buffer.len(), &[], &mut *buffer, deadline)?.transferred;
             if transferred == 0 || transferred > buffer.len() {
                 return Err(Failure::Transport);
             }
-            buffer[..transferred].copy_from_slice(&outcome.buffer[..transferred]);
             buffer = &mut buffer[transferred..];
         }
         Ok(())
@@ -162,19 +166,26 @@ impl Pipe {
 
     pub(crate) fn expect_eof(&mut self, deadline: Deadline<'_>) -> Result<()> {
         if self.server { return Err(Failure::Protocol) }
-        let outcome = self.perform(Operation::Eof, 1, &[], deadline)?;
+        let outcome = self.perform(Operation::Eof, 1, &[], &mut [], deadline)?;
         if !outcome.closed { return Err(Failure::Protocol) }
         Ok(())
     }
 
     pub(crate) fn is_server(&self) -> bool { self.server }
 
-    fn perform(&self, kind: Operation, size: usize, data: &[u8], deadline: Deadline<'_>) -> Result<Outcome> {
+    /// Run one operation of `size` bytes: a write sends `data`, a read
+    /// copies what it received into `received` when that fits.
+    fn perform(
+        &self, kind: Operation, size: usize, data: &[u8], received: &mut [u8], deadline: Deadline<'_>,
+    ) -> Result<Outcome> {
         deadline.check()?;
-        let mut pending = Pending::new(&self.handle, size)?;
-        pending.buffer[..data.len()].copy_from_slice(data);
+        let mut pending = self.idle(kind)?;
+        pending.prepare(size, data);
         // A closed scope here is known to have submitted no kernel write.
-        deadline.check()?;
+        if let Err(failure) = deadline.check() {
+            self.recycle(kind, pending);
+            return Err(failure);
+        }
         let transferred = match pending.begin(kind) {
             Ok(Submission::Complete) => pending.completion(),
             Ok(Submission::Pending) => match deadline.wait(&pending.event) {
@@ -184,9 +195,7 @@ impl Pipe {
                     // Only a successful completion of the whole write proves
                     // the position of the next message.
                     return match pending.cancel() {
-                        Some(Ok(transferred)) if transferred == size => Ok(Outcome {
-                            transferred, closed: false, buffer: Vec::new(),
-                        }),
+                        Some(Ok(transferred)) if transferred == size => Ok(Outcome { transferred, closed: false }),
                         _ => Err(Failure::Transport),
                     };
                 }
@@ -195,16 +204,22 @@ impl Pipe {
                     return Err(failure);
                 }
             },
-            Err(ERROR_PIPE_CONNECTED) if kind == Operation::Connect => {
-                deadline.check()?;
-                return Ok(Outcome { transferred: 0, closed: false, buffer: Vec::new() });
+            // Nothing was submitted.
+            Err(error) => {
+                self.recycle(kind, pending);
+                return match error {
+                    ERROR_PIPE_CONNECTED if kind == Operation::Connect => {
+                        deadline.check()?;
+                        Ok(Outcome { transferred: 0, closed: false })
+                    }
+                    ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED if kind == Operation::Eof => {
+                        deadline.check()?;
+                        Ok(Outcome { transferred: 0, closed: true })
+                    }
+                    ERROR_MORE_DATA => Err(Failure::Protocol),
+                    _ => Err(kind.failure()),
+                };
             }
-            Err(ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED) if kind == Operation::Eof => {
-                deadline.check()?;
-                return Ok(Outcome { transferred: 0, closed: true, buffer: Vec::new() });
-            }
-            Err(ERROR_MORE_DATA) => return Err(Failure::Protocol),
-            Err(_) => return Err(kind.failure()),
         };
         let transferred = match transferred {
             Ok(transferred) => transferred,
@@ -212,26 +227,59 @@ impl Pipe {
                 let _ = pending.cancel();
                 return Err(kind.failure());
             }
-            Err(ERROR_MORE_DATA) => return Err(Failure::Protocol),
-            Err(ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED) if kind == Operation::Eof => {
-                deadline.check()?;
-                return Ok(Outcome { transferred: 0, closed: true, buffer: Vec::new() });
+            // The operation completed with an error.
+            Err(error) => {
+                self.recycle(kind, pending);
+                return match error {
+                    ERROR_MORE_DATA => Err(Failure::Protocol),
+                    ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED if kind == Operation::Eof => {
+                        deadline.check()?;
+                        Ok(Outcome { transferred: 0, closed: true })
+                    }
+                    _ => Err(kind.failure()),
+                };
             }
-            Err(_) => return Err(kind.failure()),
         };
+        if let Some(received) = received.get_mut(..transferred) {
+            received.copy_from_slice(&pending.buffer[..transferred]);
+        }
+        self.recycle(kind, pending);
         // Scoped runtime writes advance the lane on a successful transfer,
         // including when that visit closed between submission and completion.
         // The evidence owner separately decides whether it can certify it.
         if kind != Operation::Write || deadline.grant.is_none() {
             deadline.check()?;
         }
-        let buffer = std::mem::take(&mut pending.buffer);
-        Ok(Outcome { transferred, closed: false, buffer })
+        Ok(Outcome { transferred, closed: false })
+    }
+
+    fn slot(&self, kind: Operation) -> &Mutex<Option<Box<Pending>>> {
+        if kind == Operation::Write { &self.writer } else { &self.reader }
+    }
+
+    fn idle(&self, kind: Operation) -> Result<Box<Pending>> {
+        match self.slot(kind).lock().ok().and_then(|mut idle| idle.take()) {
+            Some(pending) => Ok(pending),
+            None => Pending::new(&self.handle),
+        }
+    }
+
+    /// Keep an operation the kernel no longer references for the next one.
+    fn recycle(&self, kind: Operation, mut pending: Box<Pending>) {
+        erase(&mut pending.buffer);
+        if let Ok(mut idle) = self.slot(kind).lock() {
+            *idle = Some(pending);
+        }
     }
 }
 
 impl Drop for Pipe {
     fn drop(&mut self) {
+        // Idle operations hold no kernel I/O; only a deferred drain keeps
+        // another reference to the handle.
+        for idle in [&mut self.reader, &mut self.writer] {
+            *idle.get_mut().unwrap_or_else(PoisonError::into_inner) = None;
+        }
         if self.server && Arc::strong_count(&self.handle) != 1 {
             // A deferred kernel cancellation still holds the handle. Revoke the
             // connection now. On a normal close, preserve already queued bytes.
@@ -257,11 +305,6 @@ impl Operation {
 struct Outcome {
     transferred: usize,
     closed: bool,
-    buffer: Vec<u8>,
-}
-
-impl Drop for Outcome {
-    fn drop(&mut self) { erase(&mut self.buffer); }
 }
 
 struct Pending {
@@ -272,18 +315,28 @@ struct Pending {
 }
 
 // A submitted operation is boxed at a stable address. Only its cleanup owner
-// uses it after handoff. The kernel may complete it on another thread.
+// uses it after handoff. The kernel may complete it on another thread. An
+// idle operation, kept by its pipe for reuse, references no kernel I/O.
 unsafe impl Send for Pending {}
 
 impl Pending {
-    fn new(handle: &Arc<Handle>, size: usize) -> Result<Box<Self>> {
+    fn new(handle: &Arc<Handle>) -> Result<Box<Self>> {
         let done = event()?;
         Ok(Box::new(Self {
             handle: Arc::clone(handle),
             overlap: UnsafeCell::new(OVERLAPPED { hEvent: done.raw(), ..Default::default() }),
             event: done,
-            buffer: vec![0u8; size],
+            buffer: Vec::new(),
         }))
+    }
+
+    /// Reset an idle operation for `size` bytes starting with `data`. Its
+    /// buffer was erased when it became idle.
+    fn prepare(&mut self, size: usize, data: &[u8]) {
+        self.buffer.resize(size, 0);
+        self.buffer[..data.len()].copy_from_slice(data);
+        *self.overlap.get_mut() = OVERLAPPED { hEvent: self.event.raw(), ..Default::default() };
+        unsafe { ResetEvent(self.event.raw()) };
     }
 
     fn begin(&mut self, kind: Operation) -> std::result::Result<Submission, u32> {

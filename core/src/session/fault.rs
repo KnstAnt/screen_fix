@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use crate::{
-    CaptureError, CaptureErrorKind,
+    CaptureError, CaptureErrorKind, Remedy,
     package::{
         diagnostics::Failure,
         metadata::{ActivityLoss, LostActivity},
@@ -21,6 +21,9 @@ use crate::{
 /// losses are bounded by their owners (one per monitor video, the input
 /// failure limit and the auxiliary activities) and are always retained.
 const MAX_ATTEMPT_REPORTS: usize = 32;
+/// Distinct omitted attempt causes remembered so that a cause reported again
+/// is counted once. Beyond this bound a repeated omitted cause is counted again.
+const MAX_OMITTED_CAUSES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FaultClass {
@@ -37,6 +40,7 @@ pub(crate) struct FaultReport {
     kind: CaptureErrorKind,
     failure: Failure,
     message: Arc<str>,
+    remedy: Option<Remedy>,
     monitor: Option<MonitorId>,
     first_affected: Option<SessionTimeUs>,
     detected: Option<SessionTimeUs>,
@@ -47,7 +51,7 @@ impl FaultReport {
     pub(crate) fn attempt(error: &CaptureError) -> Self {
         Self {
             class: FaultClass::Attempt, kind: error.kind, failure: error.failure(), message: error.to_string().into(),
-            monitor: None, first_affected: None, detected: None,
+            remedy: error.remedy(), monitor: None, first_affected: None, detected: None,
         }
     }
 
@@ -61,7 +65,7 @@ impl FaultReport {
         Self {
             class: FaultClass::Activity(activity), kind: CaptureErrorKind::BackendFailure, failure,
             message: format!("Recording degraded: {subject} stopped. {}.", failure.operation()).into(),
-            monitor, first_affected, detected: None,
+            remedy: None, monitor, first_affected, detected: None,
         }
     }
 
@@ -74,7 +78,7 @@ impl FaultReport {
     }
 
     pub(crate) fn error(&self) -> CaptureError {
-        CaptureError::from_fault(self.kind, self.failure, self.message.to_string())
+        CaptureError::from_fault(self.kind, self.failure, self.message.to_string()).with_remedy(self.remedy)
     }
 }
 
@@ -93,6 +97,7 @@ pub(crate) struct FaultLog {
     reports: Vec<FaultReport>,
     attempt_reports: usize,
     omitted: u64,
+    omitted_causes: Vec<Failure>,
 }
 
 impl FaultLog {
@@ -107,7 +112,7 @@ impl FaultLog {
                     return None;
                 }
                 if self.attempt_reports == MAX_ATTEMPT_REPORTS {
-                    self.omitted = self.omitted.saturating_add(1);
+                    self.omit(report.failure);
                     return None;
                 }
                 self.attempt_reports += 1;
@@ -122,6 +127,17 @@ impl FaultLog {
                 Some(degraded)
             }
         }
+    }
+
+    /// Count an attempt cause beyond the retained bound once, like a retained one.
+    fn omit(&mut self, failure: Failure) {
+        if self.omitted_causes.iter().any(|old| old.same_cause(&failure)) {
+            return;
+        }
+        if self.omitted_causes.len() < MAX_OMITTED_CAUSES {
+            self.omitted_causes.push(failure);
+        }
+        self.omitted = self.omitted.saturating_add(1);
     }
 
     pub(crate) fn attempt_failure(&self) -> Option<&FaultReport> {

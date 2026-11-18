@@ -14,7 +14,15 @@ use windows::{
     core::Interface,
 };
 
-use super::{ProbeError, encode, pixels, stage, unavailable};
+use super::{ProbeError, encode, pixels, stage, unavailable, video};
+
+/// The picture in conversion, which the converter itself holds.
+const IN_CONVERSION: usize = 1;
+/// Converted pictures that can be in use at once: those the video worker's
+/// slot selection holds, those queued to it, the encoder's inputs in flight
+/// and the one in conversion. Each converter allocates up to this many NV12
+/// surfaces, or keeps this many software pictures, on demand.
+const VIDEO_INPUTS: usize = video::SELECTION_FRAMES + video::OBSERVATION_QUEUE + encode::MAX_INPUTS + IN_CONVERSION;
 
 #[derive(Clone, Copy)]
 pub(super) struct VideoFormat {
@@ -49,6 +57,11 @@ impl VideoFormat {
         } else {
             8_000_000
         }
+    }
+
+    /// The configured mean bitrate: three quarters of the peak.
+    pub(super) fn mean_bitrate(self) -> u32 {
+        self.bitrate() * 3 / 4
     }
 }
 
@@ -146,7 +159,7 @@ impl Converter {
             return Err(unavailable("The WGC frame size changed during recording"));
         }
         self.memory.retain(|entry| entry.strong_count() != 0);
-        if self.memory.len() == 3 {
+        if self.memory.len() >= VIDEO_INPUTS {
             return Ok(None);
         }
         let fence_value = self.next_fence.checked_add(1)
@@ -180,7 +193,10 @@ impl Converter {
             pInputSurface: ManuallyDrop::new(Some(input_view)),
             ..Default::default()
         };
-        // Views refer to resources on this device. The caller holds the WGC frame lease.
+        // Both views were created above on this device, and `stream` owns the
+        // input view, which is released once after the call. The caller keeps
+        // `source` alive across the call; the GPU orders later writes to it
+        // behind this blit on the same immediate context.
         let blit = unsafe {
             let result = self.video_context.VideoProcessorBlt(&self.processor, &output_view, 0, std::slice::from_ref(&stream));
             ManuallyDrop::drop(&mut stream.pInputSurface);
@@ -227,8 +243,7 @@ impl Converter {
         if let Some(texture) = self.textures.iter().find(|texture| Arc::strong_count(texture) == 1) {
             return Ok(Some(Arc::clone(texture)));
         }
-        const VIDEO_TEXTURES: usize = 3;
-        if self.textures.len() == VIDEO_TEXTURES {
+        if self.textures.len() >= VIDEO_INPUTS {
             return Ok(None);
         }
         let texture = Arc::new(create_nv12_texture(&self.device, self.format.encoded, self.staging.is_none())?);

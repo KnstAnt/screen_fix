@@ -28,13 +28,16 @@ use windows::{
 
 use crate::{capture::frame::CaptureColor, protocol::QpcTick};
 
-use super::{ProbeError, clock, stage, unavailable};
+use super::{ProbeError, ProbeKind, clock, stage, unavailable};
 
 const POOL_BUFFERS: i32 = 3;
-const CREATE_POOL: &str = "Create the free-threaded WGC frame pool";
-const CREATE_SESSION: &str = "Create the WGC session";
-const START_SESSION: &str = "Start WGC capture";
-const RECREATE_POOL: &str = "Recreate the WGC frame pool";
+/// `AsyncStatus::Started` and `AsyncStatus::Completed` of the access request.
+/// The status type lives in a crate this package does not depend on.
+const ASYNC_STARTED: i32 = 0;
+const ASYNC_COMPLETED: i32 = 1;
+/// The startup wait for the borderless capture access decision.
+const BORDERLESS_ACCESS_WAIT: Duration = Duration::from_secs(2);
+const BORDERLESS_ACCESS_POLL: Duration = Duration::from_millis(10);
 
 /// Start capture in the monitor's color mode. HDR is tone-mapped from FP16
 /// only with a known SDR white level; otherwise, or when FP16 is rejected,
@@ -61,10 +64,15 @@ pub(super) fn start_monitor(
     Ok((capture, color, fallback))
 }
 
+/// A pool or session setup call, whose rejection may be format evidence.
+fn setup<T>(result: windows::core::Result<T>, name: &'static str) -> Result<T, ProbeError> {
+    stage(result, name).map_err(|error| error.with_kind(ProbeKind::CaptureSetup))
+}
+
 fn format_rejection(error: &ProbeError) -> Option<i32> {
     let code = error.source.as_ref()?.code();
     // Never treat device removal, callback and permission failures as format evidence.
-    (matches!(error.stage, CREATE_POOL | CREATE_SESSION | START_SESSION | RECREATE_POOL)
+    (error.kind() == ProbeKind::CaptureSetup
         && matches!(code, E_INVALIDARG | E_NOTIMPL | DXGI_ERROR_UNSUPPORTED)).then_some(code.0)
 }
 
@@ -89,8 +97,8 @@ impl Capture {
         let dxgi: IDXGIDevice = stage(device.cast(), "Get the DXGI device")?;
         let winrt = stage(unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }, "Create the WinRT capture device")?;
         let device: IDirect3DDevice = stage(winrt.cast(), "Get the WinRT D3D11 interface")?;
-        let pool = stage(Direct3D11CaptureFramePool::CreateFreeThreaded(&device, format, POOL_BUFFERS, size),
-            CREATE_POOL)?;
+        let pool = setup(Direct3D11CaptureFramePool::CreateFreeThreaded(&device, format, POOL_BUFFERS, size),
+            "Create the free-threaded WGC frame pool")?;
         let mut capture = Self {
             item, pool, session: None, device, arrival_token: None, closed_token: None,
             item_closed: Arc::new(AtomicBool::new(false)), size, border_visible: true, pool_closed: false,
@@ -112,14 +120,14 @@ impl Capture {
                 Ok(())
             })
         ), "Subscribe to WGC item closure")?);
-        let session = stage(capture.pool.CreateCaptureSession(&capture.item), CREATE_SESSION)?;
+        let session = setup(capture.pool.CreateCaptureSession(&capture.item), "Create the WGC session")?;
         capture.session = Some(session);
         let session = capture.session.as_ref().ok_or_else(|| unavailable("The WGC session is unavailable"))?;
         stage(session.SetIsCursorCaptureEnabled(false), "Disable WGC cursor capture")?;
         if borderless_allowed && session.SetIsBorderRequired(false).is_ok() {
             capture.border_visible = false;
         }
-        stage(session.StartCapture(), START_SESSION)?;
+        setup(session.StartCapture(), "Start WGC capture")?;
         Ok(capture)
     }
 
@@ -167,7 +175,7 @@ impl Capture {
 
     fn recreate(&mut self, size: SizeInt32, format: DirectXPixelFormat) -> Result<(), ProbeError> {
         // BorrowedFrame never escapes a single capture-thread iteration.
-        stage(self.pool.Recreate(&self.device, format, POOL_BUFFERS, size), RECREATE_POOL)?;
+        setup(self.pool.Recreate(&self.device, format, POOL_BUFFERS, size), "Recreate the WGC frame pool")?;
         self.size = size;
         Ok(())
     }
@@ -263,11 +271,11 @@ pub(super) fn request_borderless() -> bool {
         return false;
     };
     // The user or OS may never grant access. Bound the startup wait on this worker.
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + BORDERLESS_ACCESS_WAIT;
     loop {
         match request.Status() {
-            Ok(status) if status.0 == 0 && Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(status) if status.0 == 1 => return request.GetResults().is_ok_and(|status| status == AppCapabilityAccessStatus::Allowed),
+            Ok(status) if status.0 == ASYNC_STARTED && Instant::now() < deadline => thread::sleep(BORDERLESS_ACCESS_POLL),
+            Ok(status) if status.0 == ASYNC_COMPLETED => return request.GetResults().is_ok_and(|status| status == AppCapabilityAccessStatus::Allowed),
             _ => {
                 let _ = request.Cancel();
                 return false;

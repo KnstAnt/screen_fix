@@ -1,4 +1,4 @@
-use screen_fix_protocol::ipc::{GapCause, HelperToCore, Producer, ProducerGap, Receipt};
+use screen_fix_protocol::ipc::{EnvironmentState, GapCause, HelperToCore, Producer, ProducerGap, Receipt};
 
 /// Pending gaps of one producer kept apart by cause before they merge.
 const MAX_PENDING: usize = 8;
@@ -12,16 +12,29 @@ pub struct Losses([Vec<ProducerGap>; Producer::ALL.len()]);
 
 impl Losses {
     /// The earliest pending gap of the producer, which is delivered first.
-    pub fn front(&self, producer: Producer) -> Option<ProducerGap> {
+    fn front(&self, producer: Producer) -> Option<ProducerGap> {
         self.0[producer.index()].first().copied()
     }
 
     /// Remove the front gap after it was delivered.
-    pub fn delivered(&mut self, producer: Producer) {
+    fn delivered(&mut self, producer: Producer) {
         let pending = &mut self.0[producer.index()];
         if !pending.is_empty() {
             pending.remove(0);
         }
+    }
+
+    /// Deliver the producer's pending gaps in order through `send`, which
+    /// reports whether the queue accepted one. `false` when a gap is still
+    /// pending: a record of the producer must not overtake it.
+    pub fn flush<E>(
+        &mut self, producer: Producer, mut send: impl FnMut(ProducerGap) -> Result<bool, E>,
+    ) -> Result<bool, E> {
+        while let Some(gap) = self.front(producer) {
+            if !send(gap)? { return Ok(false); }
+            self.delivered(producer);
+        }
+        Ok(true)
     }
 
     pub fn drop_record(&mut self, record: &HelperToCore) {
@@ -75,6 +88,61 @@ fn gap(producer: Producer, cause: GapCause, receipt: Receipt) -> ProducerGap {
         producer, cause,
         first_sequence: receipt.sequence, last_sequence: receipt.sequence,
         first_qpc: receipt.qpc, last_qpc: receipt.qpc,
+    }
+}
+
+/// Status records waiting for queue room: the latest environment state, which
+/// accumulates the changes of the states it replaced, and the
+/// optional-collection notices in arrival order. `defer` keeps every notice;
+/// the producer reports each lost collection once.
+#[derive(Default)]
+pub struct PendingStatus {
+    environment: Option<EnvironmentState>,
+    notices: Vec<HelperToCore>,
+}
+
+impl PendingStatus {
+    /// Queue a status record behind the pending ones. A record that is not a
+    /// status record is returned.
+    pub fn defer(&mut self, record: HelperToCore) -> Result<(), HelperToCore> {
+        match record {
+            HelperToCore::Environment(mut state) => {
+                if let Some(pending) = self.environment.take() {
+                    state.changes |= pending.changes;
+                }
+                self.environment = Some(state);
+            }
+            HelperToCore::OptionalUnavailable { .. } => self.notices.push(record),
+            record => return Err(record),
+        }
+        Ok(())
+    }
+
+    /// Drop a pending environment state that no longer applies.
+    pub fn discard_environment(&mut self) {
+        self.environment = None;
+    }
+
+    /// Deliver the pending records through `send`, which reports whether the
+    /// queue accepted one: the environment state first, then the notices in
+    /// arrival order. The merged state has no single arrival position, so it
+    /// may precede notices deferred before it. `false` when a record is still
+    /// pending.
+    pub fn flush<E>(&mut self, mut send: impl FnMut(HelperToCore) -> Result<bool, E>) -> Result<bool, E> {
+        if let Some(state) = self.environment {
+            if !send(HelperToCore::Environment(state))? { return Ok(false); }
+            self.environment = None;
+        }
+        while let Some(notice) = self.notices.first() {
+            if !send(notice.clone())? { return Ok(false); }
+            self.notices.remove(0);
+        }
+        Ok(true)
+    }
+
+    /// The records still pending when their producer stopped.
+    pub fn finish(self) -> impl Iterator<Item = HelperToCore> {
+        self.environment.map(HelperToCore::Environment).into_iter().chain(self.notices)
     }
 }
 

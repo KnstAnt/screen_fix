@@ -6,8 +6,9 @@ use std::collections::BTreeMap;
 
 use screen_fix_protocol::{
     BoundedList, DeviceId,
-    ipc::{DecodedHidReport, DeviceDescriptor, DeviceKind, HidAngleReading, HidCollectionEvidence, HidField, HidFieldDeclaration,
-        HidProfile, HidReport, HidReportResult, HidUsage, HidValue, HidValueSpec, TouchpadCapabilities,
+    ipc::{DecodedHidReport, DeviceDescriptor, EXTERNAL_PEN_USAGE, HidAngleReading, HidCollectionEvidence, HidField, HidFieldDeclaration,
+        HidProfile, HidReport, HidReportResult, HidUsage, HidValue, HidValueSpec, INTEGRATED_PEN_USAGE, OptionalCollection,
+        TouchpadCapabilities, is_pen_usage,
         MAX_HID_FIELDS, MAX_HID_REPORT_BYTES, MAX_INPUT_DEVICES},
 };
 use windows_sys::Win32::{
@@ -35,12 +36,12 @@ pub(super) struct HidCollections {
 
 impl HidCollections {
     pub(super) fn observe(&mut self, handle: HANDLE, descriptor: &mut DeviceDescriptor, pen_enabled: bool) {
-        let DeviceKind::Hid { usage_page, usage } = descriptor.kind else { return };
-        let profile = match (usage_page, usage) {
-            (0x0D, 1) if pen_enabled => HidProfile::ExternalPen,
-            (0x0D, 2) if pen_enabled => HidProfile::IntegratedPen,
-            (0x0D, 5) => HidProfile::PrecisionTouchpad,
-            (1, 8) => HidProfile::UnsupportedMultiAxisController,
+        let Some(usage) = descriptor.kind.hid_usage() else { return };
+        let profile = match (usage, OptionalCollection::from_usage(usage)) {
+            (EXTERNAL_PEN_USAGE, _) if pen_enabled => HidProfile::ExternalPen,
+            (INTEGRATED_PEN_USAGE, _) if pen_enabled => HidProfile::IntegratedPen,
+            (_, Some(OptionalCollection::Touchpad)) => HidProfile::PrecisionTouchpad,
+            (_, Some(OptionalCollection::MultiAxis)) => HidProfile::UnsupportedMultiAxisController,
             _ => return,
         };
         let collection = if self.devices.contains_key(&descriptor.id) || self.devices.len() < MAX_INPUT_DEVICES {
@@ -98,11 +99,7 @@ impl HidCollections {
             return;
         };
         let usage = (collection.caps.UsagePage, collection.caps.Usage);
-        let accepted = match usage {
-            (0x0D, 1 | 2) => pen_enabled,
-            (0x0D, 5) | (1, 8) => true,
-            _ => false,
-        };
+        let accepted = if is_pen_usage(usage) { pen_enabled } else { OptionalCollection::from_usage(usage).is_some() };
         if !accepted {
             emit(report(device, Some(usage), 0, HidReportResult::UnsupportedCollection));
             return;
@@ -141,7 +138,7 @@ impl Collection {
         if status as u32 != HIDP_STATUS_SUCCESS as u32 {
             return None;
         }
-        let multiaxis = (caps.UsagePage, caps.Usage) == (1, 8);
+        let multiaxis = (caps.UsagePage, caps.Usage) == OptionalCollection::MultiAxis.usage();
         let mut collection = Self { preparsed, caps, fields: Vec::new(), known_report_ids: [false; 256], ndof: None };
         if multiaxis {
             let mut bytes = std::mem::size_of::<RID_DEVICE_INFO>() as u32;
@@ -178,7 +175,7 @@ impl Collection {
         ) } as u32 != HIDP_STATUS_SUCCESS as u32 {
             return None;
         }
-        let touchpad = (self.caps.UsagePage, self.caps.Usage) == (0x0D, 5);
+        let touchpad = (self.caps.UsagePage, self.caps.Usage) == OptionalCollection::Touchpad.usage();
         for cap in values.get(..usize::from(value_count))? {
             self.known_report_ids[usize::from(cap.ReportID)] = true;
             if cap.IsAlias {
@@ -237,7 +234,7 @@ impl Collection {
 
     fn accepts_length(&self, length: usize) -> bool {
         let maximum = usize::from(self.caps.InputReportByteLength);
-        if (self.caps.UsagePage, self.caps.Usage) == (1, 8) {
+        if (self.caps.UsagePage, self.caps.Usage) == OptionalCollection::MultiAxis.usage() {
             (2..=maximum).contains(&length)
         } else {
             length == maximum
@@ -245,7 +242,7 @@ impl Collection {
     }
 
     fn decode(&self, bytes: &[u8]) -> HidReportResult {
-        if (self.caps.UsagePage, self.caps.Usage) == (1, 8) {
+        if (self.caps.UsagePage, self.caps.Usage) == OptionalCollection::MultiAxis.usage() {
             return self.ndof.and_then(|profile| profile.decode(bytes))
                 .map_or(HidReportResult::UnsupportedReport, HidReportResult::Ndof);
         }

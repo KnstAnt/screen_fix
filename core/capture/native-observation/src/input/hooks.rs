@@ -10,7 +10,7 @@ use std::{
     ptr::{null, null_mut},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Relaxed, Release}},
+        atomic::{AtomicBool, AtomicU64, Ordering::{AcqRel, Acquire, Relaxed, Release}},
         mpsc,
     },
     thread,
@@ -47,15 +47,38 @@ static PROGRESS_PENDING: AtomicBool = AtomicBool::new(false);
 
 static KEYBOARD: HookRing = HookRing::new();
 static POINTER: HookRing = HookRing::new();
+/// Set while one owner holds the static rings, which have a single writer
+/// and a single reader.
+static RINGS_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+/// The exclusive claim on the static rings, released on drop.
+struct RingClaim;
+
+impl RingClaim {
+    fn acquire() -> Result<Self, NativeError> {
+        if RINGS_CLAIMED.swap(true, AcqRel) {
+            return Err(NativeError::without_code(HelperFailureStage::Startup));
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for RingClaim {
+    fn drop(&mut self) {
+        RINGS_CLAIMED.store(false, Release);
+    }
+}
 
 pub(super) struct Hooks {
     thread_id: u32,
     owner: thread::JoinHandle<Result<(), NativeError>>,
     governed: bool,
+    claim: RingClaim,
 }
 
 impl Hooks {
     pub(super) fn start(scope: Option<Arc<CaptureScope>>) -> Result<Self, NativeError> {
+        let claim = RingClaim::acquire()?;
         KEYBOARD.reset();
         POINTER.reset();
         PROGRESS_PENDING.store(false, Release);
@@ -68,7 +91,7 @@ impl Hooks {
                 raw_input_registration: None,
             })?;
         match initialized.recv_timeout(Duration::from_secs(2)) {
-            Ok(Ok(thread_id)) => Ok(Self { thread_id, owner, governed }),
+            Ok(Ok(thread_id)) => Ok(Self { thread_id, owner, governed, claim }),
             result => {
                 drop(initialized);
                 if governed { let _ = owner.join(); }
@@ -120,11 +143,14 @@ impl Hooks {
             return Err(error);
         }
         self.owner.join().map_err(|_| NativeError::without_code(HelperFailureStage::MessageLoop))??;
-        Ok(ClosedHooks)
+        Ok(ClosedHooks { _claim: self.claim })
     }
 }
 
-pub(super) struct ClosedHooks;
+/// The rings of joined hooks, still claimed until they are drained.
+pub(super) struct ClosedHooks {
+    _claim: RingClaim,
+}
 
 impl ClosedHooks {
     pub(super) fn read(&mut self, producer: Producer) -> Option<(HelperToCore, Option<HookForeground>)> {

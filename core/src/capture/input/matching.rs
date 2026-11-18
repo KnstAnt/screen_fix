@@ -118,22 +118,19 @@ impl InputGap {
 
     /// Merge a loss with the same producer and reason.
     pub fn merge(self, other: Self) -> Self {
-        Self {
-            first: self.first.min(other.first), last: self.last.max(other.last),
-            count: self.count.merge(other.count),
-            source_seq: merge_bounds(self.source_seq, other.source_seq),
-            qpc: merge_bounds(self.qpc, other.qpc),
-            ..self
-        }
+        let LossRange { first_t_us, last_t_us, source_seq, qpc } = self.range().merge(other.range());
+        Self { first: first_t_us, last: last_t_us, count: self.count.merge(other.count), source_seq, qpc, ..self }
     }
 
     pub fn evidence(&self) -> LossEvidence {
         LossEvidence {
             reason: self.reason, producer: Some(self.producer.into()), count: self.count,
-            scope: LossScope::Ordinary(LossRange {
-                first_t_us: self.first, last_t_us: self.last, source_seq: self.source_seq, qpc: self.qpc,
-            }),
+            scope: LossScope::Ordinary(self.range()),
         }
+    }
+
+    fn range(&self) -> LossRange {
+        LossRange { first_t_us: self.first, last_t_us: self.last, source_seq: self.source_seq, qpc: self.qpc }
     }
 }
 
@@ -870,19 +867,12 @@ pub(crate) enum ProvisionalInputChange {
 
 fn promoted_tip(input: &PendingInput) -> Option<bool> {
     let InputSample::HookPointer(hook) = input.packet.sample else { return None };
-    if !promoted(hook.extra_information) || hook.extra_information & 0x80 != 0 {
+    if !promoted(hook.extra_information) || hook.extra_information & u64::from(PROMOTED_TOUCH) != 0 {
         return None;
     }
     match input.action {
         Action::Button { logical: Button::Left, down, .. } => Some(down),
         _ => None,
-    }
-}
-
-fn merge_bounds<T: Ord + Copy>(left: Option<[T; 2]>, right: Option<[T; 2]>) -> Option<[T; 2]> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some([left[0].min(right[0]), left[1].max(right[1])]),
-        (range, None) | (None, range) => range,
     }
 }
 
@@ -969,8 +959,18 @@ fn unqualified(sample: &InputSample) -> bool {
     }
 }
 
+/// `MI_WP_SIGNATURE`: the pen and touch promotion signature in the extra
+/// information of a promoted mouse message, under `PROMOTION_SIGNATURE_MASK`.
+const PROMOTION_SIGNATURE: u64 = 0xff51_5700;
+const PROMOTION_SIGNATURE_MASK: u64 = 0xffff_ff00;
+/// In the low byte of a promoted message's extra information: set for touch, clear for pen.
+pub(crate) const PROMOTED_TOUCH: u8 = 0x80;
+/// In the low byte of a promoted message's extra information: the pen or touch cursor id.
+pub(crate) const PROMOTED_CURSOR_ID: u8 = 0x7f;
+
+/// A mouse message Windows promoted from pen or touch input.
 pub(crate) fn promoted(extra: u64) -> bool {
-    extra & 0xffff_ff00 == 0xff51_5700
+    extra & PROMOTION_SIGNATURE_MASK == PROMOTION_SIGNATURE
 }
 
 fn same_order_class(a: Action, b: Action) -> bool {

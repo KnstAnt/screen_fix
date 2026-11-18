@@ -1,8 +1,16 @@
 //! The focus window that keyboard layout and focus evidence are read from.
 
+use std::{mem::size_of, num::NonZeroU32};
+
 use windows_sys::Win32::{
     Foundation::{GetLastError, HWND, SetLastError},
-    UI::WindowsAndMessaging::{ES_PASSWORD, GUITHREADINFO, GWL_STYLE, GetClassNameW, GetWindowLongW},
+    UI::{
+        Input::KeyboardAndMouse::{GetKeyboardLayout, HKL},
+        WindowsAndMessaging::{
+            ES_PASSWORD, GUITHREADINFO, GWL_STYLE, GetClassNameW, GetGUIThreadInfo, GetWindowLongW,
+            GetWindowThreadProcessId,
+        },
+    },
 };
 
 /// ES_PASSWORD on an Edit or RichEdit window. The style bit means nothing on
@@ -41,4 +49,29 @@ pub fn focus_window(gui: &GUITHREADINFO) -> Option<FocusWindow> {
     } else {
         None
     }
+}
+
+/// The focus window of GUI thread `thread` when process `pid` owns it.
+pub struct FocusAt {
+    pub gui: GUITHREADINFO,
+    pub window: FocusWindow,
+    /// The thread that owns the focus window.
+    pub thread: NonZeroU32,
+    /// That thread's keyboard layout; never null.
+    pub keyboard_layout: HKL,
+}
+
+pub fn focus_at(thread: NonZeroU32, pid: NonZeroU32) -> Option<FocusAt> {
+    let mut gui = GUITHREADINFO { cbSize: size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+    if unsafe { GetGUIThreadInfo(thread.get(), &mut gui) } == 0 {
+        return None;
+    }
+    let window = focus_window(&gui)?;
+    let mut owner = 0;
+    let thread = NonZeroU32::new(unsafe { GetWindowThreadProcessId(window.hwnd, &mut owner) })?;
+    if owner != pid.get() {
+        return None;
+    }
+    let keyboard_layout = unsafe { GetKeyboardLayout(thread.get()) };
+    (!keyboard_layout.is_null()).then_some(FocusAt { gui, window, thread, keyboard_layout })
 }

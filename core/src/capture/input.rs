@@ -42,7 +42,7 @@ pub(crate) struct PendingInput {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum InputOrigin {
+pub(crate) enum InputOrigin {
     Hardware,
     Touchpad,
     PenPromoted,
@@ -52,7 +52,7 @@ pub enum InputOrigin {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub struct PointerEvidence {
+pub(crate) struct PointerEvidence {
     pub origin: InputOrigin,
     pub device: Evidence<DeviceId>,
     pub monitor: Evidence<MonitorId>,

@@ -17,17 +17,21 @@ const THUMB_WIDTH: u32 = 256;
 const THUMB_HEIGHT: u32 = 144;
 const THUMB_SLOTS: usize = 3;
 
-const DRAW: &str = r#"
+const COVER: &str = r#"
 float4 cover(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2((id << 1) & 2, id & 2);
     return float4(uv.x * 2 - 1, 1 - uv.y * 2, 0, 1);
 }
+"#;
+
+/// The thumbnail luma shader; `luma_shader` defines its target size.
+const LUMA: &str = r#"
 Texture2D<float4> source_pixels : register(t0);
 float luma(float4 position : SV_Position) : SV_Target {
     uint2 source_size;
     source_pixels.GetDimensions(source_size.x, source_size.y);
     uint2 cell = uint2(position.xy);
-    uint2 target_size = uint2(256, 144);
+    uint2 target_size = uint2(THUMB_WIDTH, THUMB_HEIGHT);
     uint2 begin = cell * source_size / target_size;
     uint2 end = max(begin + 1, (cell + 1) * source_size / target_size);
     float sum = 0;
@@ -52,7 +56,7 @@ impl Painter {
         let mut deferred = None;
         stage(unsafe { device.CreateDeferredContext(0, Some(&mut deferred)) }, "Create the capture shader context")?;
         let deferred = deferred.ok_or_else(|| unavailable("D3D11 did not return the capture shader context"))?;
-        let bytecode = compile(DRAW, s!("cover"), s!("vs_5_0"))?;
+        let bytecode = compile(COVER, s!("cover"), s!("vs_5_0"))?;
         let mut cover = None;
         stage(unsafe { device.CreateVertexShader(blob(&bytecode), None::<&ID3D11ClassLinkage>, Some(&mut cover)) },
             "Create the full-screen capture vertex shader")?;
@@ -173,6 +177,11 @@ impl Drop for Mapped<'_> {
     }
 }
 
+/// The luma shader with the thumbnail size it renders.
+fn luma_shader() -> String {
+    format!("#define THUMB_WIDTH {THUMB_WIDTH}\n#define THUMB_HEIGHT {THUMB_HEIGHT}\n{LUMA}")
+}
+
 pub(super) struct Thumbnails {
     shader: ID3D11PixelShader,
     target: ID3D11Texture2D,
@@ -183,7 +192,7 @@ pub(super) struct Thumbnails {
 
 impl Thumbnails {
     pub fn new(device: &ID3D11Device, painter: &Painter) -> Result<Self, ProbeError> {
-        let shader = painter.pixel(DRAW, s!("luma"))?;
+        let shader = painter.pixel(&luma_shader(), s!("luma"))?;
         let target = texture(device, THUMB_WIDTH, THUMB_HEIGHT, DXGI_FORMAT_R8_UNORM, D3D11_BIND_RENDER_TARGET.0 as u32, false)?;
         let mut available = Vec::with_capacity(THUMB_SLOTS);
         for _ in 0..THUMB_SLOTS {

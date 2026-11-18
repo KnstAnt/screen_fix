@@ -3,22 +3,24 @@ use std::{collections::VecDeque, num::NonZeroU64, time::{Duration, Instant}};
 use screen_fix_elevated::{Failure, READINESS, Result, foreground_access, ForegroundAccess};
 use screen_fix_protocol::{AdmissionEpoch, FocusGeneration, GeometryId, QpcFrequency, QpcTick, RequestId, ipc::{
     FocusAtReceipt, InputRegistration, ProducerGap,
-    elevated::{ContextEvidence, HeldSnapshot, Query, ReadBinding, ReadOutcome, ReadUnavailable, VisitBinding,
+    elevated::{ContextEvidence, GrantedInput, HeldSnapshot, Query, ReadBinding, ReadOutcome, ReadUnavailable, VisitBinding,
         runtime::{Activation, ContextCommand, Control, CoverageLoss, CoverageReason, GrantRequest, HeldReadiness,
             IdentityClaim, Observation, Revocation, Status, Transition}},
 }};
 
-use super::peer::{LeaseState, Peer, Progress};
-use super::super::context::identity::WindowProcess;
+use super::{CLEANUP, peer::{LeaseState, Peer, Progress}};
+use super::super::context::{elevated_focus_matches, identity::WindowProcess};
 use crate::session::windows::SourceDispatch;
 
 const HELD_BUDGET: Duration = Duration::from_millis(250);
 const HELD_RETRY: Duration = Duration::from_millis(100);
 const OPTIONAL_READ_CAPACITY: usize = 32;
 const REJECT_RETENTION: Duration = Duration::from_secs(1);
+/// How long a Prepare's grant request stays valid at the collector.
+const PREPARE_EXPIRY: Duration = Duration::from_secs(1);
 
 pub(super) struct Host {
-    pub(super) peer: Peer,
+    peer: Peer,
     lease: LeaseState,
     frequency: QpcFrequency,
     configured: bool,
@@ -89,6 +91,20 @@ impl Host {
         })
     }
 
+    /// No lane failed and the connection was not cancelled.
+    pub(super) fn live(&self) -> bool { self.peer.live() }
+
+    pub(super) fn send_stop(&self, before_qpc: QpcTick, cleanup_deadline_qpc: QpcTick) -> Result<()> {
+        self.peer.send(Control::Stop { before_qpc, cleanup_deadline_qpc: Some(cleanup_deadline_qpc) })
+    }
+
+    pub(super) fn next_status(&self) -> Result<Option<Status>> { self.peer.status() }
+
+    pub(super) fn next_observation(&self) -> Result<Option<(QpcTick, Observation)>> { self.peer.observation() }
+
+    /// The next input record; `Some(None)` is a record whose payload did not decode (E3).
+    pub(super) fn next_input(&self) -> Result<Option<Option<GrantedInput>>> { self.peer.input() }
+
     pub(super) fn binding(&self) -> Option<VisitBinding> {
         self.grant.as_ref().map(|grant| grant.binding)
     }
@@ -121,7 +137,7 @@ impl Host {
             grant.closing_before = Some(grant.closing_before.map_or(before, |previous| previous.min(before)));
             if matches!(grant.phase, Phase::Closing) { return; }
             grant.phase = Phase::Closing;
-            grant.deadline = Instant::now() + Duration::from_millis(750);
+            grant.deadline = Instant::now() + CLEANUP;
         }
     }
 
@@ -168,7 +184,7 @@ impl Host {
             foreground: claim.target, focus_generation: FocusGeneration(focus_generation.get()),
             focus_revision: witness.focus_revision, resync_revision: NonZeroU64::MIN,
         };
-        let expires_qpc = add_time(progress.now, self.frequency, Duration::from_secs(1))?;
+        let expires_qpc = add_time(progress.now, self.frequency, PREPARE_EXPIRY)?;
         let sent = authorization.with_closed_phase(|| self.lease.renew(&self.peer, progress, None,
             Some(|lease: screen_fix_protocol::ipc::elevated::runtime::Lease| {
                 Control::Prepare(GrantRequest { foreground: claim.clone(), visit: binding, geometry, lease: lease.sequence, expires_qpc })
@@ -396,7 +412,7 @@ impl Host {
             Status::Invalidated { visit, before_qpc, reason } if visit == binding && before_qpc <= now => {
                 grant.closing_before = Some(grant.closing_before.map_or(before_qpc, |previous| previous.min(before_qpc)));
                 if !matches!(grant.phase, Phase::Closing) {
-                    grant.deadline = Instant::now() + Duration::from_millis(750);
+                    grant.deadline = Instant::now() + CLEANUP;
                 }
                 grant.phase = Phase::Closing;
                 return Ok(Change::Invalidated { binding, before: before_qpc, reason });
@@ -564,19 +580,17 @@ fn foreground_is(claim: &IdentityClaim) -> bool {
 }
 
 fn focus_current(binding: VisitBinding, focus: FocusAtReceipt) -> bool {
-    use screen_fix_native_observation::windows::FocusSnapshot;
     use screen_fix_protocol::ipc::elevated::WindowInstance;
-    let Some(window) = WindowProcess::foreground().filter(|window| WindowInstance::from(*window) == binding.foreground)
-        else { return false; };
-    FocusSnapshot::read(window).is_some_and(|observed| observed.matches_identity(focus)
-        && observed.focus.password_style.is_none_or(|local| focus.password_style == Some(local)))
+    WindowProcess::foreground().filter(|window| WindowInstance::from(*window) == binding.foreground)
+        .is_some_and(|window| elevated_focus_matches(window, focus))
 }
 
 fn next(previous: u64) -> Result<NonZeroU64> {
     previous.checked_add(1).and_then(NonZeroU64::new).ok_or(Failure::Protocol)
 }
 
-pub(super) fn add_time(at: QpcTick, frequency: QpcFrequency, duration: Duration) -> Result<QpcTick> {
+/// `at` plus `duration`, at least one tick later.
+pub(in crate::platform::windows) fn add_time(at: QpcTick, frequency: QpcFrequency, duration: Duration) -> Result<QpcTick> {
     let delta = duration.as_nanos().checked_mul(u128::from(frequency.0.get())).ok_or(Failure::Protocol)? / 1_000_000_000;
     let delta = i64::try_from(delta).map_err(|_| Failure::Protocol)?;
     at.0.checked_add(delta.max(1)).map(QpcTick).ok_or(Failure::Protocol)

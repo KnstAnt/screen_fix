@@ -3,7 +3,7 @@ use std::{
     num::NonZeroU64,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::{AcqRel, Acquire, Release}},
+        atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Release}},
         mpsc::{self, Receiver, SyncSender},
     },
     thread::{self, JoinHandle},
@@ -26,7 +26,9 @@ use screen_fix_protocol::{
 };
 
 use crate::{deadline::CLEANUP, win::{Failure, Result}};
-use super::{grant::Grant, outbox::Outbox, lifetime::{ProviderKind, qpc}, witness::{Foreground, Target}};
+use super::{
+    AtomicState, State, grant::Grant, outbox::Outbox, lifetime::{ProviderKind, qpc}, witness::{Foreground, Target},
+};
 
 const POLL: Duration = Duration::from_millis(4);
 const UIA_BUDGET: Duration = Duration::from_millis(500);
@@ -53,18 +55,76 @@ impl SeenWindows {
 
 /// Who resolves a pending read: its worker, its delivery after hand-off, or
 /// the owner after the request deadline (E2). Exactly one result leaves.
-const RUNNING: u8 = 0;
-const HANDED_OFF: u8 = 1;
-const TIMED_OUT: u8 = 2;
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadState {
+    Running,
+    HandedOff,
+    TimedOut,
+}
+
+impl State for ReadState {
+    const ALL: &'static [Self] = &[Self::Running, Self::HandedOff, Self::TimedOut];
+
+    fn raw(self) -> u8 { self as u8 }
+}
+
+/// The one pending read each query kind can have.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Focus,
+    Pointer,
+    ImeFocus,
+    ImeKey,
+    Window,
+    NativeFocus,
+    Hung,
+    ClipboardFence,
+}
+
+impl Slot {
+    const ALL: [Self; 8] = [
+        Self::Focus, Self::Pointer, Self::ImeFocus, Self::ImeKey,
+        Self::Window, Self::NativeFocus, Self::Hung, Self::ClipboardFence,
+    ];
+    /// The IME worker's queue holds one job per IME slot.
+    const IME: usize = {
+        let mut count = 0;
+        let mut index = 0;
+        while index < Self::ALL.len() {
+            if Self::ALL[index].ime() { count += 1; }
+            index += 1;
+        }
+        count
+    };
+
+    fn of(query: &Query) -> Option<Self> {
+        Some(match query {
+            Query::Focus { .. } => Self::Focus,
+            Query::Pointer { .. } => Self::Pointer,
+            Query::ImeFocus { .. } => Self::ImeFocus,
+            Query::ImeKey { .. } => Self::ImeKey,
+            Query::Window(_) => Self::Window,
+            Query::NativeFocus(_) => Self::NativeFocus,
+            Query::Hung(_) => Self::Hung,
+            Query::ClipboardFence(_) => Self::ClipboardFence,
+            Query::Held(_) => return None,
+        })
+    }
+
+    const fn ime(self) -> bool { matches!(self, Self::ImeFocus | Self::ImeKey) }
+
+    fn index(self) -> usize { self as usize }
+}
 
 #[derive(Clone)]
 struct Pending {
     read: ReadBinding,
     cancelled: Arc<AtomicBool>,
-    state: Arc<AtomicU8>,
+    state: Arc<AtomicState<ReadState>>,
 }
 
-type PendingReads = Arc<Mutex<[Option<Pending>; 8]>>;
+type PendingReads = Arc<Mutex<[Option<Pending>; Slot::ALL.len()]>>;
 
 #[derive(Default)]
 struct Proof {
@@ -82,7 +142,7 @@ pub(super) enum Delivery {
 pub(super) struct ReadDelivery {
     pending: Pending,
     slots: PendingReads,
-    slot: usize,
+    slot: Slot,
     proof: Proof,
 }
 
@@ -146,11 +206,11 @@ impl Proof {
     }
 }
 
-fn clear_slot(slots: &PendingReads, slot: usize, pending: &Pending) {
-    if let Ok(mut slots) = slots.lock() && slots[slot].as_ref().is_some_and(|current| {
+fn clear_slot(slots: &PendingReads, slot: Slot, pending: &Pending) {
+    if let Ok(mut slots) = slots.lock() && slots[slot.index()].as_ref().is_some_and(|current| {
         current.read == pending.read && Arc::ptr_eq(&current.cancelled, &pending.cancelled)
     }) {
-        slots[slot] = None;
+        slots[slot.index()] = None;
     }
 }
 
@@ -173,7 +233,7 @@ struct Job {
     query: Query,
     secondary: Option<IdentityClaim>,
     pending: Pending,
-    slot: usize,
+    slot: Slot,
 }
 
 pub(super) struct Owners {
@@ -190,8 +250,8 @@ impl Owners {
     ) -> Result<Self> {
         let pending = Arc::new(Mutex::new(std::array::from_fn(|_| None)));
         let seen = Arc::new(SeenWindows::default());
-        let (uia, uia_in) = mpsc::sync_channel(6);
-        let (ime, ime_in) = mpsc::sync_channel(2);
+        let (uia, uia_in) = mpsc::sync_channel(Slot::ALL.len() - Slot::IME);
+        let (ime, ime_in) = mpsc::sync_channel(Slot::IME);
         let common = Worker {
             grant: Arc::clone(grant), approved, send, pending: Arc::clone(&pending), seen: Arc::clone(&seen),
         };
@@ -203,10 +263,7 @@ impl Owners {
         {
             Ok(worker) => worker,
             Err(_) => {
-                grant.revoke();
-                grant.lifetime.enter_cleanup(qpc()?)?;
-                let _ = ui_worker.join();
-                grant.lifetime.end_cleanup();
+                grant.abandon(|| { let _ = ui_worker.join(); })?;
                 return Err(Failure::Supervisor);
             }
         };
@@ -224,32 +281,30 @@ impl Owners {
 
     pub(super) fn submit(&self, query: Query, secondary: Option<IdentityClaim>) -> Result<()> {
         let read = query.binding();
-        let slot = match query {
-            Query::Focus { .. } => 0,
-            Query::Pointer { .. } => 1,
-            Query::ImeFocus { .. } => 2,
-            Query::ImeKey { .. } => 3,
-            Query::Window(_) => 4,
-            Query::NativeFocus(_) => 5,
-            Query::Hung(_) => 6,
-            Query::ClipboardFence(_) => 7,
-            Query::Held(_) => return Err(Failure::Protocol),
-        };
+        let slot = Slot::of(&query).ok_or(Failure::Protocol)?;
         let mut pending = self.pending.lock().map_err(|_| Failure::Supervisor)?;
         // A call still running past its request deadline blocks its provider
         // kind until it returns (E2).
-        let blocked = pending.iter().enumerate().any(|(index, item)| item.as_ref().is_some_and(|item| {
-            ime_slot(index) == ime_slot(slot) && item.state.load(Acquire) == TIMED_OUT
+        let blocked = Slot::ALL.iter().zip(pending.iter()).any(|(kind, item)| item.as_ref().is_some_and(|item| {
+            kind.ime() == slot.ime() && item.state.load() == ReadState::TimedOut
         }));
-        if blocked || pending[slot].is_some() || pending.iter().flatten().any(|item| item.read.request == read.request) {
+        // Request ids strictly increase per visit (`Owner::query`), so an
+        // occupied slot is the only conflict.
+        if blocked || pending[slot.index()].is_some() {
             return Err(Failure::Busy);
         }
         let current = Pending {
-            read, cancelled: Arc::new(AtomicBool::new(false)), state: Arc::new(AtomicU8::new(RUNNING)),
+            read, cancelled: Arc::new(AtomicBool::new(false)), state: Arc::new(AtomicState::new(ReadState::Running)),
         };
-        pending[slot] = Some(current.clone());
-        let lane = if ime_slot(slot) { &self.ime } else { &self.uia };
-        lane.try_send(Job { query, secondary, pending: current, slot }).map_err(|_| Failure::Transport)
+        pending[slot.index()] = Some(current.clone());
+        let lane = if slot.ime() { &self.ime } else { &self.uia };
+        if lane.try_send(Job { query, secondary, pending: current, slot }).is_err() {
+            // The worker has exited; the owner decides whether the grant
+            // was revoked meanwhile.
+            pending[slot.index()] = None;
+            return Err(Failure::Transport);
+        }
+        Ok(())
     }
 
     /// Resolves every read still unresolved at its request deadline as timed
@@ -258,7 +313,7 @@ impl Owners {
     pub(super) fn expire(&self, now: QpcTick) -> Result<Vec<ReadBinding>> {
         let pending = self.pending.lock().map_err(|_| Failure::Supervisor)?;
         Ok(pending.iter().flatten().filter(|item| {
-            item.read.deadline_qpc <= now && item.state.compare_exchange(RUNNING, TIMED_OUT, AcqRel, Acquire).is_ok()
+            item.read.deadline_qpc <= now && item.state.transition(ReadState::Running, ReadState::TimedOut)
         }).map(|item| {
             item.cancelled.store(true, Release);
             item.read
@@ -317,7 +372,7 @@ impl Worker {
     }
 
     fn complete(&self, job: &Job) -> Result<()> {
-        if job.pending.state.load(Acquire) != HANDED_OFF {
+        if job.pending.state.load() != ReadState::HandedOff {
             clear_slot(&self.pending, job.slot, &job.pending);
         }
         Ok(())
@@ -325,8 +380,7 @@ impl Worker {
 
     fn live(&self, pending: &Pending) -> bool {
         !pending.cancelled.load(Acquire) && pending.read.visit == self.grant.visit()
-            && self.grant.read_floor(false).is_ok()
-            && self.grant.check(true).is_ok_and(|now| now < pending.read.deadline_qpc)
+            && self.grant.read_open(false).is_ok_and(|now| now < pending.read.deadline_qpc)
     }
 
     fn read(&self, job: &Job, uia: &mut Uia, scrubber: &MetadataScrubber) -> Result<()> {
@@ -356,12 +410,15 @@ impl Worker {
         }
         let (window, secondary, focus, query) = match self.uia_query(job, expected) {
             Ok(bound) => bound,
-            Err(_) => return send_error(ReadUnavailable::OutsideApproval),
-        };
-        let limited = match self.deadline(read, UIA_BUDGET) {
-            Ok(deadline) => deadline,
-            Err(Failure::ReadinessDeadline) => return send_error(ReadUnavailable::TimedOut),
+            // An unapproved or unverifiable element is outside the approval.
+            Err(Failure::TargetAccess | Failure::TokenIdentity(_) | Failure::ProcessIdentity) =>
+                return send_error(ReadUnavailable::OutsideApproval),
+            Err(Failure::TargetChanged | Failure::ScopeClosed | Failure::LeaseExpired | Failure::Cancelled
+                | Failure::PeerExited) => return send_error(ReadUnavailable::Stale),
             Err(error) => return Err(error),
+        };
+        let Some(limited) = self.deadline(read, UIA_BUDGET)? else {
+            return send_error(ReadUnavailable::TimedOut);
         };
         let Some(_call) = self.call(ProviderKind::Read, limited.0) else {
             return send_error(ReadUnavailable::TimedOut);
@@ -457,7 +514,7 @@ impl Worker {
     fn native(&self, job: &Job, uia: &mut Uia, scrubber: &MetadataScrubber) -> Result<()> {
         let read = job.pending.read;
         let start = qpc()?;
-        let limited = self.deadline(read, NATIVE_BUDGET).ok();
+        let limited = self.deadline(read, NATIVE_BUDGET).ok().flatten();
         let _call = limited.and_then(|(until, _)| self.call(ProviderKind::Read, until));
         let window = self.foreground();
         let live = self.live(&job.pending) && _call.is_some();
@@ -543,7 +600,7 @@ impl Worker {
         {
             let foreground = self.foreground();
             if let Some(focus) = FocusSnapshot::read(foreground).filter(|focus| focus.focus == expected)
-                && let Ok((until, expires)) = self.deadline(read, IME_BUDGET)
+                && let Ok(Some((until, expires))) = self.deadline(read, IME_BUDGET)
                 && let Some(_call) = self.call(ProviderKind::Ime, until)
             {
                 let state = match ime::has_ime(Some(focus)) {
@@ -641,8 +698,7 @@ impl Worker {
 
     fn commit_current(&self, visit: VisitBinding, focus: FocusAtReceipt, revision: &AtomicU64, expected: u64) -> bool {
         visit == self.grant.visit() && revision.load(Acquire) == expected
-            && self.grant.read_floor(false).is_ok()
-            && self.grant.check(true).is_ok() && self.safe_focus(self.foreground(), focus)
+            && self.grant.read_open(false).is_ok() && self.safe_focus(self.foreground(), focus)
     }
 
     fn safe_focus(&self, foreground: WindowProcess, focus: FocusAtReceipt) -> bool {
@@ -677,13 +733,15 @@ impl Worker {
         self.grant.lifetime.provider(kind, QpcTick(slot))
     }
 
-    fn deadline(&self, read: ReadBinding, cap: Duration) -> Result<(QpcTick, Instant)> {
+    /// The provider call deadline: the request deadline capped by `cap`, as
+    /// a QPC tick and an instant; `None` when no time remains.
+    fn deadline(&self, read: ReadBinding, cap: Duration) -> Result<Option<(QpcTick, Instant)>> {
         let start = qpc()?;
         let capped = read.deadline_qpc.0.min(start.0.checked_add(self.grant.lifetime.ticks(cap)?).ok_or(Failure::Supervisor)?);
-        let remaining = capped.checked_sub(start.0).filter(|value| *value > 0).ok_or(Failure::ReadinessDeadline)?;
+        let Some(remaining) = capped.checked_sub(start.0).filter(|value| *value > 0) else { return Ok(None) };
         let total = self.grant.lifetime.ticks(Duration::from_secs(1))?;
         let nanos = u64::try_from(i128::from(remaining) * 1_000_000_000 / i128::from(total)).map_err(|_| Failure::Supervisor)?;
-        Ok((QpcTick(capped), Instant::now() + Duration::from_nanos(nanos)))
+        Ok(Some((QpcTick(capped), Instant::now() + Duration::from_nanos(nanos))))
     }
 
     fn publish(&self, job: &Job, result: ContextEvidence) -> Result<()> {
@@ -692,7 +750,7 @@ impl Worker {
 
     fn publish_item(&self, job: &Job, result: ContextEvidence, proof: Proof) -> Result<bool> {
         if job.pending.cancelled.load(Acquire) || job.pending.read.visit != self.grant.visit()
-            || job.pending.state.compare_exchange(RUNNING, HANDED_OFF, AcqRel, Acquire).is_err()
+            || !job.pending.state.transition(ReadState::Running, ReadState::HandedOff)
         {
             return Ok(false);
         }
@@ -725,8 +783,6 @@ impl Uia {
         }
     }
 }
-
-fn ime_slot(slot: usize) -> bool { (2..=3).contains(&slot) }
 
 fn unavailable<T>(read: ReadBinding, now: QpcTick, status: ReadUnavailable) -> ReadEvidence<T> {
     ReadEvidence { binding: read, started_qpc: None, completed_qpc: Some(now), outcome: ReadOutcome::Unavailable(status) }

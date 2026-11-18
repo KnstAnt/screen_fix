@@ -13,7 +13,7 @@ use crate::{
     session::windows::WorkerSession,
 };
 
-use super::{Monitor, enumerate};
+use super::{Monitor, Survey, survey};
 use crate::platform::windows::{ProbeError, clock, io_error, stage};
 
 #[derive(Clone, PartialEq, Eq)]
@@ -48,7 +48,41 @@ impl Output {
 
 pub(in crate::platform::windows) struct Snapshot {
     pub received: QpcTick,
+    /// Every active output; none when the enumeration failed or left an
+    /// output unreadable, so the list proves nothing.
     pub outputs: Option<Vec<Output>>,
+    /// The readable outputs of an enumeration that left some unreadable.
+    partial: Vec<Output>,
+    /// Outputs identified but not read: their presence is unknown.
+    unreadable: Vec<DisplayKey>,
+}
+
+impl Snapshot {
+    fn new(received: QpcTick, survey: Result<Survey, ProbeError>) -> Self {
+        let read = survey.and_then(|survey| {
+            let outputs = survey.monitors.iter().map(Output::from_native).collect::<Result<Vec<_>, _>>()?;
+            Ok((outputs, survey.unreadable.into_iter().map(|(key, _)| key).collect::<Vec<_>>()))
+        });
+        match read {
+            Ok((outputs, unreadable)) if unreadable.is_empty() => {
+                Self { received, outputs: Some(outputs), partial: Vec::new(), unreadable }
+            }
+            Ok((partial, unreadable)) => Self { received, outputs: None, partial, unreadable },
+            // A failed enumeration carries no proof of removal.
+            Err(_) => Self { received, outputs: None, partial: Vec::new(), unreadable: Vec::new() },
+        }
+    }
+
+    /// The output of `key`: `Some(None)` proves it absent, `None` proves
+    /// nothing. Another output's unreadable properties do not affect it (V4).
+    pub fn output(&self, key: &DisplayKey) -> Option<Option<&Output>> {
+        let outputs = match &self.outputs {
+            Some(outputs) => outputs,
+            None if self.unreadable.is_empty() || self.unreadable.contains(key) => return None,
+            None => &self.partial,
+        };
+        Some(outputs.iter().find(|output| output.key == *key))
+    }
 }
 
 #[derive(Clone)]
@@ -125,10 +159,9 @@ impl Topology {
                 let observed = worker.display_revision();
                 if now >= next || revision != observed {
                     let received = clock::qpc();
-                    let outputs = enumerate().and_then(|displays| displays.iter().map(Output::from_native).collect());
+                    let surveyed = survey();
                     if let Ok(received) = received {
-                        // A failed enumeration carries no proof of removal.
-                        let snapshot = Arc::new(Snapshot { received, outputs: outputs.ok() });
+                        let snapshot = Arc::new(Snapshot::new(received, surveyed));
                         *self.snapshot.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
                     }
                     revision = observed;

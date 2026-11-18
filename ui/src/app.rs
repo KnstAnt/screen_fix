@@ -4,6 +4,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use eframe::egui;
 
 use screen_fix_core::{
+    Remedy,
     config::{
         CapturePace, ClipboardMode, EffectiveCapabilities, MAX_SELECTED_MONITORS, ResolvedCaptureConfig,
         ResolvedProfile, SelectedMonitor,
@@ -17,7 +18,7 @@ use screen_fix_core::{
 #[cfg(target_os = "windows")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 #[cfg(target_os = "windows")]
-use screen_fix_core::session::hotkey::{ControlOutcome, HotkeyActivation, HotkeyBindings, RecorderAction};
+use screen_fix_core::session::hotkey::{ControlOutcome, DEBUGGER_FUNCTION, HotkeyActivation, HotkeyBindings, RecorderAction};
 
 pub(crate) struct ScreenFix {
     state: RecordingState,
@@ -126,8 +127,14 @@ enum RecordingState {
     #[default]
     Idle,
     Running { session: SessionHandle, status: SessionStatus, stop_requested: bool },
-    Reporting { message: String, result: Receiver<String> },
-    Complete(Result<SessionResult, String>),
+    Reporting { message: String, result: Receiver<String>, remedy: Option<Remedy> },
+    Complete(Result<SessionResult, Failed>),
+}
+
+/// A failed attempt's report and the action that can resolve it, if known.
+struct Failed {
+    report: String,
+    remedy: Option<Remedy>,
 }
 
 impl eframe::App for ScreenFix {
@@ -165,7 +172,7 @@ impl eframe::App for ScreenFix {
                         #[cfg(target_os = "windows")]
                         let report = self.indicator_diagnostic.take().map(|snapshot| {
                             let issue = self.indicator_error.as_deref().unwrap_or("The recording indicator failed.");
-                            recording_error(format!("{issue}\n{}", message.message), snapshot, Some(ctx))
+                            recording_error(format!("{issue}\n{}", message.message), snapshot, None, Some(ctx))
                         });
                         self.state = RecordingState::Complete(Ok(message));
                         #[cfg(target_os = "windows")]
@@ -198,24 +205,25 @@ impl eframe::App for ScreenFix {
                             let issue = self.indicator_error.as_deref().unwrap_or("The recording indicator failed.");
                             message.push_str(&format!("\n{issue}"));
                         }
-                        self.state = recording_error(message, error.into_diagnostic().with_output_root(self.folder.clone()), Some(ctx));
+                        let remedy = error.remedy();
+                        self.state = recording_error(message, error.into_diagnostic().with_output_root(self.folder.clone()), remedy, Some(ctx));
                     }
                     Err(TryRecvError::Disconnected) => {
                         self.last_status = Some(session.status().unwrap_or_else(|| status.clone()));
                         self.state = recording_error(
                             "The session controller exited without returning a result.".into(),
                             diagnostic(FailureComponent::Controller, "Read the session result").with_output_root(self.folder.clone()),
-                            Some(ctx),
+                            None, Some(ctx),
                         );
                     }
                     Err(TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(100)),
                 }
             }
-            RecordingState::Reporting { message, result } => match result.try_recv() {
-                Ok(report) => self.state = RecordingState::Complete(Err(report)),
-                Err(TryRecvError::Disconnected) => self.state = RecordingState::Complete(Err(with_report(
-                    message, ReportOutcome::Unavailable { native_code: None },
-                ))),
+            RecordingState::Reporting { message, result, remedy } => match result.try_recv() {
+                Ok(report) => self.state = RecordingState::Complete(Err(Failed { report, remedy: *remedy })),
+                Err(TryRecvError::Disconnected) => self.state = RecordingState::Complete(Err(Failed {
+                    report: with_report(message, ReportOutcome::Unavailable { native_code: None }), remedy: *remedy,
+                })),
                 Err(TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(100)),
             },
             _ => {}
@@ -230,10 +238,13 @@ impl eframe::App for ScreenFix {
         #[cfg(target_os = "windows")]
         if matches!(self.state, RecordingState::Idle | RecordingState::Complete(_)) {
             if let Some(hotkeys) = self.hotkeys.as_ref() {
+                // The hotkey pump requests a repaint for a Start activation; it
+                // does not report the previous attempt's hotkeys clearing.
                 if let Some(activation) = hotkeys.take_start() {
                     self.start_recording(ctx, Some(activation));
+                } else if !hotkeys.ready_for_start() {
+                    ctx.request_repaint_after(Duration::from_millis(40));
                 }
-                ctx.request_repaint_after(Duration::from_millis(40));
             }
         }
 
@@ -651,14 +662,13 @@ impl ScreenFix {
             RecordingState::Complete(Ok(result)) => {
                 ui.label(result.message.as_str());
             }
-            RecordingState::Complete(Err(message)) => {
-                ui.label(message.as_str());
-                #[cfg(target_os = "windows")]
-                if message.contains("ms-settings:optionalfeatures") {
+            RecordingState::Complete(Err(failed)) => {
+                ui.label(failed.report.as_str());
+                if let Some(Remedy::InstallMediaFeaturePack) = failed.remedy {
                     ui.hyperlink_to("Open Windows Optional features", "ms-settings:optionalfeatures");
                 }
                 if ui.button("Copy diagnostics").clicked() {
-                    ui.ctx().copy_text(message.clone());
+                    ui.ctx().copy_text(failed.report.clone());
                 }
             }
         }
@@ -786,7 +796,10 @@ impl ScreenFix {
         if let Some(resolved) = inventory.resolved_executable {
             match resolved {
                 Ok(executable) => self.approved_executable = Some(executable),
-                Err(error) => self.state = recording_error(error.to_string(), error.into_diagnostic().with_output_root(self.folder.clone()), Some(ctx)),
+                Err(error) => {
+                    let remedy = error.remedy();
+                    self.state = recording_error(error.to_string(), error.into_diagnostic().with_output_root(self.folder.clone()), remedy, Some(ctx));
+                }
             }
         }
         match inventory.displays {
@@ -827,7 +840,9 @@ impl ScreenFix {
         let ctx = ctx.clone();
         match thread::Builder::new().name("setup-hotkeys".into()).spawn(move || {
             drop(previous);
-            let result = platform::RecorderHotkeys::open(bindings).map_err(|error| error.to_string());
+            let repaint = ctx.clone();
+            let result = platform::RecorderHotkeys::open(bindings, std::sync::Arc::new(move || repaint.request_repaint()))
+                .map_err(|error| error.to_string());
             let _ = send.try_send(result);
             ctx.request_repaint();
         }) {
@@ -875,7 +890,7 @@ impl ScreenFix {
                 }
             });
         });
-        if RecorderAction::ALL.into_iter().any(|action| self.hotkey_bindings.function(action) == 12) {
+        if RecorderAction::ALL.into_iter().any(|action| self.hotkey_bindings.function(action) == DEBUGGER_FUNCTION) {
             ui.label("Windows reserves F12 for debugger use. If registration fails, choose a different function key under Recorder hotkeys.");
         }
         let available = self.hotkeys.as_ref().is_some_and(platform::RecorderHotkeys::available);
@@ -915,7 +930,7 @@ impl ScreenFix {
             Ok(config) => config,
             Err(error) => {
                 self.state = recording_error(
-                    error.to_string(), diagnostic(FailureComponent::Interface, "Resolve the recording configuration").with_output_root(self.folder.clone()), Some(ctx),
+                    error.to_string(), diagnostic(FailureComponent::Interface, "Resolve the recording configuration").with_output_root(self.folder.clone()), None, Some(ctx),
                 );
                 return;
             }
@@ -932,7 +947,10 @@ impl ScreenFix {
                 self.record_clipboard = false;
                 RecordingState::Running { session, status: SessionStatus::default(), stop_requested: false }
             }
-            Err(error) => recording_error(error.to_string(), error.into_diagnostic().with_output_root(self.folder.clone()), Some(ctx)),
+            Err(error) => {
+                let remedy = error.remedy();
+                recording_error(error.to_string(), error.into_diagnostic().with_output_root(self.folder.clone()), remedy, Some(ctx))
+            }
         };
     }
 }
@@ -946,7 +964,7 @@ fn degraded_line(ui: &mut egui::Ui, degraded: &[screen_fix_core::session::Degrad
 }
 
 fn recording_error(
-    message: String, snapshot: DiagnosticSnapshot, ctx: Option<&egui::Context>,
+    message: String, snapshot: DiagnosticSnapshot, remedy: Option<Remedy>, ctx: Option<&egui::Context>,
 ) -> RecordingState {
     let (sender, result) = mpsc::sync_channel(1);
     let issue = message.clone();
@@ -957,10 +975,11 @@ fn recording_error(
             ctx.request_repaint();
         }
     }) {
-        Ok(_) => RecordingState::Reporting { message, result },
-        Err(error) => RecordingState::Complete(Err(with_report(
-            &message, ReportOutcome::Unavailable { native_code: error.raw_os_error() },
-        ))),
+        Ok(_) => RecordingState::Reporting { message, result, remedy },
+        Err(error) => RecordingState::Complete(Err(Failed {
+            report: with_report(&message, ReportOutcome::Unavailable { native_code: error.raw_os_error() }),
+            remedy,
+        })),
     }
 }
 

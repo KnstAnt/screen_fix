@@ -12,11 +12,11 @@ use std::{
 use screen_fix_protocol::{QpcTick, WindowId, ipc::elevated::WindowInstance};
 use windows_sys::{
     Win32::{
-        Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{HANDLE, HWND, LPARAM, LRESULT, WAIT_FAILED, WPARAM},
         System::{
             SystemInformation::GetTickCount64,
             LibraryLoader::GetModuleHandleW,
-            RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, WTS_SESSIONSTATE_UNLOCK, WTSActive, WTSFreeMemory,
+            RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, ProcessIdToSessionId, WTS_SESSIONSTATE_UNLOCK, WTSActive, WTSFreeMemory,
                 WTSINFOEXW, WTSQuerySessionInformationW, WTSRegisterSessionNotification,
                 WTSSessionInfoEx, WTSUnRegisterSessionNotification},
             StationsAndDesktops::{CloseDesktop, DESKTOP_HOOKCONTROL, DESKTOP_JOURNALRECORD,
@@ -32,8 +32,11 @@ use windows_sys::{
     w,
 };
 
-use crate::{deadline::Cancellation, process::Process, win::{Failure, Result}};
+use crate::{deadline::{Cancellation, milliseconds}, process::Process, win::{Failure, Result}};
 use super::lifetime::qpc;
+
+/// The longest interval between two witness samples.
+const SAMPLE: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Foreground {
@@ -356,7 +359,14 @@ fn observe(
         output.revisions.store(focus_revision, Release);
         output.published.store(serial, Release);
         progress.store(finished.0, Release);
-        thread::park_timeout(Duration::from_millis(10));
+        // Wake on a queued message or cancellation; the timeout bounds the
+        // polling of state that changes without a notification.
+        let handles = [cancel.handle().raw()];
+        let woken = unsafe {
+            MsgWaitForMultipleObjectsEx(handles.len() as u32, handles.as_ptr(), milliseconds(SAMPLE), QS_ALLINPUT,
+                MWMO_INPUTAVAILABLE)
+        };
+        if woken == WAIT_FAILED { return Err(Failure::Witness); }
     }
     Ok(())
 }
@@ -410,8 +420,10 @@ pub(super) fn normal_desktop(target_thread: Option<NonZeroU32>) -> bool {
 }
 
 pub fn normal_capture_desktop(target_thread: NonZeroU32) -> bool {
+    let mut session = 0;
     normal_desktop(Some(target_thread))
-        && Process::current().and_then(|process| process.session()).is_ok_and(session_unlocked)
+        && unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) } != 0
+        && session_unlocked(session)
 }
 
 /// Hold the access-checked handle throughout the physical key read. UOI_IO
@@ -478,8 +490,9 @@ impl Target {
     pub(super) fn prove(
         local: Foreground, claim: &screen_fix_protocol::ipc::elevated::runtime::IdentityClaim, parent: &Process,
     ) -> Result<Self> {
+        // `recheck` below also proves the desktop binding.
         if local.pid.get() == parent.pid() || local.pid.get() == unsafe { GetCurrentProcessId() }
-            || !local.matches(claim.target) || !normal_desktop(Some(local.thread))
+            || !local.matches(claim.target)
         {
             return Err(Failure::TargetChanged);
         }

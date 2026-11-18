@@ -22,15 +22,21 @@ pub struct RetainedRecording {
 
 #[derive(Debug)]
 pub struct CaptureError {
-    pub kind: CaptureErrorKind,
-    pub operation: &'static str,
-    pub native_code: Option<i32>,
+    pub(crate) kind: CaptureErrorKind,
     message: String,
     failure: Failure,
     context: Option<Box<DiagnosticContext>>,
     /// Secondary causes recorded before a diagnostic context is attached.
     additional_failures: Vec<Failure>,
     retained_recording: Option<RetainedRecording>,
+    remedy: Option<Remedy>,
+}
+
+/// An action the user can take to resolve a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Remedy {
+    /// Install the Media Feature Pack in Windows Optional features.
+    InstallMediaFeaturePack,
 }
 
 impl CaptureError {
@@ -38,13 +44,12 @@ impl CaptureError {
     pub(crate) fn unsupported(operation: &'static str, message: &'static str) -> Self {
         Self {
             kind: CaptureErrorKind::UnsupportedPlatform,
-            operation,
-            native_code: None,
             message: message.into(),
             failure: Failure::new(FailureComponent::Interface, operation, None),
             context: None,
             additional_failures: Vec::new(),
             retained_recording: None,
+            remedy: None,
         }
     }
 
@@ -52,13 +57,12 @@ impl CaptureError {
     pub(crate) fn unsupported_configuration(message: &'static str) -> Self {
         Self {
             kind: CaptureErrorKind::UnsupportedConfiguration,
-            operation: "Record a display",
-            native_code: None,
             message: message.into(),
             failure: Failure::new(FailureComponent::Interface, "Record a display", None),
             context: None,
             additional_failures: Vec::new(),
             retained_recording: None,
+            remedy: None,
         }
     }
 
@@ -74,8 +78,8 @@ impl CaptureError {
     #[cfg(target_os = "windows")]
     pub(crate) fn from_fault(kind: CaptureErrorKind, failure: Failure, message: String) -> Self {
         Self {
-            kind, operation: failure.operation(), native_code: failure.native_code(), message, failure,
-            context: None, additional_failures: Vec::new(), retained_recording: None,
+            kind, message, failure,
+            context: None, additional_failures: Vec::new(), retained_recording: None, remedy: None,
         }
     }
 
@@ -93,8 +97,8 @@ impl CaptureError {
         native_code: Option<i32>, message: String,
     ) -> Self {
         Self {
-            kind, operation, native_code, message, failure: Failure::new(component, operation, native_code),
-            context: None, additional_failures: Vec::new(), retained_recording: None,
+            kind, message, failure: Failure::new(component, operation, native_code),
+            context: None, additional_failures: Vec::new(), retained_recording: None, remedy: None,
         }
     }
 
@@ -102,9 +106,9 @@ impl CaptureError {
     pub(crate) fn journal(operation: &'static str, error: &crate::package::journal::JournalError) -> Self {
         let native_code = error.source.as_ref().and_then(std::io::Error::raw_os_error);
         Self {
-            kind: CaptureErrorKind::JournalFailure, operation, native_code, message: error.to_string(),
+            kind: CaptureErrorKind::JournalFailure, message: error.to_string(),
             failure: Failure::journal(operation, error.stream, native_code), context: None,
-            additional_failures: Vec::new(), retained_recording: None,
+            additional_failures: Vec::new(), retained_recording: None, remedy: None,
         }
     }
 
@@ -144,6 +148,17 @@ impl CaptureError {
     }
 
     #[cfg(target_os = "windows")]
+    pub(crate) fn with_remedy(mut self, remedy: Option<Remedy>) -> Self {
+        self.remedy = remedy;
+        self
+    }
+
+    /// The action that can resolve this failure, if one is known.
+    pub fn remedy(&self) -> Option<Remedy> {
+        self.remedy
+    }
+
+    #[cfg(target_os = "windows")]
     pub(crate) fn with_additional_failure(mut self, failure: Failure) -> Self {
         match &mut self.context {
             Some(context) => context.additional_failures.push(failure),
@@ -158,6 +173,10 @@ impl CaptureError {
 
     pub(crate) fn failure(&self) -> Failure {
         self.failure
+    }
+
+    pub(crate) fn operation(&self) -> &'static str {
+        self.failure.operation()
     }
 
     pub(crate) fn with_context(mut self, mut context: DiagnosticContext) -> Self {

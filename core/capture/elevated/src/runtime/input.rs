@@ -9,12 +9,12 @@ use std::{
 
 use screen_fix_native_observation::{
     held,
-    input::{self, CaptureScope, Collector, HookForeground, NativeError, Settings, loss::{self, Losses}},
+    input::{self, CaptureScope, Collector, HookForeground, NativeError, Settings, loss::{self, Losses, PendingStatus}},
 };
 use screen_fix_protocol::{
     QpcFrequency, QpcTick,
     ipc::{
-        EnvironmentState, HelperFailure, HelperFailureStage, HelperToCore, InputRegistration, Producer,
+        HelperFailure, HelperFailureStage, HelperToCore, InputRegistration, Producer,
         elevated::{GrantedInput, HeldSnapshot, InputEvidence, VisitBinding, runtime::CoverageReason},
     },
 };
@@ -47,14 +47,13 @@ impl Native {
             let scope = Arc::new(CaptureScope {
                 foreground: grant.visit().foreground,
                 hook_open: Arc::new(move || hooks.hook_stamp()),
-                raw_open: Arc::new(move || raw.read_floor(false).is_ok() && raw.check(true).is_ok()),
+                raw_open: Arc::new(move || raw.read_open(false).is_ok()),
                 serial: Arc::new(move || scope_visit.scope_serial()),
             });
             let owner = unsafe { BorrowedHandle::borrow_raw(grant.parent.raw()) };
             let wake = unsafe { BorrowedHandle::borrow_raw(grant.stop.handle().raw()) };
             let mut output = Output {
-                grant: Arc::clone(&grant), send, ready, losses: Losses::default(), environment: None, visit: None, raw_source: None,
-                notices: Vec::new(),
+                grant: Arc::clone(&grant), send, ready, losses: Losses::default(), status: PendingStatus::default(), visit: None, raw_source: None,
             };
             input::run_scoped(Settings { qpc_frequency: frequency, pen_hid }, owner, wake, &mut output, Some(scope))
         }).map_err(|_| Failure::Supervisor)?;
@@ -84,15 +83,13 @@ struct Output {
     send: SyncSender<Item>,
     ready: SyncSender<InputRegistration>,
     losses: Losses,
-    environment: Option<EnvironmentState>,
+    /// Status records waiting for queue room (E3).
+    status: PendingStatus,
     visit: Option<VisitBinding>,
     /// Source lower bound of the latest Raw Input record with a message time.
     /// Records drained from the Raw Input buffer after it have no message
     /// time and were queued after it, so it bounds their source time too.
     raw_source: Option<QpcTick>,
-    /// Optional-collection notices waiting for queue room (E3); at most one
-    /// per collection.
-    notices: Vec<InputEvidence>,
 }
 
 fn transport() -> NativeError { NativeError::without_code(HelperFailureStage::Transport) }
@@ -126,9 +123,8 @@ impl Collector for Output {
             // The old binding's evidence is closed. Its pending gaps are kept
             // and delivered first in the new binding, where gaps before the
             // resync sample only count (E3).
-            self.environment = None;
+            self.status = PendingStatus::default();
             self.raw_source = None;
-            self.notices.clear();
             self.visit = Some(visit);
         }
         // A native gap is never dropped: outside the open scope it waits as a
@@ -145,16 +141,11 @@ impl Collector for Output {
             self.losses.drop_record(&record);
             return Ok(());
         }
-        if let HelperToCore::Environment(state) = record {
-            let mut state = state;
-            if let Some(pending) = self.environment.take() { state.changes |= pending.changes; }
-            if !self.enqueue(InputEvidence::Environment(state))? { self.environment = Some(state); }
-            return Ok(());
-        }
-        if let HelperToCore::OptionalUnavailable { collection, observed_qpc } = record {
-            self.notices.push(InputEvidence::OptionalUnavailable { collection, observed_qpc });
-            return self.flush_notices();
-        }
+        // A status record waits for queue room behind the pending ones.
+        let record = match self.status.defer(record) {
+            Ok(()) => return self.flush_status().map(|_| ()),
+            Err(record) => record,
+        };
         let value = match &record {
             HelperToCore::Input(input) => InputEvidence::Input(input.clone()),
             HelperToCore::DeviceArrived { receipt, descriptor } => InputEvidence::DeviceArrived { receipt: *receipt, descriptor: descriptor.clone() },
@@ -172,12 +163,7 @@ impl Collector for Output {
         for producer in Producer::ALL {
             if !self.flush_loss(producer)? { return Ok(()) }
         }
-        if let Some(state) = self.environment
-            && self.enqueue(InputEvidence::Environment(state))?
-        {
-            self.environment = None;
-        }
-        self.flush_notices()
+        self.flush_status().map(|_| ())
     }
 
     fn finish(&mut self, _: BorrowedHandle<'_>) -> std::result::Result<(), NativeError> { Ok(()) }
@@ -227,20 +213,25 @@ impl Output {
         }
     }
 
-    fn flush_notices(&mut self) -> std::result::Result<(), NativeError> {
-        while let Some(notice) = self.notices.first() {
-            if !self.enqueue(notice.clone())? { break; }
-            self.notices.remove(0);
-        }
-        Ok(())
+    fn flush_status(&mut self) -> std::result::Result<bool, NativeError> {
+        // The pending records leave `self` while `enqueue` borrows it.
+        let mut status = std::mem::take(&mut self.status);
+        let flushed = status.flush(|record| match record {
+            HelperToCore::Environment(state) => self.enqueue(InputEvidence::Environment(state)),
+            HelperToCore::OptionalUnavailable { collection, observed_qpc } =>
+                self.enqueue(InputEvidence::OptionalUnavailable { collection, observed_qpc }),
+            _ => Err(transport()),
+        });
+        self.status = status;
+        flushed
     }
 
     fn flush_loss(&mut self, producer: Producer) -> std::result::Result<bool, NativeError> {
-        while let Some(gap) = self.losses.front(producer) {
-            if !self.enqueue(InputEvidence::Gap(gap))? { return Ok(false); }
-            self.losses.delivered(producer);
-        }
-        Ok(true)
+        // The pending gaps leave `self` while `enqueue` borrows it.
+        let mut losses = std::mem::take(&mut self.losses);
+        let flushed = losses.flush(producer, |gap| self.enqueue(InputEvidence::Gap(gap)));
+        self.losses = losses;
+        flushed
     }
 
     fn enqueue(&self, evidence: InputEvidence) -> std::result::Result<bool, NativeError> {

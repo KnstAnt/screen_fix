@@ -12,7 +12,7 @@ Marks:
 - **ext**: an extension. A record the PDF describes without naming the field is ext.
 
 Shapes used below:
-- Times ending in `_t_us`, `_us` or `recv_t_us` are integer microseconds on the session clock. `_qpc` values are raw QPC ticks. `tick_ms` is the raw `GetTickCount` tick.
+- Times ending in `_t_us`, `_us` or `recv_t_us` are integer microseconds on the session clock. A conversion from QPC or WGC time floors toward negative infinity, also before the clock origin. `_qpc` values are raw QPC ticks. `tick_ms` is the raw `GetTickCount` tick.
 - **Evidence** is `{"status":"observed","detail":v}`, `{"status":"uncertain","detail":{"value":v,"reason":r}}` or `{"status":"unavailable","detail":r}`, with `r` one of `no_device`, `unsupported`, `not_observed`, `missing_calibration`, `ambiguous`, `blind`, `expired`.
 - A point is `{"x","y"}` and a rectangle `{"left","top","right","bottom"}` in physical desktop pixels, right and bottom exclusive. A geometry id is `{"monitor","epoch"}`; a frame id is `{"monitor","epoch","sequence"}`; an event reference is `{"stream","seq"}`.
 - "true or null" fields are always written and are `null` when the condition does not hold. Fields described as "absent" are omitted.
@@ -33,7 +33,7 @@ The order of the other fields is not significant.
 
 ### 2.1 Gap rows (`kind: "gap"`, ext)
 
-Every stream except frames records ledger losses as typed gap rows. A pending loss is written before the stream's next row, at a boundary or at close. Privacy-sensitive losses (password, possibly sensitive or approval-unknown context) never become rows; they are only counted in the manifest.
+Every stream except frames records ledger losses as typed gap rows. A pending loss is written before the stream's next row, at a boundary or at close. Privacy-sensitive losses (password, possibly sensitive or approval-unknown context, and key records lost before their visit is classified) never become rows; they are only counted in the manifest.
 
 | Field | Meaning |
 | --- | --- |
@@ -75,6 +75,8 @@ Entries with the same `reason` and `producer` merge; the merged range is their h
 | `notification_overflow` | The bounded window notification ring or queue was full. |
 | `uncertified_source` | Elevated records past the certified prefix of an interrupted visit (E1). |
 
+Commit losses (`late_commit`, `commit_*`) are input-stream losses with producer `text_edit`, also in an elevated visit.
+
 `LossProducer`: `text_edit`, `raw_input`, `device_notifications`, `keyboard_hook`, `pointer_hook`, `optional_hid`.
 
 `SuppressionClass` (manifest counts only, never rows): `pause`, `not_approved`, `approval_unknown`, `recorder_control`, `control_uncertain`, `cluster_excess_hook`, `focus_uncertain`, `unconfirmed_synchronization`, `not_publishable`.
@@ -93,6 +95,8 @@ A health condition is a `health` row in `context.jsonl` and `stills.jsonl`, and 
 | `ongoing` | Whether the condition persists. |
 | `monitor`, `count` | Affected monitor and occurrence count, or `null`. |
 | `counts` | `paused_summary` only: `{HealthKind: count}`. |
+
+The input stream holds at most 32 pending health conditions. Beyond that, a condition merges into the latest pending one of the same kind (its `count` grows); a condition of a kind with nothing pending is not written and sets `input_capture.transport_overflow`.
 
 `source_t_us` is `null`. `HealthKind`: `video_failure`, `hdr_white_level_unavailable`, `encoder_candidate_rejected`, `suspend_finalize_late`, `input_failure`, `attempt_failure`, `still_progress_stall`, `paused_summary`, `input_producer_stall`, `input_registration_lost`, `input_hook_lost`, `optional_collection_unavailable`, `identity_unresolved`, `auxiliary_activity_loss`, `still_write_failure`, `elevated_source_sleep`.
 
@@ -225,7 +229,7 @@ Synthetic edges close or reopen held state at a boundary. They carry `synthetic:
 | `redacted` | ext | `field_start_t_us`, `field_end_t_us`, `key_count`, `admission_epoch`: one row per password or possibly sensitive field visit. |
 | `suppressed_interval` | ext | `reason` (`ineligible_token`, `elevated_source_unavailable`, `non_approved_app`, `unknown_foreground`), `start_t_us`, `end_t_us`, `input_suppressed` (count), `admission_epoch` (C5, D-3 A). |
 | `blind` | PDF | `reason`, `start_us`, `end_us` (PDF); `producers` (ext, present only when the interval covers some producers). `reason` is an input blind reason (`helper_exited`, `registration_lost`, `hook_lost`, `helper_communication_failed`, `helper_cleanup_failed`, `producer_stall`, `resync_unavailable`, `elevated_window`, `foreground_inaccessible`, `device_removed`) or, for a pause interval, `secure_desktop`, `elevation_transition`, `user`, `sleep` or `low_disk`. |
-| `input_health` | PDF kind | A health condition (§2.3), or per-second counts (ext): `session_second`, `raw_packets_coalesced`, `motion_rows_thinned`, `suppressed` (`{class: count}`), `raw_motion[{device, packets, delta}]`, `admission_epoch`. |
+| `input_health` | PDF kind | A health condition (§2.3), or per-second counts (ext): `session_second`, `raw_packets_coalesced`, `motion_rows_thinned`, `suppressed` (`{class: count}`; an AltGr companion key is counted only in the stream summary), `raw_motion[{device, packets, delta}]`, `admission_epoch`. |
 | `gap` | ext | §2.1. |
 
 ## 5. context.jsonl
@@ -239,9 +243,11 @@ Rows written through the context owner carry `tick_ms` (PDF) and `source_uncerta
 `foreground` (PDF), approved: `approved: true`, `pid`, `exe`, `product`, `version` (dotted fixed file version), `version_string`, `rect`, `monitor`, `title`, `class` (PDF); `window`, `version_observation: "approved_file_at_startup"`, `geometry`, `dpi`, `dpi_awareness`, `metadata_observed_at_read: true`, `ghost_replacement` (on a verified Ghost replacement) (ext). Variants:
 - not approved: `{kind, approved: false}` only;
 - approved but unreadable metadata: `{kind, approved: true, window, pid, metadata: "unavailable"}`;
-- elevated read without evidence: `{kind, approved, window, native_status}` with `native_status` `timed_out`, `unavailable`, `stale` or a read outcome; a timed-out unapproved notice is `{kind, approved: false, native_status: "timed_out"}`.
+- elevated read without evidence: `{kind, approved, window, native_status}` with `native_status` `timed_out`, `unavailable`, `stale` or a read outcome; a window notice already older than the read budget when handled is `{kind, approved: false, native_status: "timed_out"}`.
 
-`window_title`, `window_location`, `window_shown` and `window_hidden` (ext kinds) have the same shapes. Rows caused by a notification add `source_event_tick_ms`; a rate-limited location re-read adds `trailing: true`.
+In `exe`, `product` and `version_string`, the values of `USERPROFILE`, `COMPUTERNAME` and `USERNAME` are replaced by `<home>`, `<host>` and `<user>`. A value matches ignoring ASCII case, and only as a whole token or path segment (no adjacent letter or digit).
+
+`window_title`, `window_location`, `window_shown` and `window_hidden` (ext kinds) have the same shapes. Rows caused by a notification add `source_event_tick_ms`; a rate-limited location re-read, including one read through the elevated collector, adds `trailing: true`.
 
 ### 5.3 Focus and element
 

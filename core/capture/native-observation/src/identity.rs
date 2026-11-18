@@ -1,8 +1,8 @@
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, FILETIME, HANDLE, HWND},
+        Foundation::{CloseHandle, HANDLE, HWND},
         System::Threading::{
-            GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+            OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
             QueryFullProcessImageNameW,
         },
         UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId},
@@ -65,13 +65,7 @@ impl ProcessHandle {
     }
 
     pub fn instance(&self, pid: NonZeroU32) -> Option<ProcessInstance> {
-        let mut created = FILETIME::default();
-        let mut exited = FILETIME::default();
-        let mut kernel = FILETIME::default();
-        let mut user = FILETIME::default();
-        unsafe { GetProcessTimes(self.0, &mut created, &mut exited, &mut kernel, &mut user) }.ok()?;
-        let creation_filetime = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
-        Some(ProcessInstance { pid, creation_filetime })
+        crate::process_instance(self.0.0, pid)
     }
 
     /// Query the Windows-reported spelling without opening or resolving an image path.
@@ -111,7 +105,7 @@ pub fn canonical_image(path: &str) -> Option<String> {
         CreateFileW(name.as_ptr(), GENERIC_READ, FILE_SHARE_READ, std::ptr::null(), OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL, std::ptr::null_mut())
     };
-    if raw.is_null() || raw == INVALID_HANDLE_VALUE { return None; }
+    if raw == INVALID_HANDLE_VALUE { return None; }
     let file = File(raw);
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     if unsafe { GetFileInformationByHandle(file.0, &mut info) } == 0 || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
@@ -127,6 +121,8 @@ pub fn canonical_image(path: &str) -> Option<String> {
     })
 }
 
+/// Replaces the user's profile path, computer name and user name in metadata
+/// with fixed tokens.
 #[derive(Clone)]
 pub struct MetadataScrubber {
     substitutions: Vec<(String, &'static str)>,
@@ -144,18 +140,23 @@ impl MetadataScrubber {
         Self { substitutions }
     }
 
+    /// Scrub `source` into at most `bound` bytes. A value matches, ignoring
+    /// ASCII case, only as a whole token or path segment: it neither follows
+    /// nor precedes a letter or digit, so a user name "dev" leaves "Device"
+    /// intact.
     pub fn scrub(&self, source: &str, bound: usize) -> String {
         let mut result = String::with_capacity(source.len().min(bound));
         let mut offset = 0;
-        while let Some(rest) = source.get(offset..).filter(|rest| !rest.is_empty()) {
-            let matched = self.substitutions.iter().find(|(value, _)| {
+        while let Some(rest) = source.get(offset..) {
+            let Some(next) = rest.chars().next() else { break };
+            let at_boundary = source[..offset].chars().next_back().is_none_or(|previous| !previous.is_alphanumeric());
+            let matched = at_boundary.then(|| self.substitutions.iter().find(|(value, _)| {
                 rest.get(..value.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(value))
-            });
-            let (part, consumed) = if let Some((value, token)) = matched {
-                (*token, value.len())
-            } else {
-                let first = rest.chars().next().expect("nonempty metadata");
-                (&rest[..first.len_utf8()], first.len_utf8())
+                    && rest[value.len()..].chars().next().is_none_or(|following| !following.is_alphanumeric())
+            })).flatten();
+            let (part, consumed) = match matched {
+                Some((value, token)) => (*token, value.len()),
+                None => (&rest[..next.len_utf8()], next.len_utf8()),
             };
             if result.len().saturating_add(part.len()) > bound {
                 break;

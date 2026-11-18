@@ -8,26 +8,27 @@ use std::{
 
 use screen_fix_protocol::{
     MessageTickMs, PhysicalPoint, PhysicalRect, QpcTick, SourceSequence, WindowId,
-    ipc::{CollectedInput, DeviceDescriptor, FocusAtReceipt, ForegroundAtReceipt, HelperFailureStage, InputSample, OptionalCollection, ProcessInstance, Producer, RawInputRegistrationMismatch, RawInputRegistrationObservation, RawKey, RawPointer, Receipt},
+    ipc::{CollectedInput, DeviceDescriptor, EXTERNAL_PEN_USAGE, INTEGRATED_PEN_USAGE, FocusAtReceipt, ForegroundAtReceipt, HelperFailureStage, InputSample, OptionalCollection, ProcessInstance, Producer, RawInputRegistrationMismatch, RawInputRegistrationObservation, RawKey, RawPointer, Receipt},
 };
 use windows_sys::{
     Win32::{
-        Foundation::{ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE, HWND, POINT},
+        Devices::HumanInterfaceDevice::{HID_USAGE_GENERIC_KEYBOARD, HID_USAGE_GENERIC_MOUSE, HID_USAGE_PAGE_GENERIC},
+        Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE, HWND, POINT},
         System::{Performance::QueryPerformanceCounter, SystemInformation::GetTickCount64, Threading::{
-            GetCurrentThread, GetProcessTimes, IsWow64Process, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            GetCurrentThread, IsWow64Process, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
             SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
         }},
         UI::{
             Input::{
-                GetRawInputBuffer, GetRawInputData, GetRegisteredRawInputDevices, HRAWINPUT, RAWINPUT,
-                RAWINPUTDEVICE, RAWINPUTHEADER, RAWKEYBOARD, RAWMOUSE, RID_INPUT, RIDEV_DEVNOTIFY,
+                GetRawInputBuffer, GetRawInputData, GetRegisteredRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE,
+                MOUSE_VIRTUAL_DESKTOP, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RAWKEYBOARD, RAWMOUSE, RID_INPUT, RIDEV_DEVNOTIFY,
                 RIDEV_INPUTSINK, RIDEV_REMOVE, RIM_TYPEHID, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE, RegisterRawInputDevices,
             },
             Input::KeyboardAndMouse::GetKeyboardLayout,
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow,
                 GetGUIThreadInfo, GetPhysicalCursorPos, GetSystemMetrics, GetWindowThreadProcessId,
-                GUITHREADINFO, HWND_MESSAGE, MSG, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
+                HWND_MESSAGE, MSG, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
                 SM_CYVIRTUALSCREEN, SM_SWAPBUTTON, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
             },
         },
@@ -40,6 +41,8 @@ use super::{NativeError, device, hid::HidCollections, last_error};
 const INITIAL_RAW_BYTES: usize = 16 * 1024;
 const MAX_RAW_BYTES: usize = 256 * 1024;
 const HEADER_BYTES: usize = size_of::<RAWINPUTHEADER>();
+/// The least interval between two periodic registration checks.
+const REGISTRATION_CHECK_MS: u64 = 5_000;
 
 /// One Raw Input packet outcome. A packet that fails validation is skipped
 /// with its own sequence number, so the loop continues (INP-1, I5).
@@ -139,9 +142,19 @@ impl RawWindow {
 
     pub(super) fn check_registration(&mut self) -> Result<(), NativeError> {
         let now = unsafe { GetTickCount64() };
-        if now.wrapping_sub(self.last_registration_check) < 5_000 { return Ok(()); }
+        if now.wrapping_sub(self.last_registration_check) < REGISTRATION_CHECK_MS { return Ok(()); }
         self.last_registration_check = now;
         self.verify_registration()
+    }
+
+    /// Verify the registration now, whatever the last check. The returned
+    /// QPC was read just before the check, so the registration was verified
+    /// at or after it (E4).
+    pub(super) fn verify_now(&mut self) -> Result<QpcTick, NativeError> {
+        let checked = qpc()?;
+        self.last_registration_check = unsafe { GetTickCount64() };
+        self.verify_registration()?;
+        Ok(checked)
     }
 
     /// A required collection mismatch is a registration loss of the helper.
@@ -294,16 +307,26 @@ impl Drop for RawWindow {
         let entries = registrations(null_mut(), RIDEV_REMOVE, self.pen_hid);
         unsafe {
             RegisterRawInputDevices(entries.as_ptr(), entries.len() as u32, size_of::<RAWINPUTDEVICE>() as u32);
-            DestroyWindow(self.handle);
         }
+        // Optional collections registered one by one; each one still
+        // registered is removed on its own.
+        for (collection, registered) in OptionalCollection::ALL.into_iter().zip(self.optional) {
+            if !registered { continue; }
+            let entry = [optional_registration(null_mut(), RIDEV_REMOVE, collection)];
+            unsafe { RegisterRawInputDevices(entry.as_ptr(), 1, size_of::<RAWINPUTDEVICE>() as u32) };
+        }
+        unsafe { DestroyWindow(self.handle) };
     }
 }
 
 /// The required collections: keyboard, mouse and, when configured, pen.
 fn registrations(window: HWND, flags: u32, pen_hid: bool) -> Vec<RAWINPUTDEVICE> {
-    let mut collections = vec![(1, 2), (1, 6)];
+    let mut collections = vec![
+        (HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_MOUSE),
+        (HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_KEYBOARD),
+    ];
     if pen_hid {
-        collections.extend([(0x0D, 1), (0x0D, 2)]);
+        collections.extend([EXTERNAL_PEN_USAGE, INTEGRATED_PEN_USAGE]);
     }
     collections.into_iter().map(|(page, usage)| RAWINPUTDEVICE {
         usUsagePage: page, usUsage: usage, dwFlags: flags, hwndTarget: window,
@@ -394,14 +417,7 @@ impl RawWindow {
             }
             // OpenProcess returns a newly owned handle.
             let process = unsafe { OwnedHandle::from_raw_handle(process) };
-            let mut created = FILETIME::default();
-            let mut exited = FILETIME::default();
-            let mut kernel = FILETIME::default();
-            let mut user = FILETIME::default();
-            if unsafe { GetProcessTimes(process.as_raw_handle(), &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
-                return None;
-            }
-            let creation_filetime = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+            let creation_filetime = crate::process_instance(process.as_raw_handle(), pid)?.creation_filetime;
             self.foreground = Some(ForegroundProcess { pid: pid.get(), _process: process, creation_filetime });
         }
         let creation_filetime = self.foreground.as_ref()?.creation_filetime;
@@ -424,20 +440,13 @@ impl RawWindow {
 }
 
 fn sample_focus(thread: NonZeroU32, pid: NonZeroU32) -> Option<FocusAtReceipt> {
-    let mut gui = GUITHREADINFO { cbSize: size_of::<GUITHREADINFO>() as u32, ..Default::default() };
-    if unsafe { GetGUIThreadInfo(thread.get(), &mut gui) } == 0 {
-        return None;
-    }
-    let crate::focus::FocusWindow { hwnd: focus, active_fallback } = crate::focus::focus_window(&gui)?;
-    let mut owner = 0;
-    let focus_thread = NonZeroU32::new(unsafe { GetWindowThreadProcessId(focus, &mut owner) })?;
-    if owner != pid.get() {
-        return None;
-    }
-    let layout = unsafe { GetKeyboardLayout(focus_thread.get()) };
+    let crate::focus::FocusAt {
+        mut gui, window: crate::focus::FocusWindow { hwnd: focus, active_fallback }, thread: focus_thread,
+        keyboard_layout: layout,
+    } = crate::focus::focus_at(thread, pid)?;
     // The active window used when nothing has focus is layout evidence only.
     let password_style = (!active_fallback).then(|| crate::focus::password_style(focus)).flatten();
-    if layout.is_null() || unsafe { GetGUIThreadInfo(thread.get(), &mut gui) } == 0
+    if unsafe { GetGUIThreadInfo(thread.get(), &mut gui) } == 0
         || crate::focus::focus_window(&gui).map(|current| current.hwnd) != Some(focus)
         || unsafe { GetKeyboardLayout(focus_thread.get()) } != layout
     {
@@ -450,10 +459,10 @@ fn sample_focus(thread: NonZeroU32, pid: NonZeroU32) -> Option<FocusAtReceipt> {
 }
 
 fn absolute_desktop(flags: u16) -> Option<PhysicalRect> {
-    if flags & 1 == 0 {
+    if flags & MOUSE_MOVE_ABSOLUTE == 0 {
         return None;
     }
-    let (left, top, width, height) = if flags & 2 != 0 {
+    let (left, top, width, height) = if flags & MOUSE_VIRTUAL_DESKTOP != 0 {
         unsafe { (
             GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
             GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN),
@@ -536,10 +545,27 @@ fn packet(bytes: &[u8], wow64_buffered: bool) -> Result<(Packet<'_>, usize), Nat
     Ok((sample, size))
 }
 
-// The only callers use Win32 integer/pointer PODs copied from initialized
-// scratch memory. The length check covers the whole struct including padding.
-fn native_copy<T: Copy>(bytes: &[u8]) -> Result<T, NativeError> {
+/// A Win32 struct that `native_copy` may read from arbitrary initialized bytes.
+///
+/// # Safety
+///
+/// Every bit pattern of the implementing type must be a valid value: it holds
+/// only integers, raw handles and unions of them.
+unsafe trait NativePod: Copy {}
+
+// SAFETY: integer fields and a raw device handle.
+unsafe impl NativePod for RAWINPUTHEADER {}
+// SAFETY: integer fields only.
+unsafe impl NativePod for RAWKEYBOARD {}
+// SAFETY: integer fields and an integer union.
+unsafe impl NativePod for RAWMOUSE {}
+
+/// Copy a native struct out of initialized scratch memory. The length check
+/// covers the whole struct, including padding.
+fn native_copy<T: NativePod>(bytes: &[u8]) -> Result<T, NativeError> {
     if bytes.len() < size_of::<T>() { return Err(invalid_raw()); }
+    // SAFETY: `bytes` holds at least `size_of::<T>()` initialized bytes, any
+    // bit pattern is a valid `T` (`NativePod`), and the read is unaligned.
     Ok(unsafe { bytes.as_ptr().cast::<T>().read_unaligned() })
 }
 

@@ -131,7 +131,12 @@ pub(crate) enum Action {
     Hid,
 }
 
-pub(crate) const MAX_PARTS: usize = 13;
+/// `RI_MOUSE_WHEEL` and `RI_MOUSE_HWHEEL` with their axes.
+const RAW_WHEELS: [(u16, WheelAxis); 2] = [(0x0400, WheelAxis::Vertical), (0x0800, WheelAxis::Horizontal)];
+
+/// The parts of one packet at most: a raw pointer packet may carry a down and
+/// an up per button, one tick per wheel axis and one motion.
+pub(crate) const MAX_PARTS: usize = 2 * Button::ALL.len() + RAW_WHEELS.len() + 1;
 
 /// `LLKHF_UP`: the low-level keyboard hook's key-release flag.
 pub(crate) const LLKHF_UP: u32 = 0x80;
@@ -160,9 +165,8 @@ pub(crate) fn parts(
         InputSample::Hid(_) => parts[0] = Some(Action::Hid),
         InputSample::RawPointer(pointer) => {
             let mut next = 0;
-            for (index, physical) in [Button::Left, Button::Right, Button::Middle, Button::X1, Button::X2]
-                .into_iter().enumerate()
-            {
+            // `Button::ALL` is in the order of the `RI_MOUSE_*_BUTTON_DOWN`/`UP` flag pairs.
+            for (index, physical) in Button::ALL.into_iter().enumerate() {
                 for (edge, down) in [(0, true), (1, false)] {
                     if pointer.button_flags & (1 << (2 * index + edge)) == 0 {
                         continue;
@@ -171,20 +175,14 @@ pub(crate) fn parts(
                     let physical = pointer.device.is_some().then_some(physical);
                     parts[next] = Some(Action::Button { logical, physical, down });
                     next += 1;
-                    if next == parts.len() {
-                        return parts;
-                    }
                 }
             }
             // One RAWMOUSE may carry both position and transitions. Keep the
             // packet's declared order as deterministic subindices.
-            for (flag, axis) in [(0x0400, WheelAxis::Vertical), (0x0800, WheelAxis::Horizontal)] {
+            for (flag, axis) in RAW_WHEELS {
                 if pointer.button_flags & flag != 0 {
                     parts[next] = Some(Action::Wheel { axis, value: pointer.button_data as i16 });
                     next += 1;
-                    if next == parts.len() {
-                        return parts;
-                    }
                 }
             }
             let (x, y) = (pointer.x, pointer.y);

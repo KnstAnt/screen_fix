@@ -12,11 +12,8 @@ use windows::{
     },
 };
 use windows_sys::Win32::UI::{
-    Input::KeyboardAndMouse::{GetKeyboardLayout, IsWindowEnabled},
-    WindowsAndMessaging::{
-        GA_ROOT, GUITHREADINFO, GW_OWNER, GetAncestor, GetGUIThreadInfo, GetWindow, GetWindowThreadProcessId,
-        IsHungAppWindow, IsWindowVisible,
-    },
+    Input::KeyboardAndMouse::IsWindowEnabled,
+    WindowsAndMessaging::{GA_ROOT, GW_OWNER, GetAncestor, GetWindow, IsHungAppWindow, IsWindowVisible},
 };
 
 use screen_fix_protocol::{
@@ -45,18 +42,10 @@ impl FocusSnapshot {
     }
 
     pub fn read(foreground: WindowProcess) -> Option<Self> {
-        let mut gui = GUITHREADINFO { cbSize: size_of::<GUITHREADINFO>() as u32, ..Default::default() };
-        if unsafe { GetGUIThreadInfo(foreground.thread.get(), &mut gui) } == 0 {
-            return None;
-        }
-        let crate::focus::FocusWindow { hwnd: focused, active_fallback } = crate::focus::focus_window(&gui)?;
-        let mut pid = 0;
-        let thread = NonZeroU32::new(unsafe { GetWindowThreadProcessId(focused, &mut pid) })?;
-        if pid != foreground.process.pid.get() {
-            return None;
-        }
-        let layout = unsafe { GetKeyboardLayout(thread.get()) };
-        if layout.is_null() || WindowProcess::foreground() != Some(foreground) {
+        let crate::focus::FocusAt {
+            gui, window: crate::focus::FocusWindow { hwnd: focused, active_fallback }, thread, keyboard_layout: layout,
+        } = crate::focus::focus_at(foreground.thread, foreground.process.pid)?;
+        if WindowProcess::foreground() != Some(foreground) {
             return None;
         }
         let hwnd = HWND(focused);

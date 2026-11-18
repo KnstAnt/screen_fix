@@ -65,8 +65,32 @@ use windows::{
     core::{self, Interface},
 };
 
+/// A failure that its callers handle by kind rather than by its stage text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ProbeKind {
+    #[default]
+    Other,
+    /// A WGC pool or session setup call whose rejection may be format evidence.
+    CaptureSetup,
+    /// The frames merge owner stopped taking rows.
+    FramesLaneClosed,
+    /// The video frames staging exceeded its bound.
+    StagingOverflow,
+    /// An admission change interrupted the encoder self-check.
+    ProbeInterrupted,
+    /// The startup encoder probe found a B-frame.
+    BFrameFound,
+    /// The elevated video prefix was revoked before publication.
+    Revoked,
+    /// The MP4 publication deadline expired.
+    PublicationDeadline,
+    /// The Media Foundation system modules could not be loaded.
+    MediaFoundationMissing,
+}
+
 pub(crate) struct ProbeError {
     stage: &'static str,
+    kind: ProbeKind,
     source: Option<core::Error>,
     journal: Option<JournalError>,
     raw_input_registration: Option<crate::protocol::ipc::RawInputRegistrationMismatch>,
@@ -88,6 +112,15 @@ impl fmt::Display for ProbeError {
 }
 
 impl ProbeError {
+    pub(crate) fn with_kind(mut self, kind: ProbeKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    pub(crate) fn kind(&self) -> ProbeKind {
+        self.kind
+    }
+
     /// Attribute the error to the owner whose boundary it crosses first. A
     /// deeper owner's attribution is kept.
     pub(crate) fn owned_by(mut self, owner: FailureComponent) -> Self {
@@ -101,8 +134,10 @@ impl ProbeError {
             return CaptureError::journal(self.stage, journal);
         }
         let code = self.source.as_ref().map(|source| source.code().0);
+        let remedy = (self.kind == ProbeKind::MediaFoundationMissing).then_some(crate::Remedy::InstallMediaFeaturePack);
         CaptureError::owned(self.owner.unwrap_or(owner), self.stage, code, self.to_string())
             .with_raw_input_registration(self.raw_input_registration)
+            .with_remedy(remedy)
     }
 
     pub(crate) fn into_error(self, owner: FailureComponent) -> CaptureError {
@@ -111,18 +146,18 @@ impl ProbeError {
 }
 
 fn stage<T>(result: core::Result<T>, name: &'static str) -> Result<T, ProbeError> {
-    result.map_err(|source| ProbeError { stage: name, source: Some(source), journal: None, raw_input_registration: None, owner: None })
+    result.map_err(|source| ProbeError { stage: name, kind: ProbeKind::Other, source: Some(source), journal: None, raw_input_registration: None, owner: None })
 }
 
 pub(crate) fn unavailable(stage: &'static str) -> ProbeError {
-    ProbeError { stage, source: None, journal: None, raw_input_registration: None, owner: None }
+    ProbeError { stage, kind: ProbeKind::Other, source: None, journal: None, raw_input_registration: None, owner: None }
 }
 
 /// An I/O failure at `stage`. Only an operating-system error carries a native
 /// code; any other I/O error has no source and reports the stage alone.
 fn io_error(stage: &'static str, error: std::io::Error) -> ProbeError {
     let source = error.raw_os_error().map(|code| core::Error::new(core::HRESULT::from_win32(code as u32), error.to_string()));
-    ProbeError { stage, source, journal: None, raw_input_registration: None, owner: None }
+    ProbeError { stage, kind: ProbeKind::Other, source, journal: None, raw_input_registration: None, owner: None }
 }
 
 /// A NUL-terminated UTF-16 copy of `value` for a wide Win32 parameter.
@@ -242,6 +277,11 @@ fn record_with_disk(worker: &WorkerSession, preflight: DiskPreflight, disk: disk
             capture.blind.get_or_insert(blind);
         }
     }
+    // Reported before the context journal closes, so that a finalization
+    // failure as the primary cause has its `attempt_failure` health row.
+    if let Some(operation) = required_finalization_failure {
+        report(&unavailable(operation).into_error(FailureComponent::Video));
+    }
     let mut streams = BTreeMap::new();
     let mut context_owner = None;
     for (stream, owner) in owners {
@@ -306,14 +346,11 @@ fn record_with_disk(worker: &WorkerSession, preflight: DiskPreflight, disk: disk
         }
     }
     drop(disk);
-    if let Some(operation) = required_finalization_failure {
-        report(&unavailable(operation).into_error(FailureComponent::Video));
-    }
     let faults = worker.fault_outcome();
     diagnostics.additional_failures.extend(faults.additional);
     diagnostics.omitted_fault_reports = faults.omitted;
     let failure = faults.error;
-    let failed_step = failure.as_ref().map(|error| error.operation);
+    let failed_step = failure.as_ref().map(|error| error.operation());
     let frame_count = video.iter().map(|monitor| monitor.encoded).sum::<u64>();
     let unavailable_video = config.monitors().iter().filter(|selection| {
         !video.iter().any(|monitor| monitor.monitor == selection.id && monitor.usable())
@@ -433,6 +470,7 @@ fn journal_operation(step: JournalStep) -> &'static str {
         JournalStep::Start => "Start the journal owner",
         JournalStep::Create => "Create the journal file",
         JournalStep::Order => "Order the journal stream",
+        JournalStep::Reserve => "Reserve lifecycle room in the journal queue",
         JournalStep::Encode => "Encode the journal row",
         JournalStep::Append => "Append the journal row",
         JournalStep::BufferedFlush => "Flush the journal buffer",
@@ -443,7 +481,7 @@ fn journal_operation(step: JournalStep) -> &'static str {
 
 pub(super) fn package_journal_error(error: JournalError) -> ProbeError {
     ProbeError {
-        stage: journal_operation(error.step), source: None, journal: Some(error), raw_input_registration: None,
+        stage: journal_operation(error.step), kind: ProbeKind::Other, source: None, journal: Some(error), raw_input_registration: None,
         owner: Some(FailureComponent::Journal),
     }
 }
@@ -700,7 +738,7 @@ fn clock_error(_: crate::protocol::ClockRangeError) -> ProbeError {
     unavailable("A timestamp is outside the supported recording time range")
 }
 
-pub(crate) fn displays() -> Result<Vec<crate::platform::Display>, ProbeError> {
+pub(super) fn displays() -> Result<Vec<crate::platform::Display>, ProbeError> {
     Ok(display::enumerate()?.into_iter().map(|display| {
         let label = format!("{} · {}×{}", display.name, display.bounds.width(), display.bounds.height());
         crate::platform::Display { key: display.key, label }

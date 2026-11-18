@@ -16,7 +16,7 @@ use std::{
 use windows_sys::{
     Win32::{
         Foundation::{ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM},
-        System::{LibraryLoader::GetModuleHandleW, Performance::QueryPerformanceCounter},
+        System::{LibraryLoader::GetModuleHandleW, Performance::QueryPerformanceCounter, Threading::GetCurrentThreadId},
         UI::{
             Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             WindowsAndMessaging::*,
@@ -43,6 +43,8 @@ pub enum StartError {
 
 const RING_LENGTH: usize = 512;
 const QUEUE_LENGTH: usize = 1024;
+/// The longest idle wait between two progress updates of a loop.
+const IDLE_WAIT_MS: u32 = 5;
 
 const EMPTY: Notice = Notice {
     event: 0, window: WindowId(0), object: 0, thread: 0,
@@ -95,6 +97,8 @@ pub struct Notifications {
     lost: Arc<LossCounter>,
     main: Option<JoinHandle<()>>,
     locations: Option<JoinHandle<()>>,
+    /// The loop threads' IDs, posted a wake message on stop.
+    threads: [u32; 2],
     progress: Arc<[AtomicI64; 2]>,
     notices: Receiver<Notice>,
 }
@@ -113,17 +117,19 @@ impl Notifications {
         let stop = Arc::new(AtomicBool::new(false));
         let lost = Arc::new(LossCounter::default());
         let progress = Arc::new([const { AtomicI64::new(0) }; 2]);
-        let main = start(Loop::Main, Arc::clone(&stop), Arc::clone(&lost), Arc::clone(&progress), send.clone(), scoped)?;
-        let locations = match start(Loop::Locations, Arc::clone(&stop), Arc::clone(&lost), Arc::clone(&progress), send, scoped) {
+        let (main, main_thread) = start(Loop::Main, Arc::clone(&stop), Arc::clone(&lost), Arc::clone(&progress), send.clone(), scoped)?;
+        let (locations, locations_thread) = match start(Loop::Locations, Arc::clone(&stop), Arc::clone(&lost), Arc::clone(&progress), send, scoped) {
             Ok(worker) => worker,
             Err(error) => {
                 stop.store(true, Release);
-                main.thread().unpark();
+                wake(main_thread);
                 if scoped { let _ = main.join(); }
                 return Err(error);
             }
         };
-        Ok(Self { stop, lost, main: Some(main), locations: Some(locations), progress, notices })
+        Ok(Self {
+            stop, lost, main: Some(main), locations: Some(locations), threads: [main_thread, locations_thread], progress, notices,
+        })
     }
 
     pub fn drain(&self) -> impl Iterator<Item = Notice> + '_ {
@@ -146,8 +152,8 @@ impl Notifications {
 
     fn request_stop(&self) {
         self.stop.store(true, Release);
-        for worker in [&self.main, &self.locations].into_iter().flatten() {
-            worker.thread().unpark();
+        for thread in self.threads {
+            wake(thread);
         }
     }
 
@@ -165,9 +171,17 @@ impl Drop for Notifications {
     }
 }
 
+/// End a loop's idle wait, so that it observes a stop request at once. After
+/// the loop thread ended, the post fails, or reaches a thread that reused the
+/// ID, where `WM_NULL` does nothing.
+fn wake(thread: u32) {
+    unsafe { PostThreadMessageW(thread, WM_NULL, 0, 0) };
+}
+
+/// Start a loop thread; returns its owner and its thread ID.
 fn start(
     kind: Loop, stop: Arc<AtomicBool>, lost: Arc<LossCounter>, progress: Arc<[AtomicI64; 2]>, send: SyncSender<Notice>, scoped: bool,
-) -> Result<JoinHandle<()>, StartError> {
+) -> Result<(JoinHandle<()>, u32), StartError> {
     let (ready, initialized) = sync_channel(1);
     let name = match kind { Loop::Main => "context-window", Loop::Locations => "context-location" };
     let worker_stop = Arc::clone(&stop);
@@ -186,14 +200,16 @@ fn start(
                 return;
             }
         };
-        if ready.try_send(Ok(())).is_err() {
+        // Ensure that a message queue exists before revealing the thread ID.
+        let mut message = MSG::default();
+        unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE) };
+        if ready.try_send(Ok(unsafe { GetCurrentThreadId() })).is_err() {
             return;
         }
         while !worker_stop.load(Acquire) {
             let mut before = 0;
             if unsafe { QueryPerformanceCounter(&mut before) } == 0 { return; }
             let mut exhausted = false;
-            let mut message = MSG::default();
             let mut busy = false;
             for _ in 0..128 {
                 if unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) } == 0 {
@@ -222,15 +238,17 @@ fn start(
                 progress[match kind { Loop::Main => 0, Loop::Locations => 1 }].store(before, Release);
             }
             if !busy {
-                thread::park_timeout(Duration::from_millis(5));
+                // Wait for new messages, a stop wake or the next progress update.
+                unsafe { MsgWaitForMultipleObjectsEx(0, null(), IDLE_WAIT_MS, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
             }
         }
     }).map_err(StartError::Spawn)?;
     match initialized.recv_timeout(Duration::from_secs(2)) {
-        Ok(Ok(())) => Ok(worker),
+        Ok(Ok(thread)) => Ok((worker, thread)),
         result => {
+            // A loop that has not reported ready observes the stop flag
+            // before its first wait.
             stop.store(true, Release);
-            worker.thread().unpark();
             if scoped { let _ = worker.join(); }
             match result {
                 Ok(Err(error)) => Err(error),

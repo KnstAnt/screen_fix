@@ -3,18 +3,18 @@
 use std::time::Instant;
 
 use windows_sys::Win32::UI::{
-    Input::{Ime::{ImmGetDefaultIMEWnd, ImmIsIME}, KeyboardAndMouse::HKL},
-    WindowsAndMessaging::{GetWindowThreadProcessId, SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW},
+    Input::{Ime::{IME_CMODE_FULLSHAPE, IME_CMODE_NATIVE, ImmGetDefaultIMEWnd, ImmIsIME}, KeyboardAndMouse::HKL},
+    WindowsAndMessaging::{GetWindowThreadProcessId, SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_IME_CONTROL},
 };
 
 pub use screen_fix_protocol::ipc::elevated::ImeState as State;
 
 use crate::{identity::WindowProcess, windows::FocusSnapshot};
 
-const IME_CONTROL: u32 = 0x0283;
-const GET_OPEN_STATUS: usize = 0x0005;
-const GET_CONVERSION_MODE: usize = 0x0001;
-const NATIVE_AND_FULLSHAPE: usize = 0x0001 | 0x0008;
+/// `WM_IME_CONTROL` commands (imm.h), not exported by windows-sys.
+const IMC_GETOPENSTATUS: usize = 0x0005;
+const IMC_GETCONVERSIONMODE: usize = 0x0001;
+const NATIVE_AND_FULLSHAPE: usize = (IME_CMODE_NATIVE | IME_CMODE_FULLSHAPE) as usize;
 
 /// Whether the focus thread's input language has an IME. Without a focus
 /// window (no snapshot, or only the active-window fallback) the answer is
@@ -60,8 +60,8 @@ fn read_inner(
             && pid == foreground.process.pid.get() && ImmGetDefaultIMEWnd(hwnd) == window }
     };
     if !valid() { return State::Unknown; }
-    let open = send(window, GET_OPEN_STATUS, expires);
-    let conversion = (open == Some(1) && valid()).then(|| send(window, GET_CONVERSION_MODE, expires)).flatten();
+    let open = send(window, IMC_GETOPENSTATUS, expires);
+    let conversion = (open == Some(1) && valid()).then(|| send(window, IMC_GETCONVERSIONMODE, expires)).flatten();
     if Instant::now() > expires || !valid() || !active(foreground, Some(focus)) {
         return State::Unknown;
     }
@@ -78,7 +78,7 @@ fn send(window: windows_sys::Win32::Foundation::HWND, command: usize, expires: I
     let timeout = u32::try_from(remaining.as_millis()).ok().filter(|value| *value != 0)?;
     let mut result = 0;
     let delivered = unsafe {
-        SendMessageTimeoutW(window, IME_CONTROL, command, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, timeout, &mut result)
+        SendMessageTimeoutW(window, WM_IME_CONTROL, command, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, timeout, &mut result)
     };
     (delivered != 0).then_some(result)
 }

@@ -24,6 +24,12 @@ impl RecorderAction {
     }
 }
 
+/// `VK_F1`. F1 through F24 have consecutive virtual-key codes.
+const VK_F1: u16 = 0x70;
+
+/// The function key that Windows reserves for debugger use.
+pub const DEBUGGER_FUNCTION: u8 = 12;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HotkeyBindings {
     functions: [u8; 4],
@@ -38,7 +44,12 @@ impl Default for HotkeyBindings {
 impl HotkeyBindings {
     pub fn function(self, action: RecorderAction) -> u8 { self.functions[action as usize] }
 
-    pub(crate) fn virtual_keys(self) -> [u16; 4] { self.functions.map(|function| 0x6f + u16::from(function)) }
+    pub(crate) fn virtual_key(self, action: RecorderAction) -> u16 { VK_F1 - 1 + u16::from(self.function(action)) }
+
+    pub(crate) fn virtual_keys(self) -> [u16; 4] { RecorderAction::ALL.map(|action| self.virtual_key(action)) }
+
+    /// The function-key number of a virtual key from `virtual_key`.
+    pub(crate) fn function_of(vk: u16) -> u16 { vk - (VK_F1 - 1) }
 
     pub fn set_function(&mut self, action: RecorderAction, function: u8) -> bool {
         if !(1..=24).contains(&function) {

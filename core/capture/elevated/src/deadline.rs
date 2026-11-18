@@ -33,6 +33,11 @@ impl Cancellation {
     }
 
     pub(crate) fn handle(&self) -> &Handle { &self.event }
+
+    /// Block for up to `timeout`, returning early once cancelled.
+    pub(crate) fn wait(&self, timeout: Duration) {
+        unsafe { WaitForSingleObject(self.event.raw(), milliseconds(timeout)) };
+    }
 }
 
 pub(crate) fn event() -> Result<Handle> {
@@ -46,6 +51,8 @@ pub(crate) fn milliseconds(duration: Duration) -> u32 {
 #[derive(Clone, Copy)]
 pub(crate) struct Deadline<'a> {
     pub(crate) at: Instant,
+    /// The failure reported when `at` passes; each bound names its own stage.
+    pub(crate) expired: Failure,
     pub(crate) cancellation: &'a Cancellation,
     pub(crate) grant: Option<&'a Cancellation>,
     pub(crate) scope_current: Option<&'a dyn Fn() -> bool>,
@@ -64,7 +71,7 @@ impl Deadline<'_> {
             peer.ensure_live()?;
         }
         if Instant::now() >= self.at {
-            return Err(Failure::ReadinessDeadline);
+            return Err(self.expired);
         }
         Ok(())
     }
@@ -91,7 +98,10 @@ impl Deadline<'_> {
         let limit = handles.len() as u32;
         loop {
             self.check()?;
-            let remaining = self.at.saturating_duration_since(Instant::now()).min(POLL);
+            // Every other condition is a waited handle; only the scope
+            // predicate has to be polled.
+            let remaining = self.at.saturating_duration_since(Instant::now());
+            let remaining = if self.scope_current.is_some() { remaining.min(POLL) } else { remaining };
             let outcome = unsafe { WaitForMultipleObjects(limit, handles.as_ptr(), 0, milliseconds(remaining)) };
             match outcome {
                 WAIT_OBJECT_0 => return Err(Failure::Cancelled),
@@ -109,8 +119,7 @@ impl Deadline<'_> {
 
     pub(crate) fn pause(self) -> Result<()> {
         self.check()?;
-        let remaining = self.at.saturating_duration_since(Instant::now()).min(POLL);
-        unsafe { WaitForSingleObject(self.cancellation.event.raw(), milliseconds(remaining)) };
+        self.cancellation.wait(self.at.saturating_duration_since(Instant::now()).min(POLL));
         self.check()
     }
 }

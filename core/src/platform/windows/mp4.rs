@@ -5,13 +5,25 @@ use std::{
     sync::{Arc, atomic::{AtomicU8, Ordering}, mpsc::{Receiver, SyncSender}},
 };
 
-use windows::{Win32::{Graphics::Dxgi::IDXGIAdapter1, Media::MediaFoundation::*}, core::PCWSTR};
+use windows::{
+    Win32::{
+        Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, WIN32_ERROR},
+        Graphics::Dxgi::IDXGIAdapter1,
+        Media::MediaFoundation::*,
+    },
+    core::PCWSTR,
+};
 
 use crate::protocol::SegmentId;
 
-use super::{ProbeError, io_error, mf, stage, unavailable, wide};
+use super::{ProbeError, ProbeKind, io_error, mf, stage, unavailable, wide};
 
 const REVOKED: &str = "The elevated video prefix was revoked before publication";
+/// Renames retried after a transient sharing or lock violation.
+const RENAME_RETRIES: u32 = 5;
+const RENAME_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+/// The tolerance between decoded and planned timing, in 100 ns (1 ms).
+const TIMING_TOLERANCE_100NS: u64 = 10_000;
 
 pub(super) struct Recording {
     writer: IMFSinkWriter,
@@ -102,7 +114,7 @@ impl Recording {
         let pending = self.pending.clone();
         let check = || {
             if !authorized(None) {
-                return Err(unavailable(REVOKED));
+                return Err(revoked());
             }
             check_deadline(&deadline)
         };
@@ -119,7 +131,7 @@ impl Recording {
             Ok(()) => Ok(Some(SegmentToVerify {
                 segment, pending, path: self.path, expected, size, authorized, claim: Arc::new(AtomicU8::new(CLAIM_OPEN)),
             })),
-            Err(error) if error.stage == REVOKED => { remove_part(&pending)?; Ok(None) }
+            Err(error) if error.kind() == ProbeKind::Revoked => { remove_part(&pending)?; Ok(None) }
             Err(error) => Err(error),
         }
     }
@@ -127,9 +139,13 @@ impl Recording {
 
 fn check_deadline(deadline: &impl Fn() -> Option<std::time::Instant>) -> Result<(), ProbeError> {
     if deadline().is_some_and(|limit| std::time::Instant::now() >= limit) {
-        return Err(unavailable(DEADLINE));
+        return Err(unavailable(DEADLINE).with_kind(ProbeKind::PublicationDeadline));
     }
     Ok(())
+}
+
+fn revoked() -> ProbeError {
+    unavailable(REVOKED).with_kind(ProbeKind::Revoked)
 }
 
 /// The per-monitor segment verifier. It decodes each handed-off part, with a
@@ -140,8 +156,18 @@ pub(super) fn verify_segments(
     adapter: IDXGIAdapter1, parts: Receiver<SegmentToVerify>, verdicts: SyncSender<Verdict>,
     deadline: impl Fn() -> Option<std::time::Instant>,
 ) {
-    // Without COM the verifier exits; the worker sees it as disconnected.
-    let Ok(_apartment) = super::Apartment::initialize() else { return };
+    let _apartment = match super::Apartment::initialize() {
+        Ok(apartment) => apartment,
+        Err(error) => {
+            // Without COM no part can be verified. The first part's verdict
+            // carries the cause; the worker then sees the verifier exit, and
+            // every part stays `.part`.
+            if let Ok(part) = parts.recv() {
+                let _ = verdicts.send(Verdict { segment: part.segment, outcome: Err(error) });
+            }
+            return;
+        }
+    };
     let decoder = super::capture_device(&adapter).and_then(|device| {
         let (token, manager) = mf::device_manager()?;
         stage(unsafe { manager.ResetDevice(&device, token) }, "Attach the segment decoder D3D11 device")?;
@@ -161,7 +187,7 @@ impl SegmentToVerify {
         self, decoder: Option<&IMFDXGIDeviceManager>, deadline: &impl Fn() -> Option<std::time::Instant>,
     ) -> Result<Option<Published>, ProbeError> {
         match self.verify_and_rename(decoder, deadline) {
-            Err(error) if error.stage == REVOKED => { remove_part(&self.pending)?; Ok(None) }
+            Err(error) if error.kind() == ProbeKind::Revoked => { remove_part(&self.pending)?; Ok(None) }
             // A rejected or abandoned part stays `.part`.
             result => result.map(Some),
         }
@@ -176,7 +202,7 @@ impl SegmentToVerify {
                 return Err(unavailable(ABANDONED));
             }
             if !(self.authorized)(decoded_end.get()) {
-                return Err(unavailable(REVOKED));
+                return Err(revoked());
             }
             check_deadline(deadline)
         };
@@ -203,20 +229,27 @@ impl SegmentToVerify {
         if self.claim.compare_exchange(CLAIM_OPEN, CLAIM_PUBLISHING, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return Err(unavailable(ABANDONED));
         }
-        for retry in 0..6 {
+        let mut retries = 0;
+        loop {
             match fs::rename(&self.pending, &self.path) {
                 Ok(()) => return Ok(Published { local_end_100ns: end, bytes, timing }),
-                Err(error) if retry < 5 && matches!(error.raw_os_error(), Some(32 | 33)) => {
+                Err(error) if retries < RENAME_RETRIES && transient_lock(&error) => {
+                    retries += 1;
                     check_deadline(deadline)?;
-                    let delay = std::time::Duration::from_millis(25);
-                    let delay = deadline().map_or(delay, |limit| delay.min(limit.saturating_duration_since(std::time::Instant::now())));
+                    let delay = deadline().map_or(RENAME_RETRY_DELAY,
+                        |limit| RENAME_RETRY_DELAY.min(limit.saturating_duration_since(std::time::Instant::now())));
                     std::thread::sleep(delay);
                 }
                 Err(error) => return Err(io_error("Publish the MP4", error)),
             }
         }
-        unreachable!()
     }
+}
+
+/// Another process, such as an indexer or a scanner, briefly holds the part.
+fn transient_lock(error: &std::io::Error) -> bool {
+    error.raw_os_error().and_then(|code| u32::try_from(code).ok())
+        .is_some_and(|code| matches!(WIN32_ERROR(code), ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION))
 }
 
 fn remove_part(path: &Path) -> Result<(), ProbeError> {
@@ -264,8 +297,9 @@ fn verify_decoded_frames(
                 let duration = stage(unsafe { sample.GetSampleDuration() }, "Read the MP4 frame duration")?;
                 let end = timestamp.checked_add(duration).ok_or_else(|| unavailable("The decoded MP4 duration overflowed"))?;
                 if duration <= 0 || previous_pts.is_some_and(|previous| timestamp <= previous)
-                    || timestamp.abs_diff(pts) > 10_000 || duration.abs_diff(expected_duration) > 10_000
-                    || end.abs_diff(pts.saturating_add(expected_duration)) > 10_000
+                    || timestamp.abs_diff(pts) > TIMING_TOLERANCE_100NS
+                    || duration.abs_diff(expected_duration) > TIMING_TOLERANCE_100NS
+                    || end.abs_diff(pts.saturating_add(expected_duration)) > TIMING_TOLERANCE_100NS
                 {
                     return Err(unavailable("The decoded segment timing does not match the frame index"));
                 }

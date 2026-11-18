@@ -5,8 +5,11 @@ use crate::{
 
 use super::{
     Action, Button, CorrelatedInput, Correlation, InputOrigin, Key, Motion, PendingInput,
-    PointerEvidence, matching::{injected_hook, promoted},
+    PointerEvidence, matching::{PROMOTED_CURSOR_ID, PROMOTED_TOUCH, injected_hook, promoted},
 };
+
+/// The extra-information values AutoHotkey marks the input it sends with.
+const AUTOHOTKEY_EXTRA: std::ops::RangeInclusive<u64> = 0xffc3_d3e9..=0xffc3_d450;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OriginEvidence {
@@ -156,6 +159,7 @@ fn origin(
             _ => continue,
         };
         if promoted(extra) {
+            // The low byte carries the touch flag and the cursor id.
             let current = extra as u8;
             conflicting |= signature.is_some_and(|old| old != current);
             signature = Some(current);
@@ -181,8 +185,8 @@ fn origin(
     }
     if let Some(signature) = signature {
         return OriginEvidence {
-            origin: if signature & 0x80 == 0 { InputOrigin::PenPromoted } else { InputOrigin::TouchPromoted },
-            device, cursor_id: Evidence::Observed(signature & 0x7f), injector_hint: None,
+            origin: if signature & PROMOTED_TOUCH == 0 { InputOrigin::PenPromoted } else { InputOrigin::TouchPromoted },
+            device, cursor_id: Evidence::Observed(signature & PROMOTED_CURSOR_ID), injector_hint: None,
         };
     }
     // An ambiguous cluster row carries no hook of its own. Its component is
@@ -201,11 +205,11 @@ fn origin(
     if let Some(extra) = injected {
         return OriginEvidence {
             origin: InputOrigin::Injected, device, cursor_id: Evidence::Unavailable(UnavailableReason::NoDevice),
-            injector_hint: (0xffc3_d3e9..=0xffc3_d450).contains(&extra).then_some(ControllerHint::AutoHotkey),
+            injector_hint: AUTOHOTKEY_EXTRA.contains(&extra).then_some(ControllerHint::AutoHotkey),
         };
     }
     if raw.is_some_and(|slot| matches!(&slot.packet.sample,
-        InputSample::Hid(report) if (report.usage_page, report.usage) == (Some(0x0D), Some(5))))
+        InputSample::Hid(report) if report.is_touchpad()))
         && matches!(device, Evidence::Observed(_))
     {
         return OriginEvidence {

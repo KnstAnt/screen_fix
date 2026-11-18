@@ -5,10 +5,10 @@ use std::{
 };
 
 use screen_fix_native_observation::input::{
-    self, Collector, NativeError, Settings, last_error, loss::{self, Losses},
+    self, Collector, NativeError, Settings, last_error, loss::{self, Losses, PendingStatus},
 };
 use screen_fix_protocol::ipc::{
-    CoreToHelper, EnvironmentState, HelperFailureStage, HelperToCore,
+    CoreToHelper, HelperFailureStage, HelperToCore,
     InputRegistration, PacketError, Producer, shared::HelperEndpoint,
 };
 use windows_sys::Win32::{
@@ -70,12 +70,13 @@ fn inherited_handles() -> Option<[OwnedHandle; 3]> {
 struct Output {
     channel: HelperEndpoint,
     losses: Losses,
-    environment: Option<EnvironmentState>,
+    /// Status records waiting for queue room (INP-14, INP-15, M1-05).
+    status: PendingStatus,
 }
 
 impl Output {
     fn new(channel: HelperEndpoint) -> Self {
-        Self { channel, losses: Losses::default(), environment: None }
+        Self { channel, losses: Losses::default(), status: PendingStatus::default() }
     }
 
     fn status(&mut self, record: HelperToCore) -> Result<(), NativeError> {
@@ -116,27 +117,21 @@ impl Collector for Output {
         self.flush_final(parent)
     }
 
-    fn offer(&mut self, mut record: HelperToCore) -> Result<(), NativeError> {
+    fn offer(&mut self, record: HelperToCore) -> Result<(), NativeError> {
+        // A status record waits for queue room behind the pending ones.
+        let record = match self.status.defer(record) {
+            Ok(()) => return self.flush_status().map(|_| ()),
+            Err(record) => record,
+        };
         if let Some(producer) = loss::producer(&record)
             && !self.flush_loss(producer)?
         {
             self.losses.drop_record(&record);
             return Ok(());
         }
-        if let HelperToCore::Environment(state) = &mut record
-            && let Some(pending) = self.environment.take()
-        {
-            state.changes |= pending.changes;
-        }
         match self.channel.send(&record) {
             Ok(true) => {}
-            Ok(false) => {
-                if let HelperToCore::Environment(state) = record {
-                    self.environment = Some(state);
-                } else {
-                    self.losses.drop_record(&record);
-                }
-            }
+            Ok(false) => self.losses.drop_record(&record),
             // A record that cannot be encoded is skipped with a counted gap.
             // Only a corrupt queue breaks the transport.
             Err(PacketError::InvalidCursor) => return Err(transport_error()),
@@ -148,26 +143,26 @@ impl Collector for Output {
 
 impl Output {
     fn flush_loss(&mut self, producer: Producer) -> Result<bool, NativeError> {
-        while let Some(gap) = self.losses.front(producer) {
-            if !self.channel.send(&HelperToCore::Gap(gap)).map_err(|_| transport_error())? {
-                return Ok(false);
-            }
-            self.losses.delivered(producer);
-        }
-        Ok(true)
+        let Self { channel, losses, .. } = self;
+        losses.flush(producer, |gap| channel.send(&HelperToCore::Gap(gap)).map_err(|_| transport_error()))
+    }
+
+    /// A status record that cannot be encoded is skipped, as in `offer`.
+    /// Only a corrupt queue breaks the transport.
+    fn flush_status(&mut self) -> Result<bool, NativeError> {
+        let Self { channel, status, .. } = self;
+        status.flush(|record| match channel.send(&record) {
+            Ok(sent) => Ok(sent),
+            Err(PacketError::InvalidCursor) => Err(transport_error()),
+            Err(_) => Ok(true),
+        })
     }
 
     fn flush_pending(&mut self) -> Result<bool, NativeError> {
         for producer in Producer::ALL {
             if !self.flush_loss(producer)? { return Ok(false); }
         }
-        if let Some(state) = self.environment {
-            if !self.channel.send(&HelperToCore::Environment(state)).map_err(|_| transport_error())? {
-                return Ok(false);
-            }
-            self.environment = None;
-        }
-        Ok(true)
+        self.flush_status()
     }
 
     fn flush_final(&mut self, parent: BorrowedHandle<'_>) -> Result<(), NativeError> {

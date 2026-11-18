@@ -122,6 +122,7 @@ pub enum SourceFailureReason {
     InstalledPath,
     InstalledPermissions,
     InstalledSignature,
+    RevocationUnknown,
     ReleaseMismatch,
     ProcessIdentity,
     TokenIdentity,
@@ -177,6 +178,8 @@ impl SourceFailure {
         match self.reason {
             DeploymentRequired | InstalledPath | InstalledPermissions | InstalledSignature | ReleaseMismatch =>
                 "Install or repair the matching signed Recorder and collector using the official machine-wide installer.",
+            RevocationUnknown =>
+                "Windows could not confirm from its cached revocation data that the installed publisher certificate is not revoked. Check the diagnostic report, then retry after Windows has refreshed its certificate revocation data.",
             TokenIdentity => match self.token_identity.map(|detail| detail.check) {
                 Some(TokenIdentityCheck::ProtectedProcess) =>
                     "The target application uses Windows process protection. Select a supported application.",
@@ -224,6 +227,7 @@ impl SourceFailure {
             Failure::InstalledPath => Reason::InstalledPath,
             Failure::InstalledPermissions => Reason::InstalledPermissions,
             Failure::InstalledSignature => Reason::InstalledSignature,
+            Failure::RevocationUnknown => Reason::RevocationUnknown,
             Failure::ReleaseMismatch => Reason::ReleaseMismatch,
             Failure::ProcessIdentity => Reason::ProcessIdentity,
             Failure::TokenIdentity(_) => Reason::TokenIdentity,

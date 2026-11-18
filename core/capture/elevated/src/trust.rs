@@ -1,4 +1,4 @@
-pub(crate) mod permissions;
+mod permissions;
 mod signature;
 
 use std::{ffi::OsString, mem::size_of, os::windows::ffi::OsStringExt, path::{Component, Path, PathBuf, Prefix}, ptr::{null, null_mut}};

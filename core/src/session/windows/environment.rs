@@ -18,18 +18,23 @@ use std::{
 
 use windows_sys::{
     Win32::{
-        Foundation::{ERROR_CLASS_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM},
         System::{
             LibraryLoader::GetModuleHandleW,
+            Power::{
+                DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS, HPOWERNOTIFY, RegisterSuspendResumeNotification,
+                UnregisterSuspendResumeNotification,
+            },
             RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification},
         },
         UI::{
             Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             WindowsAndMessaging::{
-                CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-                EVENT_SYSTEM_DESKTOPSWITCH, GWLP_USERDATA, MSG, PM_REMOVE, PeekMessageW, RegisterClassW,
-                WINEVENT_OUTOFCONTEXT, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_NCCREATE, WM_NCDESTROY,
-                WM_QUERYENDSESSION, WM_QUIT, WM_SETTINGCHANGE, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_POPUP,
+                CREATESTRUCTW, CreateWindowExW, DEVICE_NOTIFY_CALLBACK, DefWindowProcW, DestroyWindow, DispatchMessageW,
+                EVENT_SYSTEM_DESKTOPSWITCH, GWLP_USERDATA, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PM_REMOVE,
+                PeekMessageW, RegisterClassW, WINEVENT_OUTOFCONTEXT, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION,
+                WM_NCCREATE, WM_NCDESTROY, WM_QUERYENDSESSION, WM_QUIT, WM_SETTINGCHANGE, WM_WTSSESSION_CHANGE, WNDCLASSW,
+                WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
             },
         },
     },
@@ -57,11 +62,6 @@ pub(super) const SLEEP: u32 = 2;
 pub(super) const SECURE_DESKTOP: u32 = 4;
 const EDGE_SHIFT: u32 = 8;
 const ASSERT_EDGES: u32 = (LOCK_SCREEN | SLEEP | SECURE_DESKTOP) << EDGE_SHIFT;
-const WTS_SESSION_LOCK: WPARAM = 0x7;
-const WTS_SESSION_UNLOCK: WPARAM = 0x8;
-const PBT_APMSUSPEND: u32 = 0x4;
-const PBT_APMRESUMEAUTOMATIC: u32 = 0x12;
-const DEVICE_NOTIFY_CALLBACK: u32 = 2;
 
 thread_local! {
     static DESKTOP_SIGNALS: Cell<*const Signals> = const { Cell::new(null()) };
@@ -354,32 +354,20 @@ impl Drop for Window {
     }
 }
 
-#[repr(C)]
-struct PowerSubscription {
-    callback: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> u32,
-    context: *mut c_void,
-}
-
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn RegisterSuspendResumeNotification(recipient: HANDLE, flags: u32) -> HANDLE;
-    fn UnregisterSuspendResumeNotification(notification: HANDLE) -> i32;
-}
-
 struct PowerRegistration {
-    handle: HANDLE,
-    subscription: Option<Box<PowerSubscription>>,
+    handle: HPOWERNOTIFY,
+    subscription: Option<Box<DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS>>,
     signals: *const Signals,
 }
 
 impl PowerRegistration {
     fn open(signals: &Arc<Signals>) -> Result<Self, CaptureError> {
         let signals = Arc::into_raw(Arc::clone(signals));
-        let mut subscription = Box::new(PowerSubscription { callback: power_changed, context: signals.cast_mut().cast() });
+        let mut subscription = Box::new(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS { Callback: Some(power_changed), Context: signals.cast_mut().cast() });
         // The boxed native subscription and the strong reference behind its
         // context remain valid until the registration has been removed.
-        let handle = unsafe { RegisterSuspendResumeNotification((&mut *subscription as *mut PowerSubscription).cast(), DEVICE_NOTIFY_CALLBACK) };
-        if handle.is_null() {
+        let handle = unsafe { RegisterSuspendResumeNotification((&mut *subscription as *mut DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS).cast(), DEVICE_NOTIFY_CALLBACK) };
+        if handle == 0 {
             let error = native_error("Subscribe to Windows suspend and resume");
             unsafe { drop(Arc::from_raw(signals)) };
             return Err(error);
@@ -402,7 +390,7 @@ impl Drop for PowerRegistration {
     }
 }
 
-unsafe extern "system" fn power_changed(context: *mut c_void, event: u32, _setting: *mut c_void) -> u32 {
+unsafe extern "system" fn power_changed(context: *const c_void, event: u32, _setting: *const c_void) -> u32 {
     // This is the live reference owned by the callback registration.
     let signals = unsafe { &*context.cast::<Signals>() };
     // A panic must not unwind into the Windows power manager. The body uses
@@ -459,9 +447,9 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
         WM_SETTINGCHANGE => EnvironmentChange::Settings.bit(),
         WM_WTSSESSION_CHANGE => {
             if let Some(signals) = signals {
-                match wparam {
-                    WTS_SESSION_LOCK => signals.reason(LOCK_SCREEN, true),
-                    WTS_SESSION_UNLOCK => signals.reason(LOCK_SCREEN, false),
+                match u32::try_from(wparam) {
+                    Ok(WTS_SESSION_LOCK) => signals.reason(LOCK_SCREEN, true),
+                    Ok(WTS_SESSION_UNLOCK) => signals.reason(LOCK_SCREEN, false),
                     _ => {}
                 }
             }

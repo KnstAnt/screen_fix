@@ -16,7 +16,7 @@ use screen_fix_protocol::{
     },
 };
 
-use crate::{deadline::{Cancellation, Deadline}, win::{Failure, Result}};
+use crate::{deadline::{CLEANUP, Cancellation, Deadline}, win::{Failure, Result}};
 use super::{
     Connection, Links, Receiver, Sender, context, notices, outbox::Outbox,
     grant::{ESSENTIAL_PROGRESS, Grant, InputLoss, INPUT_HOLDBACK, await_witness},
@@ -91,9 +91,12 @@ pub(crate) fn run(links: Links, lifetime: &Arc<Lifetime>, startup: Instant) -> R
 }
 
 fn run_with_witness(links: Links, lifetime: &Arc<Lifetime>, startup: Instant, witness: &Witness) -> Result<()> {
-    let mut control = Receiver::<Control>::new(&links.control, &links.connection);
-    let mut status = Sender::<Status>::new(&links.control, &links.connection);
+    // Configuration is bounded by readiness; afterwards a silent control lane
+    // means no renewal arrived within the lease.
+    let mut control = Receiver::<Control>::new(&links.control, &links.connection, Failure::ReadinessDeadline);
+    let mut status = Sender::<Status>::new(&links.control, &links.connection, Failure::Transport);
     let configuration = configure(&mut control, startup)?;
+    control.0.expired = Failure::LeaseExpired;
     await_witness(&witness.view, &links.connection.stop, startup)?;
     lifetime.witness.set(Arc::clone(&witness.progress)).map_err(|_| Failure::Supervisor)?;
 
@@ -137,7 +140,7 @@ fn run_with_witness(links: Links, lifetime: &Arc<Lifetime>, startup: Instant, wi
         Ok(())
     })?;
 
-    let mut context = Receiver::<ContextCommand>::new(&links.context, &links.connection);
+    let mut context = Receiver::<ContextCommand>::new(&links.context, &links.connection, Failure::Transport);
     let (queries, query_owner) = mpsc::sync_channel(COMMANDS);
     workers.spawn("elevated-context-in", move |cancel| {
         while cancel.check().is_ok() {
@@ -149,13 +152,16 @@ fn run_with_witness(links: Links, lifetime: &Arc<Lifetime>, startup: Instant, wi
     let input_pipe = Arc::clone(&links.input);
     let peer = Arc::clone(&links.connection.peer);
     workers.spawn("elevated-input-monitor", move |cancel| {
-        let deadline = Deadline { at: long_wait(), cancellation: cancel, grant: None, scope_current: None, peer: Some(&peer) };
+        let deadline = Deadline {
+            at: long_wait(), expired: Failure::Transport, cancellation: cancel, grant: None, scope_current: None,
+            peer: Some(&peer),
+        };
         input_pipe.read_message(&mut [0], deadline)?;
         Err(Failure::Protocol)
     })?;
 
     let (input, outbound) = mpsc::sync_channel::<input::Item>(input::SLOTS);
-    let mut writer = Sender::<GrantedInput>::new(&links.input, &links.connection);
+    let mut writer = Sender::<GrantedInput>::new(&links.input, &links.connection, Failure::Transport);
     workers.spawn("elevated-input-out", move |cancel| {
         while cancel.check().is_ok() {
             let mut verified = None;
@@ -187,7 +193,7 @@ fn run_with_witness(links: Links, lifetime: &Arc<Lifetime>, startup: Instant, wi
 
     let (observation, pending) = Outbox::new();
     let drain_losses = observation.clone();
-    let mut context_writer = Sender::<Observation>::new(&links.context, &links.connection);
+    let mut context_writer = Sender::<Observation>::new(&links.context, &links.connection, Failure::Transport);
     workers.spawn("elevated-context-out", move |cancel| {
         while cancel.check().is_ok() {
             drain_losses.flush_losses()?;
@@ -239,9 +245,10 @@ fn run_with_witness(links: Links, lifetime: &Arc<Lifetime>, startup: Instant, wi
 }
 
 impl Owner<'_> {
-    /// A control write fails the lane only past the lease bound (E3).
+    /// A control write fails the lane only past the cleanup bound, the same
+    /// bound within which the supervisor requires owner progress (E3).
     fn send(&mut self, status: &Status) -> Result<()> {
-        self.status.send(status, Instant::now() + LEASE)
+        self.status.send(status, Instant::now() + CLEANUP)
     }
 
     fn run(&mut self, commands: Queue<Control>, queries: Queue<ContextCommand>) -> Result<()> {
@@ -320,12 +327,16 @@ impl Owner<'_> {
                     }
                     Err(error) => return Err(error),
                 };
-                {
+                let stopping = {
                     let mut urgent = self.urgent.grant.lock().map_err(|_| Failure::Supervisor)?;
-                    if self.urgent.stopping.load(Acquire) {
-                        return Ok(false);
-                    }
-                    *urgent = Some(Arc::clone(&grant));
+                    let stopping = self.urgent.stopping.load(Acquire);
+                    if !stopping { *urgent = Some(Arc::clone(&grant)); }
+                    stopping
+                };
+                if stopping {
+                    // Every Prepare is acknowledged exactly once.
+                    self.transition_rejected(visit, Transition::Prepare, ReadUnavailable::Stale)?;
+                    return Ok(false);
                 }
                 let context = context::Owners::start(&grant, Arc::clone(&self.configuration.approved), self.observation.clone())?;
                 let posted = notices::Owner::start(Arc::clone(&grant), self.observation.clone(), Arc::clone(&context.seen));
@@ -333,19 +344,15 @@ impl Owner<'_> {
                     Ok(notices) => match Native::start(Arc::clone(&grant), self.frequency, self.configuration.pen_hid, self.input.clone()) {
                         Ok(native) => (notices, native),
                         Err(error) => {
-                            grant.revoke();
-                            self.lifetime.enter_cleanup(qpc()?)?;
-                            let _ = notices.join();
-                            let _ = context.stop();
-                            self.lifetime.end_cleanup();
+                            grant.abandon(|| {
+                                let _ = notices.join();
+                                let _ = context.stop();
+                            })?;
                             return Err(error);
                         }
                     },
                     Err(error) => {
-                        grant.revoke();
-                        self.lifetime.enter_cleanup(qpc()?)?;
-                        let _ = context.stop();
-                        self.lifetime.end_cleanup();
+                        grant.abandon(|| { let _ = context.stop(); })?;
                         return Err(error);
                     }
                 };
@@ -436,10 +443,7 @@ impl Owner<'_> {
         // Keep the original process and lanes live until the Recorder has
         // read the terminal record and closed the connection. Its sibling
         // lanes otherwise race peer-exit against the control acknowledgement.
-        let until = Instant::now() + crate::deadline::CLEANUP;
-        while self.connection.stop.check().is_ok() && Instant::now() < until {
-            thread::park_timeout(POLL);
-        }
+        self.connection.stop.wait(CLEANUP);
         Ok(true)
     }
 
@@ -561,9 +565,14 @@ impl Owner<'_> {
             return self.read_rejected(read, ReadUnavailable::Stale);
         }
         if !held {
-            return match visit.context.submit(query, secondary) {
+            let submitted = visit.context.submit(query, secondary);
+            // A revoke can stop the read workers after the scope check above;
+            // the read is then stale, not a transport fault (§3.2).
+            let stopped = visit.grant.stopped();
+            return match submitted {
                 Ok(()) => Ok(()),
                 Err(Failure::Busy) => self.read_rejected(read, ReadUnavailable::Unavailable),
+                Err(Failure::Transport) if stopped => self.read_rejected(read, ReadUnavailable::Stale),
                 Err(error) => Err(error),
             };
         }

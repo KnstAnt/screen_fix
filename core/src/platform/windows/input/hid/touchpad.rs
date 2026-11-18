@@ -4,8 +4,10 @@ use serde_json::{Value, json};
 
 use crate::protocol::{
     SessionTimeUs,
-    ipc::{DecodedHidReport, ForegroundAtReceipt, HidUsage, HidValue, MAX_HID_FIELDS},
+    ipc::{DecodedHidReport, ForegroundAtReceipt, HidUsage, HidValue},
 };
+
+use super::{number, switch, unique};
 
 const MAX_CONTACTS: usize = 32;
 
@@ -59,7 +61,7 @@ pub(super) fn observe(
     // Slots beyond Contact Count are padding, even when the descriptor
     // declares fields for all slots. A Tip Off inside the count is evidence.
     let mut links = BTreeMap::<u16, [Option<HidValue>; 5]>::new();
-    for field in report.fields.as_slice().iter().take(MAX_HID_FIELDS) {
+    for field in report.fields.as_slice() {
         let index = match field.usage {
             HidUsage::ContactId => 0,
             HidUsage::X => 1,
@@ -116,26 +118,4 @@ fn unique_number(report: &DecodedHidReport, usage: HidUsage) -> Option<i64> {
 
 fn unique_switch(report: &DecodedHidReport, usage: HidUsage) -> Option<bool> {
     unique(report, usage).and_then(switch)
-}
-
-fn unique(report: &DecodedHidReport, usage: HidUsage) -> Option<HidValue> {
-    let mut fields = report.fields.as_slice().iter().filter(|field| field.usage == usage);
-    match (fields.next(), fields.next()) {
-        (Some(field), None) => Some(field.value),
-        _ => None,
-    }
-}
-
-fn number(value: HidValue) -> Option<i64> {
-    match value {
-        HidValue::Number { raw, .. } => raw,
-        _ => None,
-    }
-}
-
-fn switch(value: HidValue) -> Option<bool> {
-    match value {
-        HidValue::Switch(active) => Some(active),
-        _ => None,
-    }
 }

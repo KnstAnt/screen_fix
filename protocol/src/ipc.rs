@@ -135,8 +135,22 @@ impl OptionalCollection {
     }
 
     pub fn of(usage_page: Option<u16>, usage: Option<u16>) -> Option<Self> {
-        Self::ALL.into_iter().find(|collection| Some(collection.usage()) == usage_page.zip(usage))
+        usage_page.zip(usage).and_then(Self::from_usage)
     }
+
+    pub fn from_usage(usage: (u16, u16)) -> Option<Self> {
+        Self::ALL.into_iter().find(|collection| collection.usage() == usage)
+    }
+}
+
+/// HID digitizer external pen (usage page 0x0D, usage 1).
+pub const EXTERNAL_PEN_USAGE: (u16, u16) = (0x0D, 1);
+/// HID digitizer integrated pen (usage page 0x0D, usage 2).
+pub const INTEGRATED_PEN_USAGE: (u16, u16) = (0x0D, 2);
+
+/// A HID digitizer pen collection, external or integrated.
+pub fn is_pen_usage(usage: (u16, u16)) -> bool {
+    usage == EXTERNAL_PEN_USAGE || usage == INTEGRATED_PEN_USAGE
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,7 +326,15 @@ pub struct HidReport {
 
 impl HidReport {
     pub fn is_pen(&self) -> bool {
-        matches!((self.usage_page, self.usage), (Some(0x0D), Some(1 | 2)))
+        self.usage_page.zip(self.usage).is_some_and(is_pen_usage)
+    }
+
+    pub fn collection(&self) -> Option<OptionalCollection> {
+        OptionalCollection::of(self.usage_page, self.usage)
+    }
+
+    pub fn is_touchpad(&self) -> bool {
+        self.collection() == Some(OptionalCollection::Touchpad)
     }
 
     pub fn pen_continuity_uncertain(&self) -> bool {
@@ -490,6 +512,19 @@ pub enum DeviceKind {
     Hid { usage_page: u16, usage: u16 },
 }
 
+impl DeviceKind {
+    pub fn hid_usage(self) -> Option<(u16, u16)> {
+        match self {
+            Self::Hid { usage_page, usage } => Some((usage_page, usage)),
+            _ => None,
+        }
+    }
+
+    pub fn is_pen(self) -> bool {
+        self.hid_usage().is_some_and(is_pen_usage)
+    }
+}
+
 pub const MAX_INPUT_DEVICES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -627,25 +662,33 @@ impl HelperToCore {
             Self::Ready(registration) if !registration.required_ready() => {
                 Err(PacketError::InvalidRecord("Input helper reported readiness without required registrations."))
             }
-            Self::Input(CollectedInput { receipt, foreground_at_receipt, sample: InputSample::HookKey(_) | InputSample::HookPointer(_), .. })
-                if receipt.message_tick_ms.is_none() || foreground_at_receipt.is_some() =>
-            {
-                Err(PacketError::InvalidRecord("An input IPC hook sample requires its message tick and cannot attest foreground."))
-            }
+            Self::Input(input) => validate_input(input),
             Self::Progress(progress) if progress.before_qpc.0 < 0 => {
                 Err(PacketError::InvalidRecord("An input producer progress tick is negative."))
             }
             Self::Gap(gap) if gap.first_sequence > gap.last_sequence || gap.first_qpc > gap.last_qpc => {
                 Err(PacketError::InvalidRecord("Input IPC gap bounds are reversed."))
             }
-            Self::Input(CollectedInput { sample: InputSample::Hid(HidReport {
-                result: HidReportResult::Report(report), ..
-            }), .. }) if report.fields.as_slice().is_empty() =>
-            {
-                Err(PacketError::InvalidRecord("A decoded input IPC HID report requires declared fields."))
-            }
             _ => Ok(()),
         }
+    }
+}
+
+/// The record checks of one collected input sample, shared with the elevated input lane.
+pub(crate) fn validate_input(input: &CollectedInput) -> Result<(), PacketError> {
+    match input {
+        CollectedInput { receipt, foreground_at_receipt, sample: InputSample::HookKey(_) | InputSample::HookPointer(_), .. }
+            if receipt.message_tick_ms.is_none() || foreground_at_receipt.is_some() =>
+        {
+            Err(PacketError::InvalidRecord("An input IPC hook sample requires its message tick and cannot attest foreground."))
+        }
+        CollectedInput { sample: InputSample::Hid(HidReport {
+            result: HidReportResult::Report(report), ..
+        }), .. } if report.fields.as_slice().is_empty() =>
+        {
+            Err(PacketError::InvalidRecord("A decoded input IPC HID report requires declared fields."))
+        }
+        _ => Ok(()),
     }
 }
 

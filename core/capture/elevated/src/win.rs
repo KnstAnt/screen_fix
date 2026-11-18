@@ -1,3 +1,5 @@
+pub(crate) mod acl;
+
 use std::{fmt, io, os::windows::ffi::OsStrExt, ffi::OsStr};
 
 use windows_sys::Win32::{
@@ -13,6 +15,8 @@ pub enum Failure {
     InstalledPath,
     InstalledPermissions,
     InstalledSignature,
+    /// The revocation status of the installed publisher chain is unknown.
+    RevocationUnknown,
     ReleaseMismatch,
     ProcessIdentity,
     TokenIdentity(screen_fix_protocol::TokenIdentityFailure),
@@ -50,6 +54,7 @@ impl fmt::Display for Failure {
             Self::InstalledPath => "Could not verify the protected installation paths",
             Self::InstalledPermissions => "The installed paths have unexpected permissions",
             Self::InstalledSignature => "Could not verify the installed publisher signature",
+            Self::RevocationUnknown => "Could not confirm that the installed publisher certificate is not revoked",
             Self::ReleaseMismatch => "The installed Recorder and collector releases do not match",
             Self::ProcessIdentity => "Could not verify the original process image and instance",
             Self::TokenIdentity(_) => "Could not verify the process token or interactive access",

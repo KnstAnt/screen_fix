@@ -169,7 +169,7 @@ pub fn run_scoped(
     let raw_result = stopped_raw.and_then(|raw| {
         for record in raw.records.try_iter() { output.offer(record)?; }
         for gap in raw.losses.finish() { output.offer(HelperToCore::Gap(gap))?; }
-        if let Some(environment) = raw.environment { output.offer(HelperToCore::Environment(environment))?; }
+        for record in raw.status.finish() { output.offer(record)?; }
         raw.result
     });
     let hooks_result = stopped_hooks.and_then(|mut hooks| {

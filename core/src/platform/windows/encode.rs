@@ -12,6 +12,19 @@ use windows::{
 
 use super::{ProbeError, mf, stage, unavailable};
 
+/// Inputs submitted to the encoder and not yet returned, and inputs whose
+/// sample the encoder still holds: each is bounded by this count.
+pub(super) const MAX_INPUTS: usize = 3;
+/// The encoder must make progress within this interval, sleep excluded.
+const PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
+const PROGRESS_TIMEOUT_MESSAGE: &str = "The H.264 encoder failed to make progress within 5 seconds";
+/// Outstanding input requests an asynchronous encoder can issue.
+const MAX_INPUT_REQUESTS: u32 = 64;
+/// The largest output buffer the caller allocates for a synchronous encoder.
+const MAX_OUTPUT_BUFFER_BYTES: u32 = 32 * 1024 * 1024;
+/// The wait between polls of an idle encoder.
+const POLL: Duration = Duration::from_millis(1);
+
 #[derive(Clone)]
 pub(super) enum Input {
     Texture(Arc<ID3D11Texture2D>),
@@ -77,7 +90,7 @@ pub(super) fn record<S>(
     let info = stage(unsafe { encoder.GetOutputStreamInfo(0) }, "Read the H.264 output buffer contract")?;
     let provides = (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0) as u32;
     let mut output_buffer = if info.dwFlags & provides != 0 { None } else {
-        if info.cbSize == 0 || info.cbSize > 32 * 1024 * 1024 {
+        if info.cbSize == 0 || info.cbSize > MAX_OUTPUT_BUFFER_BYTES {
             return Err(unavailable("The H.264 output buffer contract is outside the supported bounds"));
         }
         Some(allocate_sample(info.cbSize, info.cbAlignment.saturating_sub(1))?)
@@ -100,10 +113,10 @@ pub(super) fn record<S>(
                 activity = Instant::now();
                 if let Some(pending) = &mut pending { pending.4 = activity; }
             }
-            if ((draining || outstanding != 0) && activity.elapsed() >= Duration::from_secs(5))
-                || pending.as_ref().is_some_and(|pending| pending.4.elapsed() >= Duration::from_secs(5))
+            if ((draining || outstanding != 0) && activity.elapsed() >= PROGRESS_TIMEOUT)
+                || pending.as_ref().is_some_and(|pending| pending.4.elapsed() >= PROGRESS_TIMEOUT)
             {
-                return Err(unavailable("The H.264 encoder failed to make progress within 5 seconds"));
+                return Err(unavailable(PROGRESS_TIMEOUT_MESSAGE));
             }
             if let Some(events) = &events {
                 match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
@@ -115,7 +128,7 @@ pub(super) fn record<S>(
                         let kind = stage(unsafe { event.GetType() }, "Read the encoder event type")?;
                         if kind == METransformNeedInput.0 as u32 && !draining {
                             requested = requested.checked_add(1)
-                                .filter(|value| *value <= 64)
+                                .filter(|value| *value <= MAX_INPUT_REQUESTS)
                                 .ok_or_else(|| unavailable("The encoder issued too many outstanding input requests"))?;
                         } else if kind == METransformHaveOutput.0 as u32 {
                             if let Output::Sample(sample) = read_output(encoder, &mut output_buffer)? {
@@ -166,9 +179,13 @@ pub(super) fn record<S>(
                         activity = Instant::now();
                         continue;
                     }
-                    Output::Empty if outstanding != 0 => continue,
-                    Output::Empty => {},
-                    Output::NeedInput => {}
+                    Output::Empty if outstanding != 0 => {
+                        // The encoder holds pictures but has none ready: wait
+                        // for it instead of polling it in a tight loop.
+                        thread::sleep(POLL);
+                        continue;
+                    }
+                    Output::Empty | Output::NeedInput => {}
                 }
             }
             if !draining && pending.is_none() {
@@ -196,8 +213,8 @@ pub(super) fn record<S>(
                     }
                 }
             }
-            if !draining && (events.is_none() || requested > 0) && outstanding < 3
-                && active.load(Ordering::Acquire) < 3
+            if !draining && (events.is_none() || requested > 0) && outstanding < MAX_INPUTS
+                && active.load(Ordering::Acquire) < MAX_INPUTS
                 && let Some((input, pts, duration, force_idr, _)) = pending.take()
             {
                 let sample = input_sample(input, pts, duration, device, &mut imports, &active)?;
@@ -211,7 +228,7 @@ pub(super) fn record<S>(
                 activity = Instant::now();
                 continue;
             }
-            thread::sleep(Duration::from_millis(1));
+            thread::sleep(POLL);
         }
         Ok(submitted)
     })();

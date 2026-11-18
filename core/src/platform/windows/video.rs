@@ -2,7 +2,8 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Arc, RwLock, atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering}, mpsc::{self, Receiver, SyncSender}},
+    ops::ControlFlow,
+    sync::{Arc, Mutex, PoisonError, RwLock, atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering}, mpsc::{self, Receiver, SyncSender}},
     thread,
     time::{Duration, Instant},
 };
@@ -24,7 +25,7 @@ use crate::{
     session::{AdmissionBoundary, fault::FaultReport, windows::{Admission, AwakeElapsed, PausedVideo, WorkerSession}},
 };
 
-use super::{context::{ApprovalReadError, ELEVATED_FRAME_WAIT_US, FramePolicy}, Apartment, ProbeError, RecordingReport, capture_device, clock, clock_error, display, encode, encoder, h264, io_error, monitor, mp4, package_journal_error, slots, stage, unavailable};
+use super::{context::{ApprovalReadError, ELEVATED_FRAME_WAIT_US, FramePolicy}, Apartment, ProbeError, ProbeKind, RecordingReport, capture_device, clock, clock_error, display, encode, encoder, h264, io_error, monitor, mp4, package_journal_error, slots, stage, unavailable};
 
 const ROTATION_US: i64 = 60_000_000;
 const IDR_ALLOWANCE_US: i64 = 1_000_000;
@@ -56,7 +57,7 @@ pub(super) fn capacity_for(fps: u32) -> VideoCapacity {
 /// rotation allowance, the verification allowance and one slot interval at
 /// the lowest rate any qualified format can have.
 fn mark_stall_us(requested_fps: u32) -> u64 {
-    let slot = US_PER_SECOND.div_ceil(u64::from(encoder::min_effective_fps(requested_fps).max(1)));
+    let slot = US_PER_SECOND.div_ceil(u64::from(encoder::min_effective_fps(requested_fps)));
     ROTATION_US.unsigned_abs().saturating_add(IDR_ALLOWANCE_US.unsigned_abs())
         .saturating_add(VERIFICATION_ALLOWANCE_US).saturating_add(slot)
 }
@@ -69,6 +70,14 @@ fn lane_rows(requested_fps: u32) -> usize {
         .div_ceil(US_PER_SECOND);
     usize::try_from(rows).unwrap_or(usize::MAX)
 }
+
+/// Converted frames queued from the capture owner to the video worker.
+pub(super) const OBSERVATION_QUEUE: usize = 2;
+/// Frames the slot selection holds: the previous slot's frame, the
+/// undecided slot's candidate and a later slot's watermark frame.
+pub(super) const SELECTION_FRAMES: usize = 3;
+/// Frames one decision step takes: the held watermark frame and the queue.
+const COLLECT_BOUND: usize = OBSERVATION_QUEUE + 1;
 
 #[derive(Clone)]
 pub(super) struct Observation {
@@ -129,12 +138,17 @@ struct Lane {
     mark: Arc<Mark>,
 }
 
+/// The merge order of a frames row: (`recv_t_us`, monitor, slot).
+type RowKey = (SessionTimeUs, MonitorId, u64);
+
 #[derive(Default)]
 struct MergeSignals {
     /// Every video worker has exited.
     finish: AtomicBool,
-    /// A worker published a verified segment: flush the written prefix.
-    flush: AtomicBool,
+    /// The last rows of segments whose outcome is final: once the merge has
+    /// released a row, the written prefix through it is flushed. `None`, a
+    /// segment without rows, asks for the prefix written so far.
+    flush: Mutex<Vec<Option<RowKey>>>,
 }
 
 /// The frames journal owner (§6.5): per-monitor lanes merged in
@@ -177,8 +191,10 @@ impl Frames {
             .ok_or_else(|| unavailable("The selected monitor has no frames lane"))
     }
 
-    fn request_flush(&self) {
-        self.signals.flush.store(true, Ordering::Release);
+    /// Flush the written frames prefix once it includes `last`, the final
+    /// row of a segment whose outcome is decided, or at once without one.
+    fn request_flush(&self, last: Option<RowKey>) {
+        self.signals.flush.lock().unwrap_or_else(PoisonError::into_inner).push(last);
     }
 
     /// Called after every video worker has exited: the remaining lane rows
@@ -259,8 +275,8 @@ struct Merge {
     signals: Arc<MergeSignals>,
     /// The latest Opening(e, R).
     opened: Option<AdmissionBoundary>,
-    /// The receipt of the last released row.
-    released: Option<SessionTimeUs>,
+    /// The key of the last released row.
+    released: Option<RowKey>,
     stall: Duration,
     undelivered: Vec<UndeliveredFrames>,
 }
@@ -288,14 +304,10 @@ impl Merge {
             // visible in its lane.
             let constraints: Vec<_> = self.lanes.iter().map(|lane| self.constraint(lane, finishing)).collect();
             let written = self.release(&constraints)?;
-            if self.signals.flush.swap(false, Ordering::AcqRel)
-                && let Some(released) = self.released
-                && !self.ingress.request_flush(released).map_err(package_journal_error)?
-            {
-                self.signals.flush.store(true, Ordering::Release);
-            }
+            self.flush(false)?;
             if finishing && written && self.lanes.iter_mut().all(|lane| lane.head().is_none()) {
-                return Ok(());
+                // A request whose row was never released is not stranded.
+                return self.flush(true);
             }
             if watched.elapsed() >= WATCHDOG_INTERVAL {
                 watched = Instant::now();
@@ -307,6 +319,29 @@ impl Merge {
                 Err(mpsc::RecvTimeoutError::Disconnected) => thread::park_timeout(MERGE_POLL),
             }
         }
+    }
+
+    /// Flush the written prefix once it includes a requested segment's last
+    /// row. A request whose row is not yet released stays pending, and a
+    /// flush the writer cannot take now is retried.
+    /// `all` takes every request, as when the merge finishes.
+    fn flush(&mut self, all: bool) -> Result<(), ProbeError> {
+        let released = self.released;
+        let lock = || self.signals.flush.lock().unwrap_or_else(PoisonError::into_inner);
+        // `None`, a segment without rows, is ordered before every row.
+        let due = |last: &Option<RowKey>| all || *last <= released;
+        if !lock().iter().any(due) {
+            return Ok(());
+        }
+        let Some(released) = self.released else {
+            // Nothing is written: no prefix to flush.
+            lock().retain(|last| !due(last));
+            return Ok(());
+        };
+        if self.ingress.request_flush(released.0).map_err(package_journal_error)? {
+            lock().retain(|last| !due(last));
+        }
+        Ok(())
     }
 
     fn open(&mut self, (opening, ack): (AdmissionBoundary, SyncSender<()>)) {
@@ -349,7 +384,7 @@ impl Merge {
                     }
                 }
             }
-            let Some((index, (receipt, monitor, _))) = next else { return Ok(true) };
+            let Some((index, key @ (receipt, monitor, _))) = next else { return Ok(true) };
             if !self.lanes.iter().zip(constraints).all(|(lane, bound)| bound.admits(lane.monitor, receipt, monitor)) {
                 return Ok(true);
             }
@@ -359,7 +394,7 @@ impl Merge {
                 return Ok(false);
             }
             self.lanes[index].queue.pop_front();
-            self.released = Some(receipt);
+            self.released = Some(key);
         }
     }
 
@@ -446,7 +481,11 @@ pub(super) fn run(
     // The capture owner starts after selection, so the startup self-check
     // pictures are converted here, while this thread alone holds the device.
     let encoder = encoder::select(&display.adapter, luid, source, requested_fps,
-        &mut |format, software| encoder::probe_input(&device, format, software))?;
+        &mut |format, software| encoder::probe_input(&device, format, software))
+        .map_err(|failure| {
+            report_rejected(worker, monitor.id, &failure.rejected);
+            failure.last
+        })?;
     let format = encoder.format;
     let geometry = video_geometry(geometry, format);
     let mut summary = MonitorVideo {
@@ -454,7 +493,7 @@ pub(super) fn run(
         slots: 0, encoded: 0, approval_suppressed: 0, unavailable: false, counters: Default::default(), segments: Vec::new(),
         intervals_without_video: 0, short_intervals_without_video: 0, open_interval: None,
     };
-    let (send, receive) = mpsc::sync_channel(2);
+    let (send, receive) = mpsc::sync_channel(OBSERVATION_QUEUE);
     let (reconfigure, changes) = mpsc::sync_channel(1);
     let (probe, probes) = mpsc::sync_channel(1);
     let pacing = Arc::new(RwLock::new(None));
@@ -511,15 +550,14 @@ impl Drop for ExitMark<'_> {
 /// Failures of the frames stream end the attempt (§6.2 rows 1 and 20);
 /// every other video failure loses this monitor's video only.
 fn fails_attempt(error: &ProbeError) -> bool {
-    error.journal.is_some() || matches!(error.stage, FRAMES_LANE_CLOSED | STAGING_OVERFLOW)
+    error.journal.is_some() || matches!(error.kind(), ProbeKind::FramesLaneClosed | ProbeKind::StagingOverflow)
 }
 
 fn geometry_for(display: &display::Monitor, monitor: &SelectedMonitor) -> Result<Geometry, ProbeError> {
     let (left, top, right, bottom) = display.bounds.edges();
-    let width = i32::try_from(display.bounds.width()).map_err(|_| unavailable("Invalid physical monitor width"))?;
-    let height = i32::try_from(display.bounds.height()).map_err(|_| unavailable("Invalid physical monitor height"))?;
+    let size = display.size()?;
     Ok(Geometry { display_id: monitor.key.as_str().into(), desktop_rect: [left, top, right, bottom],
-        source_size: [width, height], video_size: [0, 0], content_rect: None, video_scale: None })
+        source_size: [size.Width, size.Height], video_size: [0, 0], content_rect: None, video_scale: None })
 }
 
 fn video_geometry(mut geometry: Geometry, format: super::gpu::VideoFormat) -> Geometry {
@@ -557,7 +595,7 @@ impl Selection<'_> {
         available_before: SessionTimeUs, accepts: impl Fn(&Observation) -> bool, counters: &mut VideoCounters,
     ) {
         let count = |counter: &mut u64| *counter = counter.saturating_add(1);
-        for _ in 0..3 {
+        for _ in 0..COLLECT_BOUND {
             let frame = match self.future.take() {
                 Some(future) => future,
                 None => match self.receive.try_recv() {
@@ -659,13 +697,22 @@ struct Closing {
     required_finalization_failure: Option<&'static str>,
 }
 
+/// The decision point of one slot: when it is decided, its end limited by
+/// the cutoff, and the cutoff once admission closed.
+#[derive(Clone, Copy)]
+struct SlotDecision {
+    slot: slots::Slot,
+    at: SessionTimeUs,
+    end: SessionTimeUs,
+    cutoff: Option<SessionTimeUs>,
+}
+
 /// The slot decision grace G (D-10 A): one capture pacing interval plus the
 /// conversion bound, capped at two slot intervals.
 fn decision_grace(worker: &WorkerSession, fps: u32) -> i64 {
-    let pacing = 1_000_000 / i64::from(worker.config().profile().capture_pace().frames_per_second().max(1));
-    let conversion = i64::try_from(monitor::CONVERSION_DEADLINE.as_micros()).unwrap_or(i64::MAX)
-        .min(2 * 1_000_000 / i64::from(fps.max(1)));
-    pacing.saturating_add(conversion)
+    let micros = |duration: Duration| i64::try_from(duration.as_micros()).unwrap_or(i64::MAX);
+    let two_slots = 2 * 1_000_000 / i64::from(fps);
+    micros(monitor::capture_interval(worker)).saturating_add(micros(monitor::CONVERSION_DEADLINE).min(two_slots))
 }
 
 /// This monitor's video can no longer be produced (L-required, §6.2 row 9).
@@ -683,8 +730,35 @@ fn lose_video(
     }
 }
 
-const PROBE_INTERRUPTED: &str = "The encoder self-check was interrupted by an admission change";
+/// Release an encoder. A failed release loses this monitor's video only
+/// (§6.2 row 9).
+fn release_encoder(
+    encoder: encoder::Encoder, worker: &WorkerSession, id: MonitorId, summary: &mut MonitorVideo,
+    unavailable_video: &AtomicBool, reports: Option<&SyncSender<RecordingReport>>,
+) {
+    if let Err(error) = encoder.finish() {
+        lose_video(worker, id, summary, unavailable_video, reports, &error);
+    }
+}
+
+/// One health row per hardware encoder candidate rejected by a selection (V4).
+fn report_rejected(worker: &WorkerSession, id: MonitorId, rejected: &[RejectedEncoder]) {
+    for rejected in rejected {
+        let cause = match &rejected.cause {
+            std::borrow::Cow::Borrowed(cause) => *cause,
+            std::borrow::Cow::Owned(_) => "Qualify a hardware H.264 encoder",
+        };
+        worker.report_health(HealthKind::EncoderCandidateRejected,
+            Failure::new(FailureComponent::Video, cause, rejected.native_code), Some(id), false);
+    }
+}
+
 const ROTATION_IDR_MISSING: &str = "The H.264 encoder did not produce a verified rotation IDR within one second";
+/// A segment interrupted during IDR rotation was not published by Stop.
+const ROTATION_PART_UNPUBLISHED: &str = "Publish the segment interrupted during IDR rotation";
+/// The wait of an elevated segment for its input prefix closer, sleep excluded.
+const INPUT_PREFIX_WAIT: Duration = Duration::from_secs(3);
+const INPUT_PREFIX_POLL: Duration = Duration::from_millis(2);
 
 /// One self-check picture converted by the capture owner (VID-12). An
 /// admission change while waiting supersedes the format request.
@@ -702,14 +776,14 @@ fn capture_probe(
                 request = returned;
                 thread::sleep(VERIFIER_POLL);
             }
-            Err(_) => return Err(unavailable(PROBE_INTERRUPTED)),
+            Err(_) => return Err(encoder::interruption()),
         }
     }
     loop {
         match result.recv_timeout(VERIFIER_POLL) {
             Ok(input) => return input,
             Err(mpsc::RecvTimeoutError::Timeout) if open()? => {}
-            Err(_) => return Err(unavailable(PROBE_INTERRUPTED)),
+            Err(_) => return Err(encoder::interruption()),
         }
     }
 }
@@ -742,6 +816,7 @@ fn record(
     let mut verifying = VecDeque::new();
     loop {
         let capacity = capacity_for(fps);
+        // The slot evidence is sized for the highest qualifiable frame rate.
         if capacity.staged_slots > evidence.slots() {
             return Err(unavailable("The video format exceeds the monitor's slot evidence bound"));
         }
@@ -751,7 +826,7 @@ fn record(
             paused_slots.clear();
         }
         let timeline = slots::Timeline::new(origin, fps)?.with_first(next);
-        *pacing.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((start.boundary.epoch, timeline));
+        *pacing.write().unwrap_or_else(PoisonError::into_inner) = Some((start.boundary.epoch, timeline));
         let mut state = Video {
             id, worker, layout, frames, lane, frame_policy, topology, changes: &changes, change: None, change_ready: false,
             evidence, reports, timeline,
@@ -777,36 +852,11 @@ fn record(
         // The mark of this epoch lets the other monitors' rows below it pass.
         state.publish_resolved()?;
         if let Some(active) = &encoder {
-            let encoded = encode::record(&active.transform, active.device.as_ref(), &mut state,
-                Video::observe_admission, Video::next_frame, Video::finish_approval_prefix, Video::output);
-            match encoded {
-                Err(error) if fails_attempt(&error) => return Err(error),
-                Err(error) => state.flag_failure(&error),
-                Ok(_) if state.preserve_rotation_part => {
-                    let error = unavailable("The H.264 encoder drained without a verified rotation IDR");
-                    state.flag_failure(&error);
-                }
-                Ok(_) => {}
-            }
+            state.run_encoder(active)?;
         }
-        state.skip_outstanding(if state.summary.unavailable { slots::Missing::EncoderUnavailable } else { slots::Missing::EncoderSkipped })?;
-        if state.preserve_rotation_part {
-            if let Some(segment) = state.current.take() {
-                if state.elevated {
-                    segment.mux.discard()?;
-                }
-                state.required_finalization_failure.get_or_insert("Publish the segment interrupted during IDR rotation");
-            }
-        } else if let Err(error) = state.finish_current() {
-            if fails_attempt(&error) {
-                return Err(error);
-            }
-            state.flag_failure(&error);
-        }
-        if state.summary.unavailable {
-            if let Some(active) = encoder.take() {
-                let _ = active.finish();
-            }
+        state.close_open_segment()?;
+        if state.summary.unavailable && let Some(active) = encoder.take() {
+            state.release(active);
         }
         if encoder.is_none() && !state.change_ready {
             let reason = if state.summary.unavailable { slots::Missing::EncoderUnavailable } else { slots::Missing::MonitorMissing };
@@ -837,66 +887,11 @@ fn record(
             carry(&mut state);
             drop(state);
             origin = boundary.start;
-            if !matches!(worker.admit()?, Admission::Open(receipt) if receipt.boundary == start.boundary) {
-                let _ = change.reply.try_send(monitor::FormatReply::ChangedAgain);
-                continue;
+            let target = FormatOwner { monitor, worker, opening: start.boundary, unavailable_video, reports, probe: &probe };
+            if let Some(next_geometry) = target.change_format(change, &mut encoder, summary)? {
+                geometry = next_geometry;
+                fps = summary.fps;
             }
-            if let Some(old) = encoder.take() { old.finish()?; }
-            let (Some(output), Some(device)) = (change.output, change.device) else {
-                let _ = change.reply.try_send(monitor::FormatReply::Missing);
-                continue;
-            };
-            // A failed display read proves nothing: the capture owner retries
-            // on its next topology tick (VID-9).
-            let actual = display::enumerate().ok().and_then(|displays| displays.into_iter().find(|entry| entry.key == monitor.key))
-                .filter(|actual| display::topology::Output::from_native(actual).is_ok_and(|actual| actual == output));
-            let Some((actual, luid)) = actual.and_then(|actual| {
-                let luid = unsafe { actual.adapter.GetDesc1() }.ok()?.AdapterLuid;
-                Some((actual, luid))
-            }) else {
-                let _ = change.reply.try_send(monitor::FormatReply::ChangedAgain);
-                continue;
-            };
-            let encoding = if unavailable_video.load(Ordering::Acquire) {
-                // A known encoder failure cannot be retried by topology.
-                // The WGC owner can still rebuild its native-only resources.
-                None
-            } else {
-                let next_geometry = geometry_for(&actual, monitor)?;
-                let source = [next_geometry.source_size[0] as u32, next_geometry.source_size[1] as u32];
-                let requested_fps = worker.config().profile().capture_pace().frames_per_second();
-                let selected = encoder::select(&actual.adapter, luid, source, requested_fps,
-                    &mut |format, software| capture_probe(&probe, worker, start.boundary, format, software));
-                let activated = match selected {
-                    Ok(activated) => activated,
-                    Err(error) if error.stage == PROBE_INTERRUPTED => {
-                        let _ = change.reply.try_send(monitor::FormatReply::ChangedAgain);
-                        continue;
-                    }
-                    Err(error) => {
-                        // No encoder qualifies for the new format: this monitor's
-                        // video is lost (§6.2 row 9); capture continues.
-                        lose_video(worker, id, summary, unavailable_video, reports, &error);
-                        let _ = change.reply.try_send(monitor::FormatReply::Ready { device, encoding: None, output });
-                        continue;
-                    }
-                };
-                for rejected in &activated.rejected {
-                    let cause = match &rejected.cause { std::borrow::Cow::Borrowed(cause) => *cause, std::borrow::Cow::Owned(_) => "Qualify a hardware H.264 encoder" };
-                    worker.report_health(HealthKind::EncoderCandidateRejected,
-                        Failure::new(FailureComponent::Video, cause, rejected.native_code), Some(id), false);
-                }
-                let format = activated.format;
-                let software = activated.software();
-                fps = format.fps;
-                summary.fps = fps;
-                summary.degraded |= software;
-                monitor::report_video_ready(worker, id, format, software);
-                geometry = video_geometry(next_geometry, format);
-                encoder = Some(activated);
-                Some((format, software))
-            };
-            let _ = change.reply.try_send(monitor::FormatReply::Ready { device, encoding, output });
             continue;
         }
         let Some(closed) = cutoff else { return Err(unavailable("The video owner did not receive its closing boundary")) };
@@ -920,7 +915,9 @@ fn record(
             if !complete {
                 return Err(unavailable("The video slot journal does not cover the complete admitted prefix"));
             }
-            if let Some(active) = encoder.take() { active.finish()?; }
+            if let Some(active) = encoder.take() {
+                release_encoder(active, worker, id, summary, unavailable_video, reports);
+            }
             return Ok(Closing { cutoff, required_finalization_failure });
         };
         state.freeze_late();
@@ -934,7 +931,132 @@ fn record(
     }
 }
 
+/// The parties of a format change (VID-9): the video owner of one monitor
+/// and the capture owner that requested it.
+struct FormatOwner<'a> {
+    monitor: &'a SelectedMonitor,
+    worker: &'a WorkerSession,
+    opening: AdmissionBoundary,
+    unavailable_video: &'a AtomicBool,
+    reports: Option<&'a SyncSender<RecordingReport>>,
+    probe: &'a SyncSender<encoder::Probe>,
+}
+
+impl FormatOwner<'_> {
+    /// Apply a format change at its boundary slot: release the old encoder,
+    /// select one for the new output and reply to the capture owner. Returns
+    /// the new video geometry once an encoder is active; `summary.fps` then
+    /// holds its frame rate.
+    fn change_format(
+        &self, change: monitor::FormatRequest, encoder: &mut Option<encoder::Encoder>, summary: &mut MonitorVideo,
+    ) -> Result<Option<Geometry>, ProbeError> {
+        let (worker, id) = (self.worker, self.monitor.id);
+        if !matches!(worker.admit()?, Admission::Open(receipt) if receipt.boundary == self.opening) {
+            let _ = change.reply.try_send(monitor::FormatReply::ChangedAgain);
+            return Ok(None);
+        }
+        if let Some(old) = encoder.take() {
+            release_encoder(old, worker, id, summary, self.unavailable_video, self.reports);
+        }
+        let (Some(output), Some(device)) = (change.output, change.device) else {
+            let _ = change.reply.try_send(monitor::FormatReply::Missing);
+            return Ok(None);
+        };
+        // A failed display read proves nothing: the capture owner retries
+        // on its next topology tick (VID-9).
+        let actual = display::resolve(&self.monitor.key).ok()
+            .filter(|actual| display::topology::Output::from_native(actual).is_ok_and(|actual| actual == output));
+        let Some((actual, luid)) = actual.and_then(|actual| {
+            let luid = unsafe { actual.adapter.GetDesc1() }.ok()?.AdapterLuid;
+            Some((actual, luid))
+        }) else {
+            let _ = change.reply.try_send(monitor::FormatReply::ChangedAgain);
+            return Ok(None);
+        };
+        if self.unavailable_video.load(Ordering::Acquire) {
+            // A known encoder failure cannot be retried by topology.
+            // The WGC owner can still rebuild its native-only resources.
+            let _ = change.reply.try_send(monitor::FormatReply::Ready { device, encoding: None, output });
+            return Ok(None);
+        }
+        let next_geometry = geometry_for(&actual, self.monitor)?;
+        let source = [next_geometry.source_size[0] as u32, next_geometry.source_size[1] as u32];
+        let requested_fps = worker.config().profile().capture_pace().frames_per_second();
+        let selected = encoder::select(&actual.adapter, luid, source, requested_fps,
+            &mut |format, software| capture_probe(self.probe, worker, self.opening, format, software));
+        let activated = match selected {
+            Ok(activated) => activated,
+            Err(failure) if failure.last.kind() == ProbeKind::ProbeInterrupted => {
+                let _ = change.reply.try_send(monitor::FormatReply::ChangedAgain);
+                return Ok(None);
+            }
+            Err(failure) => {
+                // No encoder qualifies for the new format: this monitor's
+                // video is lost (§6.2 row 9); capture continues.
+                report_rejected(worker, id, &failure.rejected);
+                lose_video(worker, id, summary, self.unavailable_video, self.reports, &failure.last);
+                let _ = change.reply.try_send(monitor::FormatReply::Ready { device, encoding: None, output });
+                return Ok(None);
+            }
+        };
+        report_rejected(worker, id, &activated.rejected);
+        let (format, software) = (activated.format, activated.software());
+        summary.fps = format.fps;
+        summary.degraded |= software;
+        monitor::report_video_ready(worker, id, format, software);
+        *encoder = Some(activated);
+        let _ = change.reply.try_send(monitor::FormatReply::Ready { device, encoding: Some((format, software)), output });
+        Ok(Some(video_geometry(next_geometry, format)))
+    }
+}
+
 impl Video<'_> {
+    /// Encode this epoch's slots until it closes or the format changes. A
+    /// failure of the frames stream ends the attempt; any other loses this
+    /// monitor's video.
+    fn run_encoder(&mut self, active: &encoder::Encoder) -> Result<(), ProbeError> {
+        let encoded = encode::record(&active.transform, active.device.as_ref(), self,
+            Video::observe_admission, Video::next_frame, Video::finish_approval_prefix, Video::output);
+        match encoded {
+            Err(error) if fails_attempt(&error) => return Err(error),
+            Err(error) => self.flag_failure(&error),
+            Ok(_) if self.preserve_rotation_part => {
+                self.flag_failure(&unavailable("The H.264 encoder drained without a verified rotation IDR"));
+            }
+            Ok(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Resolve the inputs the encoder did not return and close the open
+    /// segment. A segment interrupted during IDR rotation is not published:
+    /// its `.part` stays and the lost video resolves its rows. It is a
+    /// required finalization failure only once the Stop deadline expired
+    /// (§6.2 rows 9 and 2).
+    fn close_open_segment(&mut self) -> Result<(), ProbeError> {
+        self.skip_outstanding(if self.summary.unavailable { slots::Missing::EncoderUnavailable } else { slots::Missing::EncoderSkipped })?;
+        if self.preserve_rotation_part {
+            if let Some(segment) = self.current.take() {
+                if self.elevated {
+                    segment.mux.discard()?;
+                }
+                if self.stop_expired() {
+                    self.required_finalization_failure.get_or_insert(ROTATION_PART_UNPUBLISHED);
+                }
+            }
+        } else if let Err(error) = self.finish_current() {
+            if fails_attempt(&error) {
+                return Err(error);
+            }
+            self.flag_failure(&error);
+        }
+        Ok(())
+    }
+
+    fn release(&mut self, encoder: encoder::Encoder) {
+        release_encoder(encoder, self.worker, self.id, self.summary, self.unavailable_video, self.reports);
+    }
+
     fn observe_admission(&mut self) -> Result<bool, ProbeError> {
         if let Some(lost) = self.poll_verification(Duration::ZERO)? {
             return Err(lost);
@@ -978,23 +1100,11 @@ impl Video<'_> {
         if self.change_at_slot(slot) {
             return Ok(encode::Next::End);
         }
-        let (at, end, cutoff) = match self.worker.admit()? {
-            Admission::Open(receipt) if receipt.boundary == self.opening => {
-                let now = receipt.clock.time(receipt.qpc).map_err(clock_error)?;
-                if now < slot.end {
-                    return Ok(encode::Next::Wait);
-                }
-                (now, slot.end, None)
-            }
-            Admission::Closed(Some(boundary)) if boundary.epoch == self.opening.epoch => {
-                self.cutoff = Some(boundary);
-                if slot.start >= boundary.time {
-                    return Ok(encode::Next::End);
-                }
-                (boundary.time, slot.end.min(boundary.time), Some(boundary.time))
-            }
-            _ => return Err(unavailable("Video admission changed without closing its slot prefix")),
+        let decision = match self.admit_slot(slot)? {
+            ControlFlow::Continue(decision) => decision,
+            ControlFlow::Break(next) => return Ok(next),
         };
+        let SlotDecision { at, end, cutoff, .. } = decision;
         let approval = match self.frame_policy.try_current(self.opening.epoch, at) {
             Ok(approval) => approval,
             Err(ApprovalReadError::NewerThanReceipt) if cutoff.is_some() => None,
@@ -1072,10 +1182,48 @@ impl Video<'_> {
             (repeated && source.is_some()).then(|| self.evidence.late(slot.index)));
         row.limit_coverage(end);
         self.next = self.next.checked_add(1).ok_or_else(|| unavailable("The video slot count overflowed"))?;
-        if approval.is_none() || row.revoked() {
+        self.classify(&mut row, decision, approval.is_some(), geometry.is_some(), decision_due, expiry, repeated);
+        if row.reason.is_some() {
+            self.stage_slot(row)?;
+            return Ok(encode::Next::Wait);
+        }
+        self.submit_slot(row, slot, cutoff)
+    }
+
+    /// The decision point of `slot`, or the encoder step while it cannot be
+    /// decided: an open epoch decides a slot once it ended, a closed one at
+    /// its cutoff.
+    fn admit_slot(&mut self, slot: slots::Slot) -> Result<ControlFlow<encode::Next, SlotDecision>, ProbeError> {
+        let decision = match self.worker.admit()? {
+            Admission::Open(receipt) if receipt.boundary == self.opening => {
+                let now = receipt.clock.time(receipt.qpc).map_err(clock_error)?;
+                if now < slot.end {
+                    return Ok(ControlFlow::Break(encode::Next::Wait));
+                }
+                SlotDecision { slot, at: now, end: slot.end, cutoff: None }
+            }
+            Admission::Closed(Some(boundary)) if boundary.epoch == self.opening.epoch => {
+                self.cutoff = Some(boundary);
+                if slot.start >= boundary.time {
+                    return Ok(ControlFlow::Break(encode::Next::End));
+                }
+                SlotDecision { slot, at: boundary.time, end: slot.end.min(boundary.time), cutoff: Some(boundary.time) }
+            }
+            _ => return Err(unavailable("Video admission changed without closing its slot prefix")),
+        };
+        Ok(ControlFlow::Continue(decision))
+    }
+
+    /// Record why a decided slot has no encoded picture, if it has none.
+    fn classify(
+        &mut self, row: &mut slots::Row, decision: SlotDecision, approved: bool, geometry_known: bool,
+        decision_due: SessionTimeUs, expiry: SessionTimeUs, repeated: bool,
+    ) {
+        let SlotDecision { slot, at, cutoff, .. } = decision;
+        if !approved || row.revoked() {
             self.summary.approval_suppressed += 1;
             row.withdraw(slots::Missing::ApprovalSuppressed);
-        } else if geometry.is_none() || (self.selection.missing && cutoff.is_none()) {
+        } else if !geometry_known || (self.selection.missing && cutoff.is_none()) {
             row.miss(slots::Missing::CaptureUnavailable);
         } else if !self.elevated && decision_due.0 < at.0.saturating_sub(slot.end.0 - slot.start.0)
             || self.elevated && at > expiry
@@ -1086,10 +1234,11 @@ impl Video<'_> {
         } else if self.selection.previous.is_none() {
             row.miss(slots::Missing::BeforeFirstFrame);
         }
-        if row.reason.is_some() {
-            self.stage_slot(row)?;
-            return Ok(encode::Next::Wait);
-        }
+    }
+
+    /// Stage a slot with a picture and submit that picture to the encoder,
+    /// forcing an IDR when the open segment is due to rotate.
+    fn submit_slot(&mut self, row: slots::Row, slot: slots::Slot, cutoff: Option<SessionTimeUs>) -> Result<encode::Next, ProbeError> {
         let input = self.selection.previous.as_ref()
             .ok_or_else(|| unavailable("The selected video slot has no input frame"))?.input.clone();
         let pts = slot.pts()?;
@@ -1159,7 +1308,7 @@ impl Video<'_> {
                     first_geometry: pending.row.geometry_version.ok_or_else(|| unavailable("The segment first frame has no geometry identity"))?,
                     fps: format.fps, software,
                     configured_peak_bitrate: format.bitrate(),
-                    configured_mean_bitrate: format.bitrate() * 3 / 4,
+                    configured_mean_bitrate: format.mean_bitrate(),
                     capacity: capacity_for(format.fps),
                     slot_decision_grace_us: self.grace.unsigned_abs(),
                     rejected_encoders: self.rejected_encoders.clone(),
@@ -1203,14 +1352,14 @@ impl Video<'_> {
         {
             // Stop can deliver the last native batch to the existing input
             // prefix closer. Do not publish an open part ahead of that result.
-            let mut deadline = Instant::now() + Duration::from_secs(3);
+            let mut deadline = Instant::now() + INPUT_PREFIX_WAIT;
             // A local sequence: `self.suspends` stays for the encoder watchdog.
             let mut seen = self.worker.suspend_marks().sequence;
             while !self.worker.input_prefix_closed(closed) {
                 // Time asleep does not count against the prefix wait (D-5 A).
                 let suspends = self.worker.suspend_marks().sequence;
                 if std::mem::replace(&mut seen, suspends) != suspends {
-                    deadline = Instant::now() + Duration::from_secs(3);
+                    deadline = Instant::now() + INPUT_PREFIX_WAIT;
                 }
                 if Instant::now() >= self.worker.segment_deadline().map_or(deadline, |limit| limit.min(deadline)) {
                     if let Some(segment) = self.current.take() { segment.mux.discard()?; }
@@ -1218,21 +1367,27 @@ impl Video<'_> {
                     self.required_finalization_failure.get_or_insert(stage);
                     return Err(unavailable(stage));
                 }
-                thread::park_timeout(Duration::from_millis(2));
+                thread::park_timeout(INPUT_PREFIX_POLL);
             }
         }
         if let Some(segment) = self.current.take() {
             let closed = match segment.close(self.id, self.geometry.clone(), self.worker, self.clock) {
                 Ok(closed) => closed,
                 Err(error) => {
-                    self.required_finalization_failure.get_or_insert(error.stage);
+                    // Only the Stop deadline makes an unclosed segment a
+                    // required finalization failure; any other close
+                    // failure loses this monitor's video (§6.2 rows 9 and 2).
+                    if error.kind() == ProbeKind::PublicationDeadline || self.stop_expired() {
+                        self.required_finalization_failure.get_or_insert(error.stage);
+                    }
                     return Err(error);
                 }
             };
             match closed {
                 Closed::Resolved(rows) => {
+                    let last = self.last_row(&rows);
                     self.resolve_all(rows)?;
-                    self.frames.request_flush();
+                    self.frames.request_flush(last);
                     self.worker.request_journal_flush();
                 }
                 Closed::Part { pending, part, suppressed } => {
@@ -1341,6 +1496,7 @@ impl Video<'_> {
             // A late verdict of an overdue part is discarded.
             return Ok(None);
         }
+        let last = self.last_row(&entry.index);
         let mut lost = None;
         match verdict.outcome {
             Ok(Some(published)) => {
@@ -1361,16 +1517,21 @@ impl Video<'_> {
                 self.resolve_all(entry.index)?;
             }
             Err(error) => {
-                if error.stage == mp4::DEADLINE {
+                if error.kind() == ProbeKind::PublicationDeadline {
                     self.required_finalization_failure.get_or_insert(mp4::DEADLINE);
                 }
                 self.unverified(entry.index)?;
                 lost = Some(error);
             }
         }
-        self.frames.request_flush();
+        self.frames.request_flush(last);
         self.worker.request_journal_flush();
         Ok(lost)
+    }
+
+    /// The merge key of a segment's last row, which its flush must include.
+    fn last_row(&self, rows: &[slots::Row]) -> Option<RowKey> {
+        rows.iter().map(|row| (row.receipt, self.id, row.slot)).max()
     }
 
     /// Stop: wait for every part in flight within the Stop deadline. A part
@@ -1419,7 +1580,7 @@ impl Video<'_> {
             loop {
                 self.publish_resolved()?;
                 if (self.staged.len() as u64) < self.staging_bound { break; }
-                if Instant::now() >= until { return Err(unavailable(STAGING_OVERFLOW)); }
+                if Instant::now() >= until { return Err(unavailable(STAGING_OVERFLOW).with_kind(ProbeKind::StagingOverflow)); }
                 thread::park_timeout(Duration::from_millis(1));
             }
         }
@@ -1471,7 +1632,7 @@ impl Video<'_> {
                     full = true;
                     break;
                 }
-                Err(mpsc::TrySendError::Disconnected(_)) => return Err(unavailable(FRAMES_LANE_CLOSED)),
+                Err(mpsc::TrySendError::Disconnected(_)) => return Err(unavailable(FRAMES_LANE_CLOSED).with_kind(ProbeKind::FramesLaneClosed)),
             }
             self.published_through += 1;
             self.summary.slots += 1;

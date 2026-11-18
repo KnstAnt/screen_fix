@@ -106,10 +106,6 @@ impl MotionSampler {
         self.emit_ready(&mut resolve);
     }
 
-    pub fn finish(&mut self, resolve: impl FnMut(Sampled)) {
-        self.flush(resolve);
-    }
-
     pub fn flush(&mut self, mut resolve: impl FnMut(Sampled)) {
         self.close_lanes();
         self.emit_ready(&mut resolve);

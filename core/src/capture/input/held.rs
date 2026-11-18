@@ -339,8 +339,7 @@ pub(crate) struct PublishedHeld {
 }
 
 impl PublishedHeld {
-    /// Call after a successful, approved edge publication. Repeats share
-    /// the existing published holding.
+    /// The modifier and button masks of the published holdings.
     pub fn modifiers_and_buttons(&self) -> (u8, u8) {
         let mut modifiers = 0;
         let mut buttons = 0;
@@ -363,6 +362,8 @@ impl PublishedHeld {
         self.held.iter().filter(|old| compatible(**old, edge.identity)).take(2).count() == 1
     }
 
+    /// Call after a successful, approved edge publication. Repeats share
+    /// the existing published holding.
     pub fn published(&mut self, edge: HeldEdge) {
         if edge.down {
             if self.held.len() < MAX_HELD && !self.held.iter().any(|old| compatible(*old, edge.identity)) {

@@ -128,7 +128,7 @@ No subsystem receives a universal CoreContext containing all queues, tasks and r
 - `FUNCTIONS` (`platform/windows/mf.rs`): the Media Foundation function table, loaded once and immutable afterwards.
 
 In the shared native crates `screen-fix-native-observation` and `screen-fix-elevated`, linked by the Recorder and, as applicable, the standard helper and the collector:
-- `KEYBOARD` and `POINTER` (`native-observation/src/input/hooks.rs`): the lock-free rings that the low-level hook callbacks write, because those callbacks have no user-data pointer. `PROGRESS_PENDING` coalesces progress probes posted to the hook thread, and the thread-local `SCOPE` holds the hook thread's capture scope, set once before the hooks are installed.
+- `KEYBOARD` and `POINTER` (`native-observation/src/input/hooks.rs`): the lock-free rings that the low-level hook callbacks write, because those callbacks have no user-data pointer. One hook owner per process holds them at a time, through an exclusive claim released when that owner is dropped; a second concurrent owner fails to start. `PROGRESS_PENDING` coalesces progress probes posted to the hook thread, and the thread-local `SCOPE` holds the hook thread's capture scope, set once before the hooks are installed.
 - `ACTIVE` (`native-observation/src/events.rs`, thread-local): the context of the WinEvent callback on its installing thread, cleared after unhooking.
 - `SERIAL` and `CHANGES` (`elevated/src/runtime/witness.rs`, thread-local): the context of the collector witness's WinEvent callbacks.
 - `DRAINING` (`elevated/src/pipe.rs`): a counter of abandoned overlapped pipe operations whose buffers are retained until the kernel acknowledges cancellation. While it is nonzero, no new attachment starts in that process.

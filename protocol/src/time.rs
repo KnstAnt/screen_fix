@@ -120,9 +120,11 @@ impl ClockOrigin {
             .div_euclid(frequency)
     }
 
+    /// Floors toward negative infinity, like `wgc_offset`, so pre-origin
+    /// samples round the same way on both paths.
     fn scale_delta(self, from: QpcTick, to: QpcTick, units_per_second: i128) -> Result<i64, ClockRangeError> {
         let delta = i128::from(to.0) - i128::from(from.0);
-        checked_i64(delta * units_per_second / i128::from(self.qpc_frequency.0.get()))
+        checked_i64((delta * units_per_second).div_euclid(i128::from(self.qpc_frequency.0.get())))
     }
 }
 
@@ -157,16 +159,20 @@ impl CoarseTime {
 }
 
 impl MessageTickAnchor {
-    /// Nearest wrap around a recent sampled tick. Exactly half a wrap is ambiguous.
+    /// The milliseconds from the anchor to `tick` at the nearest wrap of the
+    /// 32-bit message tick. Exactly half a wrap is ambiguous: `None`.
+    pub fn tick_delta_ms(self, tick: MessageTickMs) -> Option<i32> {
+        let delta = tick.0.wrapping_sub(self.tick64_ms as u32) as i32;
+        (delta != i32::MIN).then_some(delta)
+    }
+
+    /// Nearest wrap around a recent sampled tick (`tick_delta_ms`).
     pub fn coarse_estimate(
         self,
         clock: ClockOrigin,
         tick: MessageTickMs,
     ) -> Result<SessionTimeUs, ClockRangeError> {
-        let delta = tick.0.wrapping_sub(self.tick64_ms as u32) as i32;
-        if delta == i32::MIN {
-            return Err(ClockRangeError::OutOfRange);
-        }
+        let delta = self.tick_delta_ms(tick).ok_or(ClockRangeError::OutOfRange)?;
         let anchor = clock.time(self.qpc)?;
         checked_i64(i128::from(anchor.0) + i128::from(delta) * 1_000).map(SessionTimeUs)
     }

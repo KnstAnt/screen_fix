@@ -46,7 +46,10 @@ fn supervise_entry(supervisor: &Supervisor, until: Instant) -> Result<()> {
     supervisor.shared.parent.set(Arc::clone(&parent_handle)).map_err(|_| Failure::Supervisor)?;
     let parent = Process::inspect(parent_handle)?;
     if parent.instance() != args.parent { return Err(Failure::ProcessIdentity) }
-    let deadline = Deadline { at: until, cancellation: &supervisor.shared.cancel, grant: None, scope_current: None, peer: Some(&parent) };
+    let deadline = Deadline {
+        at: until, expired: Failure::ReadinessDeadline, cancellation: &supervisor.shared.cancel, grant: None,
+        scope_current: None, peer: Some(&parent),
+    };
     deadline.check()?;
 
     let current = Process::current()?;
@@ -118,18 +121,16 @@ fn watch(shared: &Shared, boot_until: Instant) {
     loop {
         if shared.cancel.check().is_err() { break }
         let remaining = if let Some(lifetime) = shared.runtime.get() {
-            let checked = qpc().and_then(|now| {
+            let healthy = qpc().is_ok_and(|now| {
                 if last_qpc.is_some_and(|previous| previous > now) {
-                    return Err(Failure::Supervisor);
+                    return false;
                 }
                 last_qpc = Some(now);
                 if lifetime.cleanup_expired(now) { terminate() }
-                if lifetime.provider_expired(now) { return Err(Failure::ReadinessDeadline); }
-                if !lifetime.witness_healthy(now) { return Err(Failure::Witness); }
-                if !lifetime.owner_healthy(now) { return Err(Failure::Supervisor); }
-                lifetime.check(now)
+                !lifetime.provider_expired(now) && lifetime.witness_healthy(now) && lifetime.owner_healthy(now)
+                    && lifetime.check(now).is_ok()
             });
-            if checked.is_err() {
+            if !healthy {
                 lifetime.stop();
                 shared.cancel.cancel();
                 break;

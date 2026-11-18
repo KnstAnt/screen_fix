@@ -10,8 +10,9 @@ use screen_fix_elevated::{Failure, READINESS, Result};
 use screen_fix_protocol::{
     AdmissionEpoch, AttemptId, GeometryId, QpcFrequency, QpcTick, SessionId,
     ipc::{EnvironmentChange, FocusAtReceipt, InputRegistration, ProducerGap, elevated::{
-        ContextEvidence, HeldSnapshot, InputEvidence, Query, ReadBinding, ReadUnavailable, VisitBinding, WindowInstance,
-        runtime::{Control, CoverageLoss, CoverageReason, ContextGap, ContextGapCause, ContextProducer, EnvironmentRevision, IdentityClaim, Observation, Revocation, Status},
+        ContextEvidence, HeldSnapshot, InputEvidence, NativeObservation, Query, ReadBinding, ReadUnavailable, VisitBinding,
+        WindowInstance, WindowNotice,
+        runtime::{CoverageLoss, CoverageReason, ContextGap, ContextGapCause, ContextProducer, EnvironmentRevision, IdentityClaim, Observation, Revocation, Status},
     }},
 };
 
@@ -21,13 +22,12 @@ use crate::{
     session::{AdmissionBoundary, SourceStage, SourceStatus, windows::{SourcePreparation, WorkerSession}},
 };
 
-use super::{LaunchStatus, Ticket, ingress::{Ingress, InputCertificate, InputStagingLoss}, peer::{Peer, Progress}, visit::{Change, Host, add_time, matches_target}};
-use super::super::{clock, context::{FramePolicy, identity::WindowProcess}, display::topology::Topology,
+use super::{CLEANUP, LaunchStatus, Ticket, ingress::{Ingress, InputCertificate, InputStagingLoss}, peer::{Peer, Progress}, visit::{Change, Host, add_time, matches_target}};
+use super::super::{clock, context::{ACCESS_RECHECK, FramePolicy, identity::WindowProcess}, display::topology::Topology,
     preflight::{Foreground, ForegroundApproval, classify_expected_foreground}};
 
 const WORK_PER_POLL: usize = 32;
 const CONTEXT_CAPACITY: usize = 1024;
-const CLEANUP: Duration = Duration::from_millis(750);
 static CLASSIFIER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub(in crate::platform::windows) struct Selector<'a> {
@@ -62,8 +62,9 @@ pub(in crate::platform::windows) struct Selector<'a> {
     /// the standard source: its preparation epoch, the suspend sequence, the
     /// request QPC and the deadline (E4).
     helper_check: Option<(AdmissionEpoch, u64, QpcTick, Instant)>,
-    /// QPC of the last tick that found the attached collector live (E4).
-    host_live: QpcTick,
+    /// The suspend count at the last tick that found the attached collector
+    /// live (E4). A larger count means the system slept since.
+    live_suspends: u64,
     /// The collector was lost across a system sleep. It is not relaunched in
     /// this attempt (A2, A5): elevated foregrounds stay with the standard
     /// source and are suppressed (E4).
@@ -102,26 +103,28 @@ impl<'a> Selector<'a> {
             opened: None, ingress: None, observations: VecDeque::new(), interrupted: None,
             closed_before: None, focus_deadline: None, loss: None, recovered: None, context_pressure: None, optional_dropped: None,
             environment_sequence: 0, geometry_revision: None, stopping: false, stage: SourceStage::Foreground,
-            helper_check: None, host_live: QpcTick(0), collector_lost: false,
+            helper_check: None, live_suspends: 0, collector_lost: false,
         })
     }
 
     pub(in crate::platform::windows) fn tick(
-        &mut self, session: &WorkerSession, topology: &Topology,
+        &mut self, topology: &Topology,
         active: Option<AdmissionBoundary>, changes: u32, ordinary: Option<QpcTick>,
     ) -> Result<()> {
-        let result = self.service(session, topology, active, changes, ordinary);
+        let session = self.session_status;
+        let result = self.service(topology, active, changes, ordinary);
         let Some(host) = self.host.as_ref() else { return result; };
-        if host.peer.live() {
-            if result.is_ok() { self.host_live = clock::qpc().map_err(|_| Failure::Supervisor)?; }
+        if host.live() {
+            if result.is_ok() { self.mark_live(); }
             return result;
         }
         // E4: a collector lost across a system sleep is G, not a source
         // failure. Its lease, watchdogs and suspend cleanup bound run on QPC,
-        // which includes the sleep. It needs a known resume after the host
-        // was last live, and no elevated epoch open. There is no relaunch.
-        let marks = session.suspend_marks();
-        let slept = marks.resume.is_some_and(|resume| self.host_live <= resume);
+        // which includes the sleep. It needs a suspend after the host was
+        // last live, and no elevated epoch open. There is no relaunch. The
+        // suspend count needs no resume mark, which may not be recorded yet
+        // when the dead peer is seen (D3).
+        let slept = session.suspend_marks().sequence > self.live_suspends;
         if result.is_err() && slept && active.is_none_or(|open| !session.elevated_epoch(open.epoch)) {
             self.host = None;
             self.pending = None;
@@ -136,18 +139,19 @@ impl<'a> Selector<'a> {
     }
 
     fn service(
-        &mut self, session: &WorkerSession, topology: &Topology,
+        &mut self, topology: &Topology,
         active: Option<AdmissionBoundary>, mut changes: u32, ordinary: Option<QpcTick>,
     ) -> Result<()> {
+        let session = self.session_status;
         let observed = clock::qpc().map_err(|_| Failure::Supervisor)?;
         if self.stopping || session.stop_requested() {
             // The lease stays renewed until `stop` has sent Control::Stop (E4).
             // A failed renewal surfaces as the actual Stop outcome there.
-            let progress = self.progress(session, observed)?;
+            let progress = self.progress(observed)?;
             if let Some(host) = self.host.as_mut() { let _ = host.renew_lease(progress); }
             return Ok(());
         }
-        self.withdraw_unauthorized(session, observed)?;
+        self.withdraw_unauthorized(observed)?;
         let foreground = self.classifier.poll()?;
         let classified_failure = match foreground {
             Some(Foreground::Unknown(error)) => error.source_failure(),
@@ -191,8 +195,8 @@ impl<'a> Selector<'a> {
         if changes != 0 && self.host.is_some() {
             self.environment(changes, observed, session.cleanup_deadline())?;
         }
-        self.poll_launch(session)?;
-        self.poll_host(session, active)?;
+        self.poll_launch()?;
+        self.poll_host(active)?;
         let preparation = if active.is_none() { session.source_preparation() } else { None };
         if active.is_none() && self.host.as_ref().is_some_and(|host| self.pending.as_ref().is_some_and(|pending| {
             Instant::now() >= pending.until && (!host.configured()
@@ -204,7 +208,7 @@ impl<'a> Selector<'a> {
         if self.focus_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(Failure::Witness);
         }
-        let progress = self.progress(session, observed)?;
+        let progress = self.progress(observed)?;
         if let Some(active) = active {
             if session.elevated_epoch(active.epoch) {
                 let host = self.host.as_mut().ok_or(Failure::Protocol)?;
@@ -223,7 +227,7 @@ impl<'a> Selector<'a> {
                 Some(Foreground::Ordinary(approval) | Foreground::Elevated(approval)) => Some(approval.clone()),
                 _ => None,
             };
-            self.prepare(session, topology, phase, candidate, progress, ordinary)?;
+            self.prepare(topology, phase, candidate, progress, ordinary)?;
         }
         if let Some(host) = self.host.as_mut() {
             host.maintain(progress)?;
@@ -461,7 +465,8 @@ impl<'a> Selector<'a> {
         self.recovered = None;
     }
 
-    pub(in crate::platform::windows) fn stop(&mut self, session: &WorkerSession, cutoff: QpcTick, limit: Option<Instant>) -> Result<()> {
+    pub(in crate::platform::windows) fn stop(&mut self, cutoff: QpcTick, limit: Option<Instant>) -> Result<()> {
+        let session = self.session_status;
         self.stopping = true;
         self.ticket.take();
         self.interrupt(cutoff);
@@ -471,12 +476,12 @@ impl<'a> Selector<'a> {
         let deadline = limit.map_or_else(|| Instant::now() + CLEANUP, |stop| (Instant::now() + CLEANUP).min(stop));
         let now = clock::qpc().map_err(|_| Failure::Supervisor)?;
         let cleanup_deadline_qpc = add_time(now, self.frequency, deadline.saturating_duration_since(Instant::now()))?;
-        host.peer.send(Control::Stop { before_qpc: cutoff.min(now), cleanup_deadline_qpc: Some(cleanup_deadline_qpc) })?;
+        host.send_stop(cutoff.min(now), cleanup_deadline_qpc)?;
         let mut stopped = false;
         loop {
             for _ in 0..WORK_PER_POLL {
                 if stopped { break; }
-                let status = host.peer.status()?;
+                let status = host.next_status()?;
                 if let Some(status) = &status {
                     let now = clock::qpc().map_err(|_| Failure::Supervisor)?;
                     if matches!(status, Status::Invalidated { before_qpc, .. } | Status::Closed { before_qpc, .. }
@@ -530,9 +535,10 @@ impl<'a> Selector<'a> {
     }
 
     fn prepare(
-        &mut self, session: &WorkerSession, topology: &Topology, phase: SourcePreparation,
+        &mut self, topology: &Topology, phase: SourcePreparation,
         candidate: Option<ForegroundApproval>, progress: Progress, ordinary: Option<QpcTick>,
     ) -> Result<()> {
+        let session = self.session_status;
         if self.ticket.is_some() { return Ok(()); }
         let ready = self.host.as_mut().map(|host| host.armed(progress.now)).transpose()?.flatten();
         if let (Some((registration, focus)), Some(pending)) = (ready, &self.pending) {
@@ -636,7 +642,8 @@ impl<'a> Selector<'a> {
         Ok(())
     }
 
-    fn poll_launch(&mut self, session: &WorkerSession) -> Result<()> {
+    fn poll_launch(&mut self) -> Result<()> {
+        let session = self.session_status;
         let Some(ticket) = self.ticket.as_mut() else { return Ok(()); };
         let epoch = self.pending.as_ref().ok_or(Failure::Protocol)?.epoch;
         match ticket.poll() {
@@ -660,7 +667,7 @@ impl<'a> Selector<'a> {
                 if matches!(&result, Err(Failure::Cancelled)) && !dispatched
                     && self.pending.as_ref().is_some_and(|pending| !session.source_authorized(pending.epoch))
                 {
-                    self.withdraw_launch(session);
+                    self.withdraw_launch();
                     return Ok(());
                 }
                 let (authenticated, until) = result?;
@@ -670,13 +677,15 @@ impl<'a> Selector<'a> {
                 pending.until = until;
                 self.host = Some(Host::new(Peer::start(authenticated, &self.attempt, &self.session, self.frequency,
                     session.config().profile(), until)?, self.frequency)?);
+                self.mark_live();
                 session.source_pending(epoch, SourceStatus::AwaitingReadiness);
             }
         }
         Ok(())
     }
 
-    fn withdraw_unauthorized(&mut self, session: &WorkerSession, observed: QpcTick) -> Result<()> {
+    fn withdraw_unauthorized(&mut self, observed: QpcTick) -> Result<()> {
+        let session = self.session_status;
         if self.host.as_ref().and_then(Host::binding).is_some_and(|visit| !session.source_authorized(visit.epoch)) {
             let before = session.paused_cutoff().map_or(observed, |closed| closed.qpc.min(observed));
             self.close(before)?;
@@ -685,23 +694,24 @@ impl<'a> Selector<'a> {
             && self.ticket.as_ref().is_some_and(Ticket::withdraw_undispatched)
         {
             self.ticket.take();
-            self.withdraw_launch(session);
+            self.withdraw_launch();
         }
         Ok(())
     }
 
     /// Drop a launch that was withdrawn before its consent dispatch.
-    fn withdraw_launch(&mut self, session: &WorkerSession) {
+    fn withdraw_launch(&mut self) {
         self.pending = None;
         self.launched = false;
         self.withdrawn_dispatch = true;
-        session.update_elevated_evidence(|evidence| evidence.withdrawn_launches = evidence.withdrawn_launches.saturating_add(1));
+        self.session_status.update_elevated_evidence(|evidence| evidence.withdrawn_launches = evidence.withdrawn_launches.saturating_add(1));
     }
 
-    fn poll_host(&mut self, session: &WorkerSession, active: Option<AdmissionBoundary>) -> Result<()> {
+    fn poll_host(&mut self, active: Option<AdmissionBoundary>) -> Result<()> {
+        let session = self.session_status;
         let Some(host) = self.host.as_mut() else { return Ok(()); };
         for _ in 0..WORK_PER_POLL {
-            let Some(status) = host.peer.status()? else { break; };
+            let Some(status) = host.next_status()? else { break; };
             let now = clock::qpc().map_err(|_| Failure::Supervisor)?;
             if let Some((visit, before)) = status_restriction(&status, now) {
                 restrict_visit(self.frames, self.session_status, visit, before);
@@ -790,7 +800,7 @@ impl<'a> Selector<'a> {
         let session_status = self.session_status;
         let restrict = |visit, before| restrict_visit(frames, session_status, visit, before);
         for _ in 0..WORK_PER_POLL {
-            let Some((arrived, observation)) = host.peer.observation()? else { break; };
+            let Some((arrived, observation)) = host.next_observation()? else { break; };
             if let Some((visit, completed, snapshot)) = host.observation(&observation, arrived)?
                 && self.ingress.as_ref().is_some_and(|ingress| ingress.can_synchronize(visit, completed))
             {
@@ -845,7 +855,7 @@ impl<'a> Selector<'a> {
             && (host.awaiting_close() || host.binding().is_none()))
         {
             for _ in 0..WORK_PER_POLL {
-                let Some(record) = host.peer.input()? else { break; };
+                let Some(record) = host.next_input()? else { break; };
                 let now = clock::qpc().map_err(|_| Failure::Supervisor)?;
                 if let Some(ingress) = &mut self.ingress {
                     match record {
@@ -886,8 +896,17 @@ impl<'a> Selector<'a> {
         Ok(())
     }
 
-    fn progress(&self, session: &WorkerSession, pump: QpcTick) -> Result<Progress> {
-        let controller = session.controller_qpc();
+    /// Record the suspends the live collector has outlived. A suspend notice
+    /// without its resume may still precede the sleep itself, so the collector
+    /// can yet die across it (D3).
+    fn mark_live(&mut self) {
+        let marks = self.session_status.suspend_marks();
+        let outstanding = marks.sequence != 0 && marks.resume.is_none();
+        self.live_suspends = marks.sequence - u64::from(outstanding);
+    }
+
+    fn progress(&self, pump: QpcTick) -> Result<Progress> {
+        let controller = self.session_status.controller_qpc();
         let now = clock::qpc().map_err(|_| Failure::Supervisor)?;
         Ok(Progress { now, controller, pump })
     }
@@ -916,7 +935,7 @@ fn drain_closed_lanes(
     let restrict = |visit, before| restrict_visit(frames, session, visit, before);
     let mut context_exited = false;
     for _ in 0..WORK_PER_POLL {
-        let (arrived, record) = match host.peer.observation() {
+        let (arrived, record) = match host.next_observation() {
             Ok(Some(item)) => item,
             Ok(None) => break,
             Err(Failure::PeerExited) if stopped => { context_exited = true; break; }
@@ -932,7 +951,7 @@ fn drain_closed_lanes(
     }
     let mut input_exited = false;
     for _ in 0..WORK_PER_POLL {
-        let record = match host.peer.input() {
+        let record = match host.next_input() {
             Ok(Some(record)) => record,
             Ok(None) => break,
             Err(Failure::PeerExited) if stopped => { input_exited = true; break; }
@@ -961,22 +980,25 @@ fn drop_optional(loss: &mut Option<(QpcTick, QpcTick, u32)>, at: QpcTick) {
     }
 }
 
-fn earliest_notice(observations: &VecDeque<(QpcTick, ContextDelivery)>) -> Option<QpcTick> {
+/// The native notices among the undelivered observations.
+fn pending_notices(
+    observations: &VecDeque<(QpcTick, ContextDelivery)>,
+) -> impl Iterator<Item = &NativeObservation<WindowNotice>> + '_ {
     observations.iter().filter_map(|(_, delivery)| match delivery {
-        ContextDelivery::Observation(Observation::Item { evidence: ContextEvidence::Notice(notice), .. }) =>
-            Some(notice.first_qpc),
+        ContextDelivery::Observation(Observation::Item { evidence: ContextEvidence::Notice(notice), .. }) => Some(notice),
         _ => None,
-    }).min()
+    })
+}
+
+fn earliest_notice(observations: &VecDeque<(QpcTick, ContextDelivery)>) -> Option<QpcTick> {
+    pending_notices(observations).map(|notice| notice.first_qpc).min()
 }
 
 fn retire_observations(
     observations: &mut VecDeque<(QpcTick, ContextDelivery)>, cutoff: &mut Option<QpcTick>,
     frames: &FramePolicy, session: &WorkerSession,
 ) {
-    if let Some(notice) = observations.iter().filter_map(|(_, delivery)| match delivery {
-        ContextDelivery::Observation(Observation::Item { evidence: ContextEvidence::Notice(notice), .. }) => Some(notice),
-        _ => None,
-    }).min_by_key(|notice| notice.first_qpc) {
+    if let Some(notice) = pending_notices(observations).min_by_key(|notice| notice.first_qpc) {
         keep_earlier(cutoff, notice.first_qpc);
         restrict_visit(frames, session, notice.visit, notice.first_qpc);
     }
@@ -1081,7 +1103,7 @@ impl Classifier {
             Err(TryRecvError::Disconnected) => return Err(Failure::Supervisor),
         }
         if let Some(proof) = foreground && self.pending.is_none()
-            && (self.current.is_none() || self.checked_at.is_none_or(|when| when.elapsed() >= Duration::from_millis(250)))
+            && (self.current.is_none() || self.checked_at.is_none_or(|when| when.elapsed() >= ACCESS_RECHECK))
             && self.request.try_send(proof).is_ok()
         {
             self.pending = Some(proof);

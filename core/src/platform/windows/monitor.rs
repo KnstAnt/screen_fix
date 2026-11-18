@@ -22,13 +22,32 @@ use crate::{
     package::{diagnostics::{Failure, FailureComponent}, metadata::{CaptureCounters, MonitorCapture}, outcome::HealthKind},
     protocol::{AdmissionEpoch, CaptureEpoch, FrameId, FrameSequence, GeometryEpoch, GeometryId, MonitorId, SessionTimeUs},
     config::SelectedMonitor,
-    session::{AdmissionBoundary, fault::FaultReport, windows::{Admission, PauseProducer, WorkerSession}},
+    session::{AdmissionBoundary, fault::FaultReport, windows::{Admission, PauseProducer, Receipt, WorkerSession}},
 };
 
-use super::{context::{ELEVATED_FRAME_WAIT_US, FramePolicy}, Apartment, ProbeError, capture_device, clock, clock_error, display, encoder, gpu, hdr, native, pixels, readback, slots, stage, still_png, still_rows, stills, unavailable, video, wgc};
+use super::{context::{ELEVATED_FRAME_WAIT_US, FrameApproval, FramePolicy}, Apartment, ProbeError, capture_device, clock, clock_error, display, encoder, gpu, hdr, native, pixels, readback, slots, stage, still_png, still_rows, stills, unavailable, video, wgc};
 
 /// The bound on one GPU video conversion.
 pub(super) const CONVERSION_DEADLINE: Duration = Duration::from_secs(3);
+const CONVERSION_TIMED_OUT: &str = "GPU video conversion did not complete within 3 seconds";
+/// The wait of an elevated frame's finished conversion for its approval.
+const APPROVAL_POLL: Duration = Duration::from_millis(1);
+/// The capture loop's wait while GPU work or readbacks are pending.
+const BUSY_POLL: Duration = Duration::from_millis(1);
+/// The capture loop's longest wait for a frame while idle.
+const IDLE_POLL: Duration = Duration::from_millis(10);
+/// The capture loop's wait while the monitor is missing or reconfiguring.
+const RECONFIGURE_POLL: Duration = Duration::from_millis(5);
+/// The bound on draining the stills of a pause or Stop boundary.
+const STILL_DRAIN_WAIT: Duration = Duration::from_secs(3);
+/// The interval between device-removal checks of the capture GPU.
+const DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+/// The capture pacing interval: one frame period at the configured pace.
+pub(super) fn capture_interval(worker: &WorkerSession) -> Duration {
+    Duration::from_nanos(NANOS_PER_SECOND / u64::from(worker.config().profile().capture_pace().frames_per_second()))
+}
 
 /// A frame in video conversion, with its conversion deadline.
 type PendingVideo = Option<(gpu::PendingSample, FrameMetadata, Instant)>;
@@ -129,7 +148,7 @@ fn capture(
         "Get the display capture API")?;
     let item: GraphicsCaptureItem = stage(unsafe { interop.CreateForMonitor(display.handle) }, "Select the display to capture")?;
     let size = stage(item.Size(), "Read the display capture size")?;
-    if display_size(&display)? != size {
+    if display.size()? != size {
         return Err(unavailable("The monitor physical geometry does not match its capture size"));
     }
     let adapter_luid = stage(unsafe { display.adapter.GetDesc1() }, "Read the capture adapter")?.AdapterLuid;
@@ -165,7 +184,7 @@ fn capture(
     let result = (|| {
         let Some(start) = worker.wait_for_start()? else { return Ok(Exit::Session(None)) };
         observations.arm_start(start.boundary, mode.geometry.id);
-        let interval = Duration::from_nanos(1_000_000_000 / u64::from(worker.config().profile().capture_pace().frames_per_second()));
+        let interval = capture_interval(worker);
         let mut scheduled = Instant::now();
         let mut sequence = 0_u64;
         let mut pending_video: PendingVideo = None;
@@ -203,13 +222,11 @@ fn capture(
                 || native_capture.as_ref().is_some_and(wgc::Capture::item_closed))
             {
                 stage(unsafe { device.GetDeviceRemovedReason() }, "Check the monitor GPU device")?;
-                next_device_check = now + Duration::from_secs(1);
+                next_device_check = now + DEVICE_CHECK_INTERVAL;
             }
             let now_session = open.clock.time(open.qpc).map_err(clock_error)?;
             let snapshot = topology.snapshot();
-            let latest = snapshot.as_ref().and_then(|snapshot| snapshot.outputs.as_ref().map(|outputs| {
-                outputs.iter().find(|entry| entry.key == selected.key).cloned()
-            }));
+            let latest = snapshot.as_ref().and_then(|snapshot| snapshot.output(&selected.key).map(|output| output.cloned()));
             let item_closed = native_capture.as_ref().is_some_and(wgc::Capture::item_closed);
             if item_closed || matches!(latest, Some(None)) && native_capture.is_some() {
                 if item_closed { reopen_after = Some(clock::qpc()?); }
@@ -233,14 +250,12 @@ fn capture(
                         {
                             // A failed read proves nothing about the monitor: the
                             // request is retried on the next topology tick (VID-9).
-                            let actual = display::enumerate().ok()
-                                .and_then(|displays| displays.into_iter().find(|entry| entry.key == selected.key));
-                            if let Some(actual) = actual
+                            if let Ok(actual) = display::resolve(&selected.key)
                                 && display::topology::Output::from_native(&actual).is_ok_and(|actual| actual == target)
                             {
                                 let next = next_geometry(mode.geometry.id.epoch)?;
                                 let epoch = next_capture(mode.capture_epoch)?;
-                                let size = display_size(&actual)?;
+                                let size = actual.size()?;
                                 let same_item = native_capture.is_some() && output.identity == target.identity
                                     && output.adapter == target.adapter;
                                 if !same_item {
@@ -326,8 +341,7 @@ fn capture(
                     Some(target) if native_capture.is_some() && output.adapter == target.adapter && output.identity == target.identity => {
                         Some(Some(device.clone()))
                     }
-                    Some(target) => display::enumerate().ok()
-                        .and_then(|displays| displays.into_iter().find(|entry| entry.key == target.key))
+                    Some(target) => display::resolve(&target.key).ok()
                         .and_then(|actual| capture_device(&actual.adapter).ok()).map(Some),
                 };
                 let (reply, result) = sync_channel(1);
@@ -359,7 +373,7 @@ fn capture(
                 readbacks.poll(&images.native, now)?;
                 observations.work(&device, &images.native, &mut readbacks, &png, now_session, now)?;
                 observations.advance_idle(now_session);
-                thread::park_timeout(Duration::from_millis(5));
+                thread::park_timeout(RECONFIGURE_POLL);
                 continue;
             }
             let Some(capture) = &mut native_capture else { continue };
@@ -421,69 +435,24 @@ fn capture(
             if std::mem::replace(&mut suspends, suspend_sequence) != suspend_sequence && let Some(pending) = &mut pending_video {
                 pending.2 = Instant::now() + CONVERSION_DEADLINE;
             }
-            if let (Some(converter), Some((sample, metadata, deadline))) = (&mut converter, &pending_video) {
-                if converter.ready(sample)? {
-                    let available = open.clock.time(clock::qpc()?).map_err(clock_error)?;
-                    let approval = frame_policy.try_current(open.boundary.epoch, available);
-                    if metadata.elevated_visit().is_some() && approval.is_err() && now < *deadline {
-                        thread::park_timeout(Duration::from_millis(1));
-                        continue;
-                    }
-                    let approved = approval.ok().flatten().is_some_and(|approval| approval.matches(metadata));
-                    let input = if approved { converter.input(sample)? } else { None };
-                    if let Some(input) = input {
-                        let frame = video::Observation { input, metadata: metadata.clone(), available,
-                            change: images.native.change(metadata.id) };
-                        match video.send.try_send(frame) {
-                            Ok(()) => {}
-                            Err(TrySendError::Full(_)) => {
-                                counters.video_pressure = counters.video_pressure.saturating_add(1);
-                                if let Some(timeline) = timeline {
-                                    video.evidence.queue_pressure(timeline.containing(metadata.source_t_us)?);
-                                }
-                            }
-                            Err(TrySendError::Disconnected(_)) => {
-                                counters.video_discarded = counters.video_discarded.saturating_add(1);
-                            }
-                        }
-                    } else if approved {
-                        // The converted picture could not be read back as encoder input.
-                        counters.video_pressure = counters.video_pressure.saturating_add(1);
-                        if let Some(timeline) = timeline {
-                            video.evidence.capture_pressure(timeline.containing(metadata.source_t_us)?);
-                        }
-                    } else {
-                        counters.video_discarded = counters.video_discarded.saturating_add(1);
-                    }
-                    pending_video = None;
-                } else if now >= *deadline {
-                    return Err(unavailable("GPU video conversion did not complete within 3 seconds"));
-                }
+            if let Some(converter) = &mut converter
+                && deliver_converted(converter, &mut pending_video, &open, frame_policy, &images.native, &video, timeline,
+                    now, counters)?
+            {
+                thread::park_timeout(APPROVAL_POLL);
+                continue;
             }
             if let Ok(approval) = frame_policy.try_current(open.boundary.epoch, now_session) {
-                while let Some(metadata) = images.native.staged() {
-                    if !metadata.covered()
-                        || approval.as_ref().is_none_or(|approval| !approval.owns(&metadata))
-                        || now_session.0.saturating_sub(metadata.recv_t_us.0) >= ELEVATED_FRAME_WAIT_US
-                    {
-                        images.native.take_staged();
-                        counters.rejected_approval = counters.rejected_approval.saturating_add(1);
-                    } else if approval.as_ref().is_some_and(|approval| approval.matches(&metadata)) {
-                        let (owned, metadata) = images.native.take_staged().expect("staged capture is present");
-                        images.publish(owned, metadata, &painter, &video, timeline, &mut converter, &mut pending_video,
-                            &mut waiting, capture.size, now, counters)?;
-                    } else {
-                        break;
-                    }
-                }
+                images.release_staged(approval.as_ref(), now_session, &painter, &video, timeline, &mut converter,
+                    &mut pending_video, &mut waiting, capture.size, now, counters)?;
             }
             if elevated {
                 observations.step(&images.native, &mode, frame_policy, worker.config(), open.boundary.epoch, now_session);
             }
             let sleep = if pending_video.is_some() || images.thumbnails.has_pending() || readbacks.has_pending() {
-                Duration::from_millis(1)
+                BUSY_POLL
             } else {
-                Duration::from_millis(10)
+                IDLE_POLL
             };
             if now < scheduled {
                 thread::park_timeout(scheduled.duration_since(now).min(sleep));
@@ -613,7 +582,7 @@ fn finish_stills(
     observations: &mut stills::Stills, readbacks: &mut readback::Readbacks, png: &still_png::Inbox,
 ) -> Result<(), ProbeError> {
     observations.finish_boundary(prefix, cutoff, images, mode, stopping, capture_available);
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + STILL_DRAIN_WAIT;
     loop {
         let now = Instant::now();
         let budget = if stopping { worker.stop_deadline() } else { worker.segment_deadline() };
@@ -628,7 +597,7 @@ fn finish_stills(
         }
         readbacks.poll(images, now)?;
         observations.work(device, images, readbacks, png, cutoff.time, now)?;
-        thread::park_timeout(Duration::from_millis(1));
+        thread::park_timeout(BUSY_POLL);
     }
     if !stopping && worker.pause_pending(cutoff) {
         observations.advance_boundary(cutoff.time);
@@ -680,6 +649,32 @@ impl Resources {
         Ok(())
     }
 
+    /// Publish the staged elevated frames whose receipts the approval now
+    /// certifies, in order. A frame the approval no longer owns, or one that
+    /// waited past the elevated frame wait, is rejected.
+    fn release_staged(
+        &mut self, approval: Option<&FrameApproval>, now_session: SessionTimeUs, painter: &pixels::Painter,
+        video: &VideoTarget, timeline: Option<slots::Timeline>, converter: &mut Option<gpu::Converter>,
+        pending_video: &mut PendingVideo, waiting: &mut TimelineWait, size: SizeInt32, now: Instant,
+        counters: &mut CaptureCounters,
+    ) -> Result<(), ProbeError> {
+        while let Some(metadata) = self.native.staged() {
+            if !metadata.covered()
+                || approval.is_none_or(|approval| !approval.owns(&metadata))
+                || now_session.0.saturating_sub(metadata.recv_t_us.0) >= ELEVATED_FRAME_WAIT_US
+            {
+                self.native.take_staged();
+                counters.rejected_approval = counters.rejected_approval.saturating_add(1);
+            } else if approval.is_some_and(|approval| approval.matches(&metadata)) {
+                let Some((owned, metadata)) = self.native.take_staged() else { break };
+                self.publish(owned, metadata, painter, video, timeline, converter, pending_video, waiting, size, now, counters)?;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn new(
         device: &ID3D11Device, painter: &pixels::Painter, size: SizeInt32,
         color: CaptureColor, white: Option<std::num::NonZeroU32>,
@@ -699,6 +694,55 @@ impl Resources {
             tone_map, extent, format,
         })
     }
+}
+
+/// Hand a finished video conversion to the video worker; a frame not
+/// delivered is counted. Returns true while an elevated frame's finished
+/// conversion awaits its approval within the conversion deadline.
+fn deliver_converted(
+    converter: &mut gpu::Converter, pending_video: &mut PendingVideo, open: &Receipt, frame_policy: &FramePolicy,
+    native: &native::NativeImages, video: &VideoTarget, timeline: Option<slots::Timeline>, now: Instant,
+    counters: &mut CaptureCounters,
+) -> Result<bool, ProbeError> {
+    let Some((sample, metadata, deadline)) = pending_video.as_ref() else { return Ok(false) };
+    if !converter.ready(sample)? {
+        if now >= *deadline {
+            return Err(unavailable(CONVERSION_TIMED_OUT));
+        }
+        return Ok(false);
+    }
+    let available = open.clock.time(clock::qpc()?).map_err(clock_error)?;
+    let approval = frame_policy.try_current(open.boundary.epoch, available);
+    if metadata.elevated_visit().is_some() && approval.is_err() && now < *deadline {
+        return Ok(true);
+    }
+    let approved = approval.ok().flatten().is_some_and(|approval| approval.matches(metadata));
+    let input = if approved { converter.input(sample)? } else { None };
+    if let Some(input) = input {
+        let frame = video::Observation { input, metadata: metadata.clone(), available, change: native.change(metadata.id) };
+        match video.send.try_send(frame) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                counters.video_pressure = counters.video_pressure.saturating_add(1);
+                if let Some(timeline) = timeline {
+                    video.evidence.queue_pressure(timeline.containing(metadata.source_t_us)?);
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                counters.video_discarded = counters.video_discarded.saturating_add(1);
+            }
+        }
+    } else if approved {
+        // The converted picture could not be read back as encoder input.
+        counters.video_pressure = counters.video_pressure.saturating_add(1);
+        if let Some(timeline) = timeline {
+            video.evidence.capture_pressure(timeline.containing(metadata.source_t_us)?);
+        }
+    } else {
+        counters.video_discarded = counters.video_discarded.saturating_add(1);
+    }
+    *pending_video = None;
+    Ok(false)
 }
 
 /// Submit one approved frame for video conversion. A busy or failed
@@ -799,12 +843,6 @@ impl TimelineWait {
             }
         }
     }
-}
-
-fn display_size(display: &display::Monitor) -> Result<SizeInt32, ProbeError> {
-    let width = i32::try_from(display.bounds.width()).map_err(|_| unavailable("The physical monitor width overflowed"))?;
-    let height = i32::try_from(display.bounds.height()).map_err(|_| unavailable("The physical monitor height overflowed"))?;
-    Ok(SizeInt32 { Width: width, Height: height })
 }
 
 /// An HDR monitor without an SDR white level is captured through the system

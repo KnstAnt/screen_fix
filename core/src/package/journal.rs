@@ -2,8 +2,12 @@
 //!
 //! The ingress keeps a keyed loss ledger outside the data queue. Every pending
 //! ledger entry becomes a typed `gap` row before the next row of the stream,
-//! at a boundary, or at close. Gap, boundary and health rows never compete
-//! with a full data queue for their existence: at worst they stay pending.
+//! at a boundary, or at close. Gap rows never compete with a full data queue
+//! for their existence: at worst they stay pending until the ingress tail.
+//! Boundary and health rows use a fixed room reserved above the data limit and
+//! shared by every lifecycle entry; when that room is full the submission
+//! fails with [`JournalStep::Reserve`], distinct from a failed writer, and the
+//! pending gaps stay in the ledger.
 
 use std::{
     collections::BTreeMap,
@@ -22,17 +26,19 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::protocol::{EventRef, MonitorId, QpcTick, SessionTimeUs, StreamId, StreamSequence};
+use crate::protocol::{EventRef, MonitorId, SessionTimeUs, StreamId, StreamSequence};
 
 use super::{
     diagnostics::Failure,
-    outcome::{DroppedTotal, GapRecord, HealthKind, LossCount, LossEvidence, LossProducer, LossReason, LossScope, SuppressionClass,
-        UiaOutcome, UiaRead, merge_bounds},
+    outcome::{DroppedTotal, GapRecord, HealthKind, LossCount, LossEvidence, LossProducer, LossRange, LossReason, LossScope,
+        SuppressionClass, UiaOutcome, UiaRead},
 };
 
 const BUFFER_INTERVAL: Duration = Duration::from_secs(1);
 const DISK_INTERVAL: Duration = Duration::from_secs(10);
 pub(super) const MAX_ROW_BYTES: usize = 1024 * 1024;
+/// Lifecycle entries (gap batches, boundary and health rows) that may wait in
+/// the writer queue above the data limit at once.
 const BOUNDARY_ENTRIES: usize = 24;
 const MAX_BOUNDARY_ROWS: usize = 512;
 const MAX_BOUNDARY_BYTES: usize = 128 * 1024;
@@ -45,6 +51,8 @@ pub(crate) enum JournalStep {
     Order,
     Encode,
     Append,
+    /// The room reserved for lifecycle entries was full.
+    Reserve,
     BufferedFlush,
     OsFlush,
     Close,
@@ -65,6 +73,7 @@ impl std::fmt::Display for JournalError {
             JournalStep::Order => "order records in",
             JournalStep::Encode => "encode a record for",
             JournalStep::Append => "append to",
+            JournalStep::Reserve => "reserve lifecycle room in",
             JournalStep::BufferedFlush => "flush the buffer of",
             JournalStep::OsFlush => "flush to disk for",
             JournalStep::Close => "close",
@@ -73,7 +82,11 @@ impl std::fmt::Display for JournalError {
     }
 }
 
-impl std::error::Error for JournalError {}
+impl std::error::Error for JournalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|source| source as _)
+    }
+}
 
 /// Closed totals of one stream. `offered` counts every item that reached a
 /// terminal outcome through the ingress: persisted data rows, ledger losses
@@ -217,27 +230,27 @@ struct PendingLoss {
     reason: LossReason,
     producer: Option<LossProducer>,
     count: LossCount,
-    first: SessionTimeUs,
-    last: SessionTimeUs,
-    source_seq: Option<[u64; 2]>,
-    qpc: Option<[QpcTick; 2]>,
+    range: LossRange,
 }
 
 impl PendingLoss {
     fn merge(&mut self, other: Self) {
         self.count = self.count.merge(other.count);
-        self.first = self.first.min(other.first);
-        self.last = self.last.max(other.last);
-        self.source_seq = merge_bounds(self.source_seq, other.source_seq);
-        self.qpc = merge_bounds(self.qpc, other.qpc);
+        self.range = self.range.merge(other.range);
+    }
+
+    /// Gap rows are written in ascending first loss time.
+    fn order(&self) -> (SessionTimeUs, SessionTimeUs) {
+        (self.range.first_t_us, self.range.last_t_us)
     }
 
     fn record(&self) -> GapRecord {
+        let LossRange { first_t_us, last_t_us, source_seq, qpc } = self.range;
         GapRecord {
             reason: self.reason, producer: self.producer, count: self.count.known(),
-            count_known: self.count.known().is_some(), first_recv_t_us: self.first, last_recv_t_us: self.last,
-            first_source_seq: self.source_seq.map(|range| range[0]), last_source_seq: self.source_seq.map(|range| range[1]),
-            first_qpc: self.qpc.map(|range| range[0]), last_qpc: self.qpc.map(|range| range[1]),
+            count_known: self.count.known().is_some(), first_recv_t_us: first_t_us, last_recv_t_us: last_t_us,
+            first_source_seq: source_seq.map(|range| range[0]), last_source_seq: source_seq.map(|range| range[1]),
+            first_qpc: qpc.map(|range| range[0]), last_qpc: qpc.map(|range| range[1]),
         }
     }
 }
@@ -376,7 +389,8 @@ struct IngressTail {
 enum Capacity {
     /// Data-time emission; a full queue keeps the entries pending.
     Normal,
-    /// Lifecycle emission in the reserved room above the data limit.
+    /// Lifecycle emission in the reserved room above the data limit; a full
+    /// reserve keeps the entries pending.
     Reserved,
     /// Waits for room; only for owners that may wait on IO.
     Blocking,
@@ -430,7 +444,7 @@ impl JournalIngress {
         }
         self.ledger_add(PendingLoss {
             reason: LossReason::QueueOverflow, producer: None, count: LossCount::Known(std::num::NonZeroU64::MIN),
-            first: receipt, last: receipt, source_seq: None, qpc: None,
+            range: LossRange { first_t_us: receipt, last_t_us: receipt, source_seq: None, qpc: None },
         }, receipt)?;
         Ok(Submit::Dropped)
     }
@@ -466,8 +480,8 @@ impl JournalIngress {
         }
         if encoded.is_empty() { return Ok(()); }
         self.totals.offered = self.totals.offered.saturating_add(encoded.len() as u64);
-        if self.paused.is_none() {
-            self.emit_pending(receipt, Capacity::Reserved)?;
+        if self.paused.is_none() && !self.emit_pending(receipt, Capacity::Reserved)? {
+            return Err(self.error(JournalStep::Reserve, None));
         }
         self.send_reserved(Entry::Boundary(receipt, encoded))
     }
@@ -482,7 +496,9 @@ impl JournalIngress {
         }
         let receipt = self.last_admission.map_or(health.detected, |last| last.max(health.detected));
         let row = self.encode(receipt, health.row(self.stream))?;
-        self.emit_pending(receipt, Capacity::Reserved)?;
+        if !self.emit_pending(receipt, Capacity::Reserved)? {
+            return Err(self.error(JournalStep::Reserve, None));
+        }
         self.send_reserved(Entry::Health(receipt, row))
     }
 
@@ -510,16 +526,11 @@ impl JournalIngress {
                 Ok(())
             }
             LossScope::Ordinary(range) => {
-                if range.first_t_us > range.last_t_us || range.last_t_us > admitted
-                    || range.source_seq.is_some_and(|[first, last]| first > last)
-                    || range.qpc.is_some_and(|[first, last]| first > last)
-                {
+                let loss = PendingLoss { reason: evidence.reason, producer: evidence.producer, count: evidence.count, range };
+                if !loss.record().is_valid(admitted) {
                     return Err(self.error(JournalStep::Order, None));
                 }
-                self.ledger_add(PendingLoss {
-                    reason: evidence.reason, producer: evidence.producer, count: evidence.count,
-                    first: range.first_t_us, last: range.last_t_us, source_seq: range.source_seq, qpc: range.qpc,
-                }, admitted)
+                self.ledger_add(loss, admitted)
             }
         }
     }
@@ -533,22 +544,25 @@ impl JournalIngress {
         Ok(())
     }
 
-    /// Emit every pending entry, in ascending first loss time, at one admission receipt.
+    /// Emit every pending entry, in ascending first loss time, at one admission
+    /// receipt. `false` means the normal or reserved room was full and the
+    /// entries stay pending.
     fn emit_pending(&mut self, admission: SessionTimeUs, capacity: Capacity) -> Result<bool, JournalError> {
         if self.ledger.is_empty() { return Ok(true); }
         self.check_order(admission)?;
         let mut gaps: Vec<_> = self.ledger.values().copied().collect();
-        gaps.sort_by_key(|gap| (gap.first, gap.last));
+        gaps.sort_by_key(PendingLoss::order);
         let entry = Entry::Gaps(admission, gaps);
-        match capacity {
-            Capacity::Normal => match self.offer_entry(entry) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => return Ok(false),
-                Err(TrySendError::Disconnected(_)) => return Err(self.error(JournalStep::Append, None)),
-            },
-            Capacity::Reserved => self.send_reserved(entry)?,
+        let sent = match capacity {
+            Capacity::Normal => self.offer_entry(entry),
+            Capacity::Reserved => self.entries.try_send(QueuedEntry::priority(entry)),
             Capacity::Blocking => self.entries.send(QueuedEntry::priority(entry))
-                .map_err(|_| self.error(JournalStep::Append, None))?,
+                .map_err(|mpsc::SendError(queued)| TrySendError::Disconnected(queued)),
+        };
+        match sent {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Ok(false),
+            Err(TrySendError::Disconnected(_)) => return Err(self.error(JournalStep::Append, None)),
         }
         self.ledger.clear();
         self.last_admission = Some(admission);
@@ -674,7 +688,10 @@ impl JournalIngress {
 
     /// Queue a lifecycle entry in the room reserved above the data limit.
     fn send_reserved(&self, entry: Entry) -> Result<(), JournalError> {
-        self.entries.try_send(QueuedEntry::priority(entry)).map_err(|_| self.error(JournalStep::Append, None))
+        self.entries.try_send(QueuedEntry::priority(entry)).map_err(|error| match error {
+            TrySendError::Full(_) => self.error(JournalStep::Reserve, None),
+            TrySendError::Disconnected(_) => self.error(JournalStep::Append, None),
+        })
     }
 
     fn error(&self, step: JournalStep, source: Option<io::Error>) -> JournalError {
@@ -917,7 +934,7 @@ impl JournalFile {
         let IngressTail { admission, mut pending, unreported_paused_health, totals } = closed;
         if !pending.is_empty() {
             let admission = admission.ok_or_else(|| self.error(JournalStep::Order, None))?;
-            pending.sort_by_key(|gap| (gap.first, gap.last));
+            pending.sort_by_key(PendingLoss::order);
             for gap in pending {
                 self.gap(admission, gap)?;
             }

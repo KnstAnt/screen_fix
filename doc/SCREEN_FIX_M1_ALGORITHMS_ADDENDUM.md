@@ -425,13 +425,13 @@ Correlation quality is never a terminal outcome. It is metadata on a persisted r
 Ledger:
 - Each stream ingress owns the ledger. Its key is (reason, producer); reasons and producers are closed typed enums. At most one entry per key is pending, outside the data queue.
 - An entry holds a count (known, or unknown; unknown stays unknown when merged), the first and last receipt of the lost items, and optional native sequence and QPC ranges. Merging sums counts and widens ranges.
-- A loss of a password, possibly sensitive or approval-unknown item is Sensitive. It is counted only, carries no time or sequence range and never becomes a gap row.
+- A loss of a password, possibly sensitive or approval-unknown item is Sensitive, and so is a key record lost before its visit is classified (pointer and HID records keep their ranges). It is counted only, carries no time or sequence range and never becomes a gap row.
 
 Emission:
 - Pending entries are written as gap rows before the next row of the same stream, in ascending first receipt.
 - A gap row's `recv_t_us` is its admission receipt: the maximum of the triggering receipt and the stream's last receipt. Its range fields keep the original loss times.
 - At a pause boundary pending entries precede the pause row. Losses noticed while paused follow the resume row with their original ranges. At close they precede the final health rows.
-- Capacity: before a data row, pending gap rows use the normal data capacity. If it is full they stay pending in the ledger (the data row itself becomes a `queue_overflow` loss), and an idle producer wake offers them again. Gap rows are emitted in reserved capacity before boundary rows and before a health row, by a blocking priority send when a waited flush finds the queue full, and at close in the ingress tail. Health rows always use the reserve. Failure to append one is a journal failure (F) and produces no further health row.
+- Capacity: before a data row, pending gap rows use the normal data capacity. If it is full they stay pending in the ledger (the data row itself becomes a `queue_overflow` loss), and an idle producer wake offers them again. Gap rows are emitted in reserved capacity before boundary rows and before a health row, by a blocking priority send when a waited flush finds the queue full, and at close in the ingress tail. Health rows always use the reserve. The reserve (24 entries above the data limit) is shared by gap batches, boundary rows and health rows. When it is full, a gap batch stays pending in the ledger, and a boundary or health row fails with a distinct `reserve` journal failure (F). Failure to append one is a journal failure (F) and produces no further health row.
 - The frames stream never records a loss. Video losses are slot rows with a reason (13.14).
 
 Health rows:
@@ -452,14 +452,14 @@ The controller owns the classification. Owners report typed `FaultReport` values
 | # | Condition | Class |
 | --- | --- | --- |
 | 1 | Journal append, flush or close failure | F |
-| 2 | Manifest publication failure; a required segment unfinalized or unverified at the Stop deadline | F |
+| 2 | Manifest publication failure; a required segment unfinalized or unverified at the Stop deadline (including a segment interrupted during IDR rotation, once the Stop deadline has expired) | F |
 | 3 | Clock or controller failure | F |
 | 4 | Capture-thread failure that is not a topology change (for example GPU device loss) | F |
 | 5 | Admitted collector source failure (host, transport, authentication, protocol, lease, witness regression, readiness deadline, required access on the current grant, failed standard-helper check on return) | F |
 | 6 | Collector provider call still running at request deadline + 750 ms | F |
 | 7 | Collector input-lane write outstanding beyond the 500 ms coverage stall, or control-lane write beyond the lease | F |
 | 8 | Collector request deadline expiry where the call returns before deadline + 750 ms | G |
-| 9 | Encoder failure or rejected segment verification on a monitor | L-required (that monitor's video) |
+| 9 | Encoder failure or rejected segment verification on a monitor; a segment close or rotation part failing before the Stop deadline expired; encoder release failure at a format change or at Stop | L-required (that monitor's video) |
 | 10 | Helper exit or transport break | L-required (input) |
 | 11 | Input producer progress stall | G (blind interval) from 250 ms; L-required (input) from 5 s |
 | 12 | Required Raw Input registration loss or required hook loss (D-2 B) | L-required (input), blind until Stop |
@@ -482,7 +482,7 @@ Rules:
 Implementation notes:
 - Row 16: the PNG worker also owns the still journal. An encoder panic is caught; it is reported once as an L-auxiliary loss with a health row, and this and every later job resolves as `still_dropped` with reason `png_worker_unavailable`. The still journal and the recording continue. A still journal failure, or an exit of the worker outside the encoder, stays F (row 1) with no extra L report.
 - Cursor assets: a panic of the cursor asset owner is caught. The assets it already published keep their inventory entries; later assets are unavailable, and the context owner reports one L-auxiliary loss on its next health poll. A panic after the context loop's last poll keeps the inventory but is not reported.
-- Row 7: the collector writes control and status records on its owner thread with a lease-bounded (1 s) write deadline. The collector supervisor ends the collector when that thread has made no progress for 750 ms outside cleanup, so these writes are effectively bounded at 750 ms.
+- Row 7: the collector writes status records on its owner thread with the 750 ms cleanup bound as their write deadline, the same bound within which the collector supervisor requires that thread's progress outside cleanup; a write still incomplete then fails the lane. A stalled Recorder command or query write is a transport failure, not a readiness-deadline expiry.
 - Row 17: a clipboard worker exit is reported once as an L-auxiliary loss with a context health row. No replacement worker is started, so no later clipboard events are produced.
 - Rows 20 and 21 belong to the per-monitor frames lanes (13.14).
 
@@ -532,7 +532,7 @@ Origin follows INP-7 precedence: promotion signature, then hook injection flags 
 
 - An input producer stall opens a blind interval after 250 ms of awake time and becomes L-required input at 5 s. Only records of the stalled producers are dropped; hook-health transitions inside the stall interval are not counted.
 - A malformed packet is skipped and counted (G), not fatal to the helper.
-- `input_health` rows report per-second coalesced, thinned and suppressed counts. The per-second suppressed counts exclude the privacy-adjacent classes (approval unknown, not approved, control uncertain, cluster excess).
+- `input_health` rows report per-second coalesced, thinned and suppressed counts. The per-second suppressed counts exclude the privacy-adjacent classes (approval unknown, not approved, control uncertain, cluster excess) and the AltGr companion key, which is counted only in the stream summary.
 - A helper failure noticed after the pause prefix is published writes no runtime input health row; the final activity-loss row remains.
 - Suspend-excluded elapsed time comes from the power marks of the session; a mark without a QPC gives an unknown interval, never zero, and an unknown interval never produces a fault.
 
@@ -563,15 +563,15 @@ Read corrections (C1):
 ### 13.10 Segment verification and encoder selection (V3, V4)
 
 - The video worker performs rotation (IDR, finalize, flush, next part) and hands the closed part to a per-monitor verifier thread through a queue of two. Encoding continues. A full verifier queue makes the worker wait and is counted.
-- The verifier decodes the segment and checks timing and dimensions. Only after success, and an authorization check immediately before the rename, is the `.part` renamed to `.mp4`. An already published `.mp4` is never deleted on a later elevated revocation; the remaining race window is benign because the segment contains only frames admitted while the visit was approved.
+- The verifier decodes the segment and checks timing and dimensions. Only after success, and an authorization check immediately before the rename, is the `.part` renamed to `.mp4`. A verifier that cannot initialize COM returns its cause as the first part's verdict and exits; every part stays `.part`. An already published `.mp4` is never deleted on a later elevated revocation; the remaining race window is benign because the segment contains only frames admitted while the visit was approved.
 - A rejected verification is L-required for that monitor (row 9). A result not received within the verification allowance resolves the segment's rows as `segment_unverified`, keeps the `.part` and is L-required (row 19). Only an unfinished required segment at the Stop deadline is F.
-- Display read failures give unavailable fields instead of failing. HDR without an SDR white level uses the system BGRA8 conversion with a health row. Encoder selection failure at reconfigure is L-required for that monitor (capability selection, not recovery). Rejected hardware candidates are recorded with their causes. The encoder self-check pictures are converted on the capture thread.
+- Display read failures give unavailable fields instead of failing. An output whose color mode or rectangle cannot be read affects only that monitor; another selected monitor still resolves. HDR without an SDR white level uses the system BGRA8 conversion with a health row. Encoder selection failure at reconfigure is L-required for that monitor (capability selection, not recovery). Rejected hardware candidates are recorded with their causes (`encoder_candidate_rejected`), also when the selection fails because no encoder qualifies. The encoder self-check pictures are converted on the capture thread.
 - Suspend: a monitor that has not closed its open segment within 2 s of `PBT_APMSUSPEND` writes `suspend_finalize_late` and finishes after wake (D-5 A). The encoder watchdog, the elevated prefix wait and the conversion deadline restart on a suspend.
 
 ### 13.11 Session and completion rules
 
 - D-6 A: complete requires usable video for each selected monitor in each interval in which it was present and admitted. An admitted interval of a present monitor counts as without video only if it has no encoded slot and contains a slot that starts later than the interval start plus G; shorter intervals are counted in `short_intervals_without_video` and do not affect Complete. Approval-suppressed slots lie outside admitted intervals.
-- Hotkeys: a hotkey progress gap is measured as suspend-excluded time and records a control loss; it no longer disables hotkeys. There is no separate registration-loss health record: a `RegisterHotKey` registration belongs to its thread and is lost only when that thread stops, which is already detected and shown.
+- Hotkeys: the hotkey pump renews its progress mark at least every 50 ms, also without messages. A hotkey progress gap (over 250 ms) is measured as suspend-excluded time and records a control loss; it no longer disables hotkeys. There is no separate registration-loss health record: a `RegisterHotKey` registration belongs to its thread and is lost only when that thread stops, which is already detected and shown.
 - The countdown is held during lock, secure desktop and sleep. An admitted failure is reported as a retained recording with its package path when the failed manifest is confirmed.
 
 ### 13.12 Stills (P1–P3)
@@ -579,7 +579,7 @@ Read corrections (C1):
 - The PNG inbox takes a short blocking lock; `capacity` is reported only when the queue is full and the new job does not outrank the lowest one.
 - Drop reasons are set at their cause: a save without an eligible interval gives `admission_closed` or `save_interval_changed`; a pointer rest gives `admission_changed`, `geometry_changed` or `frame_not_approved`; an approved private request with no selection gives `no_approved_interval` or `adjustment_failed`. Fallback reasons remain only for a handoff disconnect.
 - A PNG write failure gives one context health row (`still_write_failure`) per episode of the same failing operation; each still row keeps its operation and native code.
-- At the drain deadline a finished PNG job keeps its result; an unfinished job is cancelled before its write and before its rename. An image published after its slot gave up is kept, unreferenced, and counted in the manifest PNG counters (`unreferenced_images`).
+- At the drain deadline a finished PNG job keeps its result; an unfinished job is cancelled before its write and before its rename. An image published after its slot gave up is kept, unreferenced. The manifest PNG counter `unreferenced_images` is exact: every inventoried image that no journaled still row names in `file` or `seen_file`, plus revoked images whose removal failed.
 - A `pre_motion` envelope, with its still-row reservations, opens only for the first motion after 300 ms without motion, decided at receipt in the Receiver. Later motion reserves nothing.
 - Retention: pending private selections take part in reclaim by IMG-7 priority, newest first among equal priority. Pending private selections hold at most two distinct frames, so one extra hold stays available to public requests.
 - `start` returns `history_lost` when an eligible frame after the boundary was already evicted, instead of a later frame.
@@ -604,6 +604,7 @@ Merge (no loss, no blocking between monitors):
 - Each video worker decides every non-paused slot in real time, including while its monitor is absent and after its own video L fault. Rows go to a bounded per-monitor lane of ceil(T × effective FPS) rows; a row that does not fit stays in the worker's staging. After each enqueue the worker publishes an atomic mark (epoch, receipt, next slot); all its rows below the mark are already in the lane.
 - The merge thread releases the smallest lane head by (`recv_t_us`, monitor, slot) while every other monitor's constraint admits it: the monitor's mark for the current epoch, the opening floor R until that monitor publishes a mark of the new epoch, and no constraint after its closing mark until the next opening. A row the writer cannot take stays at the lane head.
 - Opening: at Start and every resume the controller sends Opening(e, R) to the merge thread and waits up to 1 s for its acknowledgement before any video worker sees epoch e. The merge thread does no file IO, so a missing acknowledgement is a journal failure (F).
+- Segment flush: a segment whose outcome is final asks for a flush of the frames journal through its last row, which waits until the merge has released that row. A segment with no rows asks for the prefix written so far, at once. Requests still pending when the merge finishes are flushed then.
 - Row 20 (F): staging that still exceeds its bound after one slot interval of waiting for lane space.
 - Row 21 (F): the merge thread's watchdog reports a worker whose mark does not advance for T = segment duration + IDR allowance + verification allowance + one slot, measured as suspend-excluded elapsed time; an unknown interval restarts the measurement. It applies only while the controller is Recording. It skips a monitor whose full lane still holds rows, because those rows wait for another monitor's mark. It also watches an older epoch's mark that was never closed: at a pause a worker publishes its closing mark only when no staged row remains, so while rows of that epoch still await verification its last mark keeps constraining. On a report the lane is closed at its last mark, later rows of that worker are discarded and the undelivered slot range is recorded in diagnostics and the manifest.
 - Each row also keeps its publication time as `published_t_us`; `recv_t_us` is never taken from publication time.

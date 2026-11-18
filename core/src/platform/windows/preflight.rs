@@ -125,20 +125,23 @@ pub(super) fn validate_processes(config: &ResolvedCaptureConfig) -> Result<(), C
     if approved.is_empty() {
         return Err(error("Choose the executable whose recording is approved."));
     }
-    let mut found = false;
+    // A candidate can exit between the snapshot and its open, so a candidate
+    // that cannot be verified fails only while no approved process is found.
+    let mut unverified = None;
     for pid in process_candidates(approved)? {
-        let process = NonZeroU32::new(pid).and_then(ProcessHandle::open)
-            .ok_or_else(|| error("The identity of a possible approved application is unknown. Retry after closing it."))?;
-        let approved = approved_index(&process, approved)
-            .map_err(|()| error("The full path of a possible approved application could not be verified."))?;
-        if approved.is_some() {
-            found = true;
+        let verified = NonZeroU32::new(pid).and_then(ProcessHandle::open)
+            .ok_or_else(|| error("The identity of a possible approved application is unknown. Retry after closing it."))
+            .and_then(|process| approved_index(&process, approved)
+                .map_err(|()| error("The full path of a possible approved application could not be verified.")));
+        match verified {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(failure) => { unverified.get_or_insert(failure); }
         }
     }
-    if !found {
-        return Err(error("Open the approved application before starting the recording. Screen Fix cannot approve its own window."));
-    }
-    Ok(())
+    Err(unverified.unwrap_or_else(|| {
+        error("Open the approved application before starting the recording. Screen Fix cannot approve its own window.")
+    }))
 }
 
 #[derive(Clone)]
@@ -164,7 +167,7 @@ impl ForegroundApproval {
     }
 }
 
-pub(crate) enum Foreground {
+pub(super) enum Foreground {
     Ordinary(ForegroundApproval),
     Elevated(ForegroundApproval),
     Unapproved,
@@ -172,15 +175,11 @@ pub(crate) enum Foreground {
 }
 
 pub(super) fn validate_foreground(config: &ResolvedCaptureConfig) -> Result<ForegroundApproval, CaptureError> {
-    match classify_foreground(config) {
+    match classify_expected_foreground(config, None) {
         Foreground::Ordinary(approval) | Foreground::Elevated(approval) => Ok(approval),
         Foreground::Unapproved => Err(error("Bring the approved application to the foreground during the countdown, then retry.")),
         Foreground::Unknown(failure) => Err(failure),
     }
-}
-
-pub(crate) fn classify_foreground(config: &ResolvedCaptureConfig) -> Foreground {
-    classify_expected_foreground(config, None)
 }
 
 pub(super) fn classify_expected_foreground(config: &ResolvedCaptureConfig, expected: Option<WindowProcess>) -> Foreground {

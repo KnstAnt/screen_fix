@@ -373,9 +373,10 @@ impl From<HelperError> for super::ProbeError {
             HelperError::Reported(failure) => failure.raw_input_registration,
             _ => None,
         };
+        let win32 = |code: i32| HRESULT::from_win32(code as u32);
         let (stage, code) = match error {
             HelperError::Missing => ("The installed screen-fix-input-helper.exe is missing", None),
-            HelperError::Windows(stage, error) => (stage, error.raw_os_error()),
+            HelperError::Windows(stage, error) => (stage, error.raw_os_error().map(win32)),
             HelperError::Protocol(error) => {
                 let stage = match error {
                     PacketError::UnsupportedVersion(_) => "The installed input helper protocol version differs",
@@ -395,9 +396,10 @@ impl From<HelperError> for super::ProbeError {
                     HelperFailureStage::MessageLoop => "Run the input helper message loop",
                     HelperFailureStage::Transport => "Run input helper IPC",
                 };
-                (stage, failure.native_code)
+                (stage, failure.native_code.map(win32))
             }
-            HelperError::UnexpectedExit(_code) => ("The input helper exited unexpectedly", None),
+            // The process exit code is kept as reported; it is not a Win32 error.
+            HelperError::UnexpectedExit(code) => ("The input helper exited unexpectedly", Some(HRESULT(code as i32))),
             HelperError::ReadyTimeout => ("The input helper did not report readiness in time", None),
             HelperError::ShutdownTimeout => ("The input helper did not finish normal cleanup in time", None),
             HelperError::SuspectedHookLoss(producer) => (match producer {
@@ -415,7 +417,8 @@ impl From<HelperError> for super::ProbeError {
         };
         Self {
             stage,
-            source: code.map(|code| Error::from_hresult(HRESULT::from_win32(code as u32))),
+            kind: super::ProbeKind::Other,
+            source: code.map(Error::from_hresult),
             journal: None,
             raw_input_registration,
             owner: Some(crate::package::diagnostics::FailureComponent::InputHelper),

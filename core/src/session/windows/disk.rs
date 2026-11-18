@@ -15,7 +15,9 @@ use crate::{CaptureError, session::DiskPreflight};
 use super::WorkerSession;
 
 const GB: u64 = 1_000_000_000;
-pub(super) const START_MINIMUM: u64 = 20 * GB;
+/// The free space that starting a recording requires, in GB.
+pub(super) const START_MINIMUM_GB: u64 = 20;
+pub(super) const START_MINIMUM: u64 = START_MINIMUM_GB * GB;
 pub(super) const PAUSE_BELOW: u64 = 5 * GB;
 pub(super) const RESUME_ABOVE: u64 = 6 * GB;
 const INTERVAL: Duration = Duration::from_secs(1);
@@ -42,7 +44,7 @@ impl Monitor {
         let available_bytes = available(&directory).map_err(preflight_error)?;
         if available_bytes < START_MINIMUM {
             return Err(CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, "Check recording disk space", None,
-                format!("Recording needs at least 20 GB free. Available: {available_bytes} bytes.")));
+                format!("Recording needs at least {START_MINIMUM_GB} GB free. Available: {available_bytes} bytes.")));
         }
         let preflight = DiskPreflight {
             available_bytes, minimum_bytes: START_MINIMUM, duration_reserve_bytes: None,

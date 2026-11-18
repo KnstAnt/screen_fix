@@ -5,7 +5,7 @@ use screen_fix_protocol::{
     ipc::ProcessInstance,
 };
 use windows_sys::Win32::{
-    Foundation::{ERROR_INSUFFICIENT_BUFFER, FILETIME, GetLastError, HANDLE, LUID, WAIT_TIMEOUT},
+    Foundation::{ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE, LUID, WAIT_TIMEOUT},
     Security::{
         EqualSid, GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
         IsValidSid, IsWellKnownSid, PSID, SID_AND_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_LINKED_TOKEN,
@@ -15,9 +15,10 @@ use windows_sys::Win32::{
         WinInteractiveSid, WinLocalSystemSid,
     },
     System::Threading::{
-        GetCurrentProcessId, GetProcessId, GetProcessInformation, GetProcessTimes, OpenProcess, OpenProcessToken,
+        GetCurrentProcessId, GetProcessId, GetProcessInformation, OpenProcess, OpenProcessToken,
         PROCESS_PROTECTION_LEVEL_INFORMATION, PROTECTION_LEVEL_NONE, ProcessProtectionLevelInfo,
-        PROCESS_NAME_NATIVE, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, WaitForSingleObject,
+        PROCESS_NAME_FORMAT, PROCESS_NAME_NATIVE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW, WaitForSingleObject,
     },
 };
 
@@ -59,21 +60,9 @@ impl Process {
     pub(crate) fn inspect(handle: Arc<Handle>) -> Result<Self> {
         let pid = std::num::NonZeroU32::new(unsafe { GetProcessId(handle.raw()) })
             .ok_or(Failure::ProcessIdentity)?;
-        let mut created = FILETIME::default();
-        let mut exit = FILETIME::default();
-        let mut kernel = FILETIME::default();
-        let mut user = FILETIME::default();
-        if unsafe { GetProcessTimes(handle.raw(), &mut created, &mut exit, &mut kernel, &mut user) } == 0 {
-            return Err(Failure::ProcessIdentity);
-        }
-        let creation_filetime = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
-        let mut path = vec![0u16; 32768];
-        let mut length = path.len() as u32;
-        if unsafe { QueryFullProcessImageNameW(handle.raw(), PROCESS_NAME_NATIVE, path.as_mut_ptr(), &mut length) } == 0 {
-            return Err(Failure::ProcessIdentity);
-        }
-        path.truncate(length as usize);
-        let process = Self { handle, instance: ProcessInstance { pid, creation_filetime }, native_image: path };
+        let instance = screen_fix_native_observation::process_instance(handle.raw(), pid).ok_or(Failure::ProcessIdentity)?;
+        let native_image = image_name(handle.raw(), PROCESS_NAME_NATIVE)?;
+        let process = Self { handle, instance, native_image };
         process.ensure_live()?;
         Ok(process)
     }
@@ -100,13 +89,7 @@ impl Process {
 
     /// The Win32 image path Windows reports for this live process.
     pub(crate) fn win32_image(&self) -> Result<Vec<u16>> {
-        let mut path = vec![0u16; 4096];
-        let mut length = path.len() as u32;
-        if unsafe { QueryFullProcessImageNameW(self.raw(), 0, path.as_mut_ptr(), &mut length) } == 0 {
-            return Err(Failure::ProcessIdentity);
-        }
-        path.truncate(length as usize);
-        Ok(path)
+        image_name(self.raw(), PROCESS_NAME_WIN32)
     }
 
     pub(crate) fn session(&self) -> Result<u32> {
@@ -136,6 +119,21 @@ impl Process {
         let handle = unsafe { Handle::take(token, identity_failure(subject, Check::InvalidTokenHandle, None))? };
         Ok(Token { handle, subject })
     }
+}
+
+/// The longest image path Windows reports, in UTF-16 units.
+const MAX_IMAGE_PATH: usize = 32768;
+
+/// The image path of a process in the requested format, sized to fit.
+fn image_name(process: HANDLE, format: PROCESS_NAME_FORMAT) -> Result<Vec<u16>> {
+    let mut path = vec![0u16; MAX_IMAGE_PATH];
+    let mut length = path.len() as u32;
+    if unsafe { QueryFullProcessImageNameW(process, format, path.as_mut_ptr(), &mut length) } == 0 {
+        return Err(Failure::ProcessIdentity);
+    }
+    path.truncate(length as usize);
+    path.shrink_to_fit();
+    Ok(path)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,7 +220,7 @@ impl Token {
         identity_failure(self.subject, check, native_code)
     }
 
-    fn fixed<T>(&self, class: i32, fact: TokenFact) -> Result<T> {
+    fn fixed<T: FixedTokenInformation>(&self, class: i32, fact: TokenFact) -> Result<T> {
         let mut value = MaybeUninit::<T>::uninit();
         let len = size_of::<T>() as u32;
         let mut returned = 0;
@@ -233,6 +231,8 @@ impl Token {
         if returned != len {
             return Err(self.failure(Check::TokenShape { class: fact }, None));
         }
+        // SAFETY: Windows wrote all `len` bytes, and every bit pattern is a
+        // valid `T` (`FixedTokenInformation`).
         Ok(unsafe { value.assume_init() })
     }
 
@@ -328,6 +328,19 @@ impl Token {
         })
     }
 }
+
+/// A fixed-size token information structure.
+///
+/// # Safety
+/// Every bit pattern of the type's size must be a valid value of it.
+unsafe trait FixedTokenInformation {}
+
+// SAFETY: plain integers and C structures of integers and raw handles.
+unsafe impl FixedTokenInformation for u32 {}
+unsafe impl FixedTokenInformation for i32 {}
+unsafe impl FixedTokenInformation for TOKEN_STATISTICS {}
+unsafe impl FixedTokenInformation for TOKEN_ELEVATION {}
+unsafe impl FixedTokenInformation for TOKEN_LINKED_TOKEN {}
 
 struct TokenScope {
     user: Sid,
@@ -452,8 +465,8 @@ pub(crate) fn verify_capture_target(medium: &Process, target: &Process) -> Resul
 fn verify_capture_target_for(
     medium: &Process, target: &Process, subject: TokenSubject, linked_subject: TokenSubject,
 ) -> Result<()> {
+    // The protection level of a live process does not change.
     target.unprotected(subject)?;
     verify_linked_pair_with_subject(medium, target, subject, linked_subject)?;
-    target.unprotected(subject)?;
     target.ensure_live()
 }

@@ -497,6 +497,7 @@ Correlation quality is never a terminal outcome. It is metadata on a Persisted r
    - The ledger key includes a privacy class, `Ordinary` or `Sensitive`.
    - A loss is `Sensitive` when its items belong to a password visit, a possibly sensitive visit, or an approval-unknown receipt.
    - `Sensitive` entries record a count only. They have no first or last times, no sequence ranges and no QPC ranges, and they are never emitted as gap rows.
+   - A key record lost before its visit is classified is `Sensitive`, since its visit may be sensitive. Pointer and HID records lost the same way stay `Ordinary` with their ranges.
    - The count is added to the open redacted aggregate of that visit. Approval-unknown losses go only to the stream summary's suppression totals.
    - This follows ALG §7.2 ("Aggregated health may count suppressed work without identifying keys") and PRIV-5 ("never per-key timing").
 6. **Frames stream exception.** The frames ingress never records a loss. Frame rows are submitted with blocking backpressure only. Any video loss is a slot row with a reason, not a journal gap.
@@ -537,14 +538,14 @@ There are three classes, with L split into two kinds:
 | # | Condition | Class | Boundary or source |
 | --- | --- | --- | --- |
 | 1 | Journal append, flush or close failure of any stream | F | Integrity; current behaviour |
-| 2 | Manifest publication failure; required finalization failure at Stop (unverified or unfinalized required segment at the Stop deadline) | F | REL-7, C6 |
+| 2 | Manifest publication failure; required finalization failure at Stop (unverified or unfinalized required segment at the Stop deadline, including a segment interrupted during IDR rotation that is unpublished when the Stop deadline has expired) | F | REL-7, C6 |
 | 3 | Clock failure; controller failure | F | Current behaviour |
 | 4 | Capture-thread failure that is not a topology change (for example, GPU device loss) | F | Current behaviour retained. A2 defers device rebuild, and no finding requires a change |
 | 5 | Admitted collector source failure (ELC-5): host or transport failure, authentication or protocol failure, lease loss, witness regression, readiness deadline expiry, required-access failure on the current grant, a failed standard-helper check when switching back from the collector (`StandardHelperUnavailable`) | F | ELC-5, ELEVATED §4.2, ALG §4 item 5. Conditions that are transitions rather than faults are governed by D-8 |
 | 6 | Collector provider call still running at request deadline + 750 ms. The supervisor terminates the collector | F | ELEVATED §3.3 ("forcibly terminate"), §5.2 ("terminated by the supervisor") with ELC-5 |
 | 7 | Collector input-lane write outstanding beyond the 500 ms essential coverage stall, or control-lane write beyond the lease | F | ALG §6.4 ("a persistent required-path coverage stall is a source failure") |
 | 8 | Collector request deadline expiry where the call returns before deadline + 750 ms | G | ELEVATED §5.2 typed unavailability |
-| 9 | Encoder failure or rejected segment verification on a monitor | L-required (that monitor's video) | VID-6, A2; current behaviour |
+| 9 | Encoder failure or rejected segment verification on a monitor; a segment close or rotation part that fails before the Stop deadline expired; an encoder release failure at a format change or at Stop | L-required (that monitor's video) | VID-6, A2; current behaviour |
 | 10 | Helper process exit or transport break | L-required (input) | A2 (no restart); current behaviour (`input_failed`) |
 | 11 | Input producer progress stall: blind interval from 250 ms, escalating at 5 s | G below 5 s; L-required (input) from 5 s | 250 ms: current stall bound; 5 s: REL-5 heartbeat interval |
 | 12 | Required Raw Input registration loss, or required hook loss (HookHealth: 20 unmatched transitions) | D-2 B: L-required (input), interval open until Stop. D-2 A: G per repaired episode, L-required (input) on a second failure within 5 s | INP-1, INP-12, D-2 |
@@ -668,6 +669,7 @@ Ties are broken by (`recv_t_us`, monitor, slot). D-10 A changes only d_k and whi
     - After Stop, monitors stay Closed.
   - **Monitor absence and return.** These need no merge registration. Real-time slot rows keep X Open with an advancing mark for the whole admission epoch. The former "removed monitor stops constraining" rule is withdrawn.
 - **Release rule.** The journal owner releases the smallest lane-head row r (by key) when r < c_X for every selected monitor X.
+- **Segment flush.** When a segment's outcome is final, its worker asks the journal owner to flush the frames journal through the segment's last row. The flush waits until the merge has released that row; a segment with no rows requests the prefix written so far immediately. Requests still pending when the merge finishes are flushed then.
 - **No deadlock.**
   - Let r_min be the smallest lane-head row, in monitor X's lane. Then r_min < p_X, so for Open X, r_min < c_X.
   - Every monitor Y with a non-empty lane has c_Y ≥ p_Y > head_Y ≥ r_min. If Y is still at floor F, its lane is empty.
@@ -885,6 +887,8 @@ Stages that are not blocked can run in parallel within these dependencies. A sug
   - opening-resync drops (`resync_pending`): counted with a range, never with payload;
   - drops for a non-ordinary foreground (`foreground_inaccessible`): counted, with a blind interval (stage I5 adds the interval).
 
+  A key record lost before its visit is classified (`resync_pending`, `foreground_inaccessible`, `producer_stall`, `unknown_device`, `uncertified_source`, Gate overflow, `staging_pressure`) is counted as `Sensitive` (§6.1 rule 5): count only, no range. Pointer and HID records keep their ranges.
+
   `input_continuity_gap` is replaced by the typed gap row, emitted at the gap's admission receipt with the original range.
 - **Counters.** `ProvisionalRequests.{suppressed, dropped, synthetic_suppressed, private_gaps}` feed the ingress counters (A1) and the per-second `input_health`, or are deleted where they duplicate them.
 - **Uncertain control.** `ControlDisposition::Uncertain` records are Suppressed with class `control_uncertain` and counted. A recorder hotkey is never published.
@@ -1024,6 +1028,7 @@ Stages that are not blocked can run in parallel within these dependencies. A sug
 - **Optional collections (INP-14, INP-15, M1-05).**
   - Touchpad and 3D-mouse collections are registered separately from the required ones. A failure marks that collection `unavailable` in the manifest.
   - Registration verification treats a missing optional collection as an `input_health` record plus manifest unavailability, not a helper failure.
+  - The helper's notice of a lost optional collection is kept while the record queue is full and delivered when room returns, or at the latest at stop.
   - Optional HID traffic gets its own producer identity and loss slot. Its gap does not invalidate keyboard and mouse state.
   - This is a protocol enum extension and a helper change.
 - **Required registration and hook loss (detection, under both D-2 options).**
@@ -1034,6 +1039,7 @@ Stages that are not blocked can run in parallel within these dependencies. A sug
   - The helper sends `DeviceArrived` with the descriptor before the first record that uses a lazily assigned device ID.
   - The core inventory therefore resolves it, and SM_SWAPBUTTON and origin apply.
   - HID reports with an ID absent from the inventory are counted (`unknown_device`).
+  - A device beyond the manifest inventory cap still reaches the Gate's touchpad inventory; only `device_inventory_truncated` is set.
 - **Blind rows.** These are emitted when the interval closes, or at Stop for open intervals. Start is the earliest missing time (last progress or boundary), not the detection time. Placement is the context stream until R1 moves blind rows to `input.jsonl` (D-1).
 
 **Affected modules.**
@@ -1187,7 +1193,7 @@ Stages that are not blocked can run in parallel within these dependencies. A sug
   - Clipboard notice, grant and result queue drops (`clipboard_queue`, counts only; content is never recorded).
   - `clipboard_notices`, `future_clipboard`, `cursor_completions` caps.
   - Cursor asset queue full or `try_send` failure: the `cursor` row carries `custom_asset:"unavailable"` with reason `cursor_asset_queue`, distinct from "not needed". The shape is retried on the next observation of the same cursor handle.
-  - Notification ring overflow becomes a typed gap with the first and last receipt of the lost notifications. The ring records the receipt of the first and last dropped notice.
+  - Notification ring overflow becomes a typed gap with the first and last receipt of the lost notifications. The ring records the receipt of the first and last dropped notice. During a collector-backed visit, a ring loss that ended before the visit opened is only counted (G, §6.2 row 18). A later one may have hidden a foreground change, so it revokes the visit from its first possible notice (a source change), instead of failing the source.
   - `context_notifications_gap` becomes a typed gap.
 - **WinEvent callback.** Filter top-level kinds (NAMECHANGE, LOCATIONCHANGE, SHOW, HIDE, DESTROY) with `GetAncestor(hwnd, GA_ROOT) == hwnd` in the callback (CTX-1). `GetAncestor` is a cheap, non-blocking user32 query; no lock or allocation is added.
 - **Identity resolution.** A canonicalization failure or a resolution pending over 2 s makes that foreground approval-unknown: suppressed, a G loss, plus a diagnostic report entry. `Context::poll` no longer returns Err for it. A resolver thread blocked in one native call longer than the 2 s bound is L-auxiliary (§6.2 row 15): later alternative spellings stay unknown, and no replacement thread is started.
@@ -1344,12 +1350,13 @@ Stages that are not blocked can run in parallel within these dependencies. A sug
 **Changes.**
 - **Display enumeration.**
   - A per-monitor read failure marks only that monitor's fields unavailable (null DPI, SDR white or refresh, with a reason).
+  - An output whose color mode or rectangle cannot be read fails only the resolution of that monitor. It proves neither presence nor absence, so a full enumeration with such an output fails and is retried on the next topology tick.
   - A failure for an unselected monitor never affects capture.
   - For a selected monitor, the reconfigure path keeps the old epoch closed and records `display_reconfiguring`. It retries on the next topology tick, so slots become `MonitorMissing`.
   - Topology-race exhaustion is retried on the next tick.
   - None of these return Err to the capture thread (VID-9).
 - **HDR without an SDR white level.** Use the B8G8R8A8 capture path with `conversion:"system_bgra8"` and a health row (VID-8).
-- **Encoder reselection after a format change.** Record every rejected hardware candidate with its cause (health row plus segment metadata). The SW selection remains a VID-6 capability selection for the new format, recorded as such.
+- **Encoder reselection after a format change.** Record every rejected hardware candidate with its cause (health row plus segment metadata). When no encoder qualifies and the selection fails, the health rows are still written. The SW selection remains a VID-6 capability selection for the new format, recorded as such.
 - **Self-check during reconfigure.** The conversion steps of the self-check (`VideoProcessorBlt`, `CopyResource`, `Map`) run on the capture thread as part of handling the reconfigure request. The capture thread produces the self-test samples, and the video thread drives only the encoder (VID-12).
 - **SW path.** Convert and read back only the frames selected for video slots at the encoding fps. Thumbnails and still selection stay at capture pace.
 - **Bitrate metadata.** Rename to `configured_peak_bitrate` and `configured_mean_bitrate`.
@@ -1497,7 +1504,7 @@ S1's "lost registration records health" item is dropped as well: Windows gives n
   - the disposition is not changed by this loss (rule 4).
 
   A stills journal write failure remains F under row 1. When the worker exits because its journal failed, the F from row 1 is the reported cause, and no second L report is added for the same event.
-- **Drain.** `expire_drain` marks the corresponding PNG jobs cancelled through a per-job cancellation flag shared with the worker. The worker checks it before writing and before the rename. A file already renamed before cancellation is reported back. The row is then published as a success if its slot is still open; otherwise the file is counted as `unreferenced_image` in health and is not deleted (A2: do not delete saved data).
+- **Drain.** `expire_drain` marks the corresponding PNG jobs cancelled through a per-job cancellation flag shared with the worker. The worker checks it before writing and before the rename. A file already renamed before cancellation is reported back. The row is then published as a success if its slot is still open; otherwise the file is kept and not deleted (A2: do not delete saved data). The PNG counter `unreferenced_images` counts exactly every inventoried image that no journaled still row names in `file` or `seen_file`, plus revoked images whose removal failed.
 
 **Affected modules.** `core/src/platform/windows/{still_png.rs,stills.rs,still_rows.rs,context/cursor.rs}`.
 
@@ -1593,7 +1600,7 @@ The standard source becomes inactive only at the latch. Records with a receipt a
 **Changes.**
 - **Scope-serial change.** The raw loop emits the pending gap for the old scope (with its sequence and QPC range) before resetting `Losses`. The same applies in `runtime/input.rs`.
 - **Ingress gap crossing the resync sample.** Clip the gap to the part after the sample instead of dropping it.
-- **Rejected text-edit commits.** Count them per reason (`check_sender`, deadline, busy, too long, stale, invalid) into the context lane's loss evidence. Sender and foreground mismatches are counted without detail (§5.1).
+- **Rejected text-edit commits.** Count them per reason (`check_sender`, deadline, busy, too long, stale, invalid) into the context lane's loss evidence. Sender and foreground mismatches are counted without detail (§5.1). In the Recorder, these commit losses and the collector's TextEdit gaps become input-stream losses with producer `text_edit`, like the commit losses of an ordinary visit (I7).
 - **Data-lane writes.** One outstanding overlapped write per lane is kept. Later records queue in the existing bounded outbound queue, and drop-newest with loss accounting applies when it is full (§3.2).
 - **Lane failure.** The lane fails the connection only when its single outstanding write has not completed within the essential coverage stall budget (the existing 500 ms `essential_stalled` bound) for the input lane, or the lease bound for the control lane (ALG §6.4: a persistent stall is a source failure).
 - **Governed path drain.** Enable the buffered drain (INP-1) with the scope check evaluated once per drained batch, before and after, instead of per message.
@@ -1624,6 +1631,7 @@ The standard source becomes inactive only at the latch. Records with a receipt a
 - **Evidence.** Record the Armed held readiness (`Known`/`Unknown`, no bits), UAC dispatch and return, and withdrawn launches in `ElevatedSourceEvidence`.
 - **Return to the standard source.**
   - Require a registration check result from the helper newer than the switch request. The helper's periodic check provides it, and a fresh check is requested over the existing shared-state channel.
+  - Every helper environment record attests a registration check run just before it, unthrottled by the periodic check. Its `observed_qpc` is the QPC read before that check, and a record that waits for queue room keeps it. The environment records at stop and at a device inventory are checked the same way.
   - Restart hook-health monitoring with a cleared streak.
   - A failed check keeps the current outcome: `StandardHelperUnavailable`, an admitted source failure (F, §6.2 row 5).
 - **Arm QPC.** Taken after hook and raw registration and before the held probe.

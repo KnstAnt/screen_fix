@@ -11,7 +11,7 @@ pub(crate) use owner::run;
 pub use lifetime::HEARTBEAT;
 pub use witness::normal_capture_desktop;
 
-use std::{marker::PhantomData, sync::Arc, time::Instant};
+use std::{marker::PhantomData, sync::{Arc, atomic::{AtomicU8, Ordering::{AcqRel, Acquire, Release}}}, time::Instant};
 
 use screen_fix_protocol::ipc::{PacketError, elevated::{
     GrantedInput, VisitBinding,
@@ -26,6 +26,30 @@ use crate::{
     secret::erase,
     win::{Failure, Result},
 };
+
+/// A `repr(u8)` state machine whose value lives in an atomic.
+trait State: Copy + PartialEq + 'static {
+    const ALL: &'static [Self];
+    fn raw(self) -> u8;
+}
+
+struct AtomicState<S>(AtomicU8, PhantomData<S>);
+
+impl<S: State> AtomicState<S> {
+    fn new(state: S) -> Self { Self(AtomicU8::new(state.raw()), PhantomData) }
+
+    fn load(&self) -> S {
+        let raw = self.0.load(Acquire);
+        // Only `S` values are ever stored.
+        S::ALL.iter().copied().find(|state| state.raw() == raw).unwrap_or(S::ALL[0])
+    }
+
+    fn store(&self, state: S) { self.0.store(state.raw(), Release); }
+
+    fn transition(&self, from: S, to: S) -> bool {
+        self.0.compare_exchange(from.raw(), to.raw(), AcqRel, Acquire).is_ok()
+    }
+}
 
 struct Connection {
     scope: Scope,
@@ -54,15 +78,17 @@ impl Links {
         }
     }
 
+    /// A stalled Recorder write is a transport failure. Its only finite read
+    /// bound is the readiness deadline of the first collector status.
     pub(crate) fn recorder(self) -> RecorderLanes {
         RecorderLanes {
             scope: self.connection.scope.clone(),
             cancel: Arc::clone(&self.connection.stop),
-            command: Sender::new(&self.control, &self.connection),
-            status: Receiver::new(&self.control, &self.connection),
-            input: Receiver::new(&self.input, &self.connection),
-            query: Sender::new(&self.context, &self.connection),
-            observation: Receiver::new(&self.context, &self.connection),
+            command: Sender::new(&self.control, &self.connection, Failure::Transport),
+            status: Receiver::new(&self.control, &self.connection, Failure::ReadinessDeadline),
+            input: Receiver::new(&self.input, &self.connection, Failure::Transport),
+            query: Sender::new(&self.context, &self.connection, Failure::Transport),
+            observation: Receiver::new(&self.context, &self.connection, Failure::Transport),
         }
     }
 }
@@ -84,15 +110,18 @@ struct Lane<T> {
     connection: Arc<Connection>,
     next: u64,
     frame: Vec<u8>,
+    /// The failure of an operation still incomplete at its deadline.
+    expired: Failure,
     record: PhantomData<T>,
 }
 
 impl<T: Record> Lane<T> {
-    fn new(pipe: &Arc<Pipe>, connection: &Arc<Connection>) -> Self {
+    fn new(pipe: &Arc<Pipe>, connection: &Arc<Connection>, expired: Failure) -> Self {
         Self {
             pipe: Arc::clone(pipe),
             connection: Arc::clone(connection),
             next: T::FIRST_SEQUENCE,
+            expired,
             frame: vec![0; runtime::capacity::<T>()],
             record: PhantomData,
         }
@@ -121,8 +150,8 @@ impl<T> Drop for Lane<T> {
 pub struct Sender<T>(Lane<T>);
 
 impl<T: Record> Sender<T> {
-    fn new(pipe: &Arc<Pipe>, connection: &Arc<Connection>) -> Self {
-        Self(Lane::new(pipe, connection))
+    fn new(pipe: &Arc<Pipe>, connection: &Arc<Connection>, expired: Failure) -> Self {
+        Self(Lane::new(pipe, connection, expired))
     }
 
     pub fn send(&mut self, value: &T, until: Instant) -> Result<()> {
@@ -142,7 +171,9 @@ impl<T: Record> Sender<T> {
     ) -> Result<bool> {
         let lane = &mut self.0;
         let connection = &lane.connection;
-        let deadline = Deadline { at: until, cancellation: &connection.stop, grant, scope_current, peer: Some(&connection.peer) };
+        let deadline = Deadline {
+            at: until, expired: lane.expired, cancellation: &connection.stop, grant, scope_current, peer: Some(&connection.peer),
+        };
         let encoded = runtime::encode(value, &connection.scope, connection.id, lane.next, &mut lane.frame)
             .map_err(|_| Failure::Protocol);
         let len = match encoded {
@@ -166,8 +197,8 @@ impl<T: Record> Sender<T> {
 pub struct Receiver<T>(Lane<T>);
 
 impl<T: Record> Receiver<T> {
-    fn new(pipe: &Arc<Pipe>, connection: &Arc<Connection>) -> Self {
-        Self(Lane::new(pipe, connection))
+    fn new(pipe: &Arc<Pipe>, connection: &Arc<Connection>, expired: Failure) -> Self {
+        Self(Lane::new(pipe, connection, expired))
     }
 
     pub fn receive(&mut self, until: Instant) -> Result<T> {
@@ -184,7 +215,10 @@ impl<T: Record> Receiver<T> {
     pub fn receive_lossy(&mut self, until: Instant) -> Result<Option<T>> {
         let lane = &mut self.0;
         let connection = &lane.connection;
-        let deadline = Deadline { at: until, cancellation: &connection.stop, grant: None, scope_current: None, peer: Some(&connection.peer) };
+        let deadline = Deadline {
+            at: until, expired: lane.expired, cancellation: &connection.stop, grant: None, scope_current: None,
+            peer: Some(&connection.peer),
+        };
         let result = (|| {
             let len = if lane.pipe.is_server() {
                 lane.pipe.read_message(&mut lane.frame, deadline)?

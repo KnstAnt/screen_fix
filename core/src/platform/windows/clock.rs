@@ -48,8 +48,7 @@ pub(crate) fn message_tick_anchor() -> Result<MessageTickAnchor, ProbeError> {
 pub(super) fn message_tick_interval(
     anchor: MessageTickAnchor, frequency: QpcFrequency, coarse: CoarseTime,
 ) -> Option<(QpcTick, QpcTick)> {
-    let delta = coarse.tick_ms.0.wrapping_sub(anchor.tick64_ms as u32) as i32;
-    if delta == i32::MIN { return None; }
+    let delta = anchor.tick_delta_ms(coarse.tick_ms)?;
     let frequency = i128::from(frequency.0.get());
     let center = i128::from(anchor.qpc.0) + (i128::from(delta) * frequency).div_euclid(1000);
     let uncertainty = (i128::from(coarse.uncertainty_us.0) * frequency + 999_999) / 1_000_000;

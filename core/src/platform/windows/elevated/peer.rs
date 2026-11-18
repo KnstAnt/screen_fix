@@ -1,6 +1,6 @@
 use std::{
     num::NonZeroU64,
-    sync::{Arc, Mutex, mpsc::{self, Receiver as Queue, SyncSender, TryRecvError, TrySendError}},
+    sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}, mpsc::{self, Receiver as Queue, SyncSender, TryRecvError, TrySendError}},
     thread,
     time::{Duration, Instant},
 };
@@ -21,6 +21,9 @@ const WRITE_BUDGET: Duration = Duration::from_secs(1);
 const IDLE_READ: Duration = Duration::from_secs(86_400);
 const CONTROL_QUEUE: usize = 8;
 const QUERY_QUEUE: usize = 8;
+/// Query slots an optional read never takes, so that a required held read
+/// and the cancel of its predecessor always find room (D2).
+const REQUIRED_QUERY_SLOTS: usize = 2;
 const STATUS_QUEUE: usize = 32;
 const INPUT_QUEUE: usize = 256;
 const OBSERVATION_QUEUE: usize = 1024;
@@ -92,6 +95,8 @@ pub(super) struct Peer {
     connection: Arc<Connection>,
     command: SyncSender<Commands>,
     query: SyncSender<(ContextCommand, Instant)>,
+    /// Queries sent and not yet taken by the context writer.
+    queued_queries: Arc<AtomicUsize>,
     status: Queue<Status>,
     /// `None` is an input record whose payload did not decode (E3).
     input: Queue<Option<GrantedInput>>,
@@ -148,11 +153,16 @@ impl Peer {
         let connection = Arc::new(Connection { cancel: Arc::clone(&cancel), failure: Mutex::new(None) });
         let (commands, command_queue) = mpsc::sync_channel::<Commands>(CONTROL_QUEUE);
         let (queries, query_queue) = mpsc::sync_channel::<(ContextCommand, Instant)>(QUERY_QUEUE);
+        let queued_queries = Arc::new(AtomicUsize::new(0));
+        let taken_queries = Arc::clone(&queued_queries);
         let result = (|| {
             let status = read_lane(&connection, status, STATUS_QUEUE, "elevated-control-read", Some(until), false,
                 |record| record.ok_or(Failure::Protocol))?;
             // An undecodable input record is counted, not transport-fatal (§6.2).
             let input = read_lane(&connection, input, INPUT_QUEUE, "elevated-input-read", None, true, Ok)?;
+            // An undecodable context record stays a protocol failure: context
+            // records carry per-producer positions, and a skipped record would
+            // break the position continuity that ingress verifies.
             let observation = read_lane(&connection, observation, OBSERVATION_QUEUE, "elevated-context-read", None, true,
                 |record| Ok((clock::qpc().map_err(|_| Failure::Supervisor)?, record.ok_or(Failure::Protocol)?)))?;
             spawn(&connection, "elevated-control-write", move || {
@@ -171,11 +181,12 @@ impl Peer {
             })?;
             spawn(&connection, "elevated-context-write", move || {
                 for (request, until) in query_queue {
+                    taken_queries.fetch_sub(1, Ordering::AcqRel);
                     query.send(&request, until)?;
                 }
                 Ok(())
             })?;
-            Ok(Self { connection, command: commands, query: queries, status, input, observation })
+            Ok(Self { connection, command: commands, query: queries, queued_queries, status, input, observation })
         })();
         if result.is_err() {
             cancel.cancel();
@@ -198,18 +209,31 @@ impl Peer {
         self.command.try_send(batch).map_err(|_| Failure::Transport)
     }
 
+    /// Queue a required query; a full queue fails the connection.
     pub(super) fn query(&self, request: ContextCommand) -> Result<()> {
         self.connection.check()?;
-        self.query.try_send((request, Instant::now() + WRITE_BUDGET)).map_err(|_| Failure::Transport)
+        self.send_query(request).map_err(|_| Failure::Transport)
     }
 
+    /// Queue an optional query outside the slots reserved for required ones.
+    /// Returns false when there is no room for it now.
     pub(super) fn try_query(&self, request: ContextCommand) -> Result<bool> {
         self.connection.check()?;
-        match self.query.try_send((request, Instant::now() + WRITE_BUDGET)) {
+        if self.queued_queries.load(Ordering::Acquire) >= QUERY_QUEUE - REQUIRED_QUERY_SLOTS {
+            return Ok(false);
+        }
+        match self.send_query(request) {
             Ok(()) => Ok(true),
             Err(TrySendError::Full(_)) => Ok(false),
             Err(TrySendError::Disconnected(_)) => Err(Failure::Transport),
         }
+    }
+
+    /// Count the query in before the writer can take it out.
+    fn send_query(&self, request: ContextCommand) -> std::result::Result<(), TrySendError<(ContextCommand, Instant)>> {
+        self.queued_queries.fetch_add(1, Ordering::AcqRel);
+        self.query.try_send((request, Instant::now() + WRITE_BUDGET))
+            .inspect_err(|_| { self.queued_queries.fetch_sub(1, Ordering::AcqRel); })
     }
 
     pub(super) fn status(&self) -> Result<Option<Status>> { poll(&self.status, &self.connection) }

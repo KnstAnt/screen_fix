@@ -2,7 +2,9 @@ use std::{mem::{size_of, transmute}, path::Path, ptr::{null, null_mut}};
 
 use windows_sys::{
     Win32::{
-        Foundation::{FreeLibrary, HANDLE, HMODULE},
+        Foundation::{
+            CERT_E_REVOCATION_FAILURE, CRYPT_E_NO_REVOCATION_CHECK, CRYPT_E_REVOCATION_OFFLINE, FreeLibrary, HANDLE, HMODULE,
+        },
         Security::{
             Cryptography::{
                 BCryptHash, BCRYPT_SHA256_ALG_HANDLE, CERT_PUBLIC_KEY_INFO, CryptEncodeObjectEx,
@@ -108,9 +110,17 @@ impl Release {
             ..Default::default()
         };
         let mut policy = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-        let success = unsafe { WinVerifyTrustEx(null_mut(), &mut policy, &mut trust) } == 0;
-        let module = success.then(WinTrustModule::load).flatten();
-        let publisher = module.as_ref().ok_or(Failure::InstalledSignature)
+        let verified = match unsafe { WinVerifyTrustEx(null_mut(), &mut policy, &mut trust) } {
+            0 => Ok(()),
+            // The revocation status of the chain could not be established,
+            // for example offline without a cached CRL. The signature is
+            // still not accepted; only the reported reason differs.
+            CERT_E_REVOCATION_FAILURE | CRYPT_E_REVOCATION_OFFLINE | CRYPT_E_NO_REVOCATION_CHECK =>
+                Err(Failure::RevocationUnknown),
+            _ => Err(Failure::InstalledSignature),
+        };
+        let module = verified.and_then(|()| WinTrustModule::load().ok_or(Failure::InstalledSignature));
+        let publisher = module.as_ref().map_err(|failure| *failure)
             .and_then(|module| signer_key(&trust, module));
         trust.dwStateAction = WTD_STATEACTION_CLOSE;
         unsafe { WinVerifyTrustEx(null_mut(), &mut policy, &mut trust) };

@@ -12,12 +12,15 @@ use windows_sys::Win32::{
         },
     },
     Storage::FileSystem::FILE_ALL_ACCESS,
+    System::SystemServices::SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
 };
 
 use crate::{
     process::Sid,
-    trust::permissions::{LocalAllocation, acl_entries, parse_sid},
-    win::{Failure, Handle, Result, wide},
+    win::{
+        Failure, Handle, Result, wide,
+        acl::{ACCESS_ALLOWED, ADMINISTRATORS, LocalAllocation, MANDATORY_LABEL, MEDIUM_INTEGRITY, SYSTEM, acl_entries, parse_sid},
+    },
 };
 
 use super::CLIENT_ACCESS;
@@ -53,9 +56,9 @@ impl Owner<'_> {
     }
 
     pub(super) fn verify(self, handle: &Handle) -> Result<()> {
-        let system = parse_sid("S-1-5-18").map_err(|_| Failure::PipeSecurity)?;
-        let administrators = parse_sid("S-1-5-32-544").map_err(|_| Failure::PipeSecurity)?;
-        let medium = parse_sid("S-1-16-8192").map_err(|_| Failure::PipeSecurity)?;
+        let system = parse_sid(SYSTEM, Failure::PipeSecurity)?;
+        let administrators = parse_sid(ADMINISTRATORS, Failure::PipeSecurity)?;
+        let medium = parse_sid(MEDIUM_INTEGRITY, Failure::PipeSecurity)?;
         let mut owner = null_mut();
         let mut dacl = null_mut();
         let mut descriptor = null_mut();
@@ -98,18 +101,20 @@ impl Owner<'_> {
                 administrators.matches(owner)
             }
         };
-        let dacl = acl_entries(unsafe { dacl.as_ref() }.ok_or(Failure::PipeSecurity)?)?;
-        let labels = acl_entries(unsafe { sacl.as_ref() }.ok_or(Failure::PipeSecurity)?)?;
+        let dacl = acl_entries(unsafe { dacl.as_ref() }.ok_or(Failure::PipeSecurity)?, Failure::PipeSecurity)?;
+        let labels = acl_entries(unsafe { sacl.as_ref() }.ok_or(Failure::PipeSecurity)?, Failure::PipeSecurity)?;
         if !owner_matches || dacl.len() != expected.len() || labels.len() != 1 {
             return Err(Failure::PipeSecurity);
         }
         for (ace, (sid, mask)) in dacl.iter().zip(expected) {
-            if ace.kind != 0 || ace.flags != 0 || ace.mask != mask || !sid.matches(ace.sid) {
+            if ace.kind != ACCESS_ALLOWED || ace.flags != 0 || ace.mask != mask || !sid.matches(ace.sid) {
                 return Err(Failure::PipeSecurity);
             }
         }
         let label = &labels[0];
-        if label.kind != 0x11 || label.flags != 0 || label.mask != 1 || !medium.matches(label.sid) {
+        if label.kind != MANDATORY_LABEL || label.flags != 0 || label.mask != SYSTEM_MANDATORY_LABEL_NO_WRITE_UP
+            || !medium.matches(label.sid)
+        {
             return Err(Failure::PipeSecurity);
         }
         Ok(())

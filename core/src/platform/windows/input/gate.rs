@@ -20,15 +20,17 @@ use crate::{
         journal::{HealthRecord, JournalIngress, Submit},
         outcome::{HealthKind, LossCount, LossEvidence, LossProducer, LossReason, LossScope, SuppressionClass},
     },
-    protocol::{AdmissionEpoch, DeviceId, EventRef, Evidence, FocusGeneration, GeometryId, ObservationId, SessionTimeUs, UnavailableReason, ipc::{DeviceDescriptor, DeviceKind, ForegroundAtReceipt, InputSample, MAX_INPUT_DEVICES, Producer, elevated::VisitBinding}},
+    protocol::{AdmissionEpoch, DeviceId, EventRef, Evidence, FocusGeneration, GeometryId, ObservationId, SessionTimeUs, UnavailableReason, ipc::{DeviceDescriptor, ForegroundAtReceipt, InputSample, MAX_INPUT_DEVICES, OptionalCollection, Producer, elevated::VisitBinding}},
     session::windows::Receipt,
 };
 
 use super::super::{ProbeError, clock, context::{ConfirmedText, Context, HookReceipt, ImeState, ReceiptFocus, Visit}, package_journal_error};
-use super::{ReceiptPrefix, blind::Blinds, hid::HidPublication, receiver::ProvisionalRequests, text::{KeyboardText, TextCommit, TextOrigin, TextStatus, Typing, text_key}};
+use super::{ReceiptPrefix, blind::Blinds, hid::{self, HidPublication}, receiver::ProvisionalRequests, text::{KeyboardText, TextCommit, TextOrigin, TextStatus, Typing, text_key}};
 
 const MAX_SLOTS: usize = 1024;
 const MAX_CONFIRMATIONS: usize = 256;
+/// Confirmed text commits awaiting their place in the input order.
+const MAX_CONFIRMED_TEXT: usize = 16;
 const FOCUS_CONFIRM_US: i64 = 100_000;
 const MAX_WAIT_US: i64 = 500_000;
 
@@ -251,7 +253,7 @@ impl Gate {
             held: PublishedHeld::default(), modifier_knowledge: ModifierKnowledge::from_released(0),
             redacted: None, completed_redactions: VecDeque::with_capacity(64),
             motion: None, overflow_at: None, overflow: false, active_key_visit: None,
-            keyboard_text: KeyboardText::default(), last_text_key: None, last_pointer_move: None, confirmed_text: VecDeque::with_capacity(16),
+            keyboard_text: KeyboardText::default(), last_text_key: None, last_pointer_move: None, confirmed_text: VecDeque::with_capacity(MAX_CONFIRMED_TEXT),
             outcomes: Outcomes::default(), injector_hints,
         }
     }
@@ -294,30 +296,27 @@ impl Gate {
         };
         if self.outcomes.health.len() < MAX_PENDING_HEALTH {
             self.outcomes.health.push(health);
-        } else if let Some(last) = self.outcomes.health.last_mut() {
-            // Keep the bound: the latest pending condition absorbs the count.
-            last.count = Some(last.count.unwrap_or(1).saturating_add(1));
+        } else if let Some(same) = self.outcomes.health.iter_mut().rev().find(|pending| pending.kind == kind) {
+            // Keep the bound: the latest pending condition of the same kind absorbs the count.
+            same.count = Some(same.count.unwrap_or(1).saturating_add(1));
+        } else {
+            // A condition of a kind with no pending record cannot be kept.
+            self.overflow = true;
         }
     }
 
-    /// Account each lost record once, by its producer. With `keys_sensitive`,
-    /// keyboard records are count-only: their visit may be sensitive. An
-    /// ordinary range starts at `since` when the loss began earlier, such as
-    /// at the last producer progress (§6.3).
+    /// Account each lost record once, by its producer and privacy class
+    /// ([`record_loss`]). An ordinary range starts at `since` when the loss
+    /// began earlier, such as at the last producer progress (§6.3).
     pub fn note_records_lost<'a>(
         &mut self, reason: LossReason, records: impl IntoIterator<Item = &'a PendingInput>,
-        keys_sensitive: bool, since: Option<SessionTimeUs>,
+        since: Option<SessionTimeUs>,
     ) {
         for record in records {
-            let producer = Some(LossProducer::from(record.packet.sample.producer()));
-            let key = matches!(record.packet.sample, InputSample::RawKey(_) | InputSample::HookKey(_));
             let at = record.time.recv_t_us;
-            self.outcomes.loss(if key && keys_sensitive {
-                LossEvidence::sensitive(reason, producer, std::num::NonZeroU64::MIN)
-            } else {
-                let first = since.map_or(at, |since| since.min(at));
-                LossEvidence::ordinary(reason, producer, std::num::NonZeroU64::MIN, first, at)
-            });
+            let first = since.map_or(at, |since| since.min(at));
+            let sample = &record.packet.sample;
+            self.outcomes.loss(record_loss(reason, sample.producer(), is_key(sample), first, at));
         }
     }
 
@@ -352,13 +351,14 @@ impl Gate {
         }
         // `ordinary` holds ordinary-scope losses only.
         let mut due: Vec<_> = self.outcomes.ordinary.extract_if(.., |evidence| matches!(evidence.scope,
-            LossScope::Ordinary(range) if closing.is_some() || ready.is_some_and(|ready| range.last_t_us <= ready))).collect();
-        due.sort_by_key(|evidence| match evidence.scope {
-            LossScope::Ordinary(range) => (range.first_t_us, range.last_t_us),
-            LossScope::Sensitive => (SessionTimeUs(i64::MIN), SessionTimeUs(i64::MIN)),
-        });
-        for mut evidence in due {
-            let LossScope::Ordinary(mut range) = evidence.scope else { continue };
+            LossScope::Ordinary(range) if closing.is_some() || ready.is_some_and(|ready| range.last_t_us <= ready)))
+            .filter_map(|evidence| match evidence.scope {
+                LossScope::Ordinary(range) => Some((range, evidence)),
+                LossScope::Sensitive => None,
+            })
+            .collect();
+        due.sort_by_key(|(range, _)| (range.first_t_us, range.last_t_us));
+        for (mut range, mut evidence) in due {
             if let Some(cutoff) = closing {
                 if range.first_t_us > cutoff { continue; }
                 if range.last_t_us > cutoff {
@@ -379,7 +379,7 @@ impl Gate {
             self.overflow = true;
             self.overflow_at.get_or_insert(input.input.normalized.correlated.first.time.recv_t_us);
             // A row is one item; its partner and absorbed evidence belongs to it.
-            self.note_records_lost(LossReason::StagingPressure, [&input.input.normalized.correlated.first], false, None);
+            self.note_records_lost(LossReason::StagingPressure, [&input.input.normalized.correlated.first], None);
             requests.retire_input(input.input);
         } else {
             self.slots.push_back(Slot::Input(input));
@@ -414,7 +414,7 @@ impl Gate {
                         self.slots.push_back(Slot::Input(input));
                     } else {
                         if correlated.first.time.recv_t_us < close_at {
-                            self.note_records_lost(reason, [&correlated.first], true, None);
+                            self.note_records_lost(reason, [&correlated.first], None);
                         }
                         requests.retire_input(input.input);
                     }
@@ -445,7 +445,7 @@ impl Gate {
     }
 
     pub fn note_input_device(&mut self, descriptor: &DeviceDescriptor) {
-        if matches!(descriptor.kind, DeviceKind::Hid { usage_page: 0x0D, usage: 5 }) {
+        if descriptor.kind.hid_usage() == Some(OptionalCollection::Touchpad.usage()) {
             if self.touchpads.len() == MAX_INPUT_DEVICES && !self.touchpads.contains(&descriptor.id) {
                 self.touchpad_inventory_uncertain = true;
             } else {
@@ -501,7 +501,7 @@ impl Gate {
     pub fn stage_confirmed(&mut self, text: ConfirmedText, receipt: Receipt) {
         if text.callback_at < receipt.boundary.qpc { return; }
         let Ok(at) = receipt.clock.time(text.observed_at) else { return };
-        if self.confirmed_text.len() >= 16 {
+        if self.confirmed_text.len() >= MAX_CONFIRMED_TEXT {
             self.overflow = true;
             self.note_loss(text_loss(LossReason::CommitCapacity, at));
             return;
@@ -931,7 +931,8 @@ impl Gate {
                 row
             }
             Action::AltGrCompanion => {
-                self.suppress_at(SuppressionClass::NotPublishable, 1, at);
+                // A key of a possibly sensitive visit: counted in the stream totals only.
+                self.note_suppressed(SuppressionClass::NotPublishable, 1);
                 requests.retire_input(input);
                 return Ok(());
             }
@@ -1064,7 +1065,7 @@ impl Gate {
         }
         if disposition == Submit::Queued {
             if let InputSample::Hid(sample) = &first.packet.sample {
-                if (sample.usage_page, sample.usage) == (Some(0x0D), Some(5)) {
+                if sample.is_touchpad() {
                     self.hid.observe_touchpad(sample.device, at, proof, report_reference.as_deref(), active_pad_contact);
                 }
                 self.hid.observe_published_ndof(sample, at, report_reference, proof);
@@ -1073,8 +1074,7 @@ impl Gate {
                     self.pen_observed = true;
                     self.pressure_observed |= report.fields.as_slice().iter().any(|field| {
                         field.usage == HidUsage::Pressure && matches!(field.value,
-                            HidValue::Number { raw: Some(raw), spec } if spec.logical[1] > spec.logical[0]
-                                && (spec.logical[0]..=spec.logical[1]).contains(&raw))
+                            HidValue::Number { raw: Some(raw), spec } if hid::normalize(raw, spec.logical).is_some())
                     });
                 }
             }
@@ -1359,6 +1359,25 @@ fn reference_key() -> Option<[u8; 32]> {
         BCryptGenRandom(std::ptr::null_mut(), key.as_mut_ptr(), key.len() as u32, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
     };
     (status == 0).then_some(key)
+}
+
+/// A keyboard record, raw or hook.
+pub(super) fn is_key(sample: &InputSample) -> bool {
+    matches!(sample, InputSample::RawKey(_) | InputSample::HookKey(_))
+}
+
+/// The loss evidence of one record of `producer` by its privacy class (§6.1
+/// rule 5): a key record is count-only, since its visit may be sensitive;
+/// any other keeps its receipt range from `first` to `at`.
+pub(super) fn record_loss(
+    reason: LossReason, producer: Producer, key: bool, first: SessionTimeUs, at: SessionTimeUs,
+) -> LossEvidence {
+    let producer = Some(LossProducer::from(producer));
+    if key {
+        LossEvidence::sensitive(reason, producer, std::num::NonZeroU64::MIN)
+    } else {
+        LossEvidence::ordinary(reason, producer, std::num::NonZeroU64::MIN, first, at)
+    }
 }
 
 /// One text-edit commit lost at `at`.

@@ -28,7 +28,7 @@ pub(crate) struct Lifetime {
     pub(super) witness: OnceLock<Arc<AtomicI64>>,
     cleanup: AtomicI64,
     owner: AtomicI64,
-    providers: [AtomicI64; 5],
+    providers: [AtomicI64; ProviderKind::COUNT],
 }
 
 impl Lifetime {
@@ -40,7 +40,7 @@ impl Lifetime {
         let expiry = qpc()?.0.checked_add(ticks).ok_or(Failure::Supervisor)?;
         Ok(Self {
             expiry: AtomicI64::new(expiry), ticks_per_second, witness: OnceLock::new(), cleanup: AtomicI64::new(0), owner: AtomicI64::new(0),
-            providers: [const { AtomicI64::new(0) }; 5],
+            providers: [const { AtomicI64::new(0) }; ProviderKind::COUNT],
         })
     }
 
@@ -65,7 +65,8 @@ impl Lifetime {
     }
 
     pub(crate) fn renew(&self, old: Option<Lease>, lease: Lease, now: QpcTick) -> Result<()> {
-        let oldest = now.0.saturating_sub(self.ticks_per_second);
+        let lease_ticks = self.ticks(LEASE)?;
+        let oldest = now.0.saturating_sub(lease_ticks);
         if lease.controller_qpc.0 <= oldest || lease.controller_qpc > now
             || lease.pump_qpc.0 <= oldest || lease.pump_qpc > now
             || old.map_or(lease.sequence.get() != 1, |old| {
@@ -76,7 +77,7 @@ impl Lifetime {
             return Err(Failure::LeaseExpired);
         }
         let valid_until = lease.controller_qpc.min(lease.pump_qpc).0
-            .checked_add(self.ticks_per_second).ok_or(Failure::Supervisor)?;
+            .checked_add(lease_ticks).ok_or(Failure::Supervisor)?;
         let mut expiry = self.expiry.load(Acquire);
         loop {
             if expiry == 0 || now.0 >= expiry {
@@ -92,7 +93,9 @@ impl Lifetime {
     }
 
     pub(crate) fn witness_healthy(&self, now: QpcTick) -> bool {
-        self.witness.get().is_none_or(|progress| super::witness::fresh(progress, now, self.ticks_per_second / 4))
+        self.witness.get().is_none_or(|progress| {
+            self.ticks(HEARTBEAT).is_ok_and(|max_age| super::witness::fresh(progress, now, max_age))
+        })
     }
 
     pub(super) fn ticks(&self, duration: Duration) -> Result<i64> {
@@ -158,6 +161,10 @@ pub(super) enum ProviderKind {
     Ime,
     Egress,
     Teardown,
+}
+
+impl ProviderKind {
+    const COUNT: usize = Self::Teardown as usize + 1;
 }
 
 pub(super) struct Provider<'a> {

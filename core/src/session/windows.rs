@@ -1,5 +1,7 @@
-//! Controller thread and the read-only lifecycle view used by current workers.
-//! Only the controller changes the phase, boundaries, and clock facts.
+//! Controller thread and the lifecycle state it shares with the recording
+//! workers. Only the controller changes the phase, boundaries, and clock facts;
+//! workers read them and report readiness, pause prefixes, source facts and
+//! faults through `WorkerSession`.
 
 pub(crate) mod disk;
 mod environment;
@@ -106,8 +108,7 @@ impl SourceDispatch {
     pub(crate) fn epoch(&self) -> AdmissionEpoch { self.epoch }
 
     pub(crate) fn stopped(&self) -> bool {
-        self.lifecycle.upgrade().is_none_or(|lifecycle| lifecycle.stop.load(Ordering::Acquire)
-            || lifecycle.session_end_started.get().is_some())
+        self.lifecycle.upgrade().is_none_or(|lifecycle| lifecycle.closing())
     }
 
     pub(crate) fn with_closed_phase<T>(
@@ -115,7 +116,7 @@ impl SourceDispatch {
     ) -> screen_fix_elevated::Result<T> {
         let lifecycle = self.lifecycle.upgrade().ok_or(screen_fix_elevated::Failure::Cancelled)?;
         let facts = lifecycle.lock();
-        if self.stopped() || !source_preparation_current(&facts, self.epoch)
+        if lifecycle.closing() || !source_preparation_current(&facts, self.epoch)
             || facts.startup_target.as_ref().is_some_and(|opening| opening.elevated() != Some(&self.target))
         {
             return Err(screen_fix_elevated::Failure::Cancelled);
@@ -133,7 +134,7 @@ pub(crate) struct ActiveSourceProof {
 impl ActiveSourceProof {
     pub(crate) fn current(&self) -> bool {
         let Some(lifecycle) = self.lifecycle.upgrade() else { return false; };
-        if lifecycle.stop.load(Ordering::Acquire) || lifecycle.session_end_started.get().is_some() { return false; }
+        if lifecycle.closing() { return false; }
         let Ok(facts) = lifecycle.facts.try_lock() else { return false; };
         source_active(&facts, self.epoch)
     }
@@ -196,8 +197,11 @@ enum CompletePublication {
 /// - `Stopping` → `Finished` or `Failed` when the controller returns.
 ///
 /// Latches:
-/// - `Lifecycle::stop`: Stop was requested; one-way. Set by `request_stop`,
-///   including by an attempt failure (`report_fault`).
+/// - `Lifecycle::stop`: Stop was requested; one-way, set only through
+///   `Lifecycle::latch_stop`: by `request_stop` (a UI Stop, an indicator
+///   failure, an attempt failure in `report_fault`), by the Stop hotkey, by a
+///   source failure (`stop_for_source_failure`, `required_elevated_hook_failed`,
+///   `commit_startup_source_failure`) and by session end.
 /// - `clock_failed`: the clock or a boundary sample failed; one-way. It ends
 ///   source activity and refuses Complete publication.
 /// - `source_change`: the admitted source must change at the next boundary;
@@ -331,6 +335,20 @@ impl Lifecycle {
         self.facts.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+
+    /// Stop was requested or the Windows session is ending.
+    fn closing(&self) -> bool {
+        self.stop_requested() || self.session_end_started.get().is_some()
+    }
+
+    /// Latch Stop. True when this call set the latch first.
+    fn latch_stop(&self) -> bool {
+        !self.stop.swap(true, Ordering::AcqRel)
+    }
+
     fn apply_session_end_deadlines(&self, facts: &mut Facts) {
         if let Some(&started) = self.session_end_started.get() {
             shorten(&mut facts.stop_deadline, started + SESSION_END_CONTROLLER_BUDGET);
@@ -365,7 +383,7 @@ impl Control {
         &self, signal: FixtureSave,
     ) -> Result<Receiver<FixtureSaveResult>, FixtureSaveError> {
         let mut facts = self.lifecycle.facts.try_lock().map_err(|_| FixtureSaveError::Busy)?;
-        if facts.status.phase != SessionPhase::Recording || self.lifecycle.stop.load(Ordering::Acquire) {
+        if facts.status.phase != SessionPhase::Recording || self.lifecycle.stop_requested() {
             return Err(FixtureSaveError::AdmissionClosed);
         }
         if facts.fixture_saves.len() >= MAX_FIXTURE_SAVES {
@@ -394,6 +412,14 @@ impl Control {
         if !matches!(command, SessionCommand::Pause(PauseReason::User) | SessionCommand::Resume(PauseReason::User)) {
             return Err(CommandError::PauseUnavailable);
         }
+        // The caller is the UI thread: a contended lock forwards the command,
+        // and the controller checks the phase again (`user_command`).
+        if command == SessionCommand::Pause(PauseReason::User)
+            && let Ok(facts) = self.lifecycle.facts.try_lock()
+            && !user_pause_available(facts.status.phase)
+        {
+            return Err(CommandError::PauseUnavailable);
+        }
         self.commands.try_send(command).map_err(|error| match error {
             TrySendError::Full(_) => CommandError::Busy,
             TrySendError::Disconnected(_) => CommandError::ControllerUnavailable,
@@ -404,7 +430,7 @@ impl Control {
 }
 
 fn request_stop(lifecycle: &Lifecycle, wake: &SyncSender<()>) {
-    lifecycle.stop.store(true, Ordering::Release);
+    lifecycle.latch_stop();
     // A full wake slot already guarantees that the controller wakes up.
     let _ = wake.try_send(());
 }
@@ -485,14 +511,12 @@ impl WorkerSession {
 
     pub(crate) fn elevated_active(&self, epoch: AdmissionEpoch) -> bool {
         let facts = self.lifecycle.lock();
-        !self.lifecycle.stop.load(Ordering::Acquire) && self.lifecycle.session_end_started.get().is_none()
-            && source_active(&facts, epoch)
+        !self.lifecycle.closing() && source_active(&facts, epoch)
     }
 
     pub(crate) fn ordinary_source_active(&self, epoch: AdmissionEpoch) -> bool {
         let facts = self.lifecycle.lock();
-        !self.lifecycle.stop.load(Ordering::Acquire) && self.lifecycle.session_end_started.get().is_none()
-            && source_epoch_active(&facts, epoch) && facts.elevated_epoch.is_none()
+        !self.lifecycle.closing() && source_epoch_active(&facts, epoch) && facts.elevated_epoch.is_none()
     }
 
     pub(crate) fn source_dispatch(&self, epoch: AdmissionEpoch, target: &IdentityClaim) -> SourceDispatch {
@@ -519,14 +543,13 @@ impl WorkerSession {
 
     pub(crate) fn source_preparation(&self) -> Option<SourcePreparation> {
         let facts = self.lifecycle.lock();
-        facts.source_preparation.as_ref().filter(|pending| !self.lifecycle.stop.load(Ordering::Acquire)
+        facts.source_preparation.as_ref().filter(|pending| !self.lifecycle.stop_requested()
             && source_preparation_current(&facts, pending.epoch)).cloned()
     }
 
     pub(crate) fn source_authorized(&self, epoch: AdmissionEpoch) -> bool {
         let facts = self.lifecycle.lock();
-        !self.lifecycle.stop.load(Ordering::Acquire)
-            && self.lifecycle.session_end_started.get().is_none()
+        !self.lifecycle.closing()
             && (source_preparation_current(&facts, epoch)
                 || (facts.status.phase == SessionPhase::Recording && facts.elevated_epoch == Some(epoch)))
     }
@@ -545,7 +568,7 @@ impl WorkerSession {
         &self, epoch: AdmissionEpoch, approval: ForegroundApproval, focus: Option<FocusAtReceipt>,
     ) {
         let mut facts = self.lifecycle.lock();
-        if !self.lifecycle.stop.load(Ordering::Acquire)
+        if !self.lifecycle.stop_requested()
             && source_preparation_current(&facts, epoch)
         {
             facts.source_ready = Some(SelectedSource { epoch, approval, focus });
@@ -555,14 +578,14 @@ impl WorkerSession {
 
     pub(crate) fn source_pending(&self, epoch: AdmissionEpoch, status: SourceStatus) {
         let mut facts = self.lifecycle.lock();
-        if !self.lifecycle.stop.load(Ordering::Acquire) && source_preparation_current(&facts, epoch) {
+        if !self.lifecycle.stop_requested() && source_preparation_current(&facts, epoch) {
             facts.status.source = status;
         }
     }
 
     pub(crate) fn source_enhanced(&self, epoch: AdmissionEpoch) {
         let mut facts = self.lifecycle.lock();
-        if !self.lifecycle.stop.load(Ordering::Acquire) && source_active(&facts, epoch) {
+        if !self.lifecycle.stop_requested() && source_active(&facts, epoch) {
             facts.status.source = SourceStatus::Enhanced;
         }
     }
@@ -651,7 +674,7 @@ impl WorkerSession {
 
     pub(crate) fn source_resynchronizing(&self, epoch: AdmissionEpoch) {
         let mut facts = self.lifecycle.lock();
-        if !self.lifecycle.stop.load(Ordering::Acquire) && source_active(&facts, epoch) {
+        if !self.lifecycle.stop_requested() && source_active(&facts, epoch) {
             facts.status.source = SourceStatus::Activating;
         }
     }
@@ -667,12 +690,15 @@ impl WorkerSession {
 
     pub(crate) fn fail_source(&self, stage: SourceStage, failure: screen_fix_elevated::Failure) {
         let mut facts = self.lifecycle.lock();
-        self.stop_for_source_failure(&mut facts, SourceFailure::elevated(stage, failure, false));
+        let admitted = facts.status.clock.is_some();
+        self.stop_for_source_failure(&mut facts, SourceFailure::elevated(stage, failure, admitted));
     }
 
+    /// Latch Stop for a source failure; `admitted` is set from the session clock.
+    /// True when this failure set the Stop latch first.
     fn stop_for_source_failure(&self, facts: &mut Facts, mut failure: SourceFailure) -> bool {
         failure.admitted = facts.status.clock.is_some();
-        let first = self.lifecycle.stop.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok();
+        let first = self.lifecycle.latch_stop();
         if first || (failure.admitted && matches!(failure.stage, SourceStage::Activation | SourceStage::Capture | SourceStage::Cleanup)
             && !matches!(failure.reason, SourceFailureReason::Cancelled | SourceFailureReason::ScopeClosed))
         {
@@ -684,7 +710,7 @@ impl WorkerSession {
 
     pub(crate) fn required_elevated_hook_failed(&self, closing: bool) {
         let mut facts = self.lifecycle.lock();
-        if closing || self.lifecycle.stop.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        if closing || self.lifecycle.latch_stop() {
             set_source_failure(&mut facts, SourceFailure {
                 stage: SourceStage::Capture, reason: SourceFailureReason::RequiredHook, admitted: true, native: None, token_identity: None,
             });
@@ -713,7 +739,7 @@ impl WorkerSession {
     }
 
     pub(crate) fn stop_requested(&self) -> bool {
-        self.lifecycle.stop.load(Ordering::Acquire)
+        self.lifecycle.stop_requested()
     }
 
     pub(crate) fn started(&self) -> bool {
@@ -847,12 +873,12 @@ impl WorkerSession {
         let mut facts = self.lifecycle.lock();
         while matches!(facts.admission_check, AdmissionCheck::Idle)
             && facts.status.phase == SessionPhase::Starting
-            && !self.lifecycle.stop.load(Ordering::Acquire)
+            && !self.lifecycle.stop_requested()
         {
             facts = self.lifecycle.changed.wait(facts).unwrap_or_else(PoisonError::into_inner);
         }
         if facts.status.phase != SessionPhase::Starting
-            || self.lifecycle.stop.load(Ordering::Acquire)
+            || self.lifecycle.stop_requested()
             || !matches!(facts.admission_check, AdmissionCheck::Requested)
         {
             return;
@@ -1225,31 +1251,24 @@ fn run(
         Arc::clone(&lifecycle.input_environment), Arc::clone(&lifecycle.elevated_environment), Arc::clone(&lifecycle.display_revision),
         Arc::clone(&lifecycle.session_end_started), Arc::clone(&lifecycle.power), endpoint.wake.clone(),
     )?;
-    let pause_producer_count = endpoint.config().monitors().len() * 2 + 2;
     // The controller reads the suspend marks through the same accessor as the owners.
     let session = endpoint.clone();
-    let worker = thread::Builder::new().name("video-recording".into())
-        .spawn(move || {
-            let _lease = lease;
-            let result = record(&endpoint);
-            (Instant::now(), result)
-        })
-        .map_err(|error| CaptureError::owned(FailureComponent::Controller, "Start the recording worker", None, error.to_string()))?;
-    let result = coordinate(lifecycle, &session, &commands, &wake, &ready, frequency, &worker, &environment, notifications_ready, &hotkeys, pause_producer_count);
+    let mut worker = RecordingWorker::spawn(endpoint, record, lease)?;
+    let result = coordinate(lifecycle, &session, &commands, &wake, &ready, frequency, &mut worker, &environment, notifications_ready, &hotkeys);
     if let Err(error) = &result {
         record_fault(&mut lifecycle.lock(), FaultReport::attempt(error));
         // A failed controller still closes admission and releases startup
         // waiters. A failed QPC sample may prevent a certified prefix.
         let _ = stop(lifecycle);
     }
-    while !worker.is_finished() {
+    while !worker.finished() {
         let (remaining, release_session_end_wait) = {
             let mut facts = lifecycle.lock();
             lifecycle.apply_session_end_deadlines(&mut facts);
             let deadline = facts.stop_deadline.unwrap_or_else(Instant::now);
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() && facts.complete_publication != CompletePublication::Authorized {
-                if worker.is_finished() {
+                if worker.finished() {
                     break;
                 }
                 facts.complete_publication = CompletePublication::Expired;
@@ -1264,11 +1283,12 @@ fn run(
         if release_session_end_wait {
             environment.finished();
         }
+        // The worker wakes the controller when it exits. Not every writer of
+        // the stop deadline wakes it, so every wait stays bounded.
         let wait = if remaining.is_zero() { CONTROL_WAIT } else { remaining.min(CONTROL_WAIT) };
         let _ = wake.recv_timeout(wait);
     }
-    let worker_result = worker.join()
-        .map_err(|_| failure("Record the display", "The recording worker terminated unexpectedly."));
+    let worker_result = worker.join();
     let mut facts = lifecycle.lock();
     if facts.complete_publication == CompletePublication::Authorized {
         drop(facts);
@@ -1299,6 +1319,83 @@ fn run(
     Ok(message)
 }
 
+/// The recording worker's finish time and result.
+type WorkerOutcome = (Instant, Result<SessionResult, CaptureError>);
+
+/// The recording worker thread. It sends its outcome before it wakes the
+/// controller, so the wake that follows its exit always finds the outcome.
+struct RecordingWorker {
+    thread: thread::JoinHandle<()>,
+    outcome: Receiver<WorkerOutcome>,
+    /// The received outcome once the worker finished; `Some(None)` when it
+    /// exited without one.
+    finished: Option<Option<WorkerOutcome>>,
+}
+
+/// Sends the worker's outcome and wakes the controller when the worker thread
+/// exits, including by a panic, which leaves no outcome.
+struct WorkerExit {
+    outcome: Option<SyncSender<WorkerOutcome>>,
+    wake: SyncSender<()>,
+}
+
+impl WorkerExit {
+    fn finish(mut self, outcome: WorkerOutcome) {
+        if let Some(sender) = self.outcome.take() {
+            let _ = sender.send(outcome);
+        }
+    }
+}
+
+impl Drop for WorkerExit {
+    fn drop(&mut self) {
+        // Disconnect before the wake, so a panicked worker reads as finished.
+        drop(self.outcome.take());
+        // A full wake slot already guarantees that the controller wakes up.
+        let _ = self.wake.try_send(());
+    }
+}
+
+impl RecordingWorker {
+    fn spawn(
+        endpoint: WorkerSession, record: fn(&WorkerSession) -> Result<SessionResult, CaptureError>, lease: RecordingLease,
+    ) -> Result<Self, CaptureError> {
+        let (sender, outcome) = mpsc::sync_channel(1);
+        let thread = thread::Builder::new().name("video-recording".into())
+            .spawn(move || {
+                // The worker and all nested owners hold the lease until the thread exits.
+                let _lease = lease;
+                let exit = WorkerExit { outcome: Some(sender), wake: endpoint.wake.clone() };
+                let result = record(&endpoint);
+                exit.finish((Instant::now(), result));
+            })
+            .map_err(|error| CaptureError::owned(FailureComponent::Controller, "Start the recording worker", None, error.to_string()))?;
+        Ok(Self { thread, outcome, finished: None })
+    }
+
+    /// The worker has sent its outcome or exited without one.
+    fn finished(&mut self) -> bool {
+        if self.finished.is_none() {
+            match self.outcome.try_recv() {
+                Ok(outcome) => self.finished = Some(Some(outcome)),
+                Err(mpsc::TryRecvError::Disconnected) => self.finished = Some(None),
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        self.finished.is_some()
+    }
+
+    /// Wait for the worker thread to exit, which releases the recording lease,
+    /// and take its outcome.
+    fn join(self) -> Result<WorkerOutcome, CaptureError> {
+        let Self { thread, outcome, finished } = self;
+        let exited = thread.join().is_ok();
+        finished.unwrap_or_else(|| outcome.try_recv().ok())
+            .filter(|_| exited)
+            .ok_or_else(|| failure("Record the display", "The recording worker terminated unexpectedly."))
+    }
+}
+
 /// The primary cause with every other retained cause attached for diagnostics.
 fn retained_cause(outcome: FaultOutcome, fallback: CaptureError) -> CaptureError {
     let FaultOutcome { error, additional, .. } = outcome;
@@ -1316,11 +1413,10 @@ fn coordinate(
     wake: &Receiver<()>,
     ready: &Receiver<()>,
     frequency: QpcFrequency,
-    worker: &thread::JoinHandle<(Instant, Result<SessionResult, CaptureError>)>,
+    worker: &mut RecordingWorker,
     environment: &environment::Notifications,
     notifications_ready: Receiver<Result<(), CaptureError>>,
     hotkeys: &ActiveHotkeys,
-    pause_producer_count: usize,
 ) -> Result<Option<AdmissionBoundary>, CaptureError> {
     let mut countdown = None;
     let mut reasons = BTreeSet::new();
@@ -1329,10 +1425,10 @@ fn coordinate(
     let mut subscribed = false;
     loop {
         if lifecycle.session_end_started.get().is_some() {
-            lifecycle.stop.store(true, Ordering::Release);
+            lifecycle.latch_stop();
         }
         route_hotkeys(lifecycle, &mut reasons, &mut disk_resume, hotkeys, frequency)?;
-        if lifecycle.stop.load(Ordering::Acquire) || worker.is_finished() {
+        if lifecycle.stop_requested() || worker.finished() {
             stop(lifecycle)?;
             if let Some(failure) = lifecycle.lock().status.source.failure() {
                 return Err(CaptureError::elevated(failure));
@@ -1340,37 +1436,8 @@ fn coordinate(
             return Ok(pause_finished);
         }
         lifecycle.controller_qpc.store(clock::qpc().map_err(controller_error)?.0, Ordering::Release);
-        if !subscribed {
-            match notifications_ready.try_recv() {
-                Ok(result) => { result?; subscribed = true; }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    return Err(failure("Monitor recording environment", "The Windows notification owner failed to start."));
-                }
-            }
-        } else if !environment.running() {
-            return Err(failure("Monitor recording environment", "The Windows notification owner exited unexpectedly."));
-        }
-        let (active, asserted) = environment.reasons();
-        for (bit, reason) in [(environment::SLEEP, PauseReason::Sleep), (environment::LOCK_SCREEN, PauseReason::LockScreen),
-            (environment::SECURE_DESKTOP, PauseReason::SecureDesktop)]
-        {
-            if (active | asserted) & bit != 0 {
-                if reason == PauseReason::Sleep && !reasons.contains(&reason) {
-                    let mut facts = lifecycle.lock();
-                    if matches!(facts.status.phase, SessionPhase::Recording | SessionPhase::Paused) {
-                        // Video finalization may continue after wake; a miss is
-                        // a health row, never a fault (D-5 A).
-                        facts.suspend_wait = Some(session.suspend_marks().sequence);
-                        shorten(&mut facts.suspend_cleanup, Instant::now() + environment::SUSPEND_BUDGET);
-                    }
-                }
-                pause_command(lifecycle, &mut reasons, SessionCommand::Pause(reason))?;
-            }
-            if active & bit == 0 {
-                pause_command(lifecycle, &mut reasons, SessionCommand::Resume(reason))?;
-            }
-        }
+        subscribed = watch_notifications(environment, &notifications_ready, subscribed)?;
+        track_environment(lifecycle, session, environment, &mut reasons)?;
         let startup_hotkeys_lost = {
             let facts = lifecycle.lock();
             facts.status.hotkeys_unavailable && facts.status.phase == SessionPhase::Starting
@@ -1384,12 +1451,12 @@ fn coordinate(
         }
         // Bound processing per wake and revisit the independent Stop latch first.
         for command in commands.try_iter().take(8) {
-            if lifecycle.stop.load(Ordering::Acquire) {
+            if lifecycle.stop_requested() {
                 break;
             }
             user_command(lifecycle, &mut reasons, &mut disk_resume, command)?;
         }
-        if lifecycle.stop.load(Ordering::Acquire) {
+        if lifecycle.stop_requested() {
             continue;
         }
         update_disk(lifecycle, &mut reasons, &mut disk_resume)?;
@@ -1400,187 +1467,321 @@ fn coordinate(
         if handoff {
             pause_command(lifecycle, &mut reasons, SessionCommand::Pause(PauseReason::ElevationTransition))?;
         }
-        {
-            let mut facts = lifecycle.lock();
-            if facts.status.phase == SessionPhase::Paused {
-                if facts.pause_prefix.iter().filter(|producer| matches!(producer, PauseProducer::Video(_))).count()
-                    == (pause_producer_count - 2) / 2
-                {
-                    facts.suspend_wait = None;
-                    facts.suspend_cleanup = None;
-                } else if let Some(sequence) = facts.suspend_wait {
-                    // The suspend window cannot be measured while the suspend is
-                    // open. A video prefix still open when the system has
-                    // resumed missed it: one G row per late monitor.
-                    let marks = session.suspend_marks();
-                    if marks.sequence != sequence || marks.resume.is_some() {
-                        facts.suspend_wait = None;
-                        let late: Vec<_> = session.config().monitors().iter().map(|monitor| monitor.id)
-                            .filter(|id| !facts.pause_prefix.contains(&PauseProducer::Video(*id))).collect();
-                        for monitor in late {
-                            push_health(&mut facts, HealthKind::SuspendFinalizeLate,
-                                Failure::new(FailureComponent::Video, "Finish the suspended video segment", None), Some(monitor), false);
-                        }
-                    }
-                }
-                if facts.pause_prefix.len() == pause_producer_count {
-                    pause_finished = facts.status.closed;
-                    facts.pause_started = None;
-                }
-            }
-        }
-        let pause_overdue = {
-            let facts = lifecycle.lock();
-            let now = clock::qpc().map_err(controller_error)?;
-            facts.pause_started.is_some_and(|(started, since)| matches!(
-                session.suspend_marks().awake_elapsed(started, now, since, frequency),
-                AwakeElapsed::Known(elapsed) if elapsed >= STOP_BUDGET))
-        };
-        if pause_overdue {
+        track_pause_prefix(lifecycle, session, &mut pause_finished);
+        if pause_overdue(lifecycle, session, frequency)? {
             return Err(failure("Finish the paused recording prefix", "A recording owner did not finish its pause prefix."));
         }
-        if let Some(finished) = pause_finished {
-            if !handoff && reasons.is_empty() {
-                resume(lifecycle, finished, None)?;
-                pause_finished = None;
-            } else if handoff && reasons.iter().all(|reason| *reason == PauseReason::ElevationTransition) {
-                let selected = {
-                    let mut facts = lifecycle.lock();
-                    prepare_source(&mut facts)?;
-                    facts.source_ready.take()
-                };
-                if let Some(selected) = selected.filter(SelectedSource::current) {
-                    pause_command(lifecycle, &mut reasons, SessionCommand::Resume(PauseReason::ElevationTransition))?;
-                    resume(lifecycle, finished, Some(selected))?;
-                    pause_finished = None;
-                }
-            }
-        }
-        let mut wait = CONTROL_WAIT;
-        // A lock, secure desktop or suspend holds the countdown at its full
-        // length: the approved application must be in front when it ends.
-        if countdown.is_some() && reasons.iter().any(|reason| matches!(reason,
-            PauseReason::LockScreen | PauseReason::SecureDesktop | PauseReason::Sleep))
+        if let Some(finished) = pause_finished
+            && reopen_finished_pause(lifecycle, &mut reasons, handoff, finished)?
         {
-            countdown = Some(clock::qpc().map_err(controller_error)?);
-            lifecycle.lock().status.countdown_seconds = None;
-        } else if let Some(begin) = countdown {
-            let ticks_per_second = i128::from(frequency.0.get());
-            let elapsed = i128::from(clock::qpc().map_err(controller_error)?.0) - i128::from(begin.0);
-            if elapsed < 0 {
-                return Err(failure("Count down to recording", "QPC moved backward during the countdown."));
-            }
-            let remaining = (i128::from(COUNTDOWN_SECONDS) * ticks_per_second - elapsed).max(0);
-            if remaining == 0 && reasons.contains(&PauseReason::LowDisk) {
-                return Err(startup_disk_error());
-            }
-            if remaining == 0 && reasons.is_empty() {
-                let (checked, selected) = {
-                    let mut facts = lifecycle.lock();
-                    if facts.startup_target.is_some() {
-                        prepare_source(&mut facts)?;
-                        (None, facts.source_ready.take())
-                    } else {
-                        let checked = match std::mem::take(&mut facts.admission_check) {
-                            AdmissionCheck::Idle => {
-                                facts.admission_check = AdmissionCheck::Requested;
-                                facts.status.startup = StartupStep::VerifyingAdmission;
-                                facts.status.countdown_seconds = None;
-                                lifecycle.changed.notify_all();
-                                None
-                            }
-                            AdmissionCheck::Finished(result) => Some(result),
-                            pending => {
-                                facts.admission_check = pending;
-                                facts.status.countdown_seconds = None;
-                                None
-                            }
-                        };
-                        (checked, None)
-                    }
-                };
-                if let Some(checked) = checked {
-                    if lifecycle.stop.load(Ordering::Acquire) {
-                        continue;
-                    }
-                    let approved = match checked {
-                        Ok(approved) => approved,
-                        Err(error) => {
-                            let mut facts = lifecycle.lock();
-                            if lifecycle.stop.load(Ordering::Acquire) { continue; }
-                            if let Some(failure) = error.source_failure()
-                                && !commit_startup_source_failure(lifecycle, &mut facts, failure)
-                            {
-                                continue;
-                            }
-                            return Err(error);
-                        }
-                    };
-                    if !lifecycle.lock().status.disk_available_bytes.is_some_and(|bytes| bytes >= disk::START_MINIMUM) {
-                        return Err(startup_disk_error());
-                    }
-                    if !approved.still_current() {
-                        if approved.elevated().is_some() {
-                            let mut facts = lifecycle.lock();
-                            let failure = SourceFailure {
-                                stage: SourceStage::Foreground, reason: SourceFailureReason::TargetChanged,
-                                admitted: false, native: None, token_identity: None,
-                            };
-                            if !commit_startup_source_failure(lifecycle, &mut facts, failure) { continue; }
-                            return Err(CaptureError::elevated(failure));
-                        }
-                        return Err(failure("Verify approved foreground",
-                            "The approved foreground window changed before recording started. Retry and keep the application in front."));
-                    }
-                    if approved.elevated().is_some() {
-                        let mut facts = lifecycle.lock();
-                        facts.startup_target = Some(approved);
-                        prepare_source(&mut facts)?;
-                    } else {
-                        start(lifecycle, frequency, None)?;
-                        countdown = None;
-                    }
-                } else if let Some(selected) = selected {
-                    let live = {
-                        let facts = lifecycle.lock();
-                        facts.startup_target.as_ref().and_then(ForegroundApproval::elevated) == selected.approval.elevated()
-                            && facts.status.disk_available_bytes.is_some_and(|bytes| bytes >= disk::START_MINIMUM)
-                    };
-                    if !live || !selected.current() {
-                        let mut facts = lifecycle.lock();
-                        if lifecycle.stop.load(Ordering::Acquire) { continue; }
-                        if !facts.status.disk_available_bytes.is_some_and(|bytes| bytes >= disk::START_MINIMUM) {
-                            return Err(startup_disk_error());
-                        }
-                        let failure = SourceFailure {
-                            stage: SourceStage::Readiness, reason: SourceFailureReason::TargetChanged,
-                            admitted: false, native: None, token_identity: None,
-                        };
-                        if !commit_startup_source_failure(lifecycle, &mut facts, failure) { continue; }
-                        return Err(CaptureError::elevated(failure));
-                    }
-                    start(lifecycle, frequency, Some(selected))?;
-                    countdown = None;
-                }
-            } else {
-                let seconds = ((remaining + ticks_per_second - 1) / ticks_per_second) as u8;
-                lifecycle.lock().status.countdown_seconds = (remaining != 0).then_some(seconds);
-                if remaining != 0 {
-                    // Use a bounded wait and let the next QPC read decide when Start occurs.
-                    let nanos = (remaining * 1_000_000_000 + ticks_per_second - 1) / ticks_per_second;
-                    wait = wait.min(Duration::from_nanos(nanos as u64));
-                }
-            }
+            pause_finished = None;
         }
+        let Some(wait) = advance_countdown(lifecycle, frequency, &reasons, &mut countdown)? else {
+            continue;
+        };
         sample_anchors(lifecycle)?;
         let _ = wake.recv_timeout(wait);
     }
 }
 
-fn commit_startup_source_failure(lifecycle: &Lifecycle, facts: &mut Facts, failure: SourceFailure) -> bool {
-    if lifecycle.session_end_started.get().is_some()
-        || lifecycle.stop.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err()
+/// Whether the Windows notification owner has subscribed. An owner that
+/// failed to start or exited afterwards fails the attempt.
+fn watch_notifications(
+    environment: &environment::Notifications, ready: &Receiver<Result<(), CaptureError>>, subscribed: bool,
+) -> Result<bool, CaptureError> {
+    if subscribed {
+        if !environment.running() {
+            return Err(failure("Monitor recording environment", "The Windows notification owner exited unexpectedly."));
+        }
+        return Ok(true);
+    }
+    match ready.try_recv() {
+        Ok(result) => result.map(|()| true),
+        Err(mpsc::TryRecvError::Empty) => Ok(false),
+        Err(mpsc::TryRecvError::Disconnected) => {
+            Err(failure("Monitor recording environment", "The Windows notification owner failed to start."))
+        }
+    }
+}
+
+/// Pause for every asserted environment reason and resume each one that is no
+/// longer active. A new sleep pause also bounds video finalization and the
+/// elevated collector's cleanup by the suspend budget.
+fn track_environment(
+    lifecycle: &Lifecycle, session: &WorkerSession, environment: &environment::Notifications,
+    reasons: &mut BTreeSet<PauseReason>,
+) -> Result<(), CaptureError> {
+    let (active, asserted) = environment.reasons();
+    for (bit, reason) in [(environment::SLEEP, PauseReason::Sleep), (environment::LOCK_SCREEN, PauseReason::LockScreen),
+        (environment::SECURE_DESKTOP, PauseReason::SecureDesktop)]
     {
+        if (active | asserted) & bit != 0 {
+            if reason == PauseReason::Sleep && !reasons.contains(&reason) {
+                let mut facts = lifecycle.lock();
+                if matches!(facts.status.phase, SessionPhase::Recording | SessionPhase::Paused) {
+                    // Video finalization may continue after wake; a miss is
+                    // a health row, never a fault (D-5 A).
+                    facts.suspend_wait = Some(session.suspend_marks().sequence);
+                    shorten(&mut facts.suspend_cleanup, Instant::now() + environment::SUSPEND_BUDGET);
+                }
+            }
+            pause_command(lifecycle, reasons, SessionCommand::Pause(reason))?;
+        }
+        if active & bit == 0 {
+            pause_command(lifecycle, reasons, SessionCommand::Resume(reason))?;
+        }
+    }
+    Ok(())
+}
+
+/// The pause producers: input, stills, and capture and video for each monitor.
+const fn pause_producer_count(monitors: usize) -> usize {
+    monitors * 2 + 2
+}
+
+/// Follow the producers' pause prefixes. A suspend wait ends once every video
+/// producer has finished, or once the system has resumed, with one health row
+/// for each monitor whose video prefix is still open. `pause_finished`
+/// receives the pause cutoff once every producer has finished.
+fn track_pause_prefix(lifecycle: &Lifecycle, session: &WorkerSession, pause_finished: &mut Option<AdmissionBoundary>) {
+    let monitors = session.config().monitors();
+    let mut facts = lifecycle.lock();
+    if facts.status.phase != SessionPhase::Paused {
+        return;
+    }
+    if facts.pause_prefix.iter().filter(|producer| matches!(producer, PauseProducer::Video(_))).count() == monitors.len() {
+        facts.suspend_wait = None;
+        facts.suspend_cleanup = None;
+    } else if let Some(sequence) = facts.suspend_wait {
+        // The suspend window cannot be measured while the suspend is
+        // open. A video prefix still open when the system has
+        // resumed missed it: one G row per late monitor.
+        let marks = session.suspend_marks();
+        if marks.sequence != sequence || marks.resume.is_some() {
+            facts.suspend_wait = None;
+            let late: Vec<_> = monitors.iter().map(|monitor| monitor.id)
+                .filter(|id| !facts.pause_prefix.contains(&PauseProducer::Video(*id))).collect();
+            for monitor in late {
+                push_health(&mut facts, HealthKind::SuspendFinalizeLate,
+                    Failure::new(FailureComponent::Video, "Finish the suspended video segment", None), Some(monitor), false);
+            }
+        }
+    }
+    if facts.pause_prefix.len() == pause_producer_count(monitors.len()) {
+        *pause_finished = facts.status.closed;
+        facts.pause_started = None;
+    }
+}
+
+/// The pause prefix has stayed open for the Stop budget, sleep excluded.
+fn pause_overdue(lifecycle: &Lifecycle, session: &WorkerSession, frequency: QpcFrequency) -> Result<bool, CaptureError> {
+    let facts = lifecycle.lock();
+    let now = clock::qpc().map_err(controller_error)?;
+    Ok(facts.pause_started.is_some_and(|(started, since)| matches!(
+        session.suspend_marks().awake_elapsed(started, now, since, frequency),
+        AwakeElapsed::Known(elapsed) if elapsed >= STOP_BUDGET)))
+}
+
+/// Reopen admission after a finished pause: at once when no reason remains, or
+/// with the newly selected source when only the elevation transition holds the
+/// pause. True when the pause was handed to `resume`.
+fn reopen_finished_pause(
+    lifecycle: &Lifecycle, reasons: &mut BTreeSet<PauseReason>, handoff: bool, finished: AdmissionBoundary,
+) -> Result<bool, CaptureError> {
+    if !handoff && reasons.is_empty() {
+        resume(lifecycle, finished, None)?;
+        return Ok(true);
+    }
+    if !handoff || !reasons.iter().all(|reason| *reason == PauseReason::ElevationTransition) {
+        return Ok(false);
+    }
+    let selected = {
+        let mut facts = lifecycle.lock();
+        prepare_source(&mut facts)?;
+        facts.source_ready.take()
+    };
+    let Some(selected) = selected.filter(SelectedSource::current) else {
+        return Ok(false);
+    };
+    pause_command(lifecycle, reasons, SessionCommand::Resume(PauseReason::ElevationTransition))?;
+    resume(lifecycle, finished, Some(selected))?;
+    Ok(true)
+}
+
+/// The result of one attempt to start after the countdown.
+enum StartStep {
+    /// Revisit the controller loop at once.
+    Revisit,
+    /// Wait for the admission check or the source selection.
+    Pending,
+    /// Start ran; the countdown is over.
+    Started,
+}
+
+/// Advance the startup countdown. `None` revisits the controller loop at once;
+/// otherwise the bounded wait before the next step.
+fn advance_countdown(
+    lifecycle: &Lifecycle, frequency: QpcFrequency, reasons: &BTreeSet<PauseReason>, countdown: &mut Option<QpcTick>,
+) -> Result<Option<Duration>, CaptureError> {
+    let Some(begin) = *countdown else {
+        return Ok(Some(CONTROL_WAIT));
+    };
+    // A lock, secure desktop or suspend holds the countdown at its full
+    // length: the approved application must be in front when it ends.
+    if reasons.iter().any(|reason| matches!(reason,
+        PauseReason::LockScreen | PauseReason::SecureDesktop | PauseReason::Sleep))
+    {
+        *countdown = Some(clock::qpc().map_err(controller_error)?);
+        lifecycle.lock().status.countdown_seconds = None;
+        return Ok(Some(CONTROL_WAIT));
+    }
+    let ticks_per_second = i128::from(frequency.0.get());
+    let elapsed = i128::from(clock::qpc().map_err(controller_error)?.0) - i128::from(begin.0);
+    if elapsed < 0 {
+        return Err(failure("Count down to recording", "QPC moved backward during the countdown."));
+    }
+    let remaining = (i128::from(COUNTDOWN_SECONDS) * ticks_per_second - elapsed).max(0);
+    if remaining != 0 {
+        let seconds = ((remaining + ticks_per_second - 1) / ticks_per_second) as u8;
+        lifecycle.lock().status.countdown_seconds = Some(seconds);
+        // Use a bounded wait and let the next QPC read decide when Start occurs.
+        let nanos = (remaining * 1_000_000_000 + ticks_per_second - 1) / ticks_per_second;
+        return Ok(Some(CONTROL_WAIT.min(Duration::from_nanos(nanos as u64))));
+    }
+    if reasons.contains(&PauseReason::LowDisk) {
+        return Err(startup_disk_error());
+    }
+    if !reasons.is_empty() {
+        lifecycle.lock().status.countdown_seconds = None;
+        return Ok(Some(CONTROL_WAIT));
+    }
+    Ok(match start_when_admitted(lifecycle, frequency)? {
+        StartStep::Revisit => None,
+        StartStep::Pending => Some(CONTROL_WAIT),
+        StartStep::Started => {
+            *countdown = None;
+            Some(CONTROL_WAIT)
+        }
+    })
+}
+
+/// Start once the countdown has ended: after the startup admission check, or,
+/// for an approved elevated target, once its source is ready.
+fn start_when_admitted(lifecycle: &Lifecycle, frequency: QpcFrequency) -> Result<StartStep, CaptureError> {
+    let (checked, selected) = {
+        let mut facts = lifecycle.lock();
+        if facts.startup_target.is_some() {
+            prepare_source(&mut facts)?;
+            (None, facts.source_ready.take())
+        } else {
+            (poll_admission_check(lifecycle, &mut facts), None)
+        }
+    };
+    match (checked, selected) {
+        (Some(checked), _) => start_checked(lifecycle, frequency, checked),
+        (None, Some(selected)) => start_selected(lifecycle, frequency, selected),
+        (None, None) => Ok(StartStep::Pending),
+    }
+}
+
+/// Request the startup admission check once, and take its result when it has finished.
+fn poll_admission_check(lifecycle: &Lifecycle, facts: &mut Facts) -> Option<Result<ForegroundApproval, CaptureError>> {
+    match std::mem::take(&mut facts.admission_check) {
+        AdmissionCheck::Idle => {
+            facts.admission_check = AdmissionCheck::Requested;
+            facts.status.startup = StartupStep::VerifyingAdmission;
+            facts.status.countdown_seconds = None;
+            lifecycle.changed.notify_all();
+            None
+        }
+        AdmissionCheck::Finished(result) => Some(result),
+        pending => {
+            facts.admission_check = pending;
+            facts.status.countdown_seconds = None;
+            None
+        }
+    }
+}
+
+/// Act on the startup admission check: an ordinary target starts at once, an
+/// elevated target first prepares its source.
+fn start_checked(
+    lifecycle: &Lifecycle, frequency: QpcFrequency, checked: Result<ForegroundApproval, CaptureError>,
+) -> Result<StartStep, CaptureError> {
+    if lifecycle.stop_requested() {
+        return Ok(StartStep::Revisit);
+    }
+    let approved = match checked {
+        Ok(approved) => approved,
+        Err(error) => {
+            let mut facts = lifecycle.lock();
+            if lifecycle.stop_requested() {
+                return Ok(StartStep::Revisit);
+            }
+            if let Some(failure) = error.source_failure()
+                && !commit_startup_source_failure(lifecycle, &mut facts, failure)
+            {
+                return Ok(StartStep::Revisit);
+            }
+            return Err(error);
+        }
+    };
+    if !start_disk_available(&lifecycle.lock()) {
+        return Err(startup_disk_error());
+    }
+    if !approved.still_current() {
+        if approved.elevated().is_some() {
+            let mut facts = lifecycle.lock();
+            return startup_target_changed(lifecycle, &mut facts, SourceStage::Foreground);
+        }
+        return Err(failure("Verify approved foreground",
+            "The approved foreground window changed before recording started. Retry and keep the application in front."));
+    }
+    if approved.elevated().is_some() {
+        let mut facts = lifecycle.lock();
+        facts.startup_target = Some(approved);
+        prepare_source(&mut facts)?;
+        return Ok(StartStep::Pending);
+    }
+    start(lifecycle, frequency, None)?;
+    Ok(StartStep::Started)
+}
+
+/// Start with the elevated source selected for the approved startup target.
+fn start_selected(lifecycle: &Lifecycle, frequency: QpcFrequency, selected: SelectedSource) -> Result<StartStep, CaptureError> {
+    let live = {
+        let facts = lifecycle.lock();
+        facts.startup_target.as_ref().and_then(ForegroundApproval::elevated) == selected.approval.elevated()
+            && start_disk_available(&facts)
+    };
+    if !live || !selected.current() {
+        let mut facts = lifecycle.lock();
+        if lifecycle.stop_requested() {
+            return Ok(StartStep::Revisit);
+        }
+        if !start_disk_available(&facts) {
+            return Err(startup_disk_error());
+        }
+        return startup_target_changed(lifecycle, &mut facts, SourceStage::Readiness);
+    }
+    start(lifecycle, frequency, Some(selected))?;
+    Ok(StartStep::Started)
+}
+
+/// The elevated startup target changed before Start. The failure is reported
+/// only when it latches Stop first; otherwise the controller loop revisits.
+fn startup_target_changed(lifecycle: &Lifecycle, facts: &mut Facts, stage: SourceStage) -> Result<StartStep, CaptureError> {
+    let failure = SourceFailure {
+        stage, reason: SourceFailureReason::TargetChanged, admitted: false, native: None, token_identity: None,
+    };
+    if !commit_startup_source_failure(lifecycle, facts, failure) {
+        return Ok(StartStep::Revisit);
+    }
+    Err(CaptureError::elevated(failure))
+}
+
+fn commit_startup_source_failure(lifecycle: &Lifecycle, facts: &mut Facts, failure: SourceFailure) -> bool {
+    if lifecycle.session_end_started.get().is_some() || !lifecycle.latch_stop() {
         return false;
     }
     set_source_failure(facts, failure);
@@ -1588,17 +1789,34 @@ fn commit_startup_source_failure(lifecycle: &Lifecycle, facts: &mut Facts, failu
 }
 
 fn startup_disk_error() -> CaptureError {
-    failure("Verify startup disk space", "The recording output volume no longer reports at least 20 GB free. Free space or pick another folder, then retry.")
+    CaptureError::owned(FailureComponent::Controller, "Verify startup disk space", None, format!(
+        "The recording output volume no longer reports at least {} GB free. Free space or pick another folder, then retry.",
+        disk::START_MINIMUM_GB,
+    ))
+}
+
+/// The startup volume still has the free space that Start requires.
+fn start_disk_available(facts: &Facts) -> bool {
+    facts.status.disk_available_bytes.is_some_and(|bytes| bytes >= disk::START_MINIMUM)
 }
 
 fn user_command(
     lifecycle: &Lifecycle, reasons: &mut BTreeSet<PauseReason>, disk_resume: &mut Option<Instant>,
     command: SessionCommand,
 ) -> Result<(), CaptureError> {
+    // The phase may have changed since `Control::submit` accepted the pause.
+    if command == SessionCommand::Pause(PauseReason::User) && !user_pause_available(lifecycle.lock().status.phase) {
+        return Ok(());
+    }
     if command == SessionCommand::Resume(PauseReason::User) && reasons.contains(&PauseReason::LowDisk) {
         *disk_resume = Some(Instant::now());
     }
     pause_command(lifecycle, reasons, command)
+}
+
+/// A user pause applies only after Start and before Stop, so it never holds the countdown.
+fn user_pause_available(phase: SessionPhase) -> bool {
+    matches!(phase, SessionPhase::Recording | SessionPhase::Paused)
 }
 
 fn update_disk(
@@ -1644,14 +1862,13 @@ fn route_hotkeys(
     // Only a stopped hotkey thread makes the hotkeys unavailable.
     let failed = batch.failed;
     for activation in batch.into_events() {
-        let outcome = if lifecycle.stop.load(Ordering::Acquire) {
+        let outcome = if lifecycle.stop_requested() {
             ControlOutcome::AlreadyStopping
         } else {
             match activation.action {
                 RecorderAction::Start => ControlOutcome::AlreadyStartingOrRecording,
                 RecorderAction::TogglePause => {
-                    let can_pause = matches!(lifecycle.lock().status.phase, SessionPhase::Recording | SessionPhase::Paused);
-                    if !can_pause {
+                    if !user_pause_available(lifecycle.lock().status.phase) {
                         ControlOutcome::PauseUnavailable
                     } else if reasons.contains(&PauseReason::User) || reasons.contains(&PauseReason::LowDisk) {
                         user_command(lifecycle, reasons, disk_resume, SessionCommand::Resume(PauseReason::User))?;
@@ -1669,7 +1886,7 @@ fn route_hotkeys(
                     }
                 }
                 RecorderAction::Stop => {
-                    lifecycle.stop.store(true, Ordering::Release);
+                    lifecycle.latch_stop();
                     ControlOutcome::StopRequested
                 }
             }
@@ -1701,8 +1918,9 @@ fn restrict_interval(interval: &mut SelectedInterval, before: SessionTimeUs) {
 }
 
 /// The label of a source-transition pause: its actual pause reason, and
-/// `elevation_transition` only when the transition latch alone paused.
-fn pause_blind_reason(reasons: &BTreeSet<PauseReason>) -> SourceBlindReason {
+/// `elevation_transition` only when the transition latch alone paused (S2).
+/// The input blind rows of the pause follow the same rule.
+pub(crate) fn pause_blind_reason(reasons: &BTreeSet<PauseReason>) -> SourceBlindReason {
     reasons.iter().copied().find(|reason| *reason != PauseReason::ElevationTransition)
         .map_or(SourceBlindReason::ElevationTransition, SourceBlindReason::Pause)
 }
@@ -1780,7 +1998,7 @@ fn select_source(facts: &mut Facts, epoch: AdmissionEpoch, selected: Option<Sele
 }
 
 fn start(lifecycle: &Lifecycle, frequency: QpcFrequency, selected: Option<SelectedSource>) -> Result<(), CaptureError> {
-    if lifecycle.stop.load(Ordering::Acquire) {
+    if lifecycle.stop_requested() {
         return Ok(());
     }
     let anchor = clock::utc_anchor().map_err(controller_error)?;
@@ -1790,7 +2008,7 @@ fn start(lifecycle: &Lifecycle, frequency: QpcFrequency, selected: Option<Select
     let tick_anchor = clock::message_tick_anchor().map_err(controller_error)?;
     open_frames(lifecycle, boundary)?;
     let mut facts = lifecycle.lock();
-    if lifecycle.stop.load(Ordering::Acquire) || lifecycle.session_end_started.get().is_some() {
+    if lifecycle.closing() {
         return Ok(());
     }
     facts.tick_anchor = Some(tick_anchor);
@@ -1919,7 +2137,7 @@ fn pause_command(
 
 fn resume(lifecycle: &Lifecycle, finished: AdmissionBoundary, selected: Option<SelectedSource>) -> Result<(), CaptureError> {
     let facts = lifecycle.lock();
-    if lifecycle.stop.load(Ordering::Acquire) || facts.status.phase != SessionPhase::Paused || facts.status.closed != Some(finished) {
+    if lifecycle.stop_requested() || facts.status.phase != SessionPhase::Paused || facts.status.closed != Some(finished) {
         return Ok(());
     }
     let origin = facts.status.clock
@@ -1935,7 +2153,7 @@ fn resume(lifecycle: &Lifecycle, finished: AdmissionBoundary, selected: Option<S
     drop(facts);
     open_frames(lifecycle, reopened)?;
     let mut facts = lifecycle.lock();
-    if lifecycle.stop.load(Ordering::Acquire) || facts.status.phase != SessionPhase::Paused || facts.status.closed != Some(finished) {
+    if lifecycle.stop_requested() || facts.status.phase != SessionPhase::Paused || facts.status.closed != Some(finished) {
         return Ok(());
     }
     if facts.pause_interval_reasons.contains(&PauseReason::ElevationTransition) {

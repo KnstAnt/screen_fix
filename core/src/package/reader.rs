@@ -15,7 +15,7 @@ use crate::protocol::{
 use super::{
     ArtifactKind, ArtifactRef,
     journal::{MAX_ROW_BYTES, Unavailable, health_kind, suppressed_us},
-    metadata::{PackageError, PackageOperation, PackageReader, PackageResult, PackageState,
+    metadata::{MissingVideoSlot, PackageError, PackageOperation, PackageReader, PackageResult, PackageState,
         SelectedSourceKind, SourceEvidence},
     outcome::{GapRecord, HealthKind, LossReason, UiaOutcome, UiaRead},
 };
@@ -27,7 +27,8 @@ const STREAMS: [StreamId; 4] = [StreamId::Context, StreamId::Input, StreamId::Fr
 #[derive(Deserialize)]
 struct Envelope {
     seq: u64,
-    recv_t_us: Option<SessionTimeUs>,
+    recv_t_us: SessionTimeUs,
+    /// Absent only on frames rows.
     kind: Option<String>,
 }
 
@@ -44,7 +45,7 @@ struct FrameRow {
     frame_id: Option<FrameId>,
     geometry_version: Option<GeometryEpoch>,
     geometry: Option<crate::capture::frame::MonitorGeometry>,
-    reason: Option<String>,
+    reason: Option<MissingVideoSlot>,
 }
 
 /// Row counts of one journal scan that the stream summary must reproduce.
@@ -209,18 +210,18 @@ impl PackageReader {
                 if line.last() != Some(&b'\n') { return Err(error()); }
                 let value: Value = serde_json::from_slice(&line).map_err(|_| error())?;
                 let envelope = Envelope::deserialize(&value).map_err(|_| error())?;
-                if envelope.seq != count.saturating_add(1)
-                    || envelope.recv_t_us.zip(receipt).is_some_and(|(next, previous)| next < previous)
-                {
+                if envelope.seq != count.saturating_add(1) || receipt.is_some_and(|previous| envelope.recv_t_us < previous) {
                     return Err(error());
                 }
                 if let Some(unavailable) = Unavailable::of(&value) {
                     unavailable.count(&mut tallies.unavailable, &mut tallies.uia);
                 }
                 match (stream, envelope.kind.as_deref()) {
+                    // The frames stream has no gap or health rows.
+                    (StreamId::Frames, Some(_)) if strict => return Err(error()),
                     (_, Some("gap")) => {
                         let gap = GapRecord::deserialize(&value).map_err(|_| error())?;
-                        if !envelope.recv_t_us.is_some_and(|admitted| gap.is_valid(admitted)) {
+                        if !gap.is_valid(envelope.recv_t_us) {
                             return Err(error());
                         }
                         gap_rows += 1;
@@ -235,7 +236,7 @@ impl PackageReader {
                     }
                     // A per-second `input_health` row carries counts, not a health condition.
                     (_, Some(kind)) if kind == health_kind(stream) && value.get("health").is_some() => {
-                        if envelope.recv_t_us.is_none() || HealthKind::deserialize(&value["health"]).is_err() {
+                        if HealthKind::deserialize(&value["health"]).is_err() {
                             return Err(error());
                         }
                         tallies.health += 1;
@@ -284,6 +285,7 @@ impl PackageReader {
                             return Err(error());
                         }
                     }
+                    (_, None) => return Err(error()),
                     (StreamId::Stills, Some("still" | "still_dropped")) => {
                         if let Some(event) = value.get("event_ref").filter(|value| !value.is_null()) {
                             let event = EventRef::deserialize(event).map_err(|_| error())?;
@@ -306,7 +308,7 @@ impl PackageReader {
                             if frame.monitor != geometry.monitor || !manifest.selected_displays.contains(&frame.monitor) {
                                 return Err(error());
                             }
-                            let size = self.validate_image(&format!("raw/{}", file.ok_or_else(error)?), true)?;
+                            let size = self.validate_image(&format!("raw/{}", file.ok_or_else(error)?), true, error)?;
                             if value["width"].as_u64() != Some(u64::from(size[0]))
                                 || value["height"].as_u64() != Some(u64::from(size[1]))
                             {
@@ -316,16 +318,16 @@ impl PackageReader {
                         // IMG-2: a seen image is named only when it differs from the row's image.
                         if let Some(seen) = value.get("seen_file") {
                             let seen = seen.as_str().filter(|seen| Some(*seen) != file).ok_or_else(error)?;
-                            self.validate_image(&format!("raw/{seen}"), true)?;
+                            self.validate_image(&format!("raw/{seen}"), true, error)?;
                         }
                     }
                     (StreamId::Context, Some("cursor_asset")) => {
                         let image = &value["image"];
                         match (value["available"].as_bool(), image["png"].as_str()) {
                             (Some(true), Some(png)) => {
-                                let size = self.validate_image(png, false)?;
+                                let size = self.validate_image(png, false, error)?;
                                 if let Some(mask) = image["xor_mask"].as_str() {
-                                    if self.validate_image(mask, false)? != size {
+                                    if self.validate_image(mask, false, error)? != size {
                                         return Err(error());
                                     }
                                 } else if !image["xor_mask"].is_null() {
@@ -336,7 +338,6 @@ impl PackageReader {
                             _ => return Err(error()),
                         }
                     }
-                    (StreamId::Frames, Some(_)) if strict => return Err(error()),
                     (_, Some("pause")) => tallies.pauses += 1,
                     (_, Some("blind")) => tallies.blind += 1,
                     (_, Some("suppressed_interval")) => {
@@ -347,7 +348,7 @@ impl PackageReader {
                 }
                 gates.row(stream, envelope.seq, envelope.recv_t_us, envelope.kind.as_deref(), &value)?;
                 count = envelope.seq;
-                receipt = envelope.recv_t_us.or(receipt);
+                receipt = Some(envelope.recv_t_us);
             }
             if count != summary.rows || receipt != summary.last_receipt
                 || dropped != summary.dropped || (manifest.profile.is_some() && gap_rows != summary.gap_rows)
@@ -365,10 +366,12 @@ impl PackageReader {
         Ok(())
     }
 
-    fn validate_image(&self, uri: &str, still: bool) -> PackageResult<[u32; 2]> {
-        let artifact = self.artifact_for_uri(uri).ok_or(PackageError::InvalidManifest)?;
+    /// Check one image a journal row names. A name that is not an inventoried
+    /// image of the expected kind is an error of the naming row (`row_error`).
+    fn validate_image(&self, uri: &str, still: bool, row_error: impl Fn() -> PackageError) -> PackageResult<[u32; 2]> {
+        let artifact = self.artifact_for_uri(uri).ok_or_else(&row_error)?;
         if !matches!((artifact.kind, still), (ArtifactKind::StillImage(_), true) | (ArtifactKind::CursorImage(_), false)) {
-            return Err(PackageError::InvalidArtifact(artifact.kind));
+            return Err(row_error());
         }
         let invalid = || PackageError::InvalidArtifact(artifact.kind);
         let mut file = self.open_artifact(&artifact)?;
@@ -436,7 +439,7 @@ impl Gates {
         self.pauses.iter().any(|(cutoff, resume)| at > *cutoff && resume.is_none_or(|resume| at < resume))
     }
 
-    fn row(&mut self, stream: StreamId, seq: u64, at: Option<SessionTimeUs>, kind: Option<&str>, value: &Value) -> PackageResult<()> {
+    fn row(&mut self, stream: StreamId, seq: u64, at: SessionTimeUs, kind: Option<&str>, value: &Value) -> PackageResult<()> {
         let violation = |gate, reason| Err(PackageError::GateViolation { gate, stream, row: seq, reason });
         let time = |field: &str| value[field].as_i64().map(SessionTimeUs);
         match kind {
@@ -449,11 +452,11 @@ impl Gates {
         match stream {
             StreamId::Context => match kind {
                 Some("pause") => {
-                    self.pauses.push((time("cutoff_t_us").or(at).unwrap_or(SessionTimeUs(0)), None));
+                    self.pauses.push((time("cutoff_t_us").unwrap_or(at), None));
                     self.paused = true;
                 }
                 Some("resume") => {
-                    if let Some(pause) = self.pauses.last_mut() { pause.1 = at; }
+                    if let Some(pause) = self.pauses.last_mut() { pause.1 = Some(at); }
                     self.paused = false;
                 }
                 Some(kind) if PAUSE_CONTEXT.contains(&kind) => {}
@@ -461,7 +464,7 @@ impl Gates {
                 _ if self.paused => return violation(4, "a context row other than a boundary or loss row while paused"),
                 _ => {}
             },
-            StreamId::Input if at.is_some_and(|at| self.paused_at(at)) && !kind.is_some_and(|kind| PAUSE_INPUT.contains(&kind)) =>
+            StreamId::Input if self.paused_at(at) && !kind.is_some_and(|kind| PAUSE_INPUT.contains(&kind)) =>
                 return violation(4, "an input row inside a pause interval"),
             StreamId::Frames if kind.is_none() && time("pts_us").is_some_and(|slot| self.paused_at(slot)) =>
                 return violation(4, "a frames row for a paused slot"),
@@ -469,22 +472,13 @@ impl Gates {
                 return violation(4, "a still triggered inside a pause interval"),
             _ => {}
         }
-        let (StreamId::Input, Some(at)) = (stream, at) else { return Ok(()) };
+        if stream != StreamId::Input { return Ok(()) }
         if kind.is_some_and(|kind| ACTIONS.contains(&kind)) && value["synthetic"] != true {
             let index = usize::try_from(seq / 64).unwrap_or(usize::MAX);
             if self.actions.len() <= index { self.actions.resize(index.saturating_add(1), 0); }
             self.actions[index] |= 1 << (seq % 64);
         }
-        // Gate 3: a press open at a pause boundary must be closed there by a synthetic release.
-        while let Some(&(cutoff, _)) = self.pauses.get(self.next_pause) && at > cutoff {
-            // The span ends before the cutoff: the pause itself must not excuse it.
-            let before = SessionTimeUs(cutoff.0.saturating_sub(1));
-            for (row, opened) in self.presses.values().filter(|(_, opened)| *opened < cutoff) {
-                self.findings.push((*row, *opened, before, "a press stays open across a pause boundary"));
-            }
-            self.presses.retain(|_, (_, opened)| *opened >= cutoff);
-            self.next_pause += 1;
-        }
+        self.pass_pauses(Some(at));
         let Some(kind @ ("key_down" | "key_up" | "pointer_down" | "pointer_up")) = kind else { return Ok(()) };
         let synthetic = value["synthetic"] == true;
         let key = kind.starts_with("key");
@@ -505,6 +499,21 @@ impl Gates {
         Ok(())
     }
 
+    /// Gate 3: a press open at a pause boundary must be closed there by a
+    /// synthetic release. Passes every pause cutoff before `at`, or every
+    /// remaining cutoff when `at` is `None`.
+    fn pass_pauses(&mut self, at: Option<SessionTimeUs>) {
+        while let Some(&(cutoff, _)) = self.pauses.get(self.next_pause) && at.is_none_or(|at| at > cutoff) {
+            // The span ends before the cutoff: the pause itself must not excuse it.
+            let before = SessionTimeUs(cutoff.0.saturating_sub(1));
+            for (row, opened) in self.presses.values().filter(|(_, opened)| *opened < cutoff) {
+                self.findings.push((*row, *opened, before, "a press stays open across a pause boundary"));
+            }
+            self.presses.retain(|_, (_, opened)| *opened >= cutoff);
+            self.next_pause += 1;
+        }
+    }
+
     fn finish(&mut self, stream: StreamId) -> PackageResult<()> {
         match stream {
             StreamId::Context => {
@@ -512,6 +521,8 @@ impl Gates {
                 self.excluded.extend(self.pauses.iter().map(|(cutoff, resume)| (*cutoff, resume.unwrap_or(end))));
             }
             StreamId::Input => {
+                // A press opened before a pause cutoff that no later row passed (a Stop while paused).
+                self.pass_pauses(None);
                 let open = std::mem::take(&mut self.presses);
                 let end = SessionTimeUs(i64::MAX);
                 self.findings.extend(open.into_values().map(|(row, opened)| (row, opened, end, "a press has no release")));

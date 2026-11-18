@@ -1,4 +1,5 @@
 use std::{
+    convert::Infallible,
     os::windows::io::{AsRawHandle, OwnedHandle},
     ptr::null_mut,
     sync::{
@@ -11,10 +12,11 @@ use std::{
 };
 
 use screen_fix_protocol::{
-    MessageTickMs, QpcTick, SourceSequence,
+    DeviceId, MessageTickMs, QpcTick, SourceSequence,
     ipc::{DeviceDescriptor, EnvironmentChange, EnvironmentState, HelperFailureStage, HelperToCore, Producer, ProducerProgress, Receipt},
 };
 use windows_sys::Win32::{
+    Foundation::HANDLE,
     System::Threading::{GetCurrentThreadId, SetEvent},
     UI::WindowsAndMessaging::{
         DispatchMessageW, GIDC_ARRIVAL, GIDC_REMOVAL, GetMessageW, GetSystemMetrics, KillTimer,
@@ -23,7 +25,11 @@ use windows_sys::Win32::{
     },
 };
 
-use super::{CaptureScope, NativeError, device, last_error, loss::{self, Losses}, raw::{RawRecord, RawWindow, qpc}};
+use super::{
+    CaptureScope, NativeError, device, last_error,
+    loss::{self, Losses, PendingStatus},
+    raw::{RawRecord, RawWindow, qpc},
+};
 
 /// The Raw Input thread's identity and the optional collections it registered.
 type RawReady = (u32, [bool; screen_fix_protocol::ipc::OptionalCollection::ALL.len()]);
@@ -49,13 +55,13 @@ pub(super) struct RawExit {
     pub(super) result: Result<(), NativeError>,
     pub(super) records: Receiver<HelperToCore>,
     pub(super) losses: Losses,
-    pub(super) environment: Option<EnvironmentState>,
+    pub(super) status: PendingStatus,
 }
 
 struct RawResult {
     result: Result<(), NativeError>,
     losses: Losses,
-    environment: Option<EnvironmentState>,
+    status: PendingStatus,
 }
 
 impl RawOwner {
@@ -66,13 +72,13 @@ impl RawOwner {
         let pending = Arc::new(AtomicU32::new(0));
         let thread_pending = Arc::clone(&pending);
         let owner = thread::Builder::new().name("input-raw".into()).spawn(move || {
-            let mut output = Evidence { ingress, data_wake, losses: Losses::default(), environment: None, notices: Vec::new() };
+            let mut output = Evidence { ingress, data_wake, losses: Losses::default(), status: PendingStatus::default() };
             let result = raw_loop(&mut output, &thread_pending, &ready, frequency / 80, pen_hid, scope.as_deref());
             if let Err(error) = result {
                 let _ = ready.try_send(Err(error));
-                output.signal();
+                signal(&output.data_wake);
             }
-            RawResult { result, losses: output.losses, environment: output.environment }
+            RawResult { result, losses: output.losses, status: output.status }
         }).map_err(|error| NativeError {
             stage: HelperFailureStage::Startup,
             code: error.raw_os_error(),
@@ -114,9 +120,9 @@ impl RawOwner {
                 return Err(error);
             }
         }
-        let RawResult { result, losses, environment } = self.owner.join()
+        let RawResult { result, losses, status } = self.owner.join()
             .map_err(|_| NativeError::without_code(HelperFailureStage::MessageLoop))?;
-        Ok(RawExit { result, losses, records: self.records, environment })
+        Ok(RawExit { result, losses, records: self.records, status })
     }
 
     fn post(&self, message: u32) -> Result<(), NativeError> {
@@ -131,21 +137,16 @@ struct Evidence {
     ingress: SyncSender<HelperToCore>,
     data_wake: OwnedHandle,
     losses: Losses,
-    environment: Option<EnvironmentState>,
-    /// Registration notices waiting for queue room; at most one per collection.
-    notices: Vec<HelperToCore>,
+    /// Status records waiting for queue room.
+    status: PendingStatus,
 }
 
 impl Evidence {
-    fn flush_notices(&mut self) {
-        while let Some(notice) = self.notices.first() {
-            if self.ingress.try_send(notice.clone()).is_err() { return; }
-            self.notices.remove(0);
-            self.signal();
-        }
-    }
-
     fn offer(&mut self, record: HelperToCore) {
+        let record = match self.status.defer(record) {
+            Ok(()) => return self.flush_status(),
+            Err(record) => record,
+        };
         if let Some(producer) = loss::producer(&record)
             && !self.flush_loss(producer)
         {
@@ -155,37 +156,46 @@ impl Evidence {
         if let Err(mpsc::TrySendError::Full(record)) = self.ingress.try_send(record) {
             self.losses.drop_record(&record);
         } else {
-            self.signal();
+            signal(&self.data_wake);
         }
     }
 
     fn flush_loss(&mut self, producer: Producer) -> bool {
-        while let Some(gap) = self.losses.front(producer) {
-            if self.ingress.try_send(HelperToCore::Gap(gap)).is_err() { return false; }
-            self.losses.delivered(producer);
-            self.signal();
-        }
-        true
+        let Self { ingress, data_wake, losses, .. } = self;
+        let Ok(flushed) = losses.flush(producer, |gap| {
+            Ok::<_, Infallible>(deliver(ingress, data_wake, HelperToCore::Gap(gap)))
+        });
+        flushed
     }
 
-    fn environment(&mut self, changes: u32) -> Result<(), NativeError> {
-        let value = EnvironmentState {
-            changes: changes | self.environment.map_or(0, |old| old.changes),
-            observed_qpc: qpc()?,
-            swapped_buttons: unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0,
-        };
-        if self.ingress.try_send(HelperToCore::Environment(value)).is_ok() {
-            self.environment = None;
-            self.signal();
-        } else {
-            self.environment = Some(value);
-        }
-        Ok(())
+    fn flush_status(&mut self) {
+        let Self { ingress, data_wake, status, .. } = self;
+        let Ok(_) = status.flush(|record| Ok::<_, Infallible>(deliver(ingress, data_wake, record)));
     }
+}
 
-    fn signal(&self) {
-        unsafe { SetEvent(self.data_wake.as_raw_handle()) };
-    }
+/// Queue a record and wake the collector. `false` when the queue refused it.
+fn deliver(ingress: &SyncSender<HelperToCore>, data_wake: &OwnedHandle, record: HelperToCore) -> bool {
+    let sent = ingress.try_send(record).is_ok();
+    if sent { signal(data_wake); }
+    sent
+}
+
+fn signal(data_wake: &OwnedHandle) {
+    unsafe { SetEvent(data_wake.as_raw_handle()) };
+}
+
+/// An environment record also attests a passed registration check (E4): the
+/// check runs now, whatever the last check, and the record carries its QPC.
+/// A record that waits for queue room keeps that QPC.
+fn report_environment(raw: &mut RawWindow, output: &mut Evidence, changes: u32) -> Result<(), NativeError> {
+    let observed_qpc = raw.verify_now()?;
+    output.offer(HelperToCore::Environment(EnvironmentState {
+        changes,
+        observed_qpc,
+        swapped_buttons: unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0,
+    }));
+    Ok(())
 }
 
 /// Device descriptor IO (`CreateFileW`, `HidD_*`, `SetupDi*`) runs on this
@@ -219,11 +229,17 @@ impl DeviceWorker {
 
     /// Announce an arrived device and queue its identification; without a session ID it is dropped.
     fn announce(&self, output: &mut Evidence, devices: &mut device::DeviceIds, sequence: &mut u64, receipt: Receipt,
-        mut descriptor: DeviceDescriptor, path: Option<Vec<u16>>) -> Result<(), NativeError> {
+        descriptor: DeviceDescriptor, path: Option<Vec<u16>>) -> Result<(), NativeError> {
         let Some(id) = devices.assign(descriptor.id) else {
             output.losses.drop_record(&HelperToCore::DeviceArrived { receipt, descriptor });
             return Ok(());
         };
+        self.announce_as(output, sequence, receipt, id, descriptor, path)
+    }
+
+    /// Announce a device under its session ID and queue its identification.
+    fn announce_as(&self, output: &mut Evidence, sequence: &mut u64, receipt: Receipt, id: DeviceId,
+        mut descriptor: DeviceDescriptor, path: Option<Vec<u16>>) -> Result<(), NativeError> {
         descriptor.id = id;
         output.offer(HelperToCore::DeviceArrived { receipt, descriptor: descriptor.clone() });
         self.request(output, sequence, descriptor, path)
@@ -285,7 +301,7 @@ fn raw_loop(
             -1 => return Err(last_error(HelperFailureStage::MessageLoop)),
             0 if pending.load(Acquire) & STOP != 0 => {
                 let changes = pending.fetch_and(STOP, AcqRel) & EnvironmentChange::ALL_BITS;
-                if changes != 0 { output.environment(changes)?; }
+                if changes != 0 { report_environment(&mut raw, output, changes)?; }
                 return Ok(());
             }
             0 => return Err(NativeError::without_code(HelperFailureStage::MessageLoop)),
@@ -302,7 +318,7 @@ fn raw_loop(
                 ) };
             }
             let changes = changes & EnvironmentChange::ALL_BITS;
-            if changes != 0 { output.environment(changes)?; }
+            if changes != 0 { report_environment(&mut raw, output, changes)?; }
             return Ok(());
         }
         let serial = scope.map_or(0, |scope| (scope.serial)());
@@ -315,8 +331,7 @@ fn raw_loop(
             raw.reset_devices();
             // The old scope's pending gaps keep their sequence and QPC ranges (E3).
             for producer in RAW_THREAD { output.flush_loss(producer); }
-            output.losses = Losses::default();
-            output.environment = None;
+            output.status.discard_environment();
             observe_inventory(&mut raw, &worker, &mut devices, &mut device_sequence, output, device::inventory()?)?;
             inventory_serial = Some(serial);
         }
@@ -336,7 +351,6 @@ fn raw_loop(
                         return Err(error);
                     }
                 };
-                let mut lazily_seen = Vec::new();
                 raw.read(&message, qpc, true, |record| batch.push(record), || pending.load(Acquire) & STOP != 0)?;
                 // The governed scope is checked once per drained batch: before
                 // the read (`active`) and after it (E3).
@@ -353,39 +367,17 @@ fn raw_loop(
                         Some(first_seen) => {
                             // A device without a prior arrival is announced
                             // before its first record, so the core inventory resolves it.
-                            if let Some(native) = first_seen
-                                && let Some(id) = devices.assign(native)
-                            {
-                                let handle = native.0 as usize as windows_sys::Win32::Foundation::HANDLE;
-                                match (device::descriptor(handle, None),
-                                    device_receipt_at(&mut device_sequence, input.receipt.message_tick_ms, input.receipt.qpc))
-                                {
-                                    (Some((mut descriptor, _)), Ok(receipt)) => {
-                                        descriptor.id = id;
-                                        output.offer(HelperToCore::DeviceArrived { receipt, descriptor });
-                                    }
-                                    (None, Ok(receipt)) => output.losses.malformed(Producer::DeviceNotifications, receipt),
-                                    (_, Err(_)) => {}
-                                }
-                                lazily_seen.push((handle, id));
+                            if let Some((native, id)) = first_seen {
+                                announce_first_seen(&mut raw, &worker, output, &mut device_sequence, native, id, input.receipt)?;
                             }
                             output.offer(HelperToCore::Input(input));
                         }
                         None => output.losses.drop_record(&HelperToCore::Input(input)),
                     }
                 }
-                // HID report parsing for the lazily seen devices starts with
-                // their next packet; their identification is queued.
-                for (handle, id) in lazily_seen {
-                    if let Some((mut descriptor, path)) = device::descriptor(handle, None) {
-                        raw.observe_device(handle, &mut descriptor);
-                        descriptor.id = id;
-                        worker.request(output, &mut device_sequence, descriptor, path)?;
-                    }
-                }
             }
             WM_INPUT_DEVICE_CHANGE if message.hwnd == raw.handle() && active => {
-                let handle = message.lParam as windows_sys::Win32::Foundation::HANDLE;
+                let handle = message.lParam as HANDLE;
                 if message.wParam == GIDC_ARRIVAL as usize {
                     let received = observed?;
                     if let Some((mut descriptor, path)) = device::descriptor(handle, None) {
@@ -406,12 +398,11 @@ fn raw_loop(
                 raw.check_registration()?;
                 if let Ok(observed_qpc) = observed {
                     for collection in raw.take_lost_optional() {
-                        output.notices.push(HelperToCore::OptionalUnavailable { collection, observed_qpc });
+                        output.offer(HelperToCore::OptionalUnavailable { collection, observed_qpc });
                     }
                 }
-                output.flush_notices();
+                output.flush_status();
                 for producer in RAW_THREAD { output.flush_loss(producer); }
-                if output.environment.is_some() { output.environment(0)?; }
             }
             WM_TIMER if message.hwnd == raw.handle() && message.wParam == PROGRESS_TIMER => {}
             WAKE if message.hwnd.is_null() => {}
@@ -419,10 +410,8 @@ fn raw_loop(
         }
         let changes = changes & EnvironmentChange::ALL_BITS;
         if changes != 0 {
-            // An environment record also attests a passed registration check;
-            // the Recorder requests one before returning to this source (E4).
-            raw.check_registration()?;
-            output.environment(changes)?;
+            // The Recorder requests a registration check before it returns to this source (E4).
+            report_environment(&mut raw, output, changes)?;
         }
         if inventory_serial == Some(serial) && allowed() {
             worker.deliver(output, &devices, &mut device_sequence)?;
@@ -440,7 +429,7 @@ fn observe_inventory(
     raw: &mut RawWindow, worker: &DeviceWorker, devices: &mut device::DeviceIds, device_sequence: &mut u64,
     output: &mut Evidence, inventory: Vec<windows_sys::Win32::UI::Input::RAWINPUTDEVICELIST>,
 ) -> Result<(), NativeError> {
-    output.environment(EnvironmentChange::Settings.bit() | EnvironmentChange::Display.bit())?;
+    report_environment(raw, output, EnvironmentChange::Settings.bit() | EnvironmentChange::Display.bit())?;
     for entry in inventory {
         let received = qpc()?;
         if let Some((mut descriptor, path)) = device::descriptor(entry.hDevice, Some(entry.dwType)) {
@@ -450,6 +439,22 @@ fn observe_inventory(
         }
     }
     Ok(())
+}
+
+/// Announce a device seen first in an input record, with its Raw Input facts
+/// and HID evidence, and queue its identification.
+fn announce_first_seen(
+    raw: &mut RawWindow, worker: &DeviceWorker, output: &mut Evidence, device_sequence: &mut u64,
+    native: DeviceId, id: DeviceId, input: Receipt,
+) -> Result<(), NativeError> {
+    let handle = native.0 as usize as HANDLE;
+    let receipt = device_receipt_at(device_sequence, input.message_tick_ms, input.qpc)?;
+    let Some((mut descriptor, path)) = device::descriptor(handle, None) else {
+        output.losses.malformed(Producer::DeviceNotifications, receipt);
+        return Ok(());
+    };
+    raw.observe_device(handle, &mut descriptor);
+    worker.announce_as(output, device_sequence, receipt, id, descriptor, path)
 }
 
 fn device_receipt_at(

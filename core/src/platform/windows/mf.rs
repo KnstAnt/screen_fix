@@ -9,7 +9,7 @@ use windows::{
     core::{GUID, HRESULT, Interface, PCSTR, PCWSTR, w},
 };
 
-use super::{ProbeError, stage, unavailable};
+use super::{ProbeError, ProbeKind, stage, unavailable};
 
 const MEDIA_FEATURES: &str = "Media Foundation is unavailable. Install the Media Feature Pack in Windows Optional features (ms-settings:optionalfeatures), then reopen Screen Fix";
 
@@ -47,14 +47,15 @@ struct Functions {
 struct LoadError {
     operation: &'static str,
     code: HRESULT,
+    kind: ProbeKind,
 }
 
 impl Functions {
     fn load() -> Result<Self, LoadError> {
         // The successful system module loads stay referenced until process exit.
         // MF objects and allocator callbacks may outlive an individual caller.
-        let platform = load_system(w!("mfplat.dll"), MEDIA_FEATURES)?;
-        let read_write = load_system(w!("mfreadwrite.dll"), MEDIA_FEATURES)?;
+        let platform = load_system(w!("mfplat.dll"))?;
+        let read_write = load_system(w!("mfreadwrite.dll"))?;
         macro_rules! optional {
             ($module:expr, $symbol:ident, $ty:ty) => {{
                 let name = concat!(stringify!($symbol), "\0");
@@ -85,13 +86,14 @@ impl Functions {
     }
 }
 
-fn load_system(name: PCWSTR, operation: &'static str) -> Result<HMODULE, LoadError> {
+/// A Media Foundation system module; a load failure means the Media Feature Pack is missing.
+fn load_system(name: PCWSTR) -> Result<HMODULE, LoadError> {
     unsafe { LoadLibraryExW(name, None, LOAD_LIBRARY_SEARCH_SYSTEM32) }
-        .map_err(|error| LoadError { operation, code: error.code() })
+        .map_err(|error| LoadError { operation: MEDIA_FEATURES, code: error.code(), kind: ProbeKind::MediaFoundationMissing })
 }
 
 fn load_error(operation: &'static str) -> LoadError {
-    LoadError { operation, code: windows::core::Error::from_thread().code() }
+    LoadError { operation, code: windows::core::Error::from_thread().code(), kind: ProbeKind::Other }
 }
 
 fn functions() -> Result<&'static Functions, ProbeError> {
@@ -99,6 +101,7 @@ fn functions() -> Result<&'static Functions, ProbeError> {
     FUNCTIONS.get_or_init(Functions::load).as_ref()
         .map_err(|error| ProbeError {
             stage: error.operation,
+            kind: error.kind,
             source: Some(error.code.into()),
             journal: None,
             raw_input_registration: None,

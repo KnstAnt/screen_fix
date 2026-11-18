@@ -2,7 +2,7 @@
 //! reservations and progress on the same local timeline; job results fill slots.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
@@ -17,10 +17,11 @@ use crate::{
     capture::frame::FrameCoverage,
     package::{
         diagnostics::{Failure, FailureComponent},
-        journal::{HealthRecord, JournalIngress},
+        journal::{HealthRecord, JournalIngress, Submit},
         outcome::{HealthKind, LossEvidence, LossReason},
     },
-    protocol::SessionTimeUs,
+    protocol::{QpcFrequency, QpcTick, SessionTimeUs},
+    session::windows::{AwakeElapsed, SuspendMarks},
 };
 
 use super::{ProbeError, package_journal_error, unavailable};
@@ -249,8 +250,22 @@ impl Rows {
 struct Lane {
     progress: Arc<Progress>,
     before: SessionTimeUs,
-    changed: Instant,
+    /// The QPC time and suspend sequence at which `before` last changed.
+    changed: Option<(QpcTick, u64)>,
     excluded: bool,
+}
+
+/// QPC time for the lane-stall watch, which excludes sleep (S0).
+pub(super) struct Awake {
+    pub now: QpcTick,
+    pub marks: SuspendMarks,
+    pub frequency: QpcFrequency,
+}
+
+impl Awake {
+    fn mark(&self) -> (QpcTick, u64) {
+        (self.now, self.marks.sequence)
+    }
 }
 
 pub(super) struct Merge {
@@ -261,6 +276,8 @@ pub(super) struct Merge {
     ordinal: u64,
     last: SessionTimeUs,
     certified_before: SessionTimeUs,
+    /// Every image `file` and `seen_file` of a row queued to the journal.
+    referenced: HashSet<String>,
 }
 
 impl Merge {
@@ -272,9 +289,12 @@ impl Merge {
         for _ in 0..count {
             let progress = Arc::new(Progress::default());
             rows.push(Rows(Arc::new(Producer { progress: Arc::clone(&progress), send: send.clone(), budget: Arc::clone(&budget) })));
-            lanes.push(Lane { progress, before: SessionTimeUs(0), changed: Instant::now(), excluded: false });
+            lanes.push(Lane { progress, before: SessionTimeUs(0), changed: None, excluded: false });
         }
-        (rows, Self { receive, lanes, budget, ordered: BTreeMap::new(), ordinal: 0, last: SessionTimeUs(0), certified_before: SessionTimeUs(0) })
+        (rows, Self {
+            receive, lanes, budget, ordered: BTreeMap::new(), ordinal: 0, last: SessionTimeUs(0),
+            certified_before: SessionTimeUs(0), referenced: HashSet::new(),
+        })
     }
 
     pub fn finish(&mut self, journal: &mut JournalIngress) -> Result<(), ProbeError> {
@@ -283,45 +303,35 @@ impl Merge {
         }
         // A closed lane no longer holds a cutoff-equal receipt. A disconnected
         // reservation resolves to its approved fallback or is silently retired.
-        self.publish_prefix(journal, Instant::now(), true)?;
+        self.publish_prefix(journal, Instant::now(), None)?;
         if !self.ordered.is_empty() {
             return Err(unavailable("The closed still journal prefix did not drain"));
         }
         Ok(())
     }
 
-    pub fn publish(&mut self, journal: &mut JournalIngress, now: Instant) -> Result<(), ProbeError> {
-        self.publish_prefix(journal, now, false)
+    pub fn publish(&mut self, journal: &mut JournalIngress, now: Instant, awake: &Awake) -> Result<(), ProbeError> {
+        self.publish_prefix(journal, now, Some(awake))
     }
 
     pub fn latest_receipt(&self) -> SessionTimeUs { self.last }
+
+    /// Whether a row queued to the journal names this image (`file` relative to `raw/`).
+    pub fn references(&self, file: &str) -> bool {
+        self.referenced.contains(file)
+    }
 
     pub fn includes(&self, cutoff: SessionTimeUs) -> bool {
         self.certified_before > cutoff && self.ordered.first_key_value().is_none_or(|(key, _)| key.0 > cutoff)
     }
 
-    fn publish_prefix(&mut self, journal: &mut JournalIngress, now: Instant, finishing: bool)
+    /// Publish the certified prefix. Without `awake` the merge is finishing:
+    /// every lane is closed, and every slot resolves now.
+    fn publish_prefix(&mut self, journal: &mut JournalIngress, now: Instant, awake: Option<&Awake>)
         -> Result<(), ProbeError>
     {
-        // An Acquire snapshot taken before draining the shared reservation
-        // channel includes the producer's sends preceding each Release marker.
-        let mut before = SessionTimeUs(i64::MAX);
-        let mut stalled = 0;
-        for lane in &mut self.lanes {
-            if lane.excluded || lane.progress.closed.load(Ordering::Acquire) { continue; }
-            let stamp = SessionTimeUs(lane.progress.before.load(Ordering::Acquire));
-            if stamp != lane.before || self.ordered.is_empty() {
-                lane.before = stamp;
-                lane.changed = now;
-            }
-            if now.saturating_duration_since(lane.changed) >= WAIT {
-                lane.excluded = true;
-                lane.progress.excluded.store(true, Ordering::Release);
-                stalled += 1;
-                continue;
-            }
-            before = before.min(stamp);
-        }
+        let finishing = awake.is_none();
+        let (before, stalled) = self.watch_lanes(awake);
         self.certified_before = before;
         while let Ok(slot) = self.receive.try_recv() {
             self.ordinal = self.ordinal.wrapping_add(1);
@@ -359,8 +369,8 @@ impl Merge {
             if slot.owed != 0 && failed.is_none() { break; }
             let slot = entry.remove();
             // A slot whose halves did not all finish is its approved fallback.
-            // A half that already saved its PNG leaves that file unreferenced
-            // and uncounted, so `unreferenced_images` is a lower bound.
+            // An image that a finished half saved is then named by no row; the
+            // PNG worker counts it from `references`.
             let row = match failed {
                 None => slot.row(),
                 Some(error) => {
@@ -381,7 +391,10 @@ impl Merge {
                 if key.0 < self.last {
                     self.budget.omit(key.0, LossReason::LateRow);
                 } else {
-                    journal.try_submit(key.0, row).map_err(package_journal_error)?;
+                    let files = images(&row);
+                    if journal.try_submit(key.0, row).map_err(package_journal_error)? == Submit::Queued {
+                        self.referenced.extend(files);
+                    }
                     self.last = key.0;
                 }
             }
@@ -396,4 +409,42 @@ impl Merge {
         journal.offer_gap(self.last).map_err(package_journal_error)?;
         Ok(())
     }
+
+    /// The certified receipt bound over the open lanes, and the number of
+    /// lanes newly excluded because their progress stalled for `WAIT` of
+    /// awake time. A sleep does not count; an interval that cannot be
+    /// measured restarts the watch.
+    fn watch_lanes(&mut self, awake: Option<&Awake>) -> (SessionTimeUs, u64) {
+        // An Acquire snapshot taken before draining the shared reservation
+        // channel includes the producer's sends preceding each Release marker.
+        let mut before = SessionTimeUs(i64::MAX);
+        let mut stalled = 0;
+        let idle = self.ordered.is_empty();
+        for lane in &mut self.lanes {
+            if lane.excluded || lane.progress.closed.load(Ordering::Acquire) { continue; }
+            let stamp = SessionTimeUs(lane.progress.before.load(Ordering::Acquire));
+            if stamp != lane.before || idle || lane.changed.is_none() {
+                lane.before = stamp;
+                lane.changed = awake.map(Awake::mark);
+            } else if let (Some(awake), Some((since, sequence))) = (awake, lane.changed) {
+                match awake.marks.awake_elapsed(since, awake.now, sequence, awake.frequency) {
+                    AwakeElapsed::Known(elapsed) if elapsed >= WAIT => {
+                        lane.excluded = true;
+                        lane.progress.excluded.store(true, Ordering::Release);
+                        stalled += 1;
+                        continue;
+                    }
+                    AwakeElapsed::Known(_) => {}
+                    AwakeElapsed::Unknown => lane.changed = Some(awake.mark()),
+                }
+            }
+            before = before.min(stamp);
+        }
+        (before, stalled)
+    }
+}
+
+/// The image files a still row names, relative to `raw/`.
+fn images(row: &Value) -> Vec<String> {
+    ["file", "seen_file"].into_iter().filter_map(|field| row[field].as_str().map(str::to_owned)).collect()
 }

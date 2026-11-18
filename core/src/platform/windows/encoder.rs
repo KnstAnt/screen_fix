@@ -12,11 +12,30 @@ use windows::{
 
 use crate::package::metadata::RejectedEncoder;
 
-use super::{ProbeError, capture_device, encode, gpu, h264, mf, pixels, stage, unavailable};
+use super::{ProbeError, ProbeKind, capture_device, encode, gpu, h264, mf, monitor, pixels, stage, unavailable};
 
 const MICROSOFT_H264_ENCODER: core::GUID = core::GUID::from_u128(0x6ca50344_051a_4ded_9779_a43305165e35);
 const SELF_CHECK_PICTURES: u32 = 30;
 const SOFTWARE_FPS: u32 = 15;
+/// The poll interval while a self-check picture converts.
+const PROBE_POLL: Duration = Duration::from_millis(1);
+/// The self-check found a B-frame: no smaller shape of this encoder qualifies.
+const B_FRAME_FOUND: &str = "The startup encoder probe found a B-frame";
+/// An admission change superseded the format request while a self-check
+/// picture was awaited: the selection stops without rejecting the candidate.
+const PROBE_INTERRUPTED: &str = "The encoder self-check was interrupted by an admission change";
+
+/// The error that ends a selection because its format request was superseded.
+pub(super) fn interruption() -> ProbeError {
+    unavailable(PROBE_INTERRUPTED).with_kind(ProbeKind::ProbeInterrupted)
+}
+
+/// No encoder qualified, or the selection was interrupted. `rejected` holds
+/// every hardware candidate rejected before (V4).
+pub(super) struct SelectError {
+    pub last: ProbeError,
+    pub rejected: Vec<RejectedEncoder>,
+}
 
 pub(super) struct Encoder {
     pub transform: IMFTransform,
@@ -74,18 +93,17 @@ pub(super) fn min_effective_fps(requested_fps: u32) -> u32 {
 
 /// Qualify an encoder for a display format: each hardware candidate in turn,
 /// then the software encoder at its fixed rate. `probe` supplies the
-/// converted self-check picture of a candidate format.
+/// converted self-check picture of a candidate format. An interrupted
+/// self-check ends the selection at once.
 pub(super) fn select(
     adapter: &IDXGIAdapter1, luid: LUID, source: [u32; 2], requested_fps: u32,
     probe: &mut dyn FnMut(gpu::VideoFormat, bool) -> Result<encode::Input, ProbeError>,
-) -> Result<Encoder, ProbeError> {
-    let attributes = mf::attributes(1)?;
-    // Serialize the two 32-bit fields of the Windows LUID in ABI order.
-    let mut luid_bytes = [0; 8];
-    luid_bytes[..4].copy_from_slice(&luid.LowPart.to_le_bytes());
-    luid_bytes[4..].copy_from_slice(&luid.HighPart.to_le_bytes());
-    stage(unsafe { attributes.SetBlob(&MFT_ENUM_ADAPTER_LUID, &luid_bytes) },
-        "Restrict encoder discovery to the display adapter")?;
+) -> Result<Encoder, SelectError> {
+    let filter = discovery_filter(luid).map_err(|last| SelectError { last, rejected: Vec::new() })?;
+    let mut rejected = Vec::new();
+    let reject = |name: Option<String>, error: ProbeError| RejectedEncoder {
+        name, cause: Cow::Borrowed(error.stage), native_code: error.source.as_ref().map(|source| source.code().0),
+    };
     let input = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_NV12,
@@ -94,12 +112,8 @@ pub(super) fn select(
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_H264,
     };
-    let mut rejected = Vec::new();
-    let reject = |name: Option<String>, error: ProbeError| RejectedEncoder {
-        name, cause: Cow::Borrowed(error.stage), native_code: error.source.as_ref().map(|source| source.code().0),
-    };
     let candidates = mf::enum_on_adapter(MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-        &input, &output, &attributes).unwrap_or_else(|error| {
+        &input, &output, &filter).unwrap_or_else(|error| {
             rejected.push(reject(None, error));
             Vec::new()
         });
@@ -114,15 +128,32 @@ pub(super) fn select(
                         encoder.rejected = rejected;
                         return Ok(encoder);
                     }
+                    Err(error) if error.kind() == ProbeKind::ProbeInterrupted => return Err(SelectError { last: error, rejected }),
                     Err(error) => rejected.push(reject(friendly_name(candidate), error)),
                 }
             },
             Err(error) => rejected.push(reject(None, error)),
         }
     }
-    let mut encoder = qualify(source, SOFTWARE_FPS, None, probe)?;
-    encoder.rejected = rejected;
-    Ok(encoder)
+    match qualify(source, SOFTWARE_FPS, None, probe) {
+        Ok(mut encoder) => {
+            encoder.rejected = rejected;
+            Ok(encoder)
+        }
+        Err(last) => Err(SelectError { last, rejected }),
+    }
+}
+
+/// Encoder discovery attributes restricted to the display adapter.
+fn discovery_filter(luid: LUID) -> Result<IMFAttributes, ProbeError> {
+    let attributes = mf::attributes(1)?;
+    // Serialize the two 32-bit fields of the Windows LUID in ABI order.
+    let mut luid_bytes = [0; 8];
+    luid_bytes[..4].copy_from_slice(&luid.LowPart.to_le_bytes());
+    luid_bytes[4..].copy_from_slice(&luid.HighPart.to_le_bytes());
+    stage(unsafe { attributes.SetBlob(&MFT_ENUM_ADAPTER_LUID, &luid_bytes) },
+        "Restrict encoder discovery to the display adapter")?;
+    Ok(attributes)
 }
 
 fn friendly_name(candidate: &IMFActivate) -> Option<String> {
@@ -156,7 +187,7 @@ fn qualify(
                         low = candidate + 2;
                     }
                     Err(error) => {
-                        if error.stage == "The startup encoder probe found a B-frame" {
+                        if matches!(error.kind(), ProbeKind::BFrameFound | ProbeKind::ProbeInterrupted) {
                             return Err(error);
                         }
                         last_error = error;
@@ -207,8 +238,8 @@ fn configure(
 
     encode::set_properties(&encoder.transform, format.fps, format.bitrate())?;
     let output = video_type(&MFVideoFormat_H264, format)?;
-    stage(unsafe { output.SetUINT32(&MF_MT_AVG_BITRATE, format.bitrate() * 3 / 4) }, "Set the H.264 mean bitrate")?;
-    stage(unsafe { output.SetUINT32(&MF_MT_MPEG2_PROFILE, 100) }, "Set the H.264 High profile")?;
+    stage(unsafe { output.SetUINT32(&MF_MT_AVG_BITRATE, format.mean_bitrate()) }, "Set the H.264 mean bitrate")?;
+    stage(unsafe { output.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32) }, "Set the H.264 High profile")?;
     stage(unsafe { encoder.transform.SetOutputType(0, &output, 0) }, "Negotiate H.264 output")?;
     let input = video_type(&MFVideoFormat_NV12, format)?;
     stage(unsafe { encoder.transform.SetInputType(0, &input, 0) }, "Negotiate NV12 input")?;
@@ -234,10 +265,10 @@ pub(super) fn probe_input(device: &ID3D11Device, format: gpu::VideoFormat, softw
         if converter.ready(&pending)? && let Some(input) = converter.input(&pending)? {
             break input;
         }
-        if started.elapsed() >= Duration::from_secs(3) {
+        if started.elapsed() >= monitor::CONVERSION_DEADLINE {
             return Err(unavailable("The startup encoder probe conversion timed out"));
         }
-        thread::sleep(Duration::from_millis(1));
+        thread::sleep(PROBE_POLL);
     };
     Ok(input)
 }
@@ -283,7 +314,7 @@ fn self_check(encoder: &Encoder, input: encode::Input) -> Result<(), ProbeError>
         }
         let picture = probe.headers.inspect(sample)?;
         if picture.b_slice {
-            return Err(unavailable("The startup encoder probe found a B-frame"));
+            return Err(unavailable(B_FRAME_FOUND).with_kind(ProbeKind::BFrameFound));
         }
         if index == 0 || index == SELF_CHECK_PICTURES / 2 {
             probe.headers.segment_header(&picture)?;

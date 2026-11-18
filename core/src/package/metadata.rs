@@ -320,12 +320,9 @@ pub struct PngCounters {
     pub failed_jobs: u64,
     pub queue_wait_max_us: u64,
     pub processing_max_us: u64,
-    /// A lower bound on image files that no row references: images published
-    /// after their still slot was resolved without them at the drain
-    /// deadline. The files are kept. Not counted: the half of a paired still
-    /// slot that saved its PNG in time when the slot publishes its fallback
-    /// row because the other half did not finish; that file also stays in
-    /// `images` without a referencing row.
+    /// Image files in `images` that no journaled still row names in `file`
+    /// or `seen_file`, plus revoked images whose removal failed. The files
+    /// are kept.
     #[serde(default)]
     pub unreferenced_images: u64,
 }

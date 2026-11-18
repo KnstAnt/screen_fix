@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     capture::{frame::FrameMetadata, input::WheelAxis, observation::{ProvisionalInputKind, ProvisionalInputObservation}, save::{SaveKind, SaveObservation}},
-    config::ResolvedCaptureConfig,
+    config::{DeviceCalibration, ResolvedCaptureConfig},
     package::{metadata::MonitorCapture, outcome::LossReason},
     protocol::{AdmissionEpoch, DeviceId, EventRef, Evidence, FrameId, GeometryId, SessionTimeUs, ipc::{ForegroundAtReceipt, elevated::VisitBinding}},
 };
@@ -24,6 +24,8 @@ use super::{
 
 const PRIVATE_SLOTS: usize = 128;
 const CHANNEL: usize = 64;
+/// Confirmed saves queued for this owner; one step drains at most this many.
+const SAVE_QUEUE: usize = 8;
 const PRIVATE_US: i64 = 2_000_000;
 const PUBLIC_SLOTS: usize = 128;
 const NEXT_US: i64 = 1_000_000;
@@ -92,18 +94,13 @@ impl EarlyRows {
         admission: AdmissionEpoch, at: SessionTimeUs, missing: &'static str,
     ) {
         let roles = match kind {
-            ProvisionalInputKind::PreMotion => [("pre_motion", "before"); 2],
-            ProvisionalInputKind::PreAction | ProvisionalInputKind::Scroll { .. } => [("pre_action", "before"); 2],
-            ProvisionalInputKind::Next => [("next", "image"), ("settled", "image")],
+            ProvisionalInputKind::PreMotion => [(Trigger::PreMotion, Role::Before); 2],
+            ProvisionalInputKind::PreAction | ProvisionalInputKind::Scroll { .. } => [(Trigger::PreAction, Role::Before); 2],
+            ProvisionalInputKind::Next => [(Trigger::Next, Role::Image), (Trigger::Settled, Role::Image)],
         };
-        let observed = match geometry { Evidence::Observed(geometry) => Some(geometry), _ => None };
         // Both halves of a paired row share its reservation and fallback.
         for (index, (trigger, role)) in roles.into_iter().enumerate().take(if self.paired { 1 } else { 2 }) {
-            let fallback = serde_json::json!({ "kind": "still_dropped",
-                "trigger": trigger, "role": role, "trigger_t_us": at, "geometry": observed, "geometry_evidence": geometry,
-                "monitor": observed.map(|geo| geo.monitor), "admission_epoch": admission, "event_ref": event,
-                "source_t_us": null, "file": null, "width": null, "height": null, "reason": missing,
-            });
+            let fallback = fallback_row(trigger, role, at, geometry, admission, Some(event), missing);
             let lost = match &self.rows[index] {
                 // The ordered still deadline expired the slot before approval.
                 EarlyRow::Reserved(row) => (!row.approve(fallback)).then_some(LossReason::ProducerStall),
@@ -223,13 +220,6 @@ enum Selected {
 }
 
 impl Selected {
-    fn from(frame: Result<&NativeFrame, Missing>, holds: &mut Holds) -> Self {
-        match frame {
-            Ok(frame) => holds.retain(frame).map_or(Self::Capacity, Self::Retained),
-            Err(reason) => Self::Missing(reason),
-        }
-    }
-
     fn retained(&self) -> Option<&Rc<HeldFrame>> {
         match self { Self::Retained(frame) => Some(frame), _ => None }
     }
@@ -239,7 +229,7 @@ enum PrivateSelection {
     Preceding { adjustment: Adjustment, before: Selected, seen: Selected },
     Next(Selected),
     /// No still can be selected for the approved action, with the reason.
-    Unavailable(&'static str),
+    Unavailable(DropReason),
 }
 
 struct Private {
@@ -262,9 +252,10 @@ impl Private {
     }
 }
 
+/// A still row's `trigger` (schema §6).
 #[derive(Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-enum Trigger {
+pub(super) enum Trigger {
     Start,
     Checkpoint,
     Final,
@@ -276,13 +267,118 @@ enum Trigger {
     Next,
 }
 
+impl Trigger {
+    /// A pre-motion or pre-action row joins a before and a seen frame (IMG-2).
+    fn paired(self) -> bool {
+        matches!(self, Self::PreMotion | Self::PreAction)
+    }
+}
+
+/// A still row's `role` (schema §6).
 #[derive(Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-enum Role {
+pub(super) enum Role {
     Before,
     Seen,
     Image,
     FinalSaveSettled,
+}
+
+/// The trigger and role of a save-linked still.
+pub(super) fn save_slot(kind: SaveKind) -> (Trigger, Role) {
+    match kind {
+        SaveKind::Checkpoint => (Trigger::Checkpoint, Role::Image),
+        SaveKind::Final => (Trigger::Final, Role::FinalSaveSettled),
+    }
+}
+
+/// The outcome of one still slot. It is serialized only into its row, as
+/// `outcome`, and gives the row its `kind`, `file` and `reason` (schema §6).
+#[derive(Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SlotOutcome {
+    /// `image` is relative to `raw/`, where the journal lives (D-1).
+    Saved { image: Option<String>, deduplicated: bool },
+    Dropped { reason: DropReason },
+    Failed { operation: &'static str, native_code: Option<i32> },
+    Unavailable { reason: Missing },
+}
+
+impl SlotOutcome {
+    fn dropped(reason: DropReason) -> Self {
+        Self::Dropped { reason }
+    }
+}
+
+/// Why a still slot has no image.
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DropReason {
+    AdjustmentFailed,
+    AdmissionChanged,
+    AdmissionClosed,
+    AdmissionClosedBeforeScrollEnd,
+    AdmissionClosedBeforeSelection,
+    CaptureFailed,
+    CaptureIntervalChanged,
+    ElevatedFrameUncertified,
+    FrameNotApproved,
+    GeometryChanged,
+    GeometryChangedBeforeScrollEnd,
+    GeometryChangedBeforeSelection,
+    GeometryChangedBeforeStartFrame,
+    LowerPriority,
+    NativeCaptureEpochClosed,
+    NoApprovedInterval,
+    NoApprovedSettledInterval,
+    NoEligibleFinalFrameInCaptureEpoch,
+    PauseBeforeSaveSelection,
+    PauseBeforeScrollEnd,
+    PauseBeforeSelection,
+    PauseBeforeStartFrame,
+    ReadbackCapacity,
+    ReadbackDeadline,
+    RetentionCapacity,
+    RetentionLowerPriority,
+    SaveIntervalChanged,
+    ScrollBurstCapacity,
+    ScrollEndUncertified,
+    SettledDeadline,
+    SettledRetentionPressure,
+    StartFrameUnavailable,
+    StillJobCapacity,
+    StillOwnerClosed,
+    StopBeforeSaveSelection,
+    StopBeforeScrollEnd,
+    StopBeforeSelection,
+    StopBeforeStartFrame,
+    /// The PNG worker did not save the image.
+    #[serde(untagged)]
+    Png(still_png::Dropped),
+    /// The capture owner's drain deadline, named by that owner.
+    #[serde(untagged)]
+    Drain(&'static str),
+}
+
+impl DropReason {
+    /// The reason at a Stop or a pause boundary.
+    fn at_boundary(stopping: bool, stop: Self, pause: Self) -> Self {
+        if stopping { stop } else { pause }
+    }
+}
+
+impl From<readback::Rejected> for DropReason {
+    fn from(reason: readback::Rejected) -> Self {
+        use readback::Rejected;
+        match reason {
+            Rejected::Pressure => Self::ReadbackCapacity,
+            Rejected::EpochMismatch => Self::CaptureIntervalChanged,
+            Rejected::ApprovalSuppressed => Self::ElevatedFrameUncertified,
+            Rejected::Expired => Self::ReadbackDeadline,
+            Rejected::Closed => Self::AdmissionClosed,
+            Rejected::CaptureFailed => Self::CaptureFailed,
+        }
+    }
 }
 
 struct Public {
@@ -321,10 +417,22 @@ enum State {
     Settling,
     Selected(Selected),
     Work(Rc<RefCell<FrameWork>>),
-    Done(serde_json::Value),
+    Done(SlotOutcome),
+}
+
+impl State {
+    fn dropped(reason: DropReason) -> Self {
+        Self::Done(SlotOutcome::dropped(reason))
+    }
 }
 
 impl Public {
+    /// A slot without an event, interval, frame or reservation yet.
+    fn new(trigger: Trigger, role: Role, at: SessionTimeUs, geometry: GeometryId, admission: AdmissionEpoch, state: State) -> Self {
+        Self { event: None, trigger, role, at, geometry, admission, interval: None, adjustment: None, frame: None,
+            state, pointer: None, save: None, reservation: None, settled_confirmed_t_us: None, scroll_device: None }
+    }
+
     fn priority(&self) -> still_png::Priority {
         match self.trigger {
             Trigger::PreMotion | Trigger::PreAction => still_png::Priority::BeforeSeen,
@@ -339,8 +447,13 @@ impl Public {
 
     /// The row of this slot. A seen slot is the second half of its trigger's
     /// row, which `still_rows` joins to the before half (IMG-2).
-    fn row(&self, outcome: &serde_json::Value) -> serde_json::Value {
-        let saved = outcome.get("kind").and_then(serde_json::Value::as_str) == Some("saved");
+    fn row(&self, outcome: &SlotOutcome) -> serde_json::Value {
+        let (saved, file, reason) = match outcome {
+            SlotOutcome::Saved { image, .. } => (true, image.as_deref(), serde_json::Value::Null),
+            SlotOutcome::Dropped { reason } => (false, None, serde_json::json!(reason)),
+            SlotOutcome::Failed { operation, .. } => (false, None, serde_json::json!(operation)),
+            SlotOutcome::Unavailable { reason } => (false, None, serde_json::json!(reason)),
+        };
         let frame = self.frame.as_ref();
         serde_json::json!({
             "kind": if saved { "still" } else { "still_dropped" },
@@ -349,9 +462,9 @@ impl Public {
             "trigger": self.trigger, "role": self.role, "trigger_t_us": self.at,
             "frame_obs_id": frame.map(|frame| frame.id.sequence),
             "event_ref": self.event,
-            "file": outcome.get("image"),
+            "file": file,
             "width": frame.map(|frame| frame.width), "height": frame.map(|frame| frame.height),
-            "reason": outcome.get("reason").or_else(|| outcome.get("operation")),
+            "reason": reason,
             "geometry": self.geometry, "admission_epoch": self.admission, "scroll_device": self.scroll_device,
             "settled_confirmed_t_us": self.settled_confirmed_t_us, "adjustment": self.adjustment,
             "frame": self.frame, "element": self.pointer, "outcome": outcome,
@@ -359,6 +472,13 @@ impl Public {
                 "id": save.id(), "kind": save.kind(), "routing_basis": save.routing_basis(),
             })),
         })
+    }
+
+    /// The approved fallback row of this slot's reservation (schema §6).
+    fn fallback(&self, reason: DropReason) -> serde_json::Value {
+        let mut row = self.row(&SlotOutcome::dropped(reason));
+        row["geometry_evidence"] = serde_json::json!(Evidence::Observed(self.geometry));
+        row
     }
 }
 
@@ -393,13 +513,14 @@ enum WorkStage {
     Readback(readback::Ticket),
     Encoding(still_png::Ticket),
     /// The slot outcome; `withdrawn` clears each slot's frame evidence.
-    Done { outcome: serde_json::Value, withdrawn: bool },
+    Done { outcome: SlotOutcome, withdrawn: bool },
 }
 
 impl FrameWork {
     /// Advance the work. Without the PNG inbox only a finished job is collected.
     fn advance(&mut self, png: Option<&still_png::Inbox>) {
-        let done = |outcome: serde_json::Value, withdrawn: bool| WorkStage::Done { outcome, withdrawn };
+        let done = |outcome: SlotOutcome, withdrawn: bool| WorkStage::Done { outcome, withdrawn };
+        let png_dropped = |reason: still_png::Dropped| SlotOutcome::dropped(DropReason::Png(reason));
         self.stage = match &mut self.stage {
             WorkStage::Readback(ticket) => {
                 let Some(png) = png else { return };
@@ -407,29 +528,28 @@ impl FrameWork {
                 match result {
                     Ok(pixels) if pixels.metadata.covered() => match png.request(pixels, self.priority, self.exempt, self.coverage.clone()) {
                         Ok(ticket) => WorkStage::Encoding(ticket),
-                        Err(reason) => done(serde_json::json!({ "kind": "dropped", "reason": reason }), false),
+                        Err(reason) => done(png_dropped(reason), false),
                     },
-                    Ok(_) => done(dropped("elevated_frame_uncertified"), true),
-                    Err(reason) => done(readback_failure(reason), false),
+                    Ok(_) => done(SlotOutcome::dropped(DropReason::ElevatedFrameUncertified), true),
+                    Err(reason) => done(SlotOutcome::dropped(reason.into()), false),
                 }
             }
             WorkStage::Encoding(ticket) => match ticket.poll() {
                 None => return,
-                // A still `file` is relative to `raw/`, where the journal lives (D-1).
-                Some(still_png::Outcome::Saved { reference, reused }) => done(serde_json::json!({
-                    "kind": "saved", "image": reference.relative_uri().strip_prefix("raw/"), "deduplicated": reused,
-                }), false),
-                Some(still_png::Outcome::Dropped(reason)) => done(serde_json::json!({ "kind": "dropped", "reason": reason }),
+                Some(still_png::Outcome::Saved { reference, reused }) => done(SlotOutcome::Saved {
+                    image: reference.relative_uri().strip_prefix("raw/").map(str::to_owned), deduplicated: reused,
+                }, false),
+                Some(still_png::Outcome::Dropped(reason)) => done(png_dropped(reason),
                     matches!(reason, still_png::Dropped::ApprovalSuppressed)),
-                Some(still_png::Outcome::Failed { operation, native_code }) => done(serde_json::json!({
-                    "kind": "failed", "operation": operation, "native_code": native_code,
-                }), false),
+                Some(still_png::Outcome::Failed { operation, native_code }) => {
+                    done(SlotOutcome::Failed { operation, native_code }, false)
+                }
             },
             WorkStage::Done { .. } => return,
         };
     }
 
-    fn outcome(&self) -> Option<(serde_json::Value, bool)> {
+    fn outcome(&self) -> Option<(SlotOutcome, bool)> {
         match &self.stage {
             WorkStage::Done { outcome, withdrawn } => Some((outcome.clone(), *withdrawn)),
             _ => None,
@@ -471,15 +591,18 @@ struct Scroll {
 }
 
 impl Scroll {
-    fn dropped_observations(self, outcome: &serde_json::Value) -> [Public; 2] {
+    /// The next and settled slots of this burst, in `states` order.
+    fn observations(&self, states: [State; 2]) -> [Public; 2] {
         let device = self.device.map_or(Evidence::Unavailable(crate::protocol::UnavailableReason::Ambiguous), Evidence::Observed);
-        [Trigger::Next, Trigger::Settled].map(|trigger| Public {
-            event: Some(self.event), trigger, role: Role::Image,
-            at: self.end, geometry: self.interval.geometry, admission: self.interval.admission,
-            interval: Some(self.interval), adjustment: None, frame: None, pointer: None, save: None,
-            reservation: None, settled_confirmed_t_us: None, scroll_device: Some(device),
-            state: State::Done(outcome.clone()),
+        let [next, settled] = states;
+        [(Trigger::Next, next), (Trigger::Settled, settled)].map(|(trigger, state)| Public {
+            event: Some(self.event), interval: Some(self.interval), scroll_device: Some(device),
+            ..Public::new(trigger, Role::Image, self.end, self.interval.geometry, self.interval.admission, state)
         })
+    }
+
+    fn dropped_observations(&self, reason: DropReason) -> [Public; 2] {
+        self.observations([State::dropped(reason), State::dropped(reason)])
     }
 }
 
@@ -510,7 +633,7 @@ pub(super) struct Stills {
 impl Stills {
     pub fn new(rows: still_rows::Rows, budget: Arc<readback::Budget>) -> (Requests, Self) {
         let (send, input) = sync_channel(CHANNEL);
-        let (save_send, saves) = sync_channel(8);
+        let (save_send, saves) = sync_channel(SAVE_QUEUE);
         let last_activity = Arc::new(AtomicI64::new(0));
         let input_before = Arc::new(AtomicI64::new(0));
         let last_action = Arc::new(AtomicI64::new(0));
@@ -521,11 +644,9 @@ impl Stills {
     }
 
     pub fn arm_start(&mut self, boundary: crate::session::AdmissionBoundary, geometry: GeometryId) {
-        let mut start = Public { event: None, trigger: Trigger::Start, role: Role::Image,
-            at: boundary.time, geometry, admission: boundary.epoch, interval: None, adjustment: None,
-            frame: None, pointer: None, save: None, reservation: None, settled_confirmed_t_us: None,
-            scroll_device: None, state: State::Selected(Selected::Waiting) };
-        start.reservation = self.rows.reserve_public(boundary.time, start.row(&dropped("start_frame_unavailable")));
+        let mut start = Public::new(Trigger::Start, Role::Image, boundary.time, geometry, boundary.epoch,
+            State::Selected(Selected::Waiting));
+        start.reservation = self.rows.reserve_public(boundary.time, start.fallback(DropReason::StartFrameUnavailable));
         if start.reservation.is_some() {
             self.start = Some(start);
         }
@@ -543,7 +664,24 @@ impl Stills {
             self.invalidate_quiet(action);
         }
         self.start_step(images, self.receipt);
-        for _ in 0..8 {
+        self.drain_saves(images, mode, policy, admission, now);
+        let openings_drained = self.drain_commands(images, mode, policy, config, admission, now);
+        self.select_private(images, now);
+        self.resolve_private(images, config, now);
+        let approval = policy.current(admission, now);
+        let input_before = openings_drained.then_some(input_before);
+        self.scroll_step(images, now, input_before);
+        self.settle_step(images, mode, admission, approval.clone(), now, input_before);
+        self.observe(images, mode, admission, approval, now);
+        self.rows.advance(self.receipt);
+    }
+
+    /// Take the confirmed saves received by `now`. An elevated save waits for
+    /// its frame approval up to `ELEVATED_FRAME_WAIT_US`.
+    fn drain_saves(&mut self, images: &NativeImages, mode: &MonitorCapture, policy: &FramePolicy,
+        admission: AdmissionEpoch, now: SessionTimeUs,
+    ) {
+        for _ in 0..SAVE_QUEUE {
             let Some(save) = self.deferred_save.take().or_else(|| self.saves.try_recv().ok()) else { break };
             if save.confirmation.time().recv_t_us > now {
                 self.deferred_save = Some(save);
@@ -557,14 +695,19 @@ impl Stills {
             }
             self.save_step(save, images, mode, admission, approval.ok().flatten());
         }
-        let mut openings_drained = false;
+    }
+
+    /// Take the openings and pointer rests received by `now`, while private
+    /// slots remain. True when every command received by `now` was taken.
+    fn drain_commands(&mut self, images: &NativeImages, mode: &MonitorCapture, policy: &FramePolicy,
+        config: &ResolvedCaptureConfig, admission: AdmissionEpoch, now: SessionTimeUs,
+    ) -> bool {
         for _ in 0..CHANNEL {
             if self.pending.len() == PRIVATE_SLOTS {
-                break;
+                return false;
             }
             let Some(command) = self.deferred.take().or_else(|| self.input.try_recv().ok()) else {
-                openings_drained = true;
-                break;
+                return true;
             };
             let at = match &command {
                 Command::Opening(opening) => opening.request.time.recv_t_us,
@@ -572,8 +715,7 @@ impl Stills {
             };
             if at > now {
                 self.deferred = Some(command);
-                openings_drained = true;
-                break;
+                return true;
             }
             let (proof, visit) = match &command {
                 Command::Opening(opening) => (opening.request.foreground_at_receipt, opening.visit),
@@ -582,53 +724,57 @@ impl Stills {
             let approval = proof.map_or(Ok(None), |proof| policy.for_receipt(proof, admission, visit, at, now));
             if visit.is_some() && approval.is_err() && now.0.saturating_sub(at.0) < ELEVATED_FRAME_WAIT_US {
                 self.deferred = Some(command);
-                break;
+                return false;
             }
             let approval = approval.ok().flatten();
-            let opening = match command {
-                Command::Opening(opening) => opening,
-                Command::Rest(rest) => {
-                    self.rest(rest, images, mode, admission, approval);
-                    continue;
-                }
-            };
-            let request = opening.request;
-            let interval = approval.filter(|_| request.geometry == Evidence::Observed(mode.geometry.id)
-                && request.admission == admission).map(|approval| Interval {
-                geometry: mode.geometry.id, capture: mode.capture_epoch, admission, approval: approval.generation,
-                elevated_visit: approval.elevated_visit(),
-            });
-            // An unread refresh rate selects no seen boundary (`UnknownRefresh`).
-            let refresh = mode.refresh_numerator.zip(mode.refresh_denominator).map_or((0, 0), |(numerator, denominator)| (numerator, denominator.get()));
-            // The Receiver opens a pre-motion envelope only for the first
-            // motion after the IMG-2 idle period.
-            let selection = if let Some(interval) = interval {
-                match request.kind {
-                    ProvisionalInputKind::PreMotion | ProvisionalInputKind::PreAction | ProvisionalInputKind::Scroll { .. } => {
-                        let calibration = request.device.filter(|_| interval.elevated_visit.is_none())
-                            .and_then(|device| match config.calibration(device) {
-                            Evidence::Observed(calibration) => Some(calibration),
-                            _ => None,
-                        });
-                        match Adjustment::from_receipt(at, calibration) {
-                            Ok(adjustment) => {
-                                let pair = still_time::preceding(images, interval, adjustment, refresh);
-                                let before = self.retain_private(pair.before, still_png::Priority::BeforeSeen, None);
-                                let seen = self.retain_private(pair.seen, still_png::Priority::BeforeSeen, Some(&before));
-                                PrivateSelection::Preceding { adjustment, before, seen }
-                            }
-                            Err(_) => PrivateSelection::Unavailable("adjustment_failed"),
-                        }
-                    }
-                    ProvisionalInputKind::Next => PrivateSelection::Next(self.private_next(images, interval, at)),
-                }
-            } else {
-                PrivateSelection::Unavailable("no_approved_interval")
-            };
-            self.pending.push_back(Private { opening, interval, selection, scroll_next: Selected::Waiting, refresh });
+            match command {
+                Command::Opening(opening) => self.open_private(opening, images, mode, config, admission, approval),
+                Command::Rest(rest) => self.rest(rest, images, mode, admission, approval),
+            }
         }
-        // Waiting private selections are made in place, so the private hold
-        // cap counts every pending entry.
+        false
+    }
+
+    /// Select the frames of one opening at its receipt and keep it pending
+    /// until its action is approved or abandoned.
+    fn open_private(&mut self, opening: Opening, images: &NativeImages, mode: &MonitorCapture,
+        config: &ResolvedCaptureConfig, admission: AdmissionEpoch, approval: Option<FrameApproval>,
+    ) {
+        let request = opening.request;
+        let at = request.time.recv_t_us;
+        let interval = approval.filter(|_| request.geometry == Evidence::Observed(mode.geometry.id)
+            && request.admission == admission).map(|approval| Interval {
+            geometry: mode.geometry.id, capture: mode.capture_epoch, admission, approval: approval.generation,
+            elevated_visit: approval.elevated_visit(),
+        });
+        // An unread refresh rate selects no seen boundary (`UnknownRefresh`).
+        let refresh = mode.refresh_numerator.zip(mode.refresh_denominator).map_or((0, 0), |(numerator, denominator)| (numerator, denominator.get()));
+        // The Receiver opens a pre-motion envelope only for the first
+        // motion after the IMG-2 idle period.
+        let selection = if let Some(interval) = interval {
+            match request.kind {
+                ProvisionalInputKind::PreMotion | ProvisionalInputKind::PreAction | ProvisionalInputKind::Scroll { .. } => {
+                    match Adjustment::from_receipt(at, calibration(config, request.device, interval)) {
+                        Ok(adjustment) => {
+                            let pair = still_time::preceding(images, interval, adjustment, refresh);
+                            let before = self.retain_private(pair.before, still_png::Priority::BeforeSeen, None);
+                            let seen = self.retain_private(pair.seen, still_png::Priority::BeforeSeen, Some(&before));
+                            PrivateSelection::Preceding { adjustment, before, seen }
+                        }
+                        Err(_) => PrivateSelection::Unavailable(DropReason::AdjustmentFailed),
+                    }
+                }
+                ProvisionalInputKind::Next => PrivateSelection::Next(self.private_next(images, interval, at)),
+            }
+        } else {
+            PrivateSelection::Unavailable(DropReason::NoApprovedInterval)
+        };
+        self.pending.push_back(Private { opening, interval, selection, scroll_next: Selected::Waiting, refresh });
+    }
+
+    /// Make the waiting next selections of pending entries. They are made in
+    /// place, so the private hold cap counts every pending entry.
+    fn select_private(&mut self, images: &NativeImages, now: SessionTimeUs) {
         for index in 0..self.pending.len() {
             let entry = &self.pending[index];
             let Some(interval) = entry.interval else { continue };
@@ -646,6 +792,11 @@ impl Stills {
                 self.pending[index].scroll_next = selected;
             }
         }
+    }
+
+    /// Publish the pending entries whose action was approved; drop those
+    /// abandoned or older than `PRIVATE_US`.
+    fn resolve_private(&mut self, images: &NativeImages, config: &ResolvedCaptureConfig, now: SessionTimeUs) {
         let count = self.pending.len();
         for _ in 0..count {
             let Some(entry) = self.pending.pop_front() else { break };
@@ -657,12 +808,6 @@ impl Stills {
                 _ => {}
             }
         }
-        let approval = policy.current(admission, now);
-        let input_before = openings_drained.then_some(input_before);
-        self.scroll_step(images, now, input_before);
-        self.settle_step(images, mode, admission, approval.clone(), now, input_before);
-        self.observe(images, mode, admission, approval, now);
-        self.rows.advance(self.receipt);
     }
 
     fn start_step(&mut self, images: &NativeImages, now: SessionTimeUs) {
@@ -679,7 +824,7 @@ impl Stills {
         if first.is_none() && now.0.saturating_sub(start.at.0) < SETTLED_US {
             return;
         }
-        let mut start = self.start.take().expect("start has a reserved still row");
+        let Some(mut start) = self.start.take() else { return };
         let selected = self.retain(first.unwrap_or(Err(Missing::NoEligibleFrame)), still_png::Priority::Start);
         start.state = State::Selected(selected);
         self.push_public(start);
@@ -694,47 +839,49 @@ impl Stills {
             && save.monitor() == command.geometry.monitor)
             .map(|approval| Interval { geometry: command.geometry, capture: mode.capture_epoch, admission,
                 approval: approval.generation, elevated_visit: approval.elevated_visit() });
-        let ineligible = || State::Done(dropped(
-            if command.admission != admission { "admission_closed" } else { "save_interval_changed" }));
-        let (trigger, role, state) = match (save.kind(), interval) {
+        let (trigger, role) = save_slot(save.kind());
+        let state = match (save.kind(), interval) {
             (SaveKind::Checkpoint, Some(interval)) => {
                 let image = still_time::latest(images, interval, at);
-                let selected = self.retain(image.ok_or(Missing::NoEligibleFrame), still_png::Priority::Checkpoint);
-                (Trigger::Checkpoint, Role::Image, State::Selected(selected))
+                State::Selected(self.retain(image.ok_or(Missing::NoEligibleFrame), still_png::Priority::Checkpoint))
             }
-            (SaveKind::Checkpoint, None) => (Trigger::Checkpoint, Role::Image, ineligible()),
             (SaveKind::Final, Some(_)) => {
                 self.invalidate_quiet(at);
-                (Trigger::Final, Role::FinalSaveSettled, State::Settling)
+                State::Settling
             }
-            (SaveKind::Final, None) => (Trigger::Final, Role::FinalSaveSettled, ineligible()),
+            (_, None) => State::dropped(if command.admission != admission {
+                DropReason::AdmissionClosed
+            } else {
+                DropReason::SaveIntervalChanged
+            }),
         };
-        self.push_public(Public { event: None, trigger, role, at, geometry: command.geometry,
-            admission: command.admission, interval, adjustment: None, frame: None, pointer: None, save: Some(save), reservation: Some(command.reservation), settled_confirmed_t_us: None, scroll_device: None, state });
+        self.push_public(Public { interval, save: Some(save), reservation: Some(command.reservation),
+            ..Public::new(trigger, role, at, command.geometry, command.admission, state) });
     }
 
     fn rest(&mut self, rest: Rest, images: &NativeImages, mode: &MonitorCapture,
         admission: AdmissionEpoch, approval: Option<FrameApproval>,
     ) {
         let changed = if rest.admission != admission {
-            Some("admission_changed")
+            Some(DropReason::AdmissionChanged)
         } else if rest.geometry != mode.geometry.id {
-            Some("geometry_changed")
+            Some(DropReason::GeometryChanged)
         } else {
             None
         };
         let (None, Some(approval)) = (changed, approval) else {
-            let reason = changed.unwrap_or("frame_not_approved");
-            rest.reservation.finish(dropped_trigger("pointer_rest", "image", rest.at, rest.geometry, rest.admission, reason));
+            let outcome = SlotOutcome::dropped(changed.unwrap_or(DropReason::FrameNotApproved));
+            let slot = Public::new(Trigger::PointerRest, Role::Image, rest.at, rest.geometry, rest.admission,
+                State::Done(outcome.clone()));
+            rest.reservation.finish(slot.row(&outcome));
             return;
         };
         let interval = Interval { geometry: rest.geometry, capture: mode.capture_epoch, admission,
             approval: approval.generation, elevated_visit: approval.elevated_visit() };
         let candidate = still_time::latest(images, interval, rest.at).ok_or(Missing::NoEligibleFrame);
         let selected = self.retain(candidate, still_png::Priority::Idle);
-        self.push_public(Public { event: None, trigger: Trigger::PointerRest, role: Role::Image,
-            at: rest.at, geometry: rest.geometry, admission, interval: Some(interval), adjustment: None,
-            frame: None, pointer: rest.pointer, save: None, reservation: Some(rest.reservation), settled_confirmed_t_us: None, scroll_device: None, state: State::Selected(selected) });
+        self.push_public(Public { interval: Some(interval), pointer: rest.pointer, reservation: Some(rest.reservation),
+            ..Public::new(Trigger::PointerRest, Role::Image, rest.at, rest.geometry, admission, State::Selected(selected)) });
     }
 
     pub fn changed(&mut self, frame: FrameMetadata) {
@@ -763,9 +910,8 @@ impl Stills {
         }
         self.observed_frame = Some(frame.metadata.id);
         let selected = self.retain(Ok(frame), still_png::Priority::Idle);
-        self.push_public(Public { event: None, trigger: Trigger::Observe, role: Role::Image,
-            at: now, geometry: mode.geometry.id, admission, interval: Some(interval), adjustment: None,
-            frame: None, pointer: None, save: None, reservation: None, settled_confirmed_t_us: None, scroll_device: None, state: State::Selected(selected) });
+        self.push_public(Public { interval: Some(interval),
+            ..Public::new(Trigger::Observe, Role::Image, now, mode.geometry.id, admission, State::Selected(selected)) });
     }
 
     fn scroll_step(&mut self, images: &NativeImages, now: SessionTimeUs, input_before: Option<SessionTimeUs>) {
@@ -784,38 +930,36 @@ impl Stills {
             let can_wait = now.0.saturating_sub(burst.end.0) < NEXT_US;
             if burst.end > now || can_wait && (newer_pending || pending_prefix) {
                 if burst.end <= now && matches!(burst.next, Selected::Waiting) {
-                    let burst = &mut self.scrolls[index];
-                    burst.next = select_next(images, burst.interval, burst.end, &mut self.holds);
+                    let (interval, end) = (burst.interval, burst.end);
+                    let next = self.select_next(images, interval, end);
+                    self.scrolls[index].next = next;
                 }
                 index += 1;
                 continue;
             }
             let scroll = self.scrolls.remove(index);
             if pending_prefix || newer_pending {
-                self.drop_scroll(scroll, "scroll_end_uncertified");
+                self.drop_scroll(&scroll, DropReason::ScrollEndUncertified);
             } else {
                 self.finish_scroll(scroll, images);
             }
         }
     }
 
-    fn drop_scroll(&mut self, scroll: Scroll, reason: &'static str) {
-        for slot in scroll.dropped_observations(&dropped(reason)) {
+    fn drop_scroll(&mut self, scroll: &Scroll, reason: DropReason) {
+        for slot in scroll.dropped_observations(reason) {
             self.push_public(slot);
         }
     }
 
-    fn finish_scroll(&mut self, scroll: Scroll, images: &NativeImages) {
-        let next = if matches!(scroll.next, Selected::Waiting) {
-            select_next(images, scroll.interval, scroll.end, &mut self.holds)
-        } else { scroll.next };
+    fn finish_scroll(&mut self, mut scroll: Scroll, images: &NativeImages) {
+        let next = match std::mem::replace(&mut scroll.next, Selected::Waiting) {
+            Selected::Waiting => self.select_next(images, scroll.interval, scroll.end),
+            selected => selected,
+        };
         self.invalidate_quiet(scroll.end);
-        let device = scroll.device.map_or(Evidence::Unavailable(crate::protocol::UnavailableReason::Ambiguous), Evidence::Observed);
-        for (trigger, state) in [(Trigger::Next, State::Selected(next)), (Trigger::Settled, State::Settling)] {
-            self.push_public(Public { event: Some(scroll.event), trigger, role: Role::Image,
-                at: scroll.end, geometry: scroll.interval.geometry, admission: scroll.interval.admission,
-                interval: Some(scroll.interval), adjustment: None, frame: None, pointer: None, save: None,
-                reservation: None, settled_confirmed_t_us: None, scroll_device: Some(device), state });
+        for slot in scroll.observations([State::Selected(next), State::Settling]) {
+            self.push_public(slot);
         }
     }
 
@@ -831,16 +975,7 @@ impl Stills {
             geometry: mode.geometry.id, capture: mode.capture_epoch, admission,
             approval: approval.generation, elevated_visit: approval.elevated_visit(),
         });
-        for slot in &mut self.public {
-            if !matches!(slot.state, State::Settling) { continue; }
-            if slot.interval.is_none() {
-                slot.state = State::Done(dropped("no_approved_settled_interval"));
-            } else if now.0.saturating_sub(slot.at.0) >= SETTLED_US {
-                slot.state = State::Done(dropped("settled_deadline"));
-            } else if current.is_some() && slot.interval != current {
-                slot.state = State::Done(dropped("capture_interval_changed"));
-            }
-        }
+        self.expire_settling(current, now);
         let Some(interval) = current else {
             self.quiet = None;
             return;
@@ -851,7 +986,29 @@ impl Stills {
             return;
         }
         let Some(after) = self.quiet_after else { return };
-        let mut awaiting_score = false;
+        if self.track_quiet(images, interval, after) {
+            self.confirm_quiet(interval, now, input_before);
+        }
+    }
+
+    /// End the settling slots that cannot be confirmed in `current`.
+    fn expire_settling(&mut self, current: Option<Interval>, now: SessionTimeUs) {
+        for slot in &mut self.public {
+            if !matches!(slot.state, State::Settling) { continue; }
+            if slot.interval.is_none() {
+                slot.state = State::dropped(DropReason::NoApprovedSettledInterval);
+            } else if now.0.saturating_sub(slot.at.0) >= SETTLED_US {
+                slot.state = State::dropped(DropReason::SettledDeadline);
+            } else if current.is_some() && slot.interval != current {
+                slot.state = State::dropped(DropReason::CaptureIntervalChanged);
+            }
+        }
+    }
+
+    /// Follow the quiet candidate of `interval` through the frames after
+    /// `after`: a run of consecutive frames each changing less than
+    /// `CHANGE_LIMIT`. False while a frame still awaits its change score.
+    fn track_quiet(&mut self, images: &NativeImages, interval: Interval, after: SessionTimeUs) -> bool {
         for frame in images.history().iter().filter(|frame| interval.contains(&frame.metadata) && frame.metadata.source_t_us > after) {
             let meta = &frame.metadata;
             if let Some(quiet) = &mut self.quiet {
@@ -859,8 +1016,7 @@ impl Stills {
                     continue;
                 }
                 if !frame.change_sampled {
-                    awaiting_score = true;
-                    break;
+                    return false;
                 }
                 if quiet.interval == interval && quiet.last.sequence.0.checked_add(1) == Some(meta.id.sequence.0)
                     && frame.change.is_some_and(|change| change < CHANGE_LIMIT)
@@ -871,36 +1027,46 @@ impl Stills {
             }
             // Release the previous candidate before claiming another distinct hold.
             self.quiet = None;
-            if let Selected::Retained(candidate) = self.retain(Ok(frame), still_png::Priority::Settled) {
-                self.quiet = Some(Quiet { interval, last: meta.id, since: meta.source_t_us, candidate });
-            } else {
-                for slot in &mut self.public {
-                    if slot.interval == current && matches!(slot.state, State::Settling) {
-                        slot.state = State::Done(dropped("settled_retention_pressure"));
-                    }
-                }
-                return;
+            let Selected::Retained(candidate) = self.retain(Ok(frame), still_png::Priority::Settled) else {
+                self.drop_settling(DropReason::SettledRetentionPressure, |slot| slot.interval == Some(interval));
+                return true;
+            };
+            self.quiet = Some(Quiet { interval, last: meta.id, since: meta.source_t_us, candidate });
+        }
+        true
+    }
+
+    /// Select the quiet candidate for the settling slots of `interval` once
+    /// it stayed quiet for `QUIET_US`.
+    fn confirm_quiet(&mut self, interval: Interval, now: SessionTimeUs, input_before: Option<SessionTimeUs>) {
+        let Some(quiet) = &self.quiet else { return };
+        let current = Some(interval);
+        let eligible_at = SessionTimeUs(quiet.since.0.saturating_add(QUIET_US));
+        // Wait for the existing input certification prefix and any
+        // in-owner handoff which can still invalidate this candidate.
+        let unresolved_action = self.pending.iter().any(|entry| {
+            entry.interval == current && entry.opening.request.time.recv_t_us <= now
+                && entry.opening.request.kind != ProvisionalInputKind::PreMotion
+        });
+        if now < eligible_at || input_before.is_none_or(|before| before <= eligible_at) || unresolved_action {
+            return;
+        }
+        for slot in &mut self.public {
+            if slot.interval == current && matches!(slot.state, State::Settling) {
+                slot.settled_confirmed_t_us = Some(now);
+                slot.state = State::Selected(Selected::Retained(Rc::clone(&quiet.candidate)));
             }
         }
-        if !awaiting_score && let Some(quiet) = &self.quiet {
-            let eligible_at = SessionTimeUs(quiet.since.0.saturating_add(QUIET_US));
-            // Wait for the existing input certification prefix and any
-            // in-owner handoff which can still invalidate this candidate.
-            let unresolved_action = self.pending.iter().any(|entry| {
-                entry.interval == current && entry.opening.request.time.recv_t_us <= now
-                    && entry.opening.request.kind != ProvisionalInputKind::PreMotion
-            });
-            if now < eligible_at || input_before.is_none_or(|before| before <= eligible_at) || unresolved_action {
-                return;
+        self.quiet = None;
+        self.quiet_after = None;
+    }
+
+    /// End the settling slots that `scope` selects with `reason`.
+    fn drop_settling(&mut self, reason: DropReason, scope: impl Fn(&Public) -> bool) {
+        for slot in &mut self.public {
+            if matches!(slot.state, State::Settling) && scope(slot) {
+                slot.state = State::dropped(reason);
             }
-            for slot in &mut self.public {
-                if slot.interval == current && matches!(slot.state, State::Settling) {
-                    slot.settled_confirmed_t_us = Some(now);
-                    slot.state = State::Selected(Selected::Retained(Rc::clone(&quiet.candidate)));
-                }
-            }
-            self.quiet = None;
-            self.quiet_after = None;
         }
     }
 
@@ -932,6 +1098,16 @@ impl Stills {
         self.retain(Ok(frame), priority)
     }
 
+    /// The first frame after `end`, retained at the next priority, which may
+    /// release lower-priority holds (ALG §4, IMG-7).
+    fn select_next(&mut self, images: &NativeImages, interval: Interval, end: SessionTimeUs) -> Selected {
+        match still_time::next(images, interval, end) {
+            Ok(None) => Selected::Waiting,
+            Ok(Some(frame)) => self.retain(Ok(frame), still_png::Priority::Next),
+            Err(reason) => Selected::Missing(reason),
+        }
+    }
+
     fn private_next(&mut self, images: &NativeImages, interval: Interval, end: SessionTimeUs) -> Selected {
         match still_time::next(images, interval, end) {
             Ok(None) => Selected::Waiting,
@@ -950,54 +1126,78 @@ impl Stills {
         frames.len()
     }
 
-    /// Release the hold of the lowest IMG-7 priority below `priority`; among
+    /// Release the holds of the lowest IMG-7 priority below `priority`; among
     /// equal priority the newest goes first (REL-2). Private pending
     /// selections take part; with `private_only` only they do. Preceding
     /// private selections have the highest priority and are never released.
+    ///
+    /// Slots that select the same frame share one hold, so releasing only
+    /// some of them frees nothing (ALG §13.12). Outside `private_only` a frame
+    /// is released only when every holder is a victim; a holder outside the
+    /// victims, such as the frame a readback is being fitted for, keeps it.
     fn reclaim(&mut self, priority: still_png::Priority, private_only: bool) -> bool {
         use still_png::Priority::{Next, Settled};
         enum Victim { Quiet, Public(usize), Scroll(usize), PrivateNext(usize), PrivateScroll(usize) }
-        let retained = |selected: &Selected| matches!(selected, Selected::Retained(_));
-        let mut victims = Vec::new();
+        /// The victims holding one frame: their highest priority, newest
+        /// receipt, the frame's holder count and the victims.
+        struct Group { priority: still_png::Priority, at: SessionTimeUs, frame: *const HeldFrame, holders: usize, victims: Vec<Victim> }
+        let mut groups: Vec<Group> = Vec::new();
+        let mut add = |low: still_png::Priority, at: SessionTimeUs, frame: &Rc<HeldFrame>, victim: Victim| {
+            if low >= priority { return; }
+            let pointer = Rc::as_ptr(frame);
+            match groups.iter_mut().find(|group| group.frame == pointer) {
+                Some(group) => {
+                    group.priority = group.priority.max(low);
+                    group.at = group.at.max(at);
+                    group.victims.push(victim);
+                }
+                None => groups.push(Group { priority: low, at, frame: pointer, holders: Rc::strong_count(frame), victims: vec![victim] }),
+            }
+        };
         if !private_only {
-            victims.extend(self.public.iter().enumerate()
-                .filter(|(_, slot)| matches!(slot.state, State::Selected(Selected::Retained(_))))
-                .map(|(index, slot)| (slot.priority(), slot.at, Victim::Public(index))));
-            victims.extend(self.quiet.as_ref().map(|quiet| (Settled, quiet.since, Victim::Quiet)));
-            victims.extend(self.scrolls.iter().enumerate().filter(|(_, scroll)| retained(&scroll.next))
-                .map(|(index, scroll)| (Next, scroll.end, Victim::Scroll(index))));
+            for (index, slot) in self.public.iter().enumerate() {
+                if let State::Selected(Selected::Retained(frame)) = &slot.state {
+                    add(slot.priority(), slot.at, frame, Victim::Public(index));
+                }
+            }
+            if let Some(quiet) = &self.quiet {
+                add(Settled, quiet.since, &quiet.candidate, Victim::Quiet);
+            }
+            for (index, scroll) in self.scrolls.iter().enumerate() {
+                if let Some(frame) = scroll.next.retained() {
+                    add(Next, scroll.end, frame, Victim::Scroll(index));
+                }
+            }
         }
         for (index, entry) in self.pending.iter().enumerate() {
             let at = entry.opening.request.time.recv_t_us;
-            if matches!(&entry.selection, PrivateSelection::Next(selected) if retained(selected)) {
-                victims.push((Next, at, Victim::PrivateNext(index)));
+            if let PrivateSelection::Next(selected) = &entry.selection && let Some(frame) = selected.retained() {
+                add(Next, at, frame, Victim::PrivateNext(index));
             }
-            if retained(&entry.scroll_next) {
-                victims.push((Next, at, Victim::PrivateScroll(index)));
+            if let Some(frame) = entry.scroll_next.retained() {
+                add(Next, at, frame, Victim::PrivateScroll(index));
             }
         }
-        let Some((_, _, victim)) = victims.into_iter().filter(|(low, ..)| *low < priority)
-            .min_by_key(|(low, at, _)| (*low, std::cmp::Reverse(*at))) else { return false };
-        match victim {
-            Victim::Quiet => {
-                self.quiet = None;
-                for slot in &mut self.public {
-                    if matches!(slot.state, State::Settling) {
-                        slot.state = State::Done(dropped("settled_retention_pressure"));
-                    }
+        let Some(group) = groups.into_iter().filter(|group| private_only || group.victims.len() == group.holders)
+            .min_by_key(|group| (group.priority, std::cmp::Reverse(group.at))) else { return false };
+        for victim in group.victims {
+            match victim {
+                Victim::Quiet => {
+                    self.quiet = None;
+                    self.drop_settling(DropReason::SettledRetentionPressure, |_| true);
                 }
+                Victim::Public(index) => self.public[index].state = State::dropped(DropReason::RetentionLowerPriority),
+                Victim::Scroll(index) => self.scrolls[index].next = Selected::Capacity,
+                Victim::PrivateNext(index) => self.pending[index].selection = PrivateSelection::Next(Selected::Capacity),
+                Victim::PrivateScroll(index) => self.pending[index].scroll_next = Selected::Capacity,
             }
-            Victim::Public(index) => self.public[index].state = State::Done(dropped("retention_lower_priority")),
-            Victim::Scroll(index) => self.scrolls[index].next = Selected::Capacity,
-            Victim::PrivateNext(index) => self.pending[index].selection = PrivateSelection::Next(Selected::Capacity),
-            Victim::PrivateScroll(index) => self.pending[index].scroll_next = Selected::Capacity,
         }
         true
     }
 
     fn push_public(&mut self, mut slot: Public) {
         let Some(reservation) = slot.reservation.take()
-            .or_else(|| self.rows.reserve_public(self.receipt, slot.row(&dropped("still_owner_closed")))) else { return };
+            .or_else(|| self.rows.reserve_public(self.receipt, slot.fallback(DropReason::StillOwnerClosed))) else { return };
         if self.public.len() >= PUBLIC_SLOTS {
             let lowest = self.public.iter().enumerate()
                 .filter(|(_, old)| old.priority() < slot.priority()
@@ -1005,12 +1205,12 @@ impl Stills {
                 .min_by_key(|(index, old)| (old.priority(), std::cmp::Reverse(*index)))
                 .map(|(index, _)| index);
             if let Some(mut evicted) = lowest.and_then(|index| self.public.remove(index)) {
-                let row = evicted.row(&dropped("lower_priority"));
+                let row = evicted.row(&SlotOutcome::dropped(DropReason::LowerPriority));
                 if let Some(ticket) = evicted.reservation.take() {
                     ticket.finish(row);
                 }
             } else {
-                reservation.finish(slot.row(&dropped("still_job_capacity")));
+                reservation.finish(slot.row(&SlotOutcome::dropped(DropReason::StillJobCapacity)));
                 return;
             }
         }
@@ -1023,103 +1223,127 @@ impl Stills {
         config: &ResolvedCaptureConfig,
     ) {
         let request = entry.opening.request;
-        let geometry = permission.geometry;
-        if request.geometry != Evidence::Observed(geometry) || request.foreground_at_receipt != Some(permission.proof) {
+        // The Receiver sends a permission only for the request with its
+        // geometry and foreground proof.
+        // The approval guard stays at run time in case that contract breaks.
+        let matches = request.geometry == Evidence::Observed(permission.geometry)
+            && request.foreground_at_receipt == Some(permission.proof);
+        debug_assert!(matches);
+        if !matches {
             return;
         }
         let at = permission.at;
-        let event = permission.event;
         if let Some(interval) = entry.interval {
-            match &mut entry.selection {
-                PrivateSelection::Preceding { adjustment, before, seen } => {
-                    let calibration = permission.device.filter(|_| interval.elevated_visit.is_none()).and_then(|device| match config.calibration(device) {
-                        Evidence::Observed(calibration) => Some(calibration),
-                        _ => None,
-                    });
-                    if let Ok(adjusted) = Adjustment::from_receipt(at, calibration) {
-                        if adjusted.boundary != adjustment.boundary {
-                            let pair = still_time::preceding(images, interval, adjusted, entry.refresh);
-                            *before = Selected::Waiting;
-                            *seen = Selected::Waiting;
-                            *before = self.retain(pair.before, still_png::Priority::BeforeSeen);
-                            *seen = self.retain(pair.seen, still_png::Priority::BeforeSeen);
-                        }
-                        *adjustment = adjusted;
-                    } else {
-                        entry.selection = PrivateSelection::Unavailable("adjustment_failed");
-                    }
-                }
-                PrivateSelection::Next(selected) if at != request.time.recv_t_us => {
-                    *selected = select_next(images, interval, at, &mut self.holds);
-                }
-                _ => {}
-            }
+            self.reselect_at_approval(&mut entry, interval, &permission, images, config);
         }
         let trigger = match request.kind {
             ProvisionalInputKind::PreMotion => Trigger::PreMotion,
             ProvisionalInputKind::PreAction | ProvisionalInputKind::Scroll { .. } => Trigger::PreAction,
             ProvisionalInputKind::Next => Trigger::Next,
         };
-        if let ProvisionalInputKind::Scroll { axis } = request.kind && let Some(interval) = entry.interval {
-            // Ticks without a device form one unknown-device burst per monitor and axis;
-            // known devices are never merged with each other (ALG §8.3).
-            let existing = self.scrolls.iter().position(|scroll| {
-                scroll.interval == interval && scroll.device == permission.device && scroll.axis == axis
-            });
-            let end = SessionTimeUs(at.0.saturating_add(SCROLL_US));
-            let next = Scroll { device: permission.device, axis, interval, end, event,
-                next: if at == request.time.recv_t_us { entry.scroll_next } else { Selected::Waiting } };
-            if let Some(index) = existing {
-                let old = std::mem::replace(&mut self.scrolls[index], next);
-                if at < old.end {
-                    self.invalidate_quiet(at);
-                    permission.rows.suppress();
-                    return;
-                }
-                self.finish_scroll(old, images);
-            } else if self.scrolls.len() < MAX_SCROLLS {
-                self.scrolls.push(next);
-            } else {
-                // Terminal rows need journal reservations, but no still job slots.
-                let outcome = dropped("scroll_burst_capacity");
-                for slot in next.dropped_observations(&outcome) {
-                    let row = slot.row(&outcome);
-                    if let Some(reservation) = self.rows.reserve_public(self.receipt, row.clone()) {
-                        reservation.finish(row);
-                    }
-                }
-            }
+        if let ProvisionalInputKind::Scroll { axis } = request.kind && let Some(interval) = entry.interval
+            && !self.stage_scroll(&mut entry, &permission, axis, interval, images)
+        {
+            permission.rows.suppress();
+            return;
         }
         if matches!(trigger, Trigger::PreAction | Trigger::Next) {
             self.invalidate_quiet(at);
         }
-        let mut add = |index, trigger, role, adjustment, state, rows: &mut EarlyRows| {
-            let Some(reservation) = rows.take(index) else { return; };
-            self.push_public(Public {
-                event: Some(event), trigger, role, at, geometry,
-                admission: request.admission, interval: entry.interval, adjustment, frame: None,
-                state, pointer: None, save: None,
-                reservation: Some(reservation), settled_confirmed_t_us: None, scroll_device: None,
-            });
+        let slots = match entry.selection {
+            PrivateSelection::Preceding { adjustment, before, seen } => [
+                (trigger, Role::Before, Some(adjustment), State::Selected(before)),
+                (trigger, Role::Seen, Some(adjustment), State::Selected(seen)),
+            ],
+            PrivateSelection::Next(selected) => [
+                (trigger, Role::Image, None, State::Selected(selected)),
+                (Trigger::Settled, Role::Image, None, State::Settling),
+            ],
+            PrivateSelection::Unavailable(reason) if matches!(trigger, Trigger::Next) => [
+                (trigger, Role::Image, None, State::dropped(reason)),
+                (Trigger::Settled, Role::Image, None, State::dropped(reason)),
+            ],
+            PrivateSelection::Unavailable(reason) => [
+                (trigger, Role::Before, None, State::dropped(reason)),
+                (trigger, Role::Seen, None, State::dropped(reason)),
+            ],
         };
-        match entry.selection {
+        for (index, (trigger, role, adjustment, state)) in slots.into_iter().enumerate() {
+            let Some(reservation) = permission.rows.take(index) else { continue };
+            self.push_public(Public {
+                event: Some(permission.event), interval: entry.interval, adjustment, reservation: Some(reservation),
+                ..Public::new(trigger, role, at, permission.geometry, request.admission, state)
+            });
+        }
+    }
+
+    /// Reselect a pending entry's frames at its approved action time, where
+    /// that differs from the receipt.
+    fn reselect_at_approval(&mut self, entry: &mut Private, interval: Interval, permission: &Permission,
+        images: &NativeImages, config: &ResolvedCaptureConfig,
+    ) {
+        let at = permission.at;
+        let received = entry.opening.request.time.recv_t_us;
+        let refresh = entry.refresh;
+        match &mut entry.selection {
             PrivateSelection::Preceding { adjustment, before, seen } => {
-                add(0, trigger, Role::Before, Some(adjustment), State::Selected(before), &mut permission.rows);
-                add(1, trigger, Role::Seen, Some(adjustment), State::Selected(seen), &mut permission.rows);
+                let Ok(adjusted) = Adjustment::from_receipt(at, calibration(config, permission.device, interval)) else {
+                    entry.selection = PrivateSelection::Unavailable(DropReason::AdjustmentFailed);
+                    return;
+                };
+                if adjusted.boundary != adjustment.boundary {
+                    let pair = still_time::preceding(images, interval, adjusted, refresh);
+                    *before = Selected::Waiting;
+                    *seen = Selected::Waiting;
+                    *before = self.retain(pair.before, still_png::Priority::BeforeSeen);
+                    *seen = self.retain(pair.seen, still_png::Priority::BeforeSeen);
+                }
+                *adjustment = adjusted;
             }
-            PrivateSelection::Next(selected) => {
-                add(0, trigger, Role::Image, None, State::Selected(selected), &mut permission.rows);
-                add(1, Trigger::Settled, Role::Image, None, State::Settling, &mut permission.rows);
+            PrivateSelection::Next(selected) if at != received => {
+                *selected = self.select_next(images, interval, at);
             }
-            PrivateSelection::Unavailable(reason) if matches!(trigger, Trigger::Next) => {
-                add(0, trigger, Role::Image, None, State::Done(dropped(reason)), &mut permission.rows);
-                add(1, Trigger::Settled, Role::Image, None, State::Done(dropped(reason)), &mut permission.rows);
+            _ => {}
+        }
+    }
+
+    /// Join an approved scroll tick to its burst (ALG §8.3). False when the
+    /// tick only extends a running burst, whose slots stand for it.
+    fn stage_scroll(&mut self, entry: &mut Private, permission: &Permission, axis: WheelAxis, interval: Interval,
+        images: &NativeImages,
+    ) -> bool {
+        let at = permission.at;
+        // Ticks without a device form one unknown-device burst per monitor and axis;
+        // known devices are never merged with each other (ALG §8.3).
+        let existing = self.scrolls.iter().position(|scroll| {
+            scroll.interval == interval && scroll.device == permission.device && scroll.axis == axis
+        });
+        let end = SessionTimeUs(at.0.saturating_add(SCROLL_US));
+        let next = if at == entry.opening.request.time.recv_t_us {
+            std::mem::replace(&mut entry.scroll_next, Selected::Waiting)
+        } else {
+            Selected::Waiting
+        };
+        let burst = Scroll { device: permission.device, axis, interval, end, event: permission.event, next };
+        if let Some(index) = existing {
+            let old = std::mem::replace(&mut self.scrolls[index], burst);
+            if at < old.end {
+                self.invalidate_quiet(at);
+                return false;
             }
-            PrivateSelection::Unavailable(reason) => {
-                add(0, trigger, Role::Before, None, State::Done(dropped(reason)), &mut permission.rows);
-                add(1, trigger, Role::Seen, None, State::Done(dropped(reason)), &mut permission.rows);
+            self.finish_scroll(old, images);
+        } else if self.scrolls.len() < MAX_SCROLLS {
+            self.scrolls.push(burst);
+        } else {
+            // Terminal rows need journal reservations, but no still job slots.
+            let reason = DropReason::ScrollBurstCapacity;
+            for slot in burst.dropped_observations(reason) {
+                if let Some(reservation) = self.rows.reserve_public(self.receipt, slot.fallback(reason)) {
+                    reservation.finish(slot.row(&SlotOutcome::dropped(reason)));
+                }
             }
         }
+        true
     }
 
     pub fn advance_idle(&mut self, through: SessionTimeUs) {
@@ -1131,23 +1355,23 @@ impl Stills {
         for row in &mut self.public {
             let reading = matches!(&row.state, State::Work(work) if matches!(work.borrow().stage, WorkStage::Readback(_)));
             if reading || matches!(row.state, State::Selected(Selected::Retained(_))) {
-                row.state = State::Done(dropped("native_capture_epoch_closed"));
+                row.state = State::dropped(DropReason::NativeCaptureEpochClosed);
             }
         }
     }
 
     pub fn geometry_changed(&mut self, geometry: GeometryId) {
         if let Some(mut start) = self.start.take() {
-            start.state = State::Done(dropped("geometry_changed_before_start_frame"));
+            start.state = State::dropped(DropReason::GeometryChangedBeforeStartFrame);
             self.push_public(start);
         }
         for row in &mut self.public {
             if row.geometry != geometry && matches!(row.state, State::Settling | State::Selected(Selected::Waiting)) {
-                row.state = State::Done(dropped("geometry_changed_before_selection"));
+                row.state = State::dropped(DropReason::GeometryChangedBeforeSelection);
             }
         }
         for scroll in std::mem::take(&mut self.scrolls) {
-            self.drop_scroll(scroll, "geometry_changed_before_scroll_end");
+            self.drop_scroll(&scroll, DropReason::GeometryChangedBeforeScrollEnd);
         }
         self.quiet = None;
         self.quiet_after = None;
@@ -1159,6 +1383,7 @@ impl Stills {
         &mut self, prefix: crate::session::AdmissionBoundary, cutoff: crate::session::AdmissionBoundary,
         images: &NativeImages, mode: &MonitorCapture, stopping: bool, capture_available: bool,
     ) {
+        let at_boundary = |stop, pause| DropReason::at_boundary(stopping, stop, pause);
         self.receipt = self.receipt.max(cutoff.time);
         if stopping {
             let latest = capture_available.then(|| images.history().iter().rev().find(|frame| {
@@ -1168,24 +1393,18 @@ impl Stills {
                     && frame.metadata.recv_t_us < prefix.time
             })).flatten();
             let state = latest.map_or_else(
-                || State::Done(dropped("no_eligible_final_frame_in_capture_epoch")),
+                || State::dropped(DropReason::NoEligibleFinalFrameInCaptureEpoch),
                 |frame| State::Selected(self.retain(Ok(frame), still_png::Priority::Final)),
             );
-            self.push_public(Public { event: None, trigger: Trigger::Final, role: Role::Image,
-                at: cutoff.time, geometry: mode.geometry.id, admission: prefix.epoch, interval: None,
-                adjustment: None, frame: None, pointer: None, save: None, reservation: None,
-                settled_confirmed_t_us: None, scroll_device: None, state });
+            self.push_public(Public::new(Trigger::Final, Role::Image, cutoff.time, mode.geometry.id, prefix.epoch, state));
         }
         while let Some(command) = self.deferred_save.take().or_else(|| self.saves.try_recv().ok()) {
             let save = command.confirmation;
-            let (trigger, role) = match save.kind() {
-                SaveKind::Checkpoint => (Trigger::Checkpoint, Role::Image),
-                SaveKind::Final => (Trigger::Final, Role::FinalSaveSettled),
-            };
-            self.push_public(Public { event: None, trigger, role, at: save.time().recv_t_us,
-                geometry: command.geometry, admission: command.admission, interval: None, adjustment: None,
-                frame: None, pointer: None, save: Some(save), reservation: Some(command.reservation), settled_confirmed_t_us: None, scroll_device: None,
-                state: State::Done(dropped(if stopping { "stop_before_save_selection" } else { "pause_before_save_selection" })) });
+            let (trigger, role) = save_slot(save.kind());
+            let at = save.time().recv_t_us;
+            let state = State::dropped(at_boundary(DropReason::StopBeforeSaveSelection, DropReason::PauseBeforeSaveSelection));
+            self.push_public(Public { save: Some(save), reservation: Some(command.reservation),
+                ..Public::new(trigger, role, at, command.geometry, command.admission, state) });
         }
         self.quiet = None;
         self.quiet_after = None;
@@ -1193,14 +1412,14 @@ impl Stills {
             if matches!(slot.state, State::Settling | State::Selected(Selected::Waiting))
                 || slot.settled_confirmed_t_us.is_some_and(|confirmed| confirmed >= cutoff.time)
             {
-                slot.state = State::Done(dropped(if stopping { "stop_before_selection" } else { "pause_before_selection" }));
+                slot.state = State::dropped(at_boundary(DropReason::StopBeforeSelection, DropReason::PauseBeforeSelection));
             }
         }
         for scroll in std::mem::take(&mut self.scrolls) {
-            self.drop_scroll(scroll, if stopping { "stop_before_scroll_end" } else { "pause_before_scroll_end" });
+            self.drop_scroll(&scroll, at_boundary(DropReason::StopBeforeScrollEnd, DropReason::PauseBeforeScrollEnd));
         }
         if let Some(mut start) = self.start.take() {
-            start.state = State::Done(dropped(if stopping { "stop_before_start_frame" } else { "pause_before_start_frame" }));
+            start.state = State::dropped(at_boundary(DropReason::StopBeforeStartFrame, DropReason::PauseBeforeStartFrame));
             self.push_public(start);
         }
         self.observed_frame = None;
@@ -1233,11 +1452,11 @@ impl Stills {
         self.quiet_after = None;
         for row in &mut self.public {
             if matches!(row.state, State::Settling | State::Selected(Selected::Waiting)) {
-                row.state = State::Done(dropped("admission_closed_before_selection"));
+                row.state = State::dropped(DropReason::AdmissionClosedBeforeSelection);
             }
         }
         for scroll in std::mem::take(&mut self.scrolls) {
-            self.drop_scroll(scroll, "admission_closed_before_scroll_end");
+            self.drop_scroll(&scroll, DropReason::AdmissionClosedBeforeScrollEnd);
         }
     }
 
@@ -1266,7 +1485,9 @@ impl Stills {
             if finished.as_ref().is_some_and(|(_, withdrawn)| *withdrawn) {
                 slot.frame = None;
             }
-            slot.state = State::Done(finished.map_or_else(|| dropped(reason), |(outcome, _)| outcome));
+            slot.state = State::Done(finished.map_or_else(
+                || SlotOutcome::dropped(DropReason::Drain(reason)), |(outcome, _)| outcome,
+            ));
         }
     }
 
@@ -1275,22 +1496,41 @@ impl Stills {
         images: &NativeImages, readbacks: &mut readback::Readbacks, png: &still_png::Inbox,
         now: SessionTimeUs, ticking: Instant,
     ) -> Result<(), ProbeError> {
+        self.select_waiting(images, now);
+        self.advance_slots(png);
+        self.attach_shared_work();
+        self.start_readback(device, images, readbacks, ticking)?;
+        self.finish_rows();
+        Ok(())
+    }
+
+    /// Select the next frame of each waiting public slot, up to `NEXT_US`
+    /// after its trigger.
+    fn select_waiting(&mut self, images: &NativeImages, now: SessionTimeUs) {
+        for index in 0..self.public.len() {
+            let slot = &self.public[index];
+            let (Some(interval), State::Selected(Selected::Waiting)) = (slot.interval, &slot.state) else { continue };
+            let at = slot.at;
+            let selected = if now.0.saturating_sub(at.0) >= NEXT_US {
+                Selected::Missing(Missing::NoEligibleFrame)
+            } else {
+                self.select_next(images, interval, at)
+            };
+            self.public[index].state = State::Selected(selected);
+        }
+    }
+
+    /// Resolve slots without a usable frame and collect finished work.
+    fn advance_slots(&mut self, png: &still_png::Inbox) {
         for slot in &mut self.public {
-            if let (Some(interval), State::Selected(selected @ Selected::Waiting)) = (slot.interval, &mut slot.state) {
-                *selected = if now.0.saturating_sub(slot.at.0) >= NEXT_US {
-                    Selected::Missing(Missing::NoEligibleFrame)
-                } else {
-                    select_next(images, interval, slot.at, &mut self.holds)
-                };
-            }
             match &mut slot.state {
                 State::Selected(Selected::Retained(frame)) if !frame.metadata.covered() => {
-                    slot.state = State::Done(dropped("elevated_frame_uncertified"));
+                    slot.state = State::dropped(DropReason::ElevatedFrameUncertified);
                 }
-                State::Selected(Selected::Capacity) => slot.state = State::Done(dropped("retention_capacity")),
-                State::Selected(Selected::Missing(reason)) => slot.state = State::Done(serde_json::json!({
-                    "kind": "unavailable", "reason": reason,
-                })),
+                State::Selected(Selected::Capacity) => slot.state = State::dropped(DropReason::RetentionCapacity),
+                State::Selected(Selected::Missing(reason)) => {
+                    slot.state = State::Done(SlotOutcome::Unavailable { reason: *reason });
+                }
                 State::Work(work) => {
                     let work = Rc::clone(work);
                     let mut work = work.borrow_mut();
@@ -1303,8 +1543,10 @@ impl Stills {
                 _ => {}
             }
         }
+    }
 
-        // A slot whose held frame already has shared work attaches to it.
+    /// A slot whose held frame already has shared work attaches to it.
+    fn attach_shared_work(&mut self) {
         for index in 0..self.public.len() {
             let State::Selected(Selected::Retained(frame)) = &self.public[index].state else { continue };
             let id = frame.metadata.id;
@@ -1316,37 +1558,50 @@ impl Stills {
                 attach(&mut self.public[index], &work);
             }
         }
+    }
+
+    /// Start the readback of the highest-priority held frame when no readback
+    /// is pending. One readback and one PNG job serve every slot of the frame (C2).
+    fn start_readback(&mut self, device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        images: &NativeImages, readbacks: &mut readback::Readbacks, ticking: Instant,
+    ) -> Result<(), ProbeError> {
+        if readbacks.has_pending() {
+            return Ok(());
+        }
         let ready = self.public.iter().enumerate()
             .filter(|(_, slot)| matches!(slot.state, State::Selected(Selected::Retained(_))))
             .min_by_key(|(index, slot)| (std::cmp::Reverse(slot.priority()), *index));
-        if !readbacks.has_pending() && let Some((index, slot)) = ready
-            && let State::Selected(Selected::Retained(frame)) = &slot.state
-        {
-            let frame = Rc::clone(frame);
-            let priority = slot.priority();
-            while !readbacks.fits(&frame) && self.reclaim(priority, false) {}
-            let meta = &frame.metadata;
-            let request = readback::Request { frame: meta.id,
-                geometry: meta.geometry.id, admission: meta.admission, deadline: ticking + READBACK_WAIT };
-            match readbacks.try_retained(request, &frame, device, images)? {
-                Some(Ok(ticket)) => {
-                    // One readback and one PNG job serve every slot of this frame (C2).
-                    let work = Rc::new(RefCell::new(FrameWork { frame: meta.id, priority, exempt: false, coverage: None,
-                        stage: WorkStage::Readback(ticket) }));
-                    for slot in &mut self.public {
-                        if matches!(&slot.state, State::Selected(Selected::Retained(held)) if held.metadata.id == meta.id) {
-                            attach(slot, &work);
-                        }
+        let Some((index, slot)) = ready else { return Ok(()) };
+        let State::Selected(Selected::Retained(frame)) = &slot.state else { return Ok(()) };
+        // This handle keeps the frame's own hold out of `reclaim`.
+        let frame = Rc::clone(frame);
+        let priority = slot.priority();
+        while !readbacks.fits(&frame) && self.reclaim(priority, false) {}
+        let meta = &frame.metadata;
+        let request = readback::Request { frame: meta.id,
+            geometry: meta.geometry.id, admission: meta.admission, deadline: ticking + READBACK_WAIT };
+        match readbacks.try_retained(request, &frame, device, images)? {
+            Some(Ok(ticket)) => {
+                let work = Rc::new(RefCell::new(FrameWork { frame: meta.id, priority, exempt: false, coverage: None,
+                    stage: WorkStage::Readback(ticket) }));
+                for slot in &mut self.public {
+                    if matches!(&slot.state, State::Selected(Selected::Retained(held)) if held.metadata.id == meta.id) {
+                        attach(slot, &work);
                     }
                 }
-                Some(Err(reason)) => {
-                    let slot = &mut self.public[index];
-                    slot.frame = Some(FrameEvidence::new(meta, slot.settled_confirmed_t_us));
-                    slot.state = State::Done(readback_failure(reason));
-                }
-                None => {}
             }
+            Some(Err(reason)) => {
+                let slot = &mut self.public[index];
+                slot.frame = Some(FrameEvidence::new(meta, slot.settled_confirmed_t_us));
+                slot.state = State::dropped(reason.into());
+            }
+            None => {}
         }
+        Ok(())
+    }
+
+    /// Hand each resolved slot's row to its reservation.
+    fn finish_rows(&mut self) {
         self.public.retain_mut(|slot| {
             let State::Done(outcome) = &slot.state else { return true };
             let row = slot.row(outcome);
@@ -1356,40 +1611,32 @@ impl Stills {
             }
             false
         });
-        Ok(())
     }
 }
 
-fn select_next(images: &NativeImages, interval: Interval, end: SessionTimeUs, holds: &mut Holds) -> Selected {
-    match still_time::next(images, interval, end) {
-        Ok(None) => Selected::Waiting,
-        Ok(Some(frame)) => Selected::from(Ok(frame), holds),
-        Err(reason) => Selected::Missing(reason),
-    }
-}
-
-pub(super) fn dropped_trigger(
-    trigger: &'static str, role: &'static str, at: SessionTimeUs, geometry: GeometryId,
-    admission: AdmissionEpoch, reason: &'static str,
-) -> serde_json::Value {
-    serde_json::json!({ "kind": "still_dropped",
-        "trigger": trigger, "role": role, "trigger_t_us": at, "monitor": geometry.monitor,
-        "geometry": geometry, "admission_epoch": admission, "event_ref": null, "source_t_us": null,
-        "file": null, "width": null, "height": null, "reason": reason })
-}
-
-fn dropped(reason: &'static str) -> serde_json::Value {
-    serde_json::json!({ "kind": "dropped", "reason": reason })
-}
-
-fn readback_failure(reason: readback::Rejected) -> serde_json::Value {
-    use readback::Rejected::*;
-    dropped(match reason {
-        Pressure => "readback_capacity",
-        EpochMismatch => "capture_interval_changed",
-        ApprovalSuppressed => "elevated_frame_uncertified",
-        Expired => "readback_deadline",
-        Closed => "admission_closed",
-        CaptureFailed => "capture_failed",
+/// The receipt-delay calibration of an ordinary input device. Input of an
+/// elevated visit has none.
+fn calibration(config: &ResolvedCaptureConfig, device: Option<DeviceId>, interval: Interval) -> Option<DeviceCalibration> {
+    device.filter(|_| interval.elevated_visit.is_none()).and_then(|device| match config.calibration(device) {
+        Evidence::Observed(calibration) => Some(calibration),
+        _ => None,
     })
+}
+
+/// The approved fallback row of a still slot (schema §6): the PDF fields
+/// with nulls, `seen_obs_id` on a paired row, and `geometry_evidence`, which
+/// every approved fallback carries.
+pub(super) fn fallback_row(
+    trigger: Trigger, role: Role, at: SessionTimeUs, geometry: Evidence<GeometryId>,
+    admission: AdmissionEpoch, event: Option<EventRef>, reason: &'static str,
+) -> serde_json::Value {
+    let observed = match geometry { Evidence::Observed(geometry) => Some(geometry), _ => None };
+    let mut row = serde_json::json!({ "kind": "still_dropped",
+        "trigger": trigger, "role": role, "trigger_t_us": at, "monitor": observed.map(|geometry| geometry.monitor),
+        "geometry": observed, "geometry_evidence": geometry, "admission_epoch": admission, "event_ref": event,
+        "source_t_us": null, "frame_obs_id": null, "file": null, "width": null, "height": null, "reason": reason });
+    if trigger.paired() {
+        row["seen_obs_id"] = serde_json::Value::Null;
+    }
+    row
 }

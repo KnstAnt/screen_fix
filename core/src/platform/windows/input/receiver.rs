@@ -25,7 +25,7 @@ use crate::{
     session::{AdmissionBoundary, hotkey::ControlOutcome, windows::{AwakeElapsed, ControlPrefix, InputFailure, Receipt, SuspendMarks}},
 };
 
-use super::{ProbeError, ReceiptPrefix, blind::Blinds, clock, clock_error, devices::Devices, gate::{Gate, Selection}, hook_health::HookHealth, input_timing, resync, unavailable};
+use super::{ProbeError, ReceiptPrefix, blind::Blinds, clock, clock_error, devices::Devices, gate::{Gate, Selection, is_key, record_loss}, hook_health::HookHealth, input_timing, resync, unavailable};
 use super::super::{context::{ConfirmedText, Context, Visit}, elevated::InputCertificate, still_rows, stills};
 
 /// A producer without progress for this long, suspend excluded, opens a
@@ -36,6 +36,8 @@ const STALL_LOSS: std::time::Duration = std::time::Duration::from_secs(5);
 /// Resync not performed this long after its request opens `resync_unavailable`.
 const RESYNC_BLIND_US: i64 = 250_000;
 const SYNC_RETRY_US: i64 = 100_000;
+/// Pointer rest after the last motion that triggers a pointer-rest still.
+const POINTER_REST_US: i64 = 500_000;
 
 /// The latest advance of one producer's progress, with the suspend sequence
 /// read at or after it for suspend-excluded elapsed time.
@@ -83,6 +85,9 @@ pub(super) struct Receiver {
     stall: Option<Stall>,
     /// Input arrives while the receipt foreground is not ordinary-accessible.
     foreground_blind: bool,
+    /// The records of each producer's pending foreground-inaccessible matcher
+    /// gap, split by privacy class for its loss evidence.
+    foreground_losses: [ProducerLoss; Producer::ALL.len()],
     optional_lost: Vec<OptionalCollection>,
     /// The latest standard-helper environment record seen while inactive. The
     /// helper checks its registrations before each one (E4).
@@ -103,7 +108,8 @@ impl Receiver {
             requires_opening_sync: true, synchronized_qpc: None, sync_visit: None,
             source: None, source_certificate: None, device_ids: Devices::default(), past_hook_loss: (false, false),
             blinds: Blinds::default(), suspends: 0, opening_mark: None, marks: [None; Producer::ALL.len()], stall: None,
-            foreground_blind: false, optional_lost: Vec::new(), helper_checked: QpcTick(0),
+            foreground_blind: false, foreground_losses: [ProducerLoss::default(); Producer::ALL.len()],
+            optional_lost: Vec::new(), helper_checked: QpcTick(0),
         }
     }
 
@@ -114,9 +120,10 @@ impl Receiver {
 
     /// Producer liveness at `receipt.qpc`, sleep excluded (§6.2 row 11): a 250 ms
     /// stall opens a `producer_stall` blind interval at the last progress (§6.3);
-    /// a 5 s stall is returned with its first missing receipt for the activity
-    /// loss. An unknown suspend interval is not evaluated.
-    pub fn check_stall(&mut self, receipt: Receipt, power: SuspendMarks) -> Result<Option<(Producer, SessionTimeUs)>, ProbeError> {
+    /// the producer of a 5 s stall is returned once for the activity loss, whose
+    /// first missing receipt is [`Self::earliest_missing`]. An unknown suspend
+    /// interval is not evaluated.
+    pub fn check_stall(&mut self, receipt: Receipt, power: SuspendMarks) -> Result<Option<Producer>, ProbeError> {
         let now = receipt.clock.time(receipt.qpc).map_err(clock_error)?;
         // Liveness is measured from this (re)opening of ordinary input, which
         // can follow its admission boundary after an elevated visit.
@@ -149,13 +156,11 @@ impl Receiver {
             }
         }
         let Some(producer) = lost else { return Ok(None) };
-        let Some(first_missing) = self.stall.as_mut().filter(|stall| !stall.escalated).map(|stall| {
-            stall.escalated = true;
-            stall.start
-        }) else { return Ok(None) };
+        let Some(stall) = self.stall.as_mut().filter(|stall| !stall.escalated) else { return Ok(None) };
+        stall.escalated = true;
         // The activity loss reports this interval through its own blind row.
         self.blinds.discard(InputBlindReason::ProducerStall);
-        Ok(Some((producer, first_missing)))
+        Ok(Some(producer))
     }
 
     fn begin_stall(&mut self, start: SessionTimeUs, now: SessionTimeUs, stalled: Vec<(Producer, QpcTick)>) {
@@ -283,7 +288,8 @@ impl Receiver {
     ) -> Result<(), ProbeError> {
         let elevated = self.source.is_some();
         let input_receipt = match &record {
-            HelperToCore::Input(packet) => Some((packet.sample.producer(), packet.receipt.qpc, packet.receipt.message_tick_ms)),
+            HelperToCore::Input(packet) => Some((packet.sample.producer(), is_key(&packet.sample),
+                packet.receipt.qpc, packet.receipt.message_tick_ms)),
             _ => None,
         };
         let record = self.device_ids.translate(elevated, record);
@@ -293,11 +299,12 @@ impl Receiver {
         }
         let Some(record) = record else {
             // Only an input record naming an absent device is discarded here.
-            if let Some((producer, qpc, tick)) = input_receipt
+            if let Some((producer, key, qpc, tick)) = input_receipt
                 && closing.is_none_or(|closing| qpc < closing.qpc)
                 && let Some(timing) = input_timing(receipt, qpc, tick)?
             {
-                self.note_packet_lost(LossReason::UnknownDevice, producer, timing.time.recv_t_us);
+                let at = timing.time.recv_t_us;
+                self.gate.note_loss(record_loss(LossReason::UnknownDevice, producer, key, at, at));
             }
             return Ok(());
         };
@@ -323,10 +330,13 @@ impl Receiver {
                 let at = timing.time.recv_t_us;
                 if let Some(reason) = inaccessible {
                     // Counted in the ordered input stream, where its gap also
-                    // invalidates held state; the blind interval runs until return.
+                    // invalidates held state; the blind interval runs until
+                    // return. A key keeps only its count (§6.1 rule 5).
                     self.blinds.open(reason, at);
                     self.foreground_blind = true;
-                    self.matcher.gap(InputGap::logical(producer, LossReason::ForegroundInaccessible, at));
+                    let gap = InputGap::logical(producer, LossReason::ForegroundInaccessible, at);
+                    self.foreground_losses[producer.index()].record(gap, is_key(&packet.sample));
+                    self.matcher.gap(gap);
                     return Ok(());
                 }
                 if self.foreground_blind && packet.foreground_at_receipt.is_some() {
@@ -340,12 +350,12 @@ impl Receiver {
                 self.hook_health.note_callback(producer, at);
                 if self.stall.as_ref().is_some_and(|stall| stall.stalled.iter().any(|(stalled, _)| *stalled == producer)) {
                     // Only the stalled producer's late records fall in its blind interval.
-                    self.note_packet_lost(LossReason::ProducerStall, producer, at);
+                    self.note_packet_lost(LossReason::ProducerStall, &packet.sample, at);
                     return Ok(());
                 }
                 if self.requires_opening_sync || self.synchronized_qpc.is_some_and(|after| packet.receipt.qpc <= after) {
                     // Counted with its receipt only; no payload is retained.
-                    self.note_packet_lost(LossReason::ResyncPending, producer, timing.time.recv_t_us);
+                    self.note_packet_lost(LossReason::ResyncPending, &packet.sample, at);
                     return Ok(());
                 }
                 if closing.is_none() && matches!(packet.sample,
@@ -433,7 +443,7 @@ impl Receiver {
             if let Some(timing) = input_timing(receipt, packet.receipt.qpc, packet.receipt.message_tick_ms)? {
                 let at = timing.time.recv_t_us;
                 self.blinds.open(InputBlindReason::ElevatedWindow, at);
-                self.note_packet_lost(LossReason::ForegroundInaccessible, packet.sample.producer(), at);
+                self.note_packet_lost(LossReason::ForegroundInaccessible, &packet.sample, at);
             }
             return Ok(());
         }
@@ -445,7 +455,7 @@ impl Receiver {
     pub fn note_uncertified(&mut self, record: InputEvidence, receipt: Receipt) -> Result<(), ProbeError> {
         if let InputEvidence::Input(packet) = record && packet.receipt.qpc >= receipt.boundary.qpc {
             let at = receipt.clock.time(packet.receipt.qpc).map_err(clock_error)?;
-            self.note_packet_lost(LossReason::UncertifiedSource, packet.sample.producer(), at);
+            self.note_packet_lost(LossReason::UncertifiedSource, &packet.sample, at);
         }
         Ok(())
     }
@@ -501,13 +511,9 @@ impl Receiver {
             self.device_inventory_truncated = true;
             self.gate.note_device_inventory_loss();
         }
-        for descriptor in self.device_ids.current(source.is_some()) {
-            self.gate.note_input_device(descriptor);
-            if self.devices.len() < MAX_INPUT_DEVICES || self.devices.contains_key(&descriptor.id) {
-                self.devices.insert(descriptor.id, descriptor.clone());
-            } else {
-                self.device_inventory_truncated = true;
-            }
+        let current: Vec<_> = self.device_ids.current(source.is_some()).cloned().collect();
+        for descriptor in current {
+            self.add_device(descriptor);
         }
     }
 
@@ -539,21 +545,24 @@ impl Receiver {
 
     pub fn inventory(&mut self, record: HelperToCore) {
         match record {
-            HelperToCore::DeviceArrived { descriptor, .. } => {
-                if self.devices.len() < MAX_INPUT_DEVICES || self.devices.contains_key(&descriptor.id) {
-                    self.gate.note_input_device(&descriptor);
-                    self.devices.insert(descriptor.id, descriptor);
-                } else {
-                    self.device_inventory_truncated = true;
-                    self.gate.note_device_inventory_loss();
-                }
-            }
+            HelperToCore::DeviceArrived { descriptor, .. } => self.add_device(descriptor),
             HelperToCore::DeviceRemoved { id, .. } => self.gate.forget_input_device(id),
             HelperToCore::Gap(gap) if gap.producer == crate::protocol::ipc::Producer::DeviceNotifications => {
                 self.device_inventory_truncated = true;
                 self.gate.note_device_inventory_loss();
             }
             _ => {}
+        }
+    }
+
+    /// An active device. The gate always learns it; only the manifest
+    /// inventory is bounded, and a device beyond it truncates the inventory.
+    fn add_device(&mut self, descriptor: DeviceDescriptor) {
+        self.gate.note_input_device(&descriptor);
+        if self.devices.len() < MAX_INPUT_DEVICES || self.devices.contains_key(&descriptor.id) {
+            self.devices.insert(descriptor.id, descriptor);
+        } else {
+            self.device_inventory_truncated = true;
         }
     }
 
@@ -687,9 +696,21 @@ impl Receiver {
         self.matcher.close_producers();
     }
 
-    /// One admitted packet discarded before matching. It keeps only its receipt.
-    fn note_packet_lost(&mut self, reason: LossReason, producer: Producer, at: SessionTimeUs) {
-        self.gate.note_loss(LossEvidence::ordinary(reason, Some(LossProducer::from(producer)), std::num::NonZeroU64::MIN, at, at));
+    /// One admitted packet discarded before matching. It keeps only its
+    /// receipt, and a key only its count (§6.1 rule 5).
+    fn note_packet_lost(&mut self, reason: LossReason, sample: &InputSample, at: SessionTimeUs) {
+        self.gate.note_loss(record_loss(reason, sample.producer(), is_key(sample), at, at));
+    }
+
+    /// The loss evidence of a matcher gap. A foreground-inaccessible gap takes
+    /// its evidence from the per-producer split, so its keys stay count-only.
+    fn note_gap_loss(&mut self, gap: InputGap) {
+        if gap.reason == LossReason::ForegroundInaccessible {
+            std::mem::take(&mut self.foreground_losses[gap.producer.index()])
+                .note(&mut self.gate, gap.reason, gap.producer);
+        } else {
+            self.gate.note_loss(gap.evidence());
+        }
     }
 
     fn install_synchronization(
@@ -721,8 +742,9 @@ impl Receiver {
         self.gate.stage_confirmed(text, receipt);
     }
 
-    /// A text commit lost before confirmation (I7).
-    pub fn note_text_loss(&mut self, evidence: LossEvidence) {
+    /// Loss evidence found outside the receiver, such as a text commit lost
+    /// before confirmation (I7) or undecodable elevated records (E3).
+    pub fn note_loss(&mut self, evidence: LossEvidence) {
         self.gate.note_loss(evidence);
     }
 
@@ -771,6 +793,7 @@ impl Receiver {
         self.marks = [None; Producer::ALL.len()];
         self.stall = None;
         self.foreground_blind = false;
+        self.foreground_losses = Default::default();
     }
 
     pub fn interrupt(&mut self, cutoff: SessionTimeUs, boundary: HeldBoundary) {
@@ -795,7 +818,7 @@ impl Receiver {
         while self.elevated_hook_loss().is_none()
             && let Some(step) = self.matcher.finish(limit)
         { self.consume(step); }
-        self.process_samples(|sampler, emit| sampler.finish(emit));
+        self.process_samples(|sampler, emit| sampler.flush(emit));
         self.release_controls(Some(cutoff), cutoff, true);
         self.controls.close_interval(cutoff);
         self.physical.invalidate();
@@ -821,11 +844,13 @@ impl Receiver {
         let Discarded { pending, decided, gaps } = self.matcher.discard();
         // A decided row is one item, accounted through its first record.
         for input in decided.iter().map(|row| &row.first).chain(&pending).filter(|input| admitted(input.time.recv_t_us)) {
-            self.gate.note_records_lost(reason(input), [input], true, Some(cutoff));
+            self.gate.note_records_lost(reason(input), [input], Some(cutoff));
         }
         for gap in gaps.into_iter().filter(|gap| admitted(gap.first)) {
-            self.gate.note_loss(gap.evidence());
+            self.note_gap_loss(gap);
         }
+        // The matcher holds no gap now; the splits of unadmitted ones go with it.
+        self.foreground_losses = Default::default();
         self.provisional.resolve_records(pending.iter().chain(decided.iter().flat_map(|row| row.records())));
     }
 
@@ -868,7 +893,7 @@ impl Receiver {
                 if elevated {
                     self.hook_health.note_correlation(&input);
                     if self.elevated_hook_loss().is_some() {
-                        self.gate.note_records_lost(LossReason::HookLost, [&input.first], true, None);
+                        self.gate.note_records_lost(LossReason::HookLost, [&input.first], None);
                         self.provisional.resolve_records(input.records());
                         return;
                     }
@@ -897,7 +922,7 @@ impl Receiver {
                 // Optional HID loss keeps keyboard and pointer state.
                 self.overflow = true;
                 self.provisional.note_gap(gap);
-                self.gate.note_loss(gap.evidence());
+                self.note_gap_loss(gap);
                 self.gate.reset_optional_hid();
             }
             InputStep::Gap(gap) => {
@@ -905,10 +930,11 @@ impl Receiver {
                 self.hook_health.reset_streaks();
                 self.flush_motion();
                 self.apply_gap(gap.first, gap.last, HeldBoundary::InputGap, [Some(gap)]);
+                self.note_gap_loss(gap);
             }
             InputStep::Undecidable { records, since } => {
                 // Keys of an unclassified visit are counted without times.
-                self.gate.note_records_lost(LossReason::ProducerStall, &records, true, Some(since));
+                self.gate.note_records_lost(LossReason::ProducerStall, &records, Some(since));
                 self.provisional.resolve_records(&records);
             }
             InputStep::DeviceRemoved { id, at } => {
@@ -955,6 +981,8 @@ impl Receiver {
         self.apply_gap(at, through, reason, []);
     }
 
+    /// Invalidate held state over a loss from `at` through `through`. The
+    /// caller records the loss evidence of `gaps`.
     fn apply_gap(
         &mut self, at: SessionTimeUs, through: SessionTimeUs, reason: HeldBoundary,
         gaps: impl IntoIterator<Item = Option<InputGap>>,
@@ -963,7 +991,6 @@ impl Receiver {
         self.release_controls(Some(at), at, true);
         for gap in gaps.into_iter().flatten() {
             self.provisional.note_gap(gap);
-            self.gate.note_loss(gap.evidence());
         }
         self.controls.close_interval(through);
         self.physical.invalidate();
@@ -1026,6 +1053,7 @@ impl Receiver {
         self.hook_health.reset_streaks();
         self.matcher.invalidate_through(last);
         self.apply_gap(first, last, HeldBoundary::InputGap, losses.by_producer);
+        losses.note(&mut self.gate);
         true
     }
 
@@ -1047,10 +1075,42 @@ fn native_count(gap: ProducerGap, clipped: bool) -> LossCount {
         .filter(|_| !clipped).map_or(LossCount::Unknown, LossCount::Known)
 }
 
+/// The lost records of one producer split by privacy class (§6.1 rule 5):
+/// key records keep only their count, since their visit may be sensitive;
+/// the others keep their merged receipt range.
+#[derive(Clone, Copy, Default)]
+struct ProducerLoss {
+    keys: u64,
+    others: Option<InputGap>,
+}
+
+impl ProducerLoss {
+    /// One lost record, as its logical gap.
+    fn record(&mut self, gap: InputGap, key: bool) {
+        if key {
+            self.keys = self.keys.saturating_add(1);
+        } else {
+            self.others = Some(self.others.map_or(gap, |old| old.merge(gap)));
+        }
+    }
+
+    fn note(self, gate: &mut Gate, reason: LossReason, producer: Producer) {
+        if let Some(count) = std::num::NonZeroU64::new(self.keys) {
+            gate.note_loss(LossEvidence::sensitive(reason, Some(LossProducer::from(producer)), count));
+        }
+        if let Some(gap) = self.others {
+            gate.note_loss(gap.evidence());
+        }
+    }
+}
+
 #[derive(Default)]
 struct SampleLoss {
     interval: Option<(SessionTimeUs, SessionTimeUs)>,
+    /// Every lost record of each producer, for the held invalidation.
     by_producer: [Option<InputGap>; Producer::ALL.len()],
+    /// The same records split by privacy class, for their loss evidence.
+    evidence: [ProducerLoss; Producer::ALL.len()],
 }
 
 impl SampleLoss {
@@ -1061,8 +1121,15 @@ impl SampleLoss {
         let gap = InputGap::logical(producer, LossReason::StagingPressure, at);
         let pending = &mut self.by_producer[producer.index()];
         *pending = Some(pending.map_or(gap, |old| old.merge(gap)));
+        self.evidence[producer.index()].record(gap, is_key(&slot.packet.sample));
         self.interval = Some(self.interval.map_or((at, at), |(first, last)| (first.min(at), last.max(at))));
         requests.retire_input(input);
+    }
+
+    fn note(&self, gate: &mut Gate) {
+        for producer in Producer::ALL {
+            self.evidence[producer.index()].note(gate, LossReason::StagingPressure, producer);
+        }
     }
 }
 
@@ -1223,15 +1290,16 @@ impl ProvisionalRequests {
         -> Result<(), ProbeError>
     {
         let now = receipt.clock.time(observed).map_err(clock_error)?;
-        let Some(motion) = &self.motion else { return Ok(()) };
-        if now.0.saturating_sub(motion.last.0) < 500_000 { return Ok(()); }
-        let motion = self.motion.take().expect("the pointer rest timer was present");
+        let Some(motion) = self.motion.take_if(|motion| now.0.saturating_sub(motion.last.0) >= POINTER_REST_US) else {
+            return Ok(());
+        };
         if motion.admission != receipt.boundary.epoch || !context.is_current(motion.proof, Some(motion.focus)) {
             return Ok(());
         }
         let Some(endpoint) = self.endpoints.get(&motion.geometry.monitor) else { return Ok(()) };
         let Some(rows) = &self.rows else { return Ok(()) };
-        let fallback = stills::dropped_trigger("pointer_rest", "image", now, motion.geometry, motion.admission, "pointer_rest_handoff_unavailable");
+        let fallback = stills::fallback_row(stills::Trigger::PointerRest, stills::Role::Image, now,
+            crate::protocol::Evidence::Observed(motion.geometry), motion.admission, None, "pointer_rest_handoff_unavailable");
         let reservation = match rows.reserve(now, Some(fallback)) {
             Ok(reservation) => reservation,
             Err(reason) => {

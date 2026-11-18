@@ -16,6 +16,7 @@ use windows_sys::Win32::{
     },
     Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE, INVALID_HANDLE_VALUE},
     Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING},
+    System::Registry::REG_MULTI_SZ,
     UI::Input::{
         GetRawInputDeviceInfoW, GetRawInputDeviceList, RAWINPUTDEVICELIST, RID_DEVICE_INFO,
         RIDI_DEVICEINFO, RIDI_DEVICENAME, RIDI_PREPARSEDDATA, RIM_TYPEHID, RIM_TYPEKEYBOARD,
@@ -96,7 +97,7 @@ pub(super) fn identify(path: &[u16], descriptor: &mut DeviceDescriptor) {
         descriptor.product_id = Some(product);
         descriptor.version = version;
     }
-    if matches!(descriptor.kind, DeviceKind::Hid { usage_page: 0x0D, usage: 1 | 2 }) {
+    if descriptor.kind.is_pen() {
         descriptor.driver_version = driver_version(path);
     }
 }
@@ -198,7 +199,7 @@ fn hardware_ids(path: &[u16]) -> Option<(u16, u16)> {
     let mut kind = 0;
     if unsafe { SetupDiGetDeviceRegistryPropertyW(devices.0, &info, SPDRP_HARDWAREID,
         &mut kind, ids.as_mut_ptr().cast(), size_of_val(&ids) as u32, &mut size) } == 0
-        || kind != 7 // REG_MULTI_SZ
+        || kind != REG_MULTI_SZ
         || size as usize > size_of_val(&ids) || size % 2 != 0
     {
         return None;
@@ -246,9 +247,10 @@ impl DeviceIds {
     }
 
     /// Translate the record's native handle to its session device ID. `None`
-    /// when the inventory is full. `Some(Some(handle))` names a handle seen
-    /// first in this record: the caller announces it before the record.
-    pub(super) fn identify(&mut self, sample: &mut InputSample) -> Option<Option<DeviceId>> {
+    /// when the inventory is full. `Some(Some((handle, id)))` names a handle
+    /// seen first in this record and its new session ID: the caller announces
+    /// it before the record.
+    pub(super) fn identify(&mut self, sample: &mut InputSample) -> Option<Option<(DeviceId, DeviceId)>> {
         let slot = match sample {
             InputSample::RawKey(key) => key.device.as_mut(),
             InputSample::RawPointer(pointer) => pointer.device.as_mut(),
@@ -258,8 +260,9 @@ impl DeviceIds {
         let Some(slot) = slot else { return Some(None) };
         let native = *slot;
         let first_seen = !self.active.contains_key(&native);
-        *slot = self.assign(native)?;
-        Some(first_seen.then_some(native))
+        let id = self.assign(native)?;
+        *slot = id;
+        Some(first_seen.then_some((native, id)))
     }
 }
 

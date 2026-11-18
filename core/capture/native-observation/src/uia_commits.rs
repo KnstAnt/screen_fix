@@ -247,15 +247,26 @@ impl Handler {
     }
 }
 
-// SAFETY: UIA promises a live SAFEARRAY through this synchronous callback.
-// Validate the single dimension, BSTR element type and bounded count before
-// reading its COM-owned element buffer.
+/// The BSTR elements of a one-dimensional SAFEARRAY. The dimension, element
+/// type and bounded count are validated before the bound or the COM-owned
+/// element buffer is read.
+///
+/// # Safety
+///
+/// `array` must be a live SAFEARRAY whose element buffer stays valid for the
+/// returned borrow. UIA promises this for the duration of its synchronous
+/// callback.
 unsafe fn array_parts(array: &SAFEARRAY) -> Option<&[BSTR]> {
-    let count = array.rgsabound[0].cElements as usize;
     if array.cDims != 1 || array.fFeatures.0 & FADF_BSTR.0 == 0
-        || array.cbElements as usize != size_of::<BSTR>() || array.pvData.is_null() || count > MAX_PARTS
+        || array.cbElements as usize != size_of::<BSTR>() || array.pvData.is_null()
     {
         return None;
     }
+    let count = array.rgsabound[0].cElements as usize;
+    if count > MAX_PARTS {
+        return None;
+    }
+    // SAFETY: the caller guarantees a live array; its one dimension holds
+    // `count` BSTR elements at `pvData`.
     Some(unsafe { std::slice::from_raw_parts(array.pvData.cast::<BSTR>(), count) })
 }

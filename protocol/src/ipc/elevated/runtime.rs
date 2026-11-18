@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{AdmissionEpoch, AttemptId, BoundedText, GeometryId, QpcTick, RequestId, SessionId};
 use crate::ipc::{
-    FocusAtReceipt, HelperFailure, HelperToCore, InputRegistration, PacketError, ProducerGap,
+    FocusAtReceipt, HelperFailure, InputRegistration, PacketError, ProducerGap, validate_input,
 };
 
 use super::{
@@ -388,7 +388,7 @@ fn gap_valid(gap: ProducerGap) -> bool {
 fn input_valid(input: &GrantedInput) -> bool {
     visit_valid(input.visit) && match &input.evidence {
         InputEvidence::Input(sample) => tick(sample.receipt.qpc) && sample.receipt.sequence.0 != 0
-            && HelperToCore::Input(sample.clone()).validate().is_ok(),
+            && validate_input(sample).is_ok(),
         InputEvidence::DeviceArrived { receipt, descriptor } =>
             tick(receipt.qpc) && receipt.sequence.0 != 0 && descriptor.id.0 != 0,
         InputEvidence::DeviceRemoved { receipt, id } =>

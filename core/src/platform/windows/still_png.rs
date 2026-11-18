@@ -1,7 +1,7 @@
 //! The attempt's sole native PNG encoder and image publisher.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, OpenOptions},
     io,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -27,7 +27,7 @@ use crate::{
     session::{fault::FaultReport, windows::{PauseProducer, WorkerSession}},
 };
 
-use super::{ProbeError, package_journal_error, readback::Pixels, still_rows::{Merge, Rows, StillCoverage}};
+use super::{ProbeError, clock, package_journal_error, readback::Pixels, still_rows::{Awake, Merge, Rows, StillCoverage}};
 
 const JOBS: usize = 12;
 const MAX_NEW_IMAGES: usize = 6;
@@ -163,6 +163,9 @@ pub(super) struct Worker {
     encoder_lost: bool,
     /// Every image this worker published (M1-09 output inventory).
     images: Vec<ImageFile>,
+    /// Images whose authorization was revoked after their rename and whose
+    /// removal failed. Such a file is never reused as a deduplicated image.
+    revoked: HashSet<ImageDigest>,
 }
 
 impl Worker {
@@ -170,7 +173,10 @@ impl Worker {
         let input = Arc::new(Queue::default());
         input.senders.store(1, Ordering::Relaxed);
         let (rows, merge) = Merge::new(lanes);
-        (Inbox(Arc::clone(&input)), rows, Self { input, rows: merge, rate: HashMap::new(), failing: None, encoder_lost: false, images: Vec::new() })
+        (Inbox(Arc::clone(&input)), rows, Self {
+            input, rows: merge, rate: HashMap::new(), failing: None, encoder_lost: false, images: Vec::new(),
+            revoked: HashSet::new(),
+        })
     }
 
     pub fn run(mut self, layout: &AttemptLayout, journal: JournalIngress, session: &WorkerSession)
@@ -178,6 +184,7 @@ impl Worker {
     {
         let mut counters = PngCounters::default();
         let result = self.drain(layout, journal, session, &mut counters);
+        counters.unreferenced_images = self.unreferenced_images(layout);
         counters.jobs_offered = self.input.offered.load(Ordering::Relaxed);
         counters.jobs_rejected = self.input.rejected.load(Ordering::Relaxed);
         counters.jobs_evicted = self.input.evicted.load(Ordering::Relaxed);
@@ -190,8 +197,10 @@ impl Worker {
     ) -> Result<(), ProbeError> {
         let mut flushed = None;
         let mut revision = session.journal_flush_revision();
+        let frequency = clock::frequency()?;
         loop {
-            self.rows.publish(&mut journal, Instant::now())?;
+            let awake = Awake { now: clock::qpc()?, marks: session.suspend_marks(), frequency };
+            self.rows.publish(&mut journal, Instant::now(), &awake)?;
             if let Some(pause) = session.paused_cutoff().filter(|pause| flushed != Some(*pause))
                 && self.rows.includes(pause.time)
             {
@@ -228,19 +237,28 @@ impl Worker {
                     }
                     _ => {}
                 }
-                let published = matches!(outcome, Outcome::Saved { reused: false, .. });
                 // A slot that gave up the job after its image was published
-                // leaves the file without a row; it is kept and counted. A half
-                // that did reply is not counted here when its paired slot later
-                // falls back, so the counter is a lower bound.
-                if job.reply.try_send(outcome).is_err() && published {
-                    counters.unreferenced_images += 1;
-                }
+                // leaves the file without a row; it is kept and counted at the end.
+                let _ = job.reply.try_send(outcome);
             } else if self.input.senders.load(Ordering::Acquire) == 0 {
                 break;
             }
         }
         self.rows.finish(&mut journal)
+    }
+
+    /// Image files that no journaled row names: published images whose slot
+    /// gave up the job, fell back, was withdrawn or lost its row, and revoked
+    /// images whose removal still fails. The files are kept.
+    fn unreferenced_images(&self, layout: &AttemptLayout) -> u64 {
+        let published = self.images.iter()
+            .filter(|image| image.file.strip_prefix("raw/").is_none_or(|file| !self.rows.references(file)))
+            .count();
+        let revoked = self.revoked.iter()
+            .filter(|digest| fs::remove_file(layout.path(ArtifactKind::StillImage(**digest)))
+                .is_err_and(|error| error.kind() != io::ErrorKind::NotFound))
+            .count();
+        u64::try_from(published + revoked).unwrap_or(u64::MAX)
     }
 
     fn take_job(&self) -> Option<Job> {
@@ -295,9 +313,19 @@ impl Worker {
         }]);
         hash.update(pixels.bgra());
 
-        let kind = ArtifactKind::StillImage(ImageDigest(*hash.finalize().as_bytes()));
+        let digest = ImageDigest(*hash.finalize().as_bytes());
+        let kind = ArtifactKind::StillImage(digest);
         let image = layout.path(kind);
         let reference = ArtifactRef { attempt: layout.id().clone(), kind };
+        // A revoked image left at its digest path is not an inventoried image
+        // (§8): it is removed before this job may publish the same digest.
+        if self.revoked.contains(&digest) {
+            match fs::remove_file(&image) {
+                Ok(()) => { self.revoked.remove(&digest); }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => { self.revoked.remove(&digest); }
+                Err(error) => return failed("remove_revoked_image", error),
+            }
+        }
         // The filesystem of this unique attempt is the successful-image index.
         // Temporary images have a disjoint name and cannot produce a hit.
         match image.metadata() {
@@ -344,7 +372,10 @@ impl Worker {
             if !authorized() { return Err(Outcome::Dropped(Dropped::ApprovalSuppressed)); }
             move_new(&temporary, &image).map_err(|error| failed("publish_image", error))?;
             if !authorized() {
-                fs::remove_file(&image).map_err(|error| failed("remove_revoked_image", error))?;
+                fs::remove_file(&image).map_err(|error| {
+                    self.revoked.insert(digest);
+                    failed("remove_revoked_image", error)
+                })?;
                 return Err(Outcome::Dropped(Dropped::ApprovalSuppressed));
             }
             Ok(bytes)

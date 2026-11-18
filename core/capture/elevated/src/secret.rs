@@ -15,10 +15,14 @@ pub(crate) fn erase<T: Copy + Default>(values: &mut [T]) {
 
 /// Secret bytes are written in their final location and passed by
 /// reference; a move would leave an unerased copy behind (E4).
-pub(crate) struct Secret<const N: usize>(pub(crate) [u8; N]);
+pub(crate) struct Secret<const N: usize>([u8; N]);
 
 impl<const N: usize> Secret<N> {
     pub(crate) const fn zeroed() -> Self { Self([0; N]) }
+
+    pub(crate) fn bytes(&self) -> &[u8; N] { &self.0 }
+
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8; N] { &mut self.0 }
 
     pub(crate) fn randomize(&mut self) -> Result<()> { random(&mut self.0) }
 }

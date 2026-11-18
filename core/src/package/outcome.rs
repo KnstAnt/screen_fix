@@ -230,6 +230,18 @@ pub struct LossRange {
     pub qpc: Option<[QpcTick; 2]>,
 }
 
+impl LossRange {
+    /// The smallest range covering both ranges (§6.1 merge rule).
+    pub(crate) fn merge(self, other: Self) -> Self {
+        Self {
+            first_t_us: self.first_t_us.min(other.first_t_us),
+            last_t_us: self.last_t_us.max(other.last_t_us),
+            source_seq: merge_bounds(self.source_seq, other.source_seq),
+            qpc: merge_bounds(self.qpc, other.qpc),
+        }
+    }
+}
+
 /// A sensitive loss belongs to a password, possibly sensitive or
 /// approval-unknown context. It is counted without any time or sequence range
 /// and never becomes a gap row (ALG §7.2, PRIV-5).
@@ -271,19 +283,14 @@ impl LossEvidence {
         }
         let scope = match (self.scope, other.scope) {
             (LossScope::Sensitive, LossScope::Sensitive) => LossScope::Sensitive,
-            (LossScope::Ordinary(left), LossScope::Ordinary(right)) => LossScope::Ordinary(LossRange {
-                first_t_us: left.first_t_us.min(right.first_t_us),
-                last_t_us: left.last_t_us.max(right.last_t_us),
-                source_seq: merge_bounds(left.source_seq, right.source_seq),
-                qpc: merge_bounds(left.qpc, right.qpc),
-            }),
+            (LossScope::Ordinary(left), LossScope::Ordinary(right)) => LossScope::Ordinary(left.merge(right)),
             _ => return Err(other),
         };
         Ok(Self { count: self.count.merge(other.count), scope, ..self })
     }
 }
 
-pub(crate) fn merge_bounds<T: Ord + Copy>(left: Option<[T; 2]>, right: Option<[T; 2]>) -> Option<[T; 2]> {
+fn merge_bounds<T: Ord + Copy>(left: Option<[T; 2]>, right: Option<[T; 2]>) -> Option<[T; 2]> {
     match (left, right) {
         (Some(left), Some(right)) => Some([left[0].min(right[0]), left[1].max(right[1])]),
         (range, None) | (None, range) => range,

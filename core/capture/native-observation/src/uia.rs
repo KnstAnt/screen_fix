@@ -28,6 +28,8 @@ pub use screen_fix_protocol::ipc::elevated::{ReadUnavailable, TextClassification
 
 /// The client transaction timeout never exceeds the request deadline.
 const MAX_CALL: Duration = Duration::from_millis(500);
+/// The client connection timeout.
+const MAX_CONNECT: Duration = Duration::from_millis(250);
 /// A provider call with less remaining budget cannot complete usefully.
 const MIN_CALL: Duration = Duration::from_millis(10);
 
@@ -166,13 +168,11 @@ impl Client {
 
     fn open_inner(revision: Arc<AtomicU64>, scoped: bool) -> windows::core::Result<Self> {
         // The apartment guard is the last field to drop.
-        let _apartment = Apartment::initialize().map_err(|_| windows::core::Error::from_hresult(
-            windows::Win32::Foundation::E_FAIL,
-        ))?;
+        let _apartment = Apartment::initialize()?;
         let automation: IUIAutomation2 = unsafe { CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) }?;
         unsafe {
-            automation.SetConnectionTimeout(250)?;
-            automation.SetTransactionTimeout(500)?;
+            automation.SetConnectionTimeout(MAX_CONNECT.as_millis() as u32)?;
+            automation.SetTransactionTimeout(MAX_CALL.as_millis() as u32)?;
             automation.SetAutoSetFocus(false)?;
         }
         let identity = [UIA_ProcessIdPropertyId, UIA_NativeWindowHandlePropertyId];
@@ -386,7 +386,7 @@ impl Client {
             return;
         }
         let Some(client) = &self.text_edit else { return };
-        if self.subscription.is_some() || invalid(request).is_some() || self.budget(request).is_err() {
+        if self.subscription.is_some() || self.budget(request).is_err() {
             return;
         }
         let event_cache: Option<&IUIAutomationCacheRequest> = scope.as_ref().map(|_| &self.identification);

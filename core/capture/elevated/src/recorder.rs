@@ -56,7 +56,10 @@ impl RecorderBootstrap {
     ) -> Result<Authenticated> {
         let Self { installation, parent, mut bootstrap_pipe, scope } = self;
         let ready_at = shell_returned + READINESS;
-        let initial = Deadline { at: ready_at, cancellation: cancel, grant: None, scope_current: None, peer: None };
+        let initial = Deadline {
+            at: ready_at, expired: Failure::ReadinessDeadline, cancellation: cancel, grant: None, scope_current: None,
+            peer: None,
+        };
         initial.check()?;
         let handle = unsafe { Handle::take(original_handle.into_raw_handle(), Failure::ConsentLaunch)? };
         let child = Process::inspect(Arc::new(handle))?;
@@ -79,7 +82,6 @@ impl RecorderBootstrap {
         bootstrap.send_seal(&mut pipes[0], Transition::Seal, deadline)?;
         bootstrap.receive_seal(&mut pipes[0], Transition::Authenticated, deadline)?;
         deadline.check()?;
-        parent.ensure_live()?;
         Ok(Authenticated { scope: bootstrap.scope.clone(), connection: bootstrap.connection, child, pipes })
     }
 }

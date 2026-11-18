@@ -76,11 +76,13 @@ pub(super) struct BeforeSeen<'a> {
 pub(super) fn preceding(
     images: &NativeImages, interval: Interval, adjustment: Adjustment, refresh: (u32, u32),
 ) -> BeforeSeen<'_> {
+    // History is lost only when the evicted frame would itself have been
+    // eligible (ALG §8.2), as in `next`.
     let select = |eligible: &dyn Fn(SessionTimeUs) -> bool| {
         images.history().iter().rev()
             .find(|frame| interval.contains(&frame.metadata) && eligible(frame.metadata.source_t_us))
             .ok_or_else(|| {
-                if images.last_evicted().is_some_and(|frame| interval.contains(&frame)) {
+                if images.last_evicted().is_some_and(|frame| interval.contains(&frame) && eligible(frame.source_t_us)) {
                     Missing::HistoryLost
                 } else {
                     Missing::NoEligibleFrame

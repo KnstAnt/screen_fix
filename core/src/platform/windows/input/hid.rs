@@ -10,7 +10,7 @@ use crate::protocol::{
     DeviceId, SessionTimeUs,
     ipc::{
         DecodedHidReport, ForegroundAtReceipt, HidAngleReading, HidReport, HidReportResult, HidUsage, HidValue,
-        HidValueSpec, MAX_INPUT_DEVICES, NdofData,
+        HidValueSpec, MAX_INPUT_DEVICES, NdofData, OptionalCollection,
     },
 };
 
@@ -132,12 +132,7 @@ impl HidPublication {
         &mut self, sample: &HidReport, at: SessionTimeUs, reference: Option<&str>,
         proof: ForegroundAtReceipt, source: Option<SessionTimeUs>,
     ) -> (Value, bool) {
-        let kind = match (sample.usage_page, sample.usage) {
-            (Some(0x0D), Some(1 | 2)) => "pen",
-            (Some(0x0D), Some(5)) => "touchpad_report",
-            (Some(1), Some(8)) => "ndof_unavailable",
-            _ => "hid_unavailable",
-        };
+        let kind = ReportKind::of(sample);
         match &sample.result {
             HidReportResult::Ndof(report) => (json!({
                 "kind": "ndof", "report_id": report.id, "sub_index": sample.sub_index,
@@ -166,15 +161,15 @@ impl HidPublication {
                     }
                     published
                 }).collect();
-                let mut row = json!({ "kind": kind, "report_id": report.id, "sub_index": sample.sub_index,
+                let mut row = json!({ "kind": kind.label(), "report_id": report.id, "sub_index": sample.sub_index,
                     "usage_page": sample.usage_page, "usage": sample.usage, "fields": fields,
                     "report_reference": reference,
                     "source_clock": source.map(|_| "hid_scan_time_sliding_minimum"),
                 });
-                if kind == "pen" {
+                if kind == ReportKind::Pen {
                     lift_pen(&mut row, report);
                 }
-                if kind == "touchpad_report" {
+                if kind == ReportKind::Touchpad {
                     let mut frame = self.frames.remove(&sample.device);
                     let (frame_row, active) = if self.frames.len() == MAX_INPUT_DEVICES {
                         (json!({ "status": "unavailable_capacity" }), false)
@@ -194,7 +189,7 @@ impl HidPublication {
                 if !matches!(result, HidReportResult::NoRelevantFields) {
                     self.reset(Some(sample.device));
                 }
-                (json!({ "kind": kind, "sub_index": sample.sub_index, "report": result,
+                (json!({ "kind": kind.label(), "sub_index": sample.sub_index, "report": result,
                     "report_id": sample.report_id, "report_reference": reference,
                     "usage_page": sample.usage_page, "usage": sample.usage }), false)
             }
@@ -212,6 +207,36 @@ impl HidPublication {
         // receipt is never copied into source time (CLK-2).
         self.clocks.insert(device, ScanClock::start(raw, spec, at)?);
         None
+    }
+}
+
+/// The collection of a HID report, which selects its row kind.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReportKind {
+    Pen,
+    Touchpad,
+    MultiAxis,
+    Unknown,
+}
+
+impl ReportKind {
+    fn of(sample: &HidReport) -> Self {
+        match sample.collection() {
+            _ if sample.is_pen() => Self::Pen,
+            Some(OptionalCollection::Touchpad) => Self::Touchpad,
+            Some(OptionalCollection::MultiAxis) => Self::MultiAxis,
+            None => Self::Unknown,
+        }
+    }
+
+    /// The `kind` of a row that is not a decoded multi-axis report.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pen => "pen",
+            Self::Touchpad => "touchpad_report",
+            Self::MultiAxis => "ndof_unavailable",
+            Self::Unknown => "hid_unavailable",
+        }
     }
 }
 
@@ -234,19 +259,13 @@ struct NdofButton {
 /// (several transducers) is ambiguous and also stays absent. `fields` keeps
 /// the per-link evidence as an extension.
 fn lift_pen(row: &mut Value, report: &DecodedHidReport) {
-    let field = |usage: HidUsage| {
-        let mut declared = report.fields.as_slice().iter().filter(|field| field.usage == usage);
-        match (declared.next(), declared.next()) {
-            (Some(field), None) => Some(field.value),
-            _ => None,
-        }
-    };
+    let field = |usage: HidUsage| unique(report, usage);
     for (key, usage) in [
         ("tip", HidUsage::Tip), ("in_range", HidUsage::InRange), ("barrel", HidUsage::Barrel),
         ("secondary_barrel", HidUsage::SecondaryBarrel), ("invert", HidUsage::Invert), ("eraser", HidUsage::Eraser),
     ] {
         if let Some(value) = field(usage) {
-            row[key] = json!(match value { HidValue::Switch(active) => Some(active), _ => None });
+            row[key] = json!(switch(value));
         }
     }
     let (x, y) = (field(HidUsage::X), field(HidUsage::Y));
@@ -276,10 +295,28 @@ fn lift_pen(row: &mut Value, report: &DecodedHidReport) {
     }
 }
 
+/// The value of `usage` when the report declares it in exactly one field;
+/// a usage declared in several link collections is ambiguous.
+fn unique(report: &DecodedHidReport, usage: HidUsage) -> Option<HidValue> {
+    let mut declared = report.fields.as_slice().iter().filter(|field| field.usage == usage);
+    match (declared.next(), declared.next()) {
+        (Some(field), None) => Some(field.value),
+        _ => None,
+    }
+}
+
 /// The logical value read with HidP_GetUsageValue; None in the null state.
 fn number(value: HidValue) -> Option<i64> {
     match value {
         HidValue::Number { raw, .. } => raw,
+        _ => None,
+    }
+}
+
+/// The state of a button usage.
+fn switch(value: HidValue) -> Option<bool> {
+    match value {
+        HidValue::Switch(active) => Some(active),
         _ => None,
     }
 }
@@ -296,7 +333,8 @@ fn angle(value: HidValue) -> (Option<f64>, Option<i64>) {
     }
 }
 
-fn normalize(raw: i64, [min, max]: [i64; 2]) -> Option<f64> {
+/// `raw` scaled to 0..=1 over a non-empty logical range that contains it.
+pub(super) fn normalize(raw: i64, [min, max]: [i64; 2]) -> Option<f64> {
     (max > min && (min..=max).contains(&raw)).then(|| (raw - min) as f64 / (max - min) as f64)
 }
 

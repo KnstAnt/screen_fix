@@ -11,7 +11,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{CapturePace, ClipboardMode, ResolvedCaptureConfig},
+    config::{ClipboardMode, ResolvedCaptureConfig},
     protocol::{AttemptId, MonitorId, SessionTimeUs, StreamId},
 };
 
@@ -114,7 +114,7 @@ pub(crate) struct DiagnosticContext {
     pub(crate) failed_monitor: Option<MonitorId>,
     selected_displays: Vec<MonitorId>,
     profile_revision: u16,
-    capture_fps: u8,
+    capture_fps: u32,
     clipboard_opt_in: bool,
     pub(crate) streams: std::collections::BTreeMap<StreamId, StreamSummary>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -146,10 +146,7 @@ impl DiagnosticContext {
             failed_monitor: None,
             selected_displays: config.monitors().iter().map(|monitor| monitor.id).collect(),
             profile_revision: profile.revision().get(),
-            capture_fps: match profile.capture_pace() {
-                CapturePace::Fps30 => 30,
-                CapturePace::Fps60 => 60,
-            },
+            capture_fps: profile.capture_pace().frames_per_second(),
             clipboard_opt_in: profile.clipboard() == ClipboardMode::OptIn,
             streams: Default::default(),
             capture: Vec::new(),
