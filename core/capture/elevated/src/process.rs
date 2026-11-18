@@ -22,7 +22,7 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::win::{Failure, Handle, Result};
+use crate::win::{Failure, Handle, Result, read_wide};
 
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const MEDIUM: u32 = 0x2000;
@@ -121,17 +121,13 @@ impl Process {
     }
 }
 
-/// The longest image path Windows reports, in UTF-16 units.
-const MAX_IMAGE_PATH: usize = 32768;
-
-/// The image path of a process in the requested format, sized to fit.
+/// The image path of a process in the requested format, sized to fit. An
+/// empty path is a failure.
 fn image_name(process: HANDLE, format: PROCESS_NAME_FORMAT) -> Result<Vec<u16>> {
-    let mut path = vec![0u16; MAX_IMAGE_PATH];
-    let mut length = path.len() as u32;
-    if unsafe { QueryFullProcessImageNameW(process, format, path.as_mut_ptr(), &mut length) } == 0 {
-        return Err(Failure::ProcessIdentity);
-    }
-    path.truncate(length as usize);
+    let mut path = read_wide(|buffer, capacity| {
+        let mut length = capacity;
+        if unsafe { QueryFullProcessImageNameW(process, format, buffer, &mut length) } == 0 { 0 } else { length }
+    }).ok_or(Failure::ProcessIdentity)?;
     path.shrink_to_fit();
     Ok(path)
 }

@@ -8,11 +8,12 @@ use crate::{
         SessionTimeUs, SourceSequence, UnavailableReason,
         ipc::{CollectedInput, HookKey, InputSample, Producer, RawKey, Receipt},
     },
+    util::raise,
 };
 
 use super::{
     Action, Button, HeldSynchronization, Motion, PendingInput, ScanCode, WheelAxis, normalize,
-    normalize::{LLKHF_UP, VK_PACKET},
+    normalize::{LLKHF_UP, PROMOTED_TOUCH, RI_KEY_BREAK, VK_PACKET, promoted},
 };
 
 pub(crate) const MATCH_WINDOW_US: i64 = 20_000;
@@ -71,7 +72,7 @@ impl CorrelatedInput {
     pub fn keyboard_witnesses(&self) -> (Option<RawKey>, Option<HookKey>) {
         let mut raw_input = None;
         let mut keyboard_hook = None;
-        for slot in std::iter::once(&self.first).chain(&self.partners) {
+        for slot in self.slots() {
             match slot.packet.sample {
                 InputSample::RawKey(key) => raw_input = Some(key),
                 InputSample::HookKey(key) => keyboard_hook = Some(key),
@@ -81,9 +82,14 @@ impl CorrelatedInput {
         (raw_input, keyboard_hook)
     }
 
+    /// The row's own records: the first and its partners.
+    pub fn slots(&self) -> impl Iterator<Item = &PendingInput> {
+        std::iter::once(&self.first).chain(&self.partners)
+    }
+
     /// Every record this row accounts for: its own and the absorbed hooks.
     pub fn records(&self) -> impl Iterator<Item = &PendingInput> {
-        std::iter::once(&self.first).chain(&self.partners).chain(&self.absorbed)
+        self.slots().chain(&self.absorbed)
     }
 }
 
@@ -100,37 +106,39 @@ pub(crate) struct PenPromotion {
 pub(crate) struct InputGap {
     pub producer: Producer,
     pub reason: LossReason,
-    pub first: SessionTimeUs,
-    pub last: SessionTimeUs,
     pub count: LossCount,
-    pub source_seq: Option<[u64; 2]>,
-    pub qpc: Option<[QpcTick; 2]>,
+    pub range: LossRange,
 }
 
 impl InputGap {
     /// One logical record lost locally at `at`.
     pub fn logical(producer: Producer, reason: LossReason, at: SessionTimeUs) -> Self {
         Self {
-            producer, reason, first: at, last: at, count: LossCount::Known(std::num::NonZeroU64::MIN),
-            source_seq: None, qpc: None,
+            producer, reason, count: LossCount::Known(std::num::NonZeroU64::MIN),
+            range: LossRange { first_t_us: at, last_t_us: at, source_seq: None, qpc: None },
         }
+    }
+
+    /// The receipt of the first lost record.
+    pub fn first(&self) -> SessionTimeUs {
+        self.range.first_t_us
+    }
+
+    /// The receipt of the last lost record.
+    pub fn last(&self) -> SessionTimeUs {
+        self.range.last_t_us
     }
 
     /// Merge a loss with the same producer and reason.
     pub fn merge(self, other: Self) -> Self {
-        let LossRange { first_t_us, last_t_us, source_seq, qpc } = self.range().merge(other.range());
-        Self { first: first_t_us, last: last_t_us, count: self.count.merge(other.count), source_seq, qpc, ..self }
+        Self { count: self.count.merge(other.count), range: self.range.merge(other.range), ..self }
     }
 
     pub fn evidence(&self) -> LossEvidence {
         LossEvidence {
             reason: self.reason, producer: Some(self.producer.into()), count: self.count,
-            scope: LossScope::Ordinary(self.range()),
+            scope: LossScope::Ordinary(self.range),
         }
-    }
-
-    fn range(&self) -> LossRange {
-        LossRange { first_t_us: self.first, last_t_us: self.last, source_seq: self.source_seq, qpc: self.qpc }
     }
 }
 
@@ -193,10 +201,90 @@ pub(crate) struct InputMatcher {
     /// Producers whose final progress was received: no later record can arrive.
     closed: bool,
     next_id: u64,
-    pen_tips: BTreeMap<(DeviceId, u16), bool>,
-    pen_links: BTreeMap<Order, PenPromotion>,
-    pen_ambiguous: BTreeSet<Order>,
-    pen_uncertain: BTreeMap<DeviceId, SessionTimeUs>,
+    pen: PenAssociation,
+}
+
+/// Pen tip transitions and their certain association with promoted pointer
+/// records: each contact's tip state, the links decided ahead of their
+/// peer's row, and the records that can no longer form a unique link.
+#[derive(Default)]
+struct PenAssociation {
+    tips: BTreeMap<(DeviceId, u16), bool>,
+    links: BTreeMap<Order, PenPromotion>,
+    ambiguous: BTreeSet<Order>,
+    /// The last continuity-uncertain report of each pen device.
+    uncertain: BTreeMap<DeviceId, SessionTimeUs>,
+}
+
+impl PenAssociation {
+    /// A loss or barrier ends every tip state and link.
+    fn forget_links(&mut self) {
+        self.tips.clear();
+        self.links.clear();
+    }
+
+    /// A removed device ends its own tip state and every link.
+    fn forget_device(&mut self, id: DeviceId) {
+        self.tips.retain(|(device, _), _| *device != id);
+        self.uncertain.remove(&id);
+        self.links.clear();
+    }
+
+    /// A report of `device` at `at` whose contact continuity is uncertain.
+    /// `false` when the bounded table is full; the caller then invalidates.
+    fn note_uncertain(&mut self, device: DeviceId, at: SessionTimeUs) -> bool {
+        self.tips.retain(|(tip_device, _), _| *tip_device != device);
+        self.uncertain.retain(|_, last| at.0.saturating_sub(last.0) <= 2 * MATCH_WINDOW_US);
+        if self.uncertain.len() < MAX_PENDING || self.uncertain.contains_key(&device) {
+            self.uncertain.insert(device, at);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record one contact's tip state: the new state when it changed.
+    fn tip(&mut self, device: DeviceId, link: u16, down: bool) -> Option<bool> {
+        let key = (device, link);
+        if self.tips.len() >= MAX_PENDING && !self.tips.contains_key(&key) {
+            self.tips.clear();
+        }
+        self.tips.insert(key, down).filter(|prior| *prior != down).map(|_| down)
+    }
+
+    /// An uncertain report of `device` lies within the match window of `at`.
+    fn uncertain_near(&self, device: DeviceId, at: SessionTimeUs) -> bool {
+        self.uncertain.get(&device).is_some_and(|last| last.0.abs_diff(at.0) <= MATCH_WINDOW_US as u64)
+    }
+
+    /// Keep a certain link for the row of `peer`.
+    fn link(&mut self, peer: Order, link: PenPromotion) {
+        self.links.insert(peer, link);
+    }
+
+    /// Take the link kept for the row of `order`.
+    fn take_link(&mut self, order: &Order) -> Option<PenPromotion> {
+        self.links.remove(order)
+    }
+
+    fn mark_ambiguous(&mut self, orders: impl IntoIterator<Item = Order>) {
+        self.ambiguous.extend(orders);
+    }
+
+    fn is_ambiguous(&self, order: &Order) -> bool {
+        self.ambiguous.contains(order)
+    }
+
+    /// A record left the matcher.
+    fn retire(&mut self, order: &Order) {
+        self.ambiguous.remove(order);
+    }
+
+    /// Every pending record was discarded.
+    fn discard(&mut self) {
+        self.links.clear();
+        self.ambiguous.clear();
+    }
 }
 
 impl InputMatcher {
@@ -204,8 +292,7 @@ impl InputMatcher {
         Self {
             slots: BTreeMap::new(), decided: BTreeMap::new(), removals: BTreeMap::new(),
             synchronization: None, gaps: BTreeMap::new(), gap_barrier: None, bounds: [None; PRODUCERS], closed: false,
-            next_id: 0, pen_tips: BTreeMap::new(), pen_links: BTreeMap::new(), pen_ambiguous: BTreeSet::new(),
-            pen_uncertain: BTreeMap::new(),
+            next_id: 0, pen: PenAssociation::default(),
         }
     }
 
@@ -217,7 +304,7 @@ impl InputMatcher {
     /// interval. Bounds never move backward.
     pub fn progress(&mut self, producer: Producer, before: SessionTimeUs) {
         let bound = &mut self.bounds[producer.index()];
-        *bound = Some(bound.map_or(before, |previous| previous.max(before)));
+        raise(bound, before);
     }
 
     /// Every producer has delivered its final records: the helper drained and
@@ -227,17 +314,14 @@ impl InputMatcher {
     }
 
     pub fn gap(&mut self, gap: InputGap) {
-        self.pen_tips.clear();
-        self.pen_links.clear();
+        self.pen.forget_links();
         self.gaps.entry((gap.producer.index(), gap.reason))
             .and_modify(|pending| *pending = pending.merge(gap))
             .or_insert(gap);
     }
 
     pub fn remove_device(&mut self, id: DeviceId, receipt: Receipt, time: SessionTimeUs) {
-        self.pen_tips.retain(|(device, _), _| *device != id);
-        self.pen_uncertain.remove(&id);
-        self.pen_links.clear();
+        self.pen.forget_device(id);
         let producer = Producer::DeviceNotifications;
         if self.removals.len() == crate::protocol::ipc::MAX_INPUT_DEVICES {
             self.gap(InputGap::logical(producer, LossReason::MatcherCapacity, time));
@@ -274,23 +358,15 @@ impl InputMatcher {
     ) -> Result<(), InputIdExhausted> {
         let producer = packet.sample.producer();
         let parts = normalize::parts(&packet, fallback_scan);
-        if let InputSample::Hid(report) = &packet.sample && report.pen_continuity_uncertain() {
-            self.pen_tips.retain(|(device, _), _| *device != report.device);
-            self.pen_uncertain.retain(|_, last| time.recv_t_us.0.saturating_sub(last.0) <= 2 * MATCH_WINDOW_US);
-            if self.pen_uncertain.len() < MAX_PENDING || self.pen_uncertain.contains_key(&report.device) {
-                self.pen_uncertain.insert(report.device, time.recv_t_us);
-            } else {
-                self.invalidate_through(time.recv_t_us);
-            }
+        if let InputSample::Hid(report) = &packet.sample && super::pen::continuity_uncertain(report)
+            && !self.pen.note_uncertain(report.device, time.recv_t_us)
+        {
+            self.invalidate_through(time.recv_t_us);
         }
         let pen_transition = if let InputSample::Hid(report) = &packet.sample
-            && let Some((link, down)) = report.pen_tip()
+            && let Some((link, down)) = super::pen::tip(report)
         {
-            let key = (report.device, link);
-            if self.pen_tips.len() >= MAX_PENDING && !self.pen_tips.contains_key(&key) {
-                self.pen_tips.clear();
-            }
-            self.pen_tips.insert(key, down).filter(|prior| *prior != down).map(|_| down)
+            self.pen.tip(report.device, link, down)
         } else {
             None
         };
@@ -384,16 +460,14 @@ impl InputMatcher {
     }
 
     pub fn invalidate_through(&mut self, through: SessionTimeUs) {
-        self.pen_tips.clear();
-        self.pen_links.clear();
-        self.gap_barrier = Some(self.gap_barrier.map_or(through, |previous| previous.max(through)));
+        self.pen.forget_links();
+        raise(&mut self.gap_barrier, through);
     }
 
     /// Every undecided record, the rows decided but not yet taken, and the
     /// gaps not yet taken. The caller accounts the admitted ones.
     pub fn discard(&mut self) -> Discarded {
-        self.pen_links.clear();
-        self.pen_ambiguous.clear();
+        self.pen.discard();
         self.removals.clear();
         self.synchronization = None;
         Discarded {
@@ -413,11 +487,11 @@ impl InputMatcher {
     pub fn unresolved_before(&self) -> Option<SessionTimeUs> {
         let producer = self.producer_floor()?;
         let first = self.first_item().map(|order| order.time);
-        [Some(producer), first, self.first_gap().map(|gap| gap.first)].into_iter().flatten().min()
+        [Some(producer), first, self.first_gap().map(|gap| gap.first())].into_iter().flatten().min()
     }
 
     fn first_gap(&self) -> Option<InputGap> {
-        self.gaps.values().copied().min_by_key(|gap| gap.first)
+        self.gaps.values().copied().min_by_key(InputGap::first)
     }
 
     fn first_item(&self) -> Option<Order> {
@@ -435,13 +509,13 @@ impl InputMatcher {
         loop {
             let first = self.first_item();
             if let Some(gap) = self.first_gap()
-                && first.is_none_or(|order| gap.first <= order.time)
-                && due(gap.first)
+                && first.is_none_or(|order| gap.first() <= order.time)
+                && due(gap.first())
             {
                 self.gaps.remove(&(gap.producer.index(), gap.reason));
                 // An optional HID loss does not interrupt keyboard and pointer continuity.
                 if gap.producer != Producer::OptionalHid {
-                    self.invalidate_through(gap.last);
+                    self.invalidate_through(gap.last());
                 }
                 return Some(InputStep::Gap(gap));
             }
@@ -454,7 +528,7 @@ impl InputMatcher {
             if self.removals.contains_key(&order) {
                 if !due(order.time) { return None; }
                 let id = self.removals.remove(&order)?;
-                self.gap_barrier = Some(self.gap_barrier.map_or(order.time, |previous| previous.max(order.time)));
+                raise(&mut self.gap_barrier, order.time);
                 return Some(InputStep::DeviceRemoved { id, at: order.time });
             }
             // Rows decided while open may lie past a later closing limit; they
@@ -516,7 +590,7 @@ impl InputMatcher {
     }
 
     fn take_slot(&mut self, order: Order) -> Option<PendingInput> {
-        self.pen_ambiguous.remove(&order);
+        self.pen.retire(&order);
         self.slots.remove(&order)
     }
 
@@ -563,11 +637,11 @@ impl InputMatcher {
                     && raws.iter().all(|raw| null_handle(&self.slots[raw].packet.sample));
                 let (raw_count, hook_count) = (len_u32(&raws), len_u32(&hooks));
                 let mut absorbed: Vec<_> = hooks.iter().filter_map(|hook| {
-                    self.pen_links.remove(hook);
+                    self.pen.take_link(hook);
                     self.take_slot(*hook)
                 }).collect();
                 for (index, raw) in raws.into_iter().enumerate() {
-                    self.pen_links.remove(&raw);
+                    self.pen.take_link(&raw);
                     let Some(first) = self.take_slot(raw) else { continue };
                     let lead = index == 0;
                     self.decided.insert(raw, CorrelatedInput {
@@ -734,11 +808,11 @@ impl InputMatcher {
     fn promotion(&mut self, records: &[Order], correlation: Correlation) -> Option<PenPromotion> {
         if !matches!(correlation, Correlation::Matched | Correlation::Unmatched) {
             for record in records {
-                self.pen_links.remove(record);
+                self.pen.take_link(record);
             }
             return None;
         }
-        records.iter().find_map(|slot| self.pen_links.remove(slot).or_else(|| self.link_pen(*slot)))
+        records.iter().find_map(|slot| self.pen.take_link(slot).or_else(|| self.link_pen(*slot)))
     }
 
     fn link_pen(&mut self, order: Order) -> Option<PenPromotion> {
@@ -750,21 +824,18 @@ impl InputMatcher {
         };
         let peers: Vec<_> = self.pen_peers(order, direction, is_pen).collect();
         let &[peer] = peers.as_slice() else {
-            if !peers.is_empty() {
-                self.pen_ambiguous.extend(peers);
-            }
+            self.pen.mark_ambiguous(peers);
             return None;
         };
         let reciprocal: Vec<_> = self.pen_peers(peer, direction, !is_pen).collect();
         if reciprocal.as_slice() != [order] {
             // A retired alternative must never turn a rival's later
             // lookup into a falsely unique association.
-            self.pen_ambiguous.insert(peer);
-            self.pen_ambiguous.extend(reciprocal);
+            self.pen.mark_ambiguous(std::iter::once(peer).chain(reciprocal));
             return None;
         }
-        if self.pen_ambiguous.contains(&order) || self.pen_ambiguous.contains(&peer) {
-            self.pen_ambiguous.insert(peer);
+        if self.pen.is_ambiguous(&order) || self.pen.is_ambiguous(&peer) {
+            self.pen.mark_ambiguous([peer]);
             return None;
         }
         let (pen, pointer) = if is_pen { (order, peer) } else { (peer, order) };
@@ -774,9 +845,7 @@ impl InputMatcher {
         let pen_packet = &self.slots[&pen].packet;
         let InputSample::Hid(report) = &pen_packet.sample else { return None };
         let InputSample::HookPointer(hook) = self.slots[&pointer].packet.sample else { return None };
-        if self.pen_uncertain.get(&report.device).is_some_and(|at| {
-            at.0.abs_diff(pen.time.0) <= MATCH_WINDOW_US as u64
-        }) || raw_partners.iter().any(|peer| {
+        if self.pen.uncertain_near(report.device, pen.time) || raw_partners.iter().any(|peer| {
             let raw_packet = &self.slots[peer].packet;
             raw_packet.foreground_at_receipt != pen_packet.foreground_at_receipt
                 || matches!(raw_packet.sample, InputSample::RawPointer(raw)
@@ -790,7 +859,7 @@ impl InputMatcher {
             pointer: Arc::clone(&self.slots[&pointer].packet),
             gap_us: pointer.time.0.saturating_sub(pen.time.0),
         };
-        self.pen_links.insert(peer, link.clone());
+        self.pen.link(peer, link.clone());
         Some(link)
     }
 
@@ -837,7 +906,7 @@ impl InputMatcher {
     fn separated(&self, left: SessionTimeUs, right: SessionTimeUs) -> bool {
         let (low, high) = (left.min(right), left.max(right));
         self.gap_barrier.is_some_and(|barrier| low <= barrier && barrier < high)
-            || self.continuity_gaps().any(|gap| gap.first <= high && low <= gap.last)
+            || self.continuity_gaps().any(|gap| gap.first() <= high && low <= gap.last())
             || self.removals.range(lower_order(low)..lower_order(SessionTimeUs(high.0.saturating_add(1)))).next().is_some()
     }
 
@@ -851,7 +920,7 @@ impl InputMatcher {
         let lower = time.0.saturating_sub(MATCH_WINDOW_US);
         let upper = time.0.saturating_add(MATCH_WINDOW_US);
         self.gap_barrier.is_some_and(|last| lower <= last.0)
-            || self.continuity_gaps().any(|gap| upper >= gap.first.0 && lower <= gap.last.0)
+            || self.continuity_gaps().any(|gap| upper >= gap.first().0 && lower <= gap.last().0)
             || self.removals.range(lower_order(SessionTimeUs(lower))..lower_order(SessionTimeUs(upper.saturating_add(1))))
                 .next().is_some()
     }
@@ -932,7 +1001,7 @@ fn compatible(first: &PendingInput, other: &PendingInput) -> bool {
             // positively injected evidence with an identical native packet.
             return raw.virtual_key == VK_PACKET && hook.virtual_key == u32::from(VK_PACKET)
                 && raw.device.is_none() && hook.flags & LLKHF_INJECTED_ANY != 0
-                && u32::from(raw.make_code) == hook.scan_code && (raw.flags & 1 != 0) == (hook.flags & LLKHF_UP != 0);
+                && u32::from(raw.make_code) == hook.scan_code && (raw.flags & RI_KEY_BREAK != 0) == (hook.flags & LLKHF_UP != 0);
         }
         // An injected hook pairs only with a NULL-handle raw record of the same
         // kind and identity (INP-7, stage I3).
@@ -957,20 +1026,6 @@ fn unqualified(sample: &InputSample) -> bool {
         InputSample::HookPointer(pointer) => pointer.flags & LLMHF_INJECTED_ANY != 0 && !promoted(pointer.extra_information),
         _ => false,
     }
-}
-
-/// `MI_WP_SIGNATURE`: the pen and touch promotion signature in the extra
-/// information of a promoted mouse message, under `PROMOTION_SIGNATURE_MASK`.
-const PROMOTION_SIGNATURE: u64 = 0xff51_5700;
-const PROMOTION_SIGNATURE_MASK: u64 = 0xffff_ff00;
-/// In the low byte of a promoted message's extra information: set for touch, clear for pen.
-pub(crate) const PROMOTED_TOUCH: u8 = 0x80;
-/// In the low byte of a promoted message's extra information: the pen or touch cursor id.
-pub(crate) const PROMOTED_CURSOR_ID: u8 = 0x7f;
-
-/// A mouse message Windows promoted from pen or touch input.
-pub(crate) fn promoted(extra: u64) -> bool {
-    extra & PROMOTION_SIGNATURE_MASK == PROMOTION_SIGNATURE
 }
 
 fn same_order_class(a: Action, b: Action) -> bool {

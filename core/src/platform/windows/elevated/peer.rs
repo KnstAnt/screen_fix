@@ -19,6 +19,8 @@ use super::super::clock;
 /// the collector stopped reading for a whole lease, not on a brief stall (E3).
 const WRITE_BUDGET: Duration = Duration::from_secs(1);
 const IDLE_READ: Duration = Duration::from_secs(86_400);
+/// Progress older than this cannot renew the collector lease.
+const LEASE_WINDOW: Duration = Duration::from_secs(1);
 const CONTROL_QUEUE: usize = 8;
 const QUERY_QUEUE: usize = 8;
 /// Query slots an optional read never takes, so that a required held read
@@ -43,8 +45,8 @@ pub(super) struct LeaseState {
 
 impl LeaseState {
     pub(super) fn new(frequency: QpcFrequency) -> Result<Self> {
-        let one_second = i64::try_from(frequency.0.get()).map_err(|_| Failure::Protocol)?;
-        let heartbeat = (i128::from(one_second) * HEARTBEAT.as_millis() as i128 / 1000).max(1) as i64;
+        let one_second = frequency.ticks(LEASE_WINDOW).ok_or(Failure::Protocol)?;
+        let heartbeat = frequency.ticks(HEARTBEAT).ok_or(Failure::Protocol)?.max(1);
         Ok(Self { one_second, heartbeat, last: None })
     }
 

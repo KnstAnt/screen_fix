@@ -1,9 +1,17 @@
+#[cfg(not(target_os = "windows"))]
+compile_error!("Screen Fix supports only Windows.");
+
 mod app;
+
+// The development log writes timing details into every attempt directory and
+// must never ship in a signed release (`dev-log` is on by default for testing).
+#[cfg(all(feature = "elevated-release", feature = "dev-log"))]
+compile_error!("Build releases with `--no-default-features --features elevated-release`: `dev-log` must not ship.");
 
 use screen_fix_core::package::diagnostics::FailureComponent;
 
 fn main() -> std::process::ExitCode {
-    #[cfg(all(target_os = "windows", feature = "elevated-release"))]
+    #[cfg(feature = "elevated-release")]
     if let Err(error) = screen_fix_core::platform::restrict_release_dll_search() {
         eprintln!("{error}");
         return std::process::ExitCode::FAILURE;

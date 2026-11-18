@@ -11,8 +11,8 @@ use crate::{
 };
 
 use super::{
-    CollectedInput, DeviceDescriptor, EnvironmentState, FocusAtReceipt, OptionalCollection, ProcessInstance,
-    ProducerGap, ProducerProgress, Receipt,
+    CollectedInput, DeviceDescriptor, EnvironmentState, FocusAtReceipt, HelperToCore, OptionalCollection, ProcessInstance,
+    Producer, ProducerGap, ProducerProgress, Receipt,
 };
 
 pub const MAX_IMAGE_PATH_BYTES: usize = 4096;
@@ -251,6 +251,73 @@ pub enum InputEvidence {
     Gap(ProducerGap),
     /// The registration check no longer finds an optional collection (E3).
     OptionalUnavailable { collection: OptionalCollection, observed_qpc: QpcTick },
+}
+
+impl InputEvidence {
+    /// The producer whose sequence the record belongs to. Environment states
+    /// and optional-collection notices belong to no producer.
+    pub fn producer(&self) -> Option<Producer> {
+        match self {
+            Self::Input(input) => Some(input.sample.producer()),
+            Self::DeviceArrived { .. } | Self::DeviceRemoved { .. } => Some(Producer::DeviceNotifications),
+            Self::Progress(progress) => Some(progress.producer),
+            Self::Gap(gap) => Some(gap.producer),
+            Self::Environment(_) | Self::OptionalUnavailable { .. } => None,
+        }
+    }
+
+    /// The earliest receipt the record covers: a gap's first one, otherwise
+    /// its only one.
+    pub fn first_qpc(&self) -> QpcTick {
+        match self {
+            Self::Gap(gap) => gap.first_qpc,
+            _ => self.last_qpc(),
+        }
+    }
+
+    /// The latest receipt the record covers.
+    pub fn last_qpc(&self) -> QpcTick {
+        match self {
+            Self::Input(input) => input.receipt.qpc,
+            Self::DeviceArrived { receipt, .. } | Self::DeviceRemoved { receipt, .. } => receipt.qpc,
+            Self::Environment(state) => state.observed_qpc,
+            Self::OptionalUnavailable { observed_qpc, .. } => *observed_qpc,
+            Self::Progress(progress) => progress.before_qpc,
+            Self::Gap(gap) => gap.last_qpc,
+        }
+    }
+}
+
+impl From<InputEvidence> for HelperToCore {
+    fn from(evidence: InputEvidence) -> Self {
+        match evidence {
+            InputEvidence::Input(input) => Self::Input(input),
+            InputEvidence::DeviceArrived { receipt, descriptor } => Self::DeviceArrived { receipt, descriptor },
+            InputEvidence::DeviceRemoved { receipt, id } => Self::DeviceRemoved { receipt, id },
+            InputEvidence::Environment(state) => Self::Environment(state),
+            InputEvidence::Progress(progress) => Self::Progress(progress),
+            InputEvidence::Gap(gap) => Self::Gap(gap),
+            InputEvidence::OptionalUnavailable { collection, observed_qpc } => Self::OptionalUnavailable { collection, observed_qpc },
+        }
+    }
+}
+
+/// The helper's own lifecycle records are not evidence and are returned.
+impl TryFrom<HelperToCore> for InputEvidence {
+    type Error = HelperToCore;
+
+    fn try_from(record: HelperToCore) -> Result<Self, HelperToCore> {
+        Ok(match record {
+            HelperToCore::Input(input) => Self::Input(input),
+            HelperToCore::DeviceArrived { receipt, descriptor } => Self::DeviceArrived { receipt, descriptor },
+            HelperToCore::DeviceRemoved { receipt, id } => Self::DeviceRemoved { receipt, id },
+            HelperToCore::Environment(state) => Self::Environment(state),
+            HelperToCore::Progress(progress) => Self::Progress(progress),
+            HelperToCore::Gap(gap) => Self::Gap(gap),
+            HelperToCore::OptionalUnavailable { collection, observed_qpc } => Self::OptionalUnavailable { collection, observed_qpc },
+            HelperToCore::Ready(_) | HelperToCore::Failed(_) => return Err(record),
+        })
+    }
 }
 
 /// A fixed observation kind selects the local native algorithm. The source

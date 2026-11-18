@@ -6,6 +6,12 @@ use crate::protocol::{
     AdmissionEpoch, ClockOrigin, FrameId, GeometryId, PhysicalRect, QpcTick, SessionTimeUs, UncertaintyUs,
 };
 
+/// The generation of a foreground approval interval. Each new interval of
+/// one capture policy has a higher generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(transparent)]
+pub struct ApprovalGeneration(pub u64);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MonitorGeometry {
     pub id: GeometryId,
@@ -66,7 +72,7 @@ pub struct FrameMetadata {
     pub id: FrameId,
     pub geometry: MonitorGeometry,
     pub admission: AdmissionEpoch,
-    pub approval_generation: u64,
+    pub approval_generation: ApprovalGeneration,
     pub(crate) coverage: Option<Arc<FrameCoverage>>,
     pub source_t_us: SessionTimeUs,
     pub recv_t_us: SessionTimeUs,

@@ -23,7 +23,7 @@ use windows::{
     core::{BSTR, Ref, implement},
 };
 
-use crate::LossCounter;
+use crate::{LossCounter, LossSpan};
 use screen_fix_protocol::{
     FocusGeneration, QpcTick,
     ipc::elevated::{MAX_COMMIT_PARTS as MAX_PARTS, MAX_COMMIT_UTF16 as MAX_UTF16},
@@ -89,18 +89,28 @@ pub enum CommitLossReason {
     Stale,
 }
 
-const LOSS_REASONS: [CommitLossReason; 5] = [
-    CommitLossReason::Capacity, CommitLossReason::TooLong, CommitLossReason::Parts,
-    CommitLossReason::Rejected, CommitLossReason::Stale,
-];
+impl CommitLossReason {
+    const ALL: [Self; 5] = [Self::Capacity, Self::TooLong, Self::Parts, Self::Rejected, Self::Stale];
+
+    /// The reason's position in `ALL`.
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+const _: () = {
+    let mut index = 0;
+    while index < CommitLossReason::ALL.len() {
+        assert!(CommitLossReason::ALL[index].index() == index);
+        index += 1;
+    }
+};
 
 /// Lost commits of one reason since the last drain, with their receipt bounds.
 #[derive(Debug, Clone, Copy)]
 pub struct CommitLoss {
     pub reason: CommitLossReason,
-    pub count: u64,
-    pub first: QpcTick,
-    pub last: QpcTick,
+    pub span: LossSpan,
 }
 
 struct WriteReservation<'a> {
@@ -133,7 +143,7 @@ pub struct Commit {
 
 pub struct Queue {
     slots: [Slot; CAPACITY],
-    lost: [LossCounter; LOSS_REASONS.len()],
+    lost: [LossCounter; CommitLossReason::ALL.len()],
 }
 
 impl Queue {
@@ -143,13 +153,13 @@ impl Queue {
 
     /// Drain on the single context owner, per reason.
     pub fn take_loss(&self) -> Vec<CommitLoss> {
-        LOSS_REASONS.into_iter().zip(&self.lost).filter_map(|(reason, lost)| {
-            lost.take().map(|(count, first, last)| CommitLoss { reason, count, first, last })
+        CommitLossReason::ALL.into_iter().zip(&self.lost).filter_map(|(reason, lost)| {
+            lost.take().map(|span| CommitLoss { reason, span })
         }).collect()
     }
 
     fn lose(&self, reason: CommitLossReason, receipt: i64) {
-        self.lost[reason as usize].note(1, receipt, receipt);
+        self.lost[reason.index()].note(LossSpan::at(QpcTick(receipt)));
     }
 
     /// Drain on the single context owner. Callback threads only write slots.

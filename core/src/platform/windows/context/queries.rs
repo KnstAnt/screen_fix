@@ -25,6 +25,10 @@ use super::super::{ProbeError, elevated::{ContextDelivery, Selector}, unavailabl
 
 const POINTER_REST: Duration = Duration::from_millis(500);
 const POINTER_POLL: Duration = Duration::from_millis(50);
+/// A collector commit is accepted at most this long after its receipt.
+const REMOTE_COMMIT_AGE_US: i64 = 500_000;
+/// A completed pointer read serves a later action or rest at most this long after it.
+const CACHED_POINTER_AGE_US: i64 = 500_000;
 
 /// What a focus row adds beside its read (CTX-9): the cursor shape and the
 /// focus thread's IME state, when already known.
@@ -39,7 +43,7 @@ pub(super) enum Classification {
     Resolved(TextTarget, Option<QpcTick>),
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 pub(in crate::platform::windows) struct PointerLink {
     /// None when no read can serve the action (`reason`).
     request_id: Option<RequestId>,
@@ -49,7 +53,7 @@ pub(in crate::platform::windows) struct PointerLink {
     reason: Option<&'static str>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum PointerBasis {
     PreAction,
@@ -61,6 +65,17 @@ pub(super) enum PointerBackend {
     Ordinary,
     Elevated(Option<IdentityClaim>),
     Unavailable,
+}
+
+/// The last authorized pointer read, which can serve a later query at the same place.
+#[derive(Clone, Copy)]
+struct CachedPointer {
+    point: PhysicalPoint,
+    geometry: GeometryId,
+    window: WindowProcess,
+    root: WindowProcess,
+    completed: QpcTick,
+    request: RequestId,
 }
 
 pub(super) struct Queries {
@@ -84,7 +99,7 @@ pub(super) struct Queries {
     moved_at: Instant,
     pointer_rest_emitted: bool,
     next_pointer_poll: Instant,
-    cached_pointer: Option<(PhysicalPoint, GeometryId, WindowProcess, WindowProcess, QpcTick, RequestId)>,
+    cached_pointer: Option<CachedPointer>,
     deferred_reads: Vec<Read>,
     denied_target: bool,
 }
@@ -107,7 +122,7 @@ impl Queries {
 
     pub fn update_hung(&mut self, hung: &Hung) {
         self.worker.update_hung(hung);
-        if self.cached_pointer.is_some_and(|(_, _, window, _, _, _)| self.blocked(window.process).is_some()) {
+        if self.cached_pointer.is_some_and(|cached| self.blocked(cached.window.process).is_some()) {
             self.cached_pointer = None;
         }
     }
@@ -149,7 +164,7 @@ impl Queries {
     pub fn remote_commit(&self, commit: &CommitEvidence, at: QpcTick, clock: ClockOrigin) -> bool {
         commit.receipt_qpc <= at && self.accepts_remote_commit(commit.binding, commit.receipt_qpc)
             && clock.time(commit.receipt_qpc).ok().zip(clock.time(at).ok())
-                .is_some_and(|(then, now)| now.0.saturating_sub(then.0) < 500_000)
+                .is_some_and(|(then, now)| now.0.saturating_sub(then.0) < REMOTE_COMMIT_AGE_US)
     }
 
     pub fn clipboard_safe(&self) -> bool {
@@ -226,16 +241,16 @@ impl Queries {
             return Ok(None);
         }
         if !matches!(backend, PointerBackend::Unavailable)
-            && let Some((cached_point, cached_geometry, cached_window, cached_root, completed, id)) = self.cached_pointer
+            && let Some(cached) = self.cached_pointer
         {
             let reference = action_at.unwrap_or(at);
-            if cached_point == point && cached_geometry == geometry && cached_window == window && cached_root == root
-                && completed <= reference
-                && let Some(age) = clock.time(reference).ok().zip(clock.time(completed).ok())
+            if cached.point == point && cached.geometry == geometry && cached.window == window && cached.root == root
+                && cached.completed <= reference
+                && let Some(age) = clock.time(reference).ok().zip(clock.time(cached.completed).ok())
                     .map(|(reference, completed)| reference.0.saturating_sub(completed.0))
-                    .filter(|age| *age < 500_000)
+                    .filter(|age| *age < CACHED_POINTER_AGE_US)
             {
-                return Ok(Some(PointerLink { request_id: Some(id), age_us: Some(age),
+                return Ok(Some(PointerLink { request_id: Some(cached.request), age_us: Some(age),
                     basis: if action_at.is_some() { PointerBasis::PreAction } else { PointerBasis::PointerRest }, reason: None }));
             }
         }
@@ -266,8 +281,7 @@ impl Queries {
         self.poll_local_results(at, clock, extras, |_| true, rows);
         if let Some(request) = self.focus {
             if let Some(status) = self.unfinished_status(request, now) {
-                self.finish(Read { request, started: None, completed: Some(at), status: Err(status),
-                    target: TextTarget::PossiblySensitive, element: None, scoped_dpi: None }, clock, extras, rows);
+                self.finish(Read::unavailable(request, Some(at), status), clock, extras, rows);
             } else if !self.focus_sent && at >= request.requested {
                 self.focus_sent = self.worker.submit(request);
             }
@@ -307,8 +321,7 @@ impl Queries {
                 PointerBackend::Elevated(_) => return,
             };
             if let Some(status) = status {
-                self.finish(Read { request, started: None, completed: Some(at), status: Err(status),
-                    target: TextTarget::PossiblySensitive, element: None, scoped_dpi: None }, clock, None, rows);
+                self.finish(Read::unavailable(request, Some(at), status), clock, None, rows);
             } else if !self.pointer_sent && at >= request.requested {
                 self.pointer_sent = self.worker.submit(request);
             }
@@ -318,8 +331,7 @@ impl Queries {
     fn finish_unavailable(
         &mut self, request: Request, status: ReadUnavailable, clock: ClockOrigin, extras: Option<&FocusExtras>, rows: &mut Vec<Value>,
     ) {
-        self.finish(Read { request, started: None, completed: None, status: Err(status),
-            target: TextTarget::PossiblySensitive, element: None, scoped_dpi: None }, clock, extras, rows);
+        self.finish(Read::unavailable(request, None, status), clock, extras, rows);
     }
 
     pub fn remote_focus_result(
@@ -330,10 +342,7 @@ impl Queries {
             ContextDelivery::Observation(Observation::Item { evidence: ContextEvidence::FocusUia(read), .. })
                 if read.binding == expected => read,
             ContextDelivery::Rejected(binding, reason) if *binding == expected => {
-                self.finish(Read {
-                    request, started: None, completed: None, status: Err(*reason),
-                    target: TextTarget::PossiblySensitive, element: None, scoped_dpi: None,
-                }, clock, None, rows);
+                self.finish_unavailable(request, *reason, clock, None, rows);
                 self.remote_focus = None;
                 return;
             }
@@ -367,10 +376,7 @@ impl Queries {
         let Some((binding, expected)) = visit.elevated else { return Ok(()); };
         let remaining = request.expires.saturating_duration_since(Instant::now());
         if remaining.is_zero() || self.remote_focus.is_some_and(|read| at >= read.deadline_qpc) {
-            self.finish(Read {
-                request, started: None, completed: None, status: Err(ReadUnavailable::TimedOut),
-                target: TextTarget::PossiblySensitive, element: None, scoped_dpi: None,
-            }, clock, None, rows);
+            self.finish_unavailable(request, ReadUnavailable::TimedOut, clock, None, rows);
             self.remote_focus = None;
         } else if !self.focus_sent {
             let read = ReadBinding {
@@ -516,7 +522,7 @@ impl Queries {
                     return;
                 }
                 if authorized_result && let Some(completed) = read.completed {
-                    self.cached_pointer = Some((point, geometry, window, root, completed, read.request.id));
+                    self.cached_pointer = Some(CachedPointer { point, geometry, window, root, completed, request: read.request.id });
                 }
                 json!({
                     "kind": "element", "trigger": if action_at.is_some() { "pointer_down" } else { "pointer_rest" },

@@ -1,4 +1,4 @@
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +9,13 @@ pub struct QpcTick(pub i64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct QpcFrequency(pub NonZeroU64);
+
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
+const MICROS_PER_SECOND: i128 = 1_000_000;
+
+/// The receipt uncertainty of a Windows message or hook tick, whose
+/// counter advances in steps of about one timer interrupt.
+pub const MESSAGE_TICK_UNCERTAINTY_MS: u64 = 16;
 
 /// Integer microseconds from the one session origin. Pre-origin samples can be negative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -78,10 +85,48 @@ impl std::fmt::Display for ClockRangeError {
 
 impl std::error::Error for ClockRangeError {}
 
+impl QpcFrequency {
+    /// The whole ticks in `duration`, rounded down; `None` beyond `i64`.
+    pub fn ticks(self, duration: Duration) -> Option<i64> {
+        let ticks = duration.as_nanos().checked_mul(u128::from(self.0.get()))? / NANOS_PER_SECOND;
+        i64::try_from(ticks).ok()
+    }
+
+    /// The ticks covering `duration`, rounded up; `None` beyond `i64`.
+    pub fn ticks_ceil(self, duration: Duration) -> Option<i64> {
+        let ticks = duration.as_nanos().checked_mul(u128::from(self.0.get()))?.div_ceil(NANOS_PER_SECOND);
+        i64::try_from(ticks).ok()
+    }
+
+    /// The time `ticks` span, rounded down to a nanosecond.
+    pub fn duration(self, ticks: u64) -> Duration {
+        let frequency = self.0.get();
+        let nanos = u128::from(ticks % frequency) * NANOS_PER_SECOND / u128::from(frequency);
+        // The remainder is below one second, so `nanos` is below 10^9.
+        Duration::new(ticks / frequency, u32::try_from(nanos).unwrap_or(u32::MAX))
+    }
+
+    /// The whole microseconds covering `ticks`, rounded up.
+    pub fn ticks_to_us_ceil(self, ticks: u64) -> i128 {
+        let frequency = i128::from(self.0.get());
+        (i128::from(ticks) * MICROS_PER_SECOND + frequency - 1) / frequency
+    }
+}
+
 impl QpcTick {
+    /// `self` plus the whole ticks in `duration`, rounded down; `None` on overflow.
+    pub fn checked_after(self, frequency: QpcFrequency, duration: Duration) -> Option<Self> {
+        self.0.checked_add(frequency.ticks(duration)?).map(Self)
+    }
+
+    /// The signed ticks from `earlier` to `self`, without overflow.
+    pub fn ticks_since(self, earlier: Self) -> i128 {
+        i128::from(self.0) - i128::from(earlier.0)
+    }
+
     /// Midpoint and width of a bounded native sample, without adding two i64s.
     pub fn bracket(self, after: Self) -> Result<(Self, u64), ClockRangeError> {
-        let delta = i128::from(after.0) - i128::from(self.0);
+        let delta = after.ticks_since(self);
         let width = u64::try_from(delta).map_err(|_| ClockRangeError::ReversedSample)?;
         let midpoint = i128::from(self.0) + delta / 2;
         Ok((Self(checked_i64(midpoint)?), width))
@@ -123,7 +168,7 @@ impl ClockOrigin {
     /// Floors toward negative infinity, like `wgc_offset`, so pre-origin
     /// samples round the same way on both paths.
     fn scale_delta(self, from: QpcTick, to: QpcTick, units_per_second: i128) -> Result<i64, ClockRangeError> {
-        let delta = i128::from(to.0) - i128::from(from.0);
+        let delta = to.ticks_since(from);
         checked_i64((delta * units_per_second).div_euclid(i128::from(self.qpc_frequency.0.get())))
     }
 }
@@ -154,16 +199,26 @@ impl UtcAnchor {
 
 impl CoarseTime {
     pub const fn windows_message(tick_ms: MessageTickMs) -> Self {
-        Self { tick_ms, uncertainty_us: UncertaintyUs(16_000) }
+        Self { tick_ms, uncertainty_us: UncertaintyUs(MESSAGE_TICK_UNCERTAINTY_MS * 1_000) }
+    }
+}
+
+impl MessageTickMs {
+    /// The milliseconds from the `GetTickCount64` value `anchor_ms` to this
+    /// tick at the nearest wrap of the 32-bit message tick. Exactly half a
+    /// wrap is ambiguous: `None`.
+    pub fn delta_from(self, anchor_ms: u64) -> Option<i32> {
+        // The message tick is the low 32 bits of the 64-bit count, and the
+        // wrapped difference is read as signed: both casts are intended.
+        let delta = self.0.wrapping_sub(anchor_ms as u32) as i32;
+        (delta != i32::MIN).then_some(delta)
     }
 }
 
 impl MessageTickAnchor {
-    /// The milliseconds from the anchor to `tick` at the nearest wrap of the
-    /// 32-bit message tick. Exactly half a wrap is ambiguous: `None`.
+    /// The milliseconds from the anchor to `tick` (`MessageTickMs::delta_from`).
     pub fn tick_delta_ms(self, tick: MessageTickMs) -> Option<i32> {
-        let delta = tick.0.wrapping_sub(self.tick64_ms as u32) as i32;
-        (delta != i32::MIN).then_some(delta)
+        tick.delta_from(self.tick64_ms)
     }
 
     /// Nearest wrap around a recent sampled tick (`tick_delta_ms`).

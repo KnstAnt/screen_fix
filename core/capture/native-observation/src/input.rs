@@ -52,6 +52,12 @@ impl NativeError {
     pub fn without_code(stage: HelperFailureStage) -> Self {
         Self { stage, code: None, raw_input_registration: None }
     }
+
+    /// An I/O failure at `stage`, with its operating-system code if any.
+    pub(crate) fn io(stage: HelperFailureStage, error: &io::Error) -> Self {
+        Self { code: error.raw_os_error(), ..Self::without_code(stage) }
+    }
+
     pub fn into_helper_failure(self) -> HelperFailure {
         HelperFailure {
             stage: self.stage,
@@ -62,7 +68,7 @@ impl NativeError {
 }
 
 pub fn last_error(stage: HelperFailureStage) -> NativeError {
-    NativeError { stage, code: io::Error::last_os_error().raw_os_error(), raw_input_registration: None }
+    NativeError::io(stage, &io::Error::last_os_error())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -73,6 +79,20 @@ pub struct HookForeground {
     pub serial: u64,
 }
 
+/// The capture scope of a scoped run, checked by both native owners.
+pub trait InputScope: Send + Sync {
+    /// The approved foreground window, fixed for the run.
+    fn foreground(&self) -> WindowInstance;
+    /// The current scope serial while the scope is open. A cheap callback
+    /// check, restricted to local atomic state.
+    fn hook_open(&self) -> Option<u64>;
+    /// Whether the scope is open. The Raw Input owner can recheck desktop,
+    /// target and visit away from callbacks.
+    fn raw_open(&self) -> bool;
+    /// The current scope serial.
+    fn serial(&self) -> u64;
+}
+
 pub struct CaptureScope {
     pub foreground: WindowInstance,
     /// Cheap callback check, restricted to local atomic state.
@@ -80,6 +100,13 @@ pub struct CaptureScope {
     /// The raw owner can recheck desktop, target and visit away from callbacks.
     pub raw_open: Arc<dyn Fn() -> bool + Send + Sync>,
     pub serial: Arc<dyn Fn() -> u64 + Send + Sync>,
+}
+
+impl InputScope for CaptureScope {
+    fn foreground(&self) -> WindowInstance { self.foreground }
+    fn hook_open(&self) -> Option<u64> { (self.hook_open)() }
+    fn raw_open(&self) -> bool { (self.raw_open)() }
+    fn serial(&self) -> u64 { (self.serial)() }
 }
 
 pub struct Settings {
@@ -117,7 +144,7 @@ pub fn run_scoped(
     owner: BorrowedHandle<'_>,
     control_wake: BorrowedHandle<'_>,
     output: &mut impl Collector,
-    scope: Option<Arc<CaptureScope>>,
+    scope: Option<Arc<dyn InputScope>>,
 ) -> Result<(), NativeError> {
     let mut frequency = 0;
     if unsafe { QueryPerformanceFrequency(&mut frequency) } == 0 {
@@ -145,9 +172,7 @@ pub fn run_scoped(
     if data_wake.is_null() { return Err(last_error(HelperFailureStage::Startup)); }
     // CreateEventW returned a new unnamed auto-reset event.
     let data_wake = unsafe { OwnedHandle::from_raw_handle(data_wake) };
-    let raw_wake = data_wake.try_clone().map_err(|error| NativeError {
-        stage: HelperFailureStage::Startup, code: error.raw_os_error(), raw_input_registration: None,
-    })?;
+    let raw_wake = data_wake.try_clone().map_err(|error| NativeError::io(HelperFailureStage::Startup, &error))?;
     let mut hooks = Hooks::start(scope.clone())?;
     let mut raw = match RawOwner::start(raw_wake, frequency, settings.pen_hid, scope) {
         Ok(raw) => raw,
@@ -168,8 +193,7 @@ pub fn run_scoped(
     // The caller retains records already accepted before a producer failure.
     let raw_result = stopped_raw.and_then(|raw| {
         for record in raw.records.try_iter() { output.offer(record)?; }
-        for gap in raw.losses.finish() { output.offer(HelperToCore::Gap(gap))?; }
-        for record in raw.status.finish() { output.offer(record)?; }
+        for record in raw.backlog.finish() { output.offer(record)?; }
         raw.result
     });
     let hooks_result = stopped_hooks.and_then(|mut hooks| {
@@ -233,7 +257,10 @@ fn hook_timeout() -> HookTimeoutEvidence {
     };
     let milliseconds = match (result, kind) {
         (ERROR_FILE_NOT_FOUND, _) => return HookTimeoutEvidence::Absent,
-        (ERROR_SUCCESS, REG_DWORD) if size == 4 => Some(u32::from(bytes[0]) | (u32::from(bytes[1]) << 16)),
+        (ERROR_SUCCESS, REG_DWORD) if size == 4 => {
+            let ([low_0, low_1], [high_0, high_1]) = (bytes[0].to_le_bytes(), bytes[1].to_le_bytes());
+            Some(u32::from_le_bytes([low_0, low_1, high_0, high_1]))
+        }
         (ERROR_SUCCESS, REG_SZ) => {
             let len = bytes.iter().position(|unit| *unit == 0).unwrap_or(bytes.len());
             String::from_utf16(&bytes[..len]).ok().and_then(|text| text.trim().parse::<u32>().ok())

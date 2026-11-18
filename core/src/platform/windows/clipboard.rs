@@ -3,8 +3,6 @@
 
 use std::{
     mem::align_of,
-    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
-    ptr::null,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering::{Acquire, Release}},
@@ -30,15 +28,11 @@ use windows::{
     },
     core::w,
 };
-use windows_sys::Win32::{
-    Foundation::WAIT_FAILED,
-    System::Threading::{CreateEventW, INFINITE, SetEvent},
-    UI::WindowsAndMessaging::{MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, QS_ALLINPUT},
-};
+use windows_sys::Win32::System::Threading::INFINITE;
 
-use screen_fix_native_observation::LossCounter;
+use screen_fix_native_observation::{LossCounter, LossSpan, owner::{self, StartupError}, wake::WakeEvent};
 
-use crate::{protocol::{MessageTickMs, QpcTick}, session::windows::ActiveSourceProof};
+use crate::{protocol::{MessageTickMs, QpcTick}, platform::windows::controller::ActiveSourceProof};
 
 use super::{
     ProbeError, clock, context::{FocusGuard, Visit, identity::WindowProcess},
@@ -95,7 +89,7 @@ pub(super) struct Read {
 pub(super) struct Worker {
     stop: Arc<AtomicBool>,
     /// An auto-reset event that wakes the owner for a grant or for stop.
-    wake: Arc<OwnedHandle>,
+    wake: Arc<WakeEvent>,
     thread: thread::JoinHandle<()>,
     notices: Receiver<Notice>,
     grants: SyncSender<Grant>,
@@ -106,7 +100,6 @@ pub(super) struct Worker {
 
 impl Worker {
     pub fn start() -> Result<Self, ProbeError> {
-        let (ready, initialized) = sync_channel(1);
         let (notice, notices) = sync_channel(QUEUE);
         let (grants, approved) = sync_channel(QUEUE);
         let (result, results) = sync_channel(QUEUE);
@@ -114,22 +107,18 @@ impl Worker {
         let stopped = Arc::clone(&stop);
         let lost = Arc::new(LossCounter::default());
         let worker_lost = Arc::clone(&lost);
-        let event = unsafe { CreateEventW(null(), 0, 0, null()) };
-        if event.is_null() {
-            return Err(io_error("Create the clipboard owner wake", std::io::Error::last_os_error()));
-        }
-        // CreateEventW returned a new unnamed event that this worker alone closes.
-        let wake = Arc::new(unsafe { OwnedHandle::from_raw_handle(event) });
+        let wake = Arc::new(WakeEvent::new(false)
+            .map_err(|error| io_error("Create the clipboard owner wake", error))?);
         let owner_wake = Arc::clone(&wake);
-        let thread = thread::Builder::new().name("context-clipboard".into()).spawn(move || {
+        let started = owner::spawn("context-clipboard", false, || {}, move |ready| {
             let owner = match ClipboardWindow::open() {
                 Ok(owner) => owner,
                 Err(error) => {
-                    let _ = ready.try_send(Err(error));
+                    ready.fail(error);
                     return;
                 }
             };
-            if ready.try_send(Ok(())).is_err() {
+            if !ready.ready(()) {
                 return;
             }
             let mut last_sequence = unsafe { GetClipboardSequenceNumber() };
@@ -149,7 +138,7 @@ impl Worker {
                             if let Some(observation) = observe(sequence, MessageTickMs(message.time))
                                 && let Err(TrySendError::Full(observation)) = notice.try_send(observation)
                             {
-                                worker_lost.note(1, observation.received.0, observation.received.0);
+                                worker_lost.note(LossSpan::at(observation.received));
                             }
                         }
                     } else {
@@ -163,25 +152,28 @@ impl Worker {
                     if let Some(read) = owner.read(grant)
                         && let Err(TrySendError::Full(read)) = result.try_send(read)
                     {
-                        worker_lost.note(1, read.notice.received.0, read.notice.received.0);
+                        worker_lost.note(LossSpan::at(read.notice.received));
                     }
                 }
                 // Wake on a clipboard or other message, a grant, or stop.
-                let handle = owner_wake.as_raw_handle();
-                if unsafe { MsgWaitForMultipleObjectsEx(1, &handle, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE) } == WAIT_FAILED {
+                if owner_wake.wait_messages(INFINITE).is_err() {
                     return;
                 }
             }
-        }).map_err(|error| io_error("Start the opt-in clipboard owner", error))?;
-        initialized.recv_timeout(Duration::from_secs(2))
-            .map_err(|_| unavailable("The clipboard owner did not start"))??;
+        });
+        let thread = match started {
+            Ok((owner, ())) => owner.handle,
+            Err(StartupError::Spawn(error)) => return Err(io_error("Start the opt-in clipboard owner", error)),
+            Err(StartupError::Failed(error)) => return Err(error),
+            Err(StartupError::Timeout) => return Err(unavailable("The clipboard owner did not start")),
+        };
         Ok(Self { stop, wake, thread, notices, grants, results, lost })
     }
 
     /// The owner thread ended without being stopped (§6.2 row 17).
     pub fn exited(&self) -> bool { self.thread.is_finished() }
 
-    pub fn take_loss(&self) -> Option<(u64, QpcTick, QpcTick)> {
+    pub fn take_loss(&self) -> Option<LossSpan> {
         self.lost.take()
     }
 
@@ -208,7 +200,7 @@ impl Worker {
 
     fn wake_owner(&self) {
         // A failed signal leaves the grant for the owner's next message.
-        unsafe { SetEvent(self.wake.as_raw_handle()) };
+        let _ = self.wake.set();
     }
 
     pub fn results(&self) -> impl Iterator<Item = Read> + '_ {

@@ -5,16 +5,16 @@
 //! controller: their owners report them to the stream ingress as ledger
 //! entries, unavailable rows or health rows.
 
-use std::sync::Arc;
-
 use crate::{
-    CaptureError, CaptureErrorKind, Remedy,
+    CaptureError,
+    error::CaptureCause,
     package::{
         diagnostics::Failure,
         metadata::{ActivityLoss, LostActivity},
     },
     protocol::{MonitorId, SessionTimeUs},
     session::DegradedActivity,
+    util::push_bounded,
 };
 
 /// Attempt failures beyond this bound are counted, not retained. Activity
@@ -37,10 +37,7 @@ pub(crate) enum FaultClass {
 #[derive(Debug, Clone)]
 pub(crate) struct FaultReport {
     class: FaultClass,
-    kind: CaptureErrorKind,
-    failure: Failure,
-    message: Arc<str>,
-    remedy: Option<Remedy>,
+    cause: CaptureCause,
     monitor: Option<MonitorId>,
     first_affected: Option<SessionTimeUs>,
     detected: Option<SessionTimeUs>,
@@ -50,8 +47,7 @@ impl FaultReport {
     /// An attempt failure keeps the reporting owner's error, including its component.
     pub(crate) fn attempt(error: &CaptureError) -> Self {
         Self {
-            class: FaultClass::Attempt, kind: error.kind, failure: error.failure(), message: error.to_string().into(),
-            remedy: error.remedy(), monitor: None, first_affected: None, detected: None,
+            class: FaultClass::Attempt, cause: error.cause().clone(), monitor: None, first_affected: None, detected: None,
         }
     }
 
@@ -62,10 +58,11 @@ impl FaultReport {
             Some(monitor) => format!("{} on monitor {}", failure.component().label(), monitor.0),
             None => failure.component().label().to_owned(),
         };
+        let message = format!("Recording degraded: {subject} stopped. {}.", failure.operation()).into();
         Self {
-            class: FaultClass::Activity(activity), kind: CaptureErrorKind::BackendFailure, failure,
-            message: format!("Recording degraded: {subject} stopped. {}.", failure.operation()).into(),
-            remedy: None, monitor, first_affected, detected: None,
+            class: FaultClass::Activity(activity),
+            cause: CaptureCause { failure, message, remedy: None },
+            monitor, first_affected, detected: None,
         }
     }
 
@@ -74,11 +71,15 @@ impl FaultReport {
     }
 
     pub(crate) fn operation(&self) -> &'static str {
-        self.failure.operation()
+        self.cause.failure.operation()
+    }
+
+    fn failure(&self) -> Failure {
+        self.cause.failure
     }
 
     pub(crate) fn error(&self) -> CaptureError {
-        CaptureError::from_fault(self.kind, self.failure, self.message.to_string()).with_remedy(self.remedy)
+        CaptureError::from(self.cause.clone())
     }
 }
 
@@ -104,19 +105,19 @@ impl FaultLog {
     /// Record a report in arrival order. A newly lost activity is returned for the status.
     pub(crate) fn record(&mut self, mut report: FaultReport, now: Option<SessionTimeUs>) -> Option<DegradedActivity> {
         report.detected = report.detected.or(now);
-        crate::devlog::devlog!("fault", "{:?} component={} operation={:?} native_code={:?} monitor={:?} detected_us={:?}",
-            report.class, report.failure.component().label(), report.failure.operation(),
-            report.failure.native_code().map(|code| format!("{:#010x}", code as u32)),
+        crate::devlog::devlog!("fault", "{:?} component={} operation={:?} message={:?} native_code={:?} monitor={:?} detected_us={:?}",
+            report.class, report.failure().component().label(), report.failure().operation(), report.cause.message,
+            report.failure().native_code().map(|code| format!("{:#010x}", code as u32)),
             report.monitor.map(|monitor| monitor.0), report.detected.map(|time| time.0));
         match report.class {
             FaultClass::Attempt => {
                 // An owner's failure is reported when detected and again when its
                 // result is collected at finalization; the first report stands.
-                if self.reports.iter().any(|old| old.class == FaultClass::Attempt && old.failure.same_cause(&report.failure)) {
+                if self.reports.iter().any(|old| old.class == FaultClass::Attempt && old.failure().same_cause(&report.failure())) {
                     return None;
                 }
                 if self.attempt_reports == MAX_ATTEMPT_REPORTS {
-                    self.omit(report.failure);
+                    self.omit(report.failure());
                     return None;
                 }
                 self.attempt_reports += 1;
@@ -125,7 +126,7 @@ impl FaultLog {
             }
             FaultClass::Activity(activity) => {
                 let degraded = DegradedActivity {
-                    component: report.failure.component(), monitor: report.monitor, required: activity == LostActivity::Required,
+                    component: report.failure().component(), monitor: report.monitor, required: activity == LostActivity::Required,
                 };
                 self.reports.push(report);
                 Some(degraded)
@@ -138,9 +139,7 @@ impl FaultLog {
         if self.omitted_causes.iter().any(|old| old.same_cause(&failure)) {
             return;
         }
-        if self.omitted_causes.len() < MAX_OMITTED_CAUSES {
-            self.omitted_causes.push(failure);
-        }
+        push_bounded(&mut self.omitted_causes, failure, MAX_OMITTED_CAUSES);
         self.omitted = self.omitted.saturating_add(1);
     }
 
@@ -161,11 +160,11 @@ impl FaultLog {
     fn select(&self, selected: Option<usize>) -> FaultOutcome {
         let additional = self.reports.iter().enumerate()
             .filter(|(index, _)| Some(*index) != selected)
-            .map(|(_, report)| report.failure).collect();
+            .map(|(_, report)| report.failure()).collect();
         let activity_losses = self.reports.iter().filter_map(|report| match report.class {
             FaultClass::Activity(activity) => Some(ActivityLoss {
-                component: report.failure.component(), activity, monitor: report.monitor,
-                operation: report.failure.operation().to_owned(), native_code: report.failure.native_code(),
+                component: report.failure().component(), activity, monitor: report.monitor,
+                operation: report.failure().operation().to_owned(), native_code: report.failure().native_code(),
                 first_t_us: report.first_affected.or(report.detected),
             }),
             FaultClass::Attempt => None,

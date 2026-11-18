@@ -4,7 +4,7 @@
 use std::{
     io,
     mem::size_of,
-    os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle},
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     ptr::{null, null_mut},
     time::{Duration, Instant},
 };
@@ -18,20 +18,22 @@ use windows_sys::Win32::{
             SetInformationJobObject,
         },
         Threading::{
-            CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateEventW, CreateProcessW,
+            CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW,
             DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
             GetExitCodeProcess, InitializeProcThreadAttributeList,
             LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-            ResumeThread, STARTUPINFOEXW, SetEvent, TerminateProcess, UpdateProcThreadAttribute,
+            ResumeThread, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
             WaitForSingleObject,
         },
     },
 };
 
+use screen_fix_native_observation::{channel::RecorderEndpoint, wake::WakeEvent};
+
 use crate::protocol::{
     QpcTick, SourceSequence,
     ipc::{ConfigureInput, CoreToHelper, HelperFailure, HelperFailureStage, HelperToCore,
-        InputRegistration, PacketError, Producer, shared::RecorderEndpoint},
+        InputRegistration, PacketError, Producer},
 };
 
 // Standard SYNCHRONIZE access granted on the child copy of the parent process handle.
@@ -57,7 +59,7 @@ pub(super) enum HelperError {
 
 pub(super) struct InputHelper {
     channel: RecorderEndpoint,
-    wake: OwnedHandle,
+    wake: WakeEvent,
     process: OwnedHandle,
     // Closing this is the last-resort process cleanup, including parent crash.
     job: Option<OwnedHandle>,
@@ -78,11 +80,11 @@ impl InputHelper {
         }
         // Both objects start non-inheritable. Only the explicit duplicates below
         // enter the launch list, and their parent copies close after CreateProcessW.
-        let wake = own(unsafe { CreateEventW(null(), 0, 0, null()) }, "Create the input control wake")?;
+        let wake = WakeEvent::new(false).map_err(|error| HelperError::Windows("Create the input control wake", error))?;
         let job = configured_job()?;
         let parent = unsafe { GetCurrentProcess() };
         let mapping_for_child = duplicate(channel.mapping_handle().as_raw_handle(), None)?;
-        let wake_for_child = duplicate(wake.as_handle().as_raw_handle(), None)?;
+        let wake_for_child = duplicate(wake.as_raw_handle(), None)?;
         let parent_for_child = duplicate(parent, Some(WAIT_ONLY))?;
         let handles = [
             mapping_for_child.as_raw_handle(), wake_for_child.as_raw_handle(), parent_for_child.as_raw_handle(),
@@ -245,10 +247,7 @@ impl InputHelper {
     }
 
     fn signal(&self) -> Result<(), HelperError> {
-        if unsafe { SetEvent(self.wake.as_raw_handle()) } == 0 {
-            return Err(native_error("Wake the input helper"));
-        }
-        Ok(())
+        self.wake.set().map_err(|error| HelperError::Windows("Wake the input helper", error))
     }
 }
 
@@ -335,33 +334,82 @@ impl Drop for HandleList {
 }
 
 impl HelperError {
+    /// The operation text reported for this failure.
+    fn stage(&self) -> &'static str {
+        match self {
+            Self::Missing => "The installed screen-fix-input-helper.exe is missing",
+            Self::Windows(stage, _) => *stage,
+            Self::Protocol(PacketError::UnsupportedVersion(_)) => "The installed input helper protocol version differs",
+            Self::Protocol(_) => "The input helper returned an invalid IPC record",
+            Self::Reported(failure) => match failure.stage {
+                HelperFailureStage::Startup => "Initialize the input helper",
+                HelperFailureStage::PowerThrottling => "Disable input helper execution-speed power throttling",
+                HelperFailureStage::ClockMismatch => "Match the input helper QPC frequency",
+                HelperFailureStage::RawInputRegistration => "Verify input helper Raw Input registrations",
+                HelperFailureStage::DeviceDiscovery => "Discover input devices",
+                HelperFailureStage::KeyboardHook => "Install or monitor the input helper keyboard hook",
+                HelperFailureStage::PointerHook => "Install or monitor the input helper mouse hook",
+                HelperFailureStage::MessageLoop => "Run the input helper message loop",
+                HelperFailureStage::Transport => "Run input helper IPC",
+            },
+            Self::UnexpectedExit(_) => "The input helper exited unexpectedly",
+            Self::ReadyTimeout => "The input helper did not report readiness in time",
+            Self::ShutdownTimeout => "The input helper did not finish normal cleanup in time",
+            Self::SuspectedHookLoss(producer) => match producer {
+                Producer::KeyboardHook => "The keyboard hook stopped producing callbacks during keyboard input",
+                Producer::PointerHook => "The mouse hook stopped producing callbacks during mouse input",
+                _ => "An input hook stopped producing callbacks",
+            },
+            Self::ProducerStalled(producer) => match producer {
+                Producer::RawInput => "Raw Input progress stalled",
+                Producer::DeviceNotifications => "Input device-notification progress stalled",
+                Producer::KeyboardHook => "Keyboard-hook progress stalled",
+                Producer::PointerHook => "Mouse-hook progress stalled",
+                Producer::OptionalHid => "Optional HID progress stalled",
+            },
+        }
+    }
+
+    /// The native code as reported: a Win32 error, or the process exit code
+    /// of an unexpected exit.
+    fn native_code(&self) -> Option<i32> {
+        match self {
+            Self::Windows(_, error) => error.raw_os_error(),
+            Self::Reported(failure) => failure.native_code,
+            Self::UnexpectedExit(code) => Some(*code as i32),
+            _ => None,
+        }
+    }
+
+    fn raw_input_registration(&self) -> Option<crate::protocol::ipc::RawInputRegistrationMismatch> {
+        match self {
+            Self::Reported(failure) => failure.raw_input_registration,
+            _ => None,
+        }
+    }
+
     pub(super) fn runtime_failure(
         self, at: crate::protocol::SessionTimeUs, first_missing: crate::protocol::SessionTimeUs,
-    ) -> crate::session::windows::InputFailure {
+    ) -> crate::platform::windows::controller::InputFailure {
         use crate::{
             package::{diagnostics::{Failure, FailureComponent}, metadata::InputBlindReason},
-            session::windows::InputFailure,
+            platform::windows::controller::InputFailure,
         };
-        let (reason, native_code) = match &self {
-            Self::UnexpectedExit(code) => (InputBlindReason::HelperExited, Some(*code as i32)),
-            Self::ShutdownTimeout => (InputBlindReason::HelperCleanupFailed, None),
-            Self::SuspectedHookLoss(_) => (InputBlindReason::HookLost, None),
-            Self::ProducerStalled(_) => (InputBlindReason::ProducerStall, None),
-            Self::Reported(failure) => {
-                let reason = match failure.stage {
-                    HelperFailureStage::RawInputRegistration => InputBlindReason::RegistrationLost,
-                    HelperFailureStage::KeyboardHook | HelperFailureStage::PointerHook => InputBlindReason::HookLost,
-                    _ => InputBlindReason::HelperCommunicationFailed,
-                };
-                (reason, failure.native_code)
-            }
-            Self::Windows(_, error) => (InputBlindReason::HelperCommunicationFailed, error.raw_os_error()),
-            _ => (InputBlindReason::HelperCommunicationFailed, None),
+        let reason = match &self {
+            Self::UnexpectedExit(_) => InputBlindReason::HelperExited,
+            Self::ShutdownTimeout => InputBlindReason::HelperCleanupFailed,
+            Self::SuspectedHookLoss(_) => InputBlindReason::HookLost,
+            Self::ProducerStalled(_) => InputBlindReason::ProducerStall,
+            Self::Reported(failure) => match failure.stage {
+                HelperFailureStage::RawInputRegistration => InputBlindReason::RegistrationLost,
+                HelperFailureStage::KeyboardHook | HelperFailureStage::PointerHook => InputBlindReason::HookLost,
+                _ => InputBlindReason::HelperCommunicationFailed,
+            },
+            _ => InputBlindReason::HelperCommunicationFailed,
         };
-        let error = super::ProbeError::from(self);
-        let operation = error.stage;
-        let mut failure = Failure::new(FailureComponent::InputHelper, operation, native_code);
-        failure.raw_input_registration = error.raw_input_registration;
+        let operation = self.stage();
+        let mut failure = Failure::new(FailureComponent::InputHelper, operation, self.native_code());
+        failure.raw_input_registration = self.raw_input_registration();
         InputFailure { operation, at, first_missing: first_missing.min(at), reason, failure }
     }
 }
@@ -369,59 +417,14 @@ impl HelperError {
 impl From<HelperError> for super::ProbeError {
     fn from(error: HelperError) -> Self {
         use windows::core::{Error, HRESULT};
-        let raw_input_registration = match &error {
-            HelperError::Reported(failure) => failure.raw_input_registration,
-            _ => None,
-        };
-        let win32 = |code: i32| HRESULT::from_win32(code as u32);
-        let (stage, code) = match error {
-            HelperError::Missing => ("The installed screen-fix-input-helper.exe is missing", None),
-            HelperError::Windows(stage, error) => (stage, error.raw_os_error().map(win32)),
-            HelperError::Protocol(error) => {
-                let stage = match error {
-                    PacketError::UnsupportedVersion(_) => "The installed input helper protocol version differs",
-                    _ => "The input helper returned an invalid IPC record",
-                };
-                (stage, None)
-            }
-            HelperError::Reported(failure) => {
-                let stage = match failure.stage {
-                    HelperFailureStage::Startup => "Initialize the input helper",
-                    HelperFailureStage::PowerThrottling => "Disable input helper execution-speed power throttling",
-                    HelperFailureStage::ClockMismatch => "Match the input helper QPC frequency",
-                    HelperFailureStage::RawInputRegistration => "Verify input helper Raw Input registrations",
-                    HelperFailureStage::DeviceDiscovery => "Discover input devices",
-                    HelperFailureStage::KeyboardHook => "Install or monitor the input helper keyboard hook",
-                    HelperFailureStage::PointerHook => "Install or monitor the input helper mouse hook",
-                    HelperFailureStage::MessageLoop => "Run the input helper message loop",
-                    HelperFailureStage::Transport => "Run input helper IPC",
-                };
-                (stage, failure.native_code.map(win32))
-            }
+        let code = error.native_code().map(|code| match error {
             // The process exit code is kept as reported; it is not a Win32 error.
-            HelperError::UnexpectedExit(code) => ("The input helper exited unexpectedly", Some(HRESULT(code as i32))),
-            HelperError::ReadyTimeout => ("The input helper did not report readiness in time", None),
-            HelperError::ShutdownTimeout => ("The input helper did not finish normal cleanup in time", None),
-            HelperError::SuspectedHookLoss(producer) => (match producer {
-                Producer::KeyboardHook => "The keyboard hook stopped producing callbacks during keyboard input",
-                Producer::PointerHook => "The mouse hook stopped producing callbacks during mouse input",
-                _ => "An input hook stopped producing callbacks",
-            }, None),
-            HelperError::ProducerStalled(producer) => (match producer {
-                Producer::RawInput => "Raw Input progress stalled",
-                Producer::DeviceNotifications => "Input device-notification progress stalled",
-                Producer::KeyboardHook => "Keyboard-hook progress stalled",
-                Producer::PointerHook => "Mouse-hook progress stalled",
-                Producer::OptionalHid => "Optional HID progress stalled",
-            }, None),
-        };
-        Self {
-            stage,
-            kind: super::ProbeKind::Other,
-            source: code.map(Error::from_hresult),
-            journal: None,
-            raw_input_registration,
-            owner: Some(crate::package::diagnostics::FailureComponent::InputHelper),
-        }
+            HelperError::UnexpectedExit(_) => HRESULT(code),
+            _ => HRESULT::from_win32(code as u32),
+        });
+        Self::new(error.stage())
+            .with_source(code.map(Error::from_hresult))
+            .with_raw_input_registration(error.raw_input_registration())
+            .owned_by(crate::package::diagnostics::FailureComponent::InputHelper)
     }
 }

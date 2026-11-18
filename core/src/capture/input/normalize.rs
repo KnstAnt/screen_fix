@@ -54,9 +54,27 @@ pub(crate) enum Modifier {
     RightWin = 7,
 }
 
+/// The side-specific virtual key of each modifier, in discriminant order.
+const MODIFIER_VKS: [(Modifier, u16); 8] = [
+    (Modifier::LeftShift, VK_LSHIFT), (Modifier::RightShift, VK_RSHIFT),
+    (Modifier::LeftCtrl, VK_LCONTROL), (Modifier::RightCtrl, VK_RCONTROL),
+    (Modifier::LeftAlt, VK_LMENU), (Modifier::RightAlt, VK_RMENU),
+    (Modifier::LeftWin, VK_LWIN), (Modifier::RightWin, VK_RWIN),
+];
+
 impl Modifier {
     pub const ALL: [Self; 8] = [Self::LeftShift, Self::RightShift, Self::LeftCtrl, Self::RightCtrl,
         Self::LeftAlt, Self::RightAlt, Self::LeftWin, Self::RightWin];
+
+    /// The side-specific virtual key.
+    pub fn vk(self) -> u16 {
+        MODIFIER_VKS[self as usize].1
+    }
+
+    /// The modifier of a side-specific virtual key.
+    pub fn from_vk(vk: u16) -> Option<Self> {
+        MODIFIER_VKS.iter().find(|(_, key)| *key == vk).map(|(modifier, _)| *modifier)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -138,12 +156,79 @@ const RAW_WHEELS: [(u16, WheelAxis); 2] = [(0x0400, WheelAxis::Vertical), (0x080
 /// an up per button, one tick per wheel axis and one motion.
 pub(crate) const MAX_PARTS: usize = 2 * Button::ALL.len() + RAW_WHEELS.len() + 1;
 
+/// `MOUSE_MOVE_ABSOLUTE`: the raw pointer packet carries absolute coordinates.
+const MOUSE_MOVE_ABSOLUTE: u16 = 0x01;
+
+/// `RI_KEY_BREAK`: the raw keyboard record is a key release.
+pub(super) const RI_KEY_BREAK: u16 = 0x01;
+/// `RI_KEY_E0` and `RI_KEY_E1`: the scan code prefix of a raw keyboard record.
+const RI_KEY_E0: u16 = 0x02;
+const RI_KEY_E1: u16 = 0x04;
+/// `KEYBOARD_OVERRUN_MAKE_CODE`: a raw keyboard record without a key.
+const KEYBOARD_OVERRUN_MAKE_CODE: u16 = 0xff;
+/// `LLKHF_EXTENDED`: the low-level keyboard hook's E0 prefix flag.
+const LLKHF_EXTENDED: u32 = 0x01;
 /// `LLKHF_UP`: the low-level keyboard hook's key-release flag.
 pub(crate) const LLKHF_UP: u32 = 0x80;
+/// The low-level keyboard hook's scan code of the left-Ctrl companion that
+/// the system sends with the right Alt of an AltGr press.
+const ALTGR_COMPANION_SCAN: u32 = 0x21d;
+
+/// The scan codes that disambiguate the virtual keys below.
+const SCAN_CTRL: u8 = 0x1d;
+const SCAN_LEFT_SHIFT: u8 = 0x2a;
+const SCAN_RIGHT_SHIFT: u8 = 0x36;
+const SCAN_NUM_LOCK: u8 = 0x45;
+
+/// No virtual key: the record has no key to report.
+const VK_NONE: u16 = 0xff;
 /// `VK_PACKET`: a Unicode code unit sent as a key, not a physical key.
 pub(crate) const VK_PACKET: u16 = 0xe7;
 /// `VK_CAPITAL`: Caps Lock.
 pub(crate) const VK_CAPITAL: u16 = 0x14;
+const VK_SHIFT: u16 = 0x10;
+const VK_CONTROL: u16 = 0x11;
+const VK_MENU: u16 = 0x12;
+const VK_PAUSE: u16 = 0x13;
+const VK_NUMLOCK: u16 = 0x90;
+const VK_LSHIFT: u16 = 0xa0;
+const VK_RSHIFT: u16 = 0xa1;
+const VK_LCONTROL: u16 = 0xa2;
+const VK_RCONTROL: u16 = 0xa3;
+const VK_LMENU: u16 = 0xa4;
+const VK_RMENU: u16 = 0xa5;
+const VK_LWIN: u16 = 0x5b;
+const VK_RWIN: u16 = 0x5c;
+
+/// The pointer messages of the low-level mouse hook.
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_LBUTTONUP: u32 = 0x0202;
+const WM_RBUTTONDOWN: u32 = 0x0204;
+const WM_RBUTTONUP: u32 = 0x0205;
+const WM_MBUTTONDOWN: u32 = 0x0207;
+const WM_MBUTTONUP: u32 = 0x0208;
+const WM_MOUSEWHEEL: u32 = 0x020a;
+const WM_XBUTTONDOWN: u32 = 0x020b;
+const WM_XBUTTONUP: u32 = 0x020c;
+const WM_MOUSEHWHEEL: u32 = 0x020e;
+/// `XBUTTON1` and `XBUTTON2` in the high word of an X button message's mouse data.
+const XBUTTON1: u32 = 1;
+const XBUTTON2: u32 = 2;
+
+/// `MI_WP_SIGNATURE`: the pen and touch promotion signature in the extra
+/// information of a promoted mouse message, under `PROMOTION_SIGNATURE_MASK`.
+const PROMOTION_SIGNATURE: u64 = 0xff51_5700;
+const PROMOTION_SIGNATURE_MASK: u64 = 0xffff_ff00;
+/// In the low byte of a promoted message's extra information: set for touch, clear for pen.
+pub(crate) const PROMOTED_TOUCH: u8 = 0x80;
+/// In the low byte of a promoted message's extra information: the pen or touch cursor id.
+pub(crate) const PROMOTED_CURSOR_ID: u8 = 0x7f;
+
+/// A mouse message Windows promoted from pen or touch input.
+pub(crate) fn promoted(extra: u64) -> bool {
+    extra & PROMOTION_SIGNATURE_MASK == PROMOTION_SIGNATURE
+}
 
 pub(crate) fn parts(
     input: &CollectedInput,
@@ -153,7 +238,7 @@ pub(crate) fn parts(
     match input.sample {
         InputSample::RawKey(key) => parts[0] = raw_key(key, fallback_scan).map(Action::Key),
         InputSample::HookKey(key) => {
-            parts[0] = if key.scan_code == 0x21d {
+            parts[0] = if key.scan_code == ALTGR_COMPANION_SCAN {
                 // Keep native evidence privately for P08. It is never a
                 // physical left Ctrl transition or a recorder modifier.
                 Some(Action::AltGrCompanion)
@@ -186,7 +271,7 @@ pub(crate) fn parts(
                 }
             }
             let (x, y) = (pointer.x, pointer.y);
-            if pointer.move_flags & 1 != 0 {
+            if pointer.move_flags & MOUSE_MOVE_ABSOLUTE != 0 {
                 parts[next] = Some(Action::Motion(Motion::Absolute {
                     x, y, desktop_point: absolute_point(input, x, y),
                 }));
@@ -224,14 +309,14 @@ fn absolute_point(input: &CollectedInput, x: i32, y: i32) -> Evidence<PhysicalPo
 
 fn raw_key(key: RawKey, fallback_scan: impl FnOnce(u16) -> Option<ScanCode>) -> Option<Key> {
     if key.virtual_key == VK_PACKET {
-        return normalize_key(key.virtual_key, None, key.flags & 1 == 0);
+        return normalize_key(key.virtual_key, None, key.flags & RI_KEY_BREAK == 0);
     }
-    if key.make_code == 0xff || key.virtual_key == 0xff {
+    if key.make_code == KEYBOARD_OVERRUN_MAKE_CODE || key.virtual_key == VK_NONE {
         return None;
     }
-    let prefix = match key.flags & 6 {
-        2 => ScanPrefix::E0,
-        4 => ScanPrefix::E1,
+    let prefix = match key.flags & (RI_KEY_E0 | RI_KEY_E1) {
+        RI_KEY_E0 => ScanPrefix::E0,
+        RI_KEY_E1 => ScanPrefix::E1,
         _ => ScanPrefix::None,
     };
     let scan = if key.make_code == 0 {
@@ -239,79 +324,69 @@ fn raw_key(key: RawKey, fallback_scan: impl FnOnce(u16) -> Option<ScanCode>) -> 
     } else {
         u8::try_from(key.make_code).ok().map(|code| ScanCode { prefix, code })
     };
-    normalize_key(key.virtual_key, scan, key.flags & 1 == 0)
+    normalize_key(key.virtual_key, scan, key.flags & RI_KEY_BREAK == 0)
 }
 
 fn hook_key(key: HookKey) -> Option<Key> {
     if key.virtual_key == u32::from(VK_PACKET) {
         return normalize_key(VK_PACKET, None, key.flags & LLKHF_UP == 0);
     }
-    if key.virtual_key == 0xff {
+    if key.virtual_key == u32::from(VK_NONE) {
         return None;
     }
-    let prefix = if key.flags & 1 == 0 { ScanPrefix::None } else { ScanPrefix::E0 };
+    let prefix = if key.flags & LLKHF_EXTENDED == 0 { ScanPrefix::None } else { ScanPrefix::E0 };
     let scan = u8::try_from(key.scan_code).ok().filter(|code| *code != 0)
         .map(|code| ScanCode { prefix, code });
     normalize_key(u16::try_from(key.virtual_key).ok()?, scan, key.flags & LLKHF_UP == 0)
 }
 
 fn normalize_key(mut vk: u16, mut scan: Option<ScanCode>, down: bool) -> Option<Key> {
+    // An E0-prefixed shift is a fake shift. Pause and Num Lock share the make code 0x45.
     match scan {
-        Some(ScanCode { prefix: ScanPrefix::E0, code: 0x2a | 0x36 }) => return None,
-        Some(ScanCode { prefix: ScanPrefix::None, code: 0x45 }) if vk == 0x13 => {
-            scan = Some(ScanCode { prefix: ScanPrefix::E1, code: 0x45 });
+        Some(ScanCode { prefix: ScanPrefix::E0, code: SCAN_LEFT_SHIFT | SCAN_RIGHT_SHIFT }) => return None,
+        Some(ScanCode { prefix: ScanPrefix::None, code: SCAN_NUM_LOCK }) if vk == VK_PAUSE => {
+            scan = Some(ScanCode { prefix: ScanPrefix::E1, code: SCAN_NUM_LOCK });
         }
-        Some(ScanCode { prefix: ScanPrefix::E1, code: 0x1d | 0x45 }) if vk == 0x13 => {
-            scan = Some(ScanCode { prefix: ScanPrefix::E1, code: 0x45 });
+        Some(ScanCode { prefix: ScanPrefix::E1, code: SCAN_CTRL | SCAN_NUM_LOCK }) if vk == VK_PAUSE => {
+            scan = Some(ScanCode { prefix: ScanPrefix::E1, code: SCAN_NUM_LOCK });
         }
-        Some(ScanCode { code: 0x45, .. }) if vk == 0x90 => {
-            scan = Some(ScanCode { prefix: ScanPrefix::E0, code: 0x45 });
+        Some(ScanCode { code: SCAN_NUM_LOCK, .. }) if vk == VK_NUMLOCK => {
+            scan = Some(ScanCode { prefix: ScanPrefix::E0, code: SCAN_NUM_LOCK });
         }
         _ => {}
     }
     let extended = scan.is_some_and(|scan| scan.prefix == ScanPrefix::E0);
     vk = match vk {
-        0x10 if scan.is_some_and(|scan| scan.code == 0x36) => 0xa1,
-        0x10 if scan.is_some() => 0xa0,
-        0x11 if extended => 0xa3,
-        0x11 if scan.is_some() => 0xa2,
-        0x12 if extended => 0xa5,
-        0x12 if scan.is_some() => 0xa4,
+        VK_SHIFT if scan.is_some_and(|scan| scan.code == SCAN_RIGHT_SHIFT) => VK_RSHIFT,
+        VK_SHIFT if scan.is_some() => VK_LSHIFT,
+        VK_CONTROL if extended => VK_RCONTROL,
+        VK_CONTROL if scan.is_some() => VK_LCONTROL,
+        VK_MENU if extended => VK_RMENU,
+        VK_MENU if scan.is_some() => VK_LMENU,
         _ => vk,
     };
-    let modifier = match vk {
-        0xa0 => Some(Modifier::LeftShift),
-        0xa1 => Some(Modifier::RightShift),
-        0xa2 => Some(Modifier::LeftCtrl),
-        0xa3 => Some(Modifier::RightCtrl),
-        0xa4 => Some(Modifier::LeftAlt),
-        0xa5 => Some(Modifier::RightAlt),
-        0x5b => Some(Modifier::LeftWin),
-        0x5c => Some(Modifier::RightWin),
-        _ => None,
-    };
-    Some(Key { scan, virtual_key: vk, down, modifier })
+    Some(Key { scan, virtual_key: vk, down, modifier: Modifier::from_vk(vk) })
 }
 
 fn hook_pointer(pointer: HookPointer) -> Option<Action> {
     let (logical, down) = match pointer.message {
-        0x0200 => return Some(Action::Motion(Motion::HookPoint)),
-        0x0201 => (Button::Left, true),
-        0x0202 => (Button::Left, false),
-        0x0204 => (Button::Right, true),
-        0x0205 => (Button::Right, false),
-        0x0207 => (Button::Middle, true),
-        0x0208 => (Button::Middle, false),
-        0x020b | 0x020c => {
+        WM_MOUSEMOVE => return Some(Action::Motion(Motion::HookPoint)),
+        WM_LBUTTONDOWN => (Button::Left, true),
+        WM_LBUTTONUP => (Button::Left, false),
+        WM_RBUTTONDOWN => (Button::Right, true),
+        WM_RBUTTONUP => (Button::Right, false),
+        WM_MBUTTONDOWN => (Button::Middle, true),
+        WM_MBUTTONUP => (Button::Middle, false),
+        WM_XBUTTONDOWN | WM_XBUTTONUP => {
             let button = match pointer.mouse_data >> 16 {
-                1 => Button::X1,
-                2 => Button::X2,
+                XBUTTON1 => Button::X1,
+                XBUTTON2 => Button::X2,
                 _ => return None,
             };
-            (button, pointer.message == 0x020b)
+            (button, pointer.message == WM_XBUTTONDOWN)
         }
-        0x020a | 0x020e => {
-            let axis = if pointer.message == 0x020a { WheelAxis::Vertical } else { WheelAxis::Horizontal };
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            let axis = if pointer.message == WM_MOUSEWHEEL { WheelAxis::Vertical } else { WheelAxis::Horizontal };
             return Some(Action::Wheel { axis, value: (pointer.mouse_data >> 16) as i16 });
         }
         _ => return None,

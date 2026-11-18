@@ -6,17 +6,30 @@ use std::collections::VecDeque;
 use serde::Serialize;
 use windows_sys::Win32::{
     Globalization::{NormalizationC, NormalizationD, NormalizeString},
-    UI::Input::KeyboardAndMouse::{HKL, ToUnicodeEx},
+    UI::Input::KeyboardAndMouse::{
+        HKL, ToUnicodeEx, VK_CAPITAL, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_NUMLOCK, VK_RCONTROL,
+        VK_RMENU, VK_RSHIFT, VK_SCROLL, VK_SHIFT,
+    },
 };
 
 use crate::{
-    capture::input::{Correlation, HeldInput, Key, Modifier, VK_PACKET, injected_hook, modifier_bit, modifier_vk},
+    capture::input::{Correlation, HeldInput, Key, Modifier, VK_PACKET, injected_hook, modifier_bit},
     protocol::ipc::InputSample,
 };
 
 use super::super::context::ImeState;
 
 const DEAD_COMBINATIONS: usize = 64;
+/// The high bit of a key state entry: the key is down.
+const KEY_DOWN: u8 = 0x80;
+/// `ToUnicodeEx` flags: bit 0, a menu is active (no Alt+Numpad entry), and
+/// bit 2, the keyboard state of the thread is left unchanged.
+const TO_UNICODE_FLAGS: u32 = 0x5;
+
+/// The keyboard layout handle of a foreground focus record, when it fits a pointer.
+pub(super) fn hkl(layout: u64) -> Option<HKL> {
+    usize::try_from(layout).ok().map(|layout| layout as HKL)
+}
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,7 +151,7 @@ impl KeyboardText {
     }
 
     fn infer(&mut self, input: &HeldInput, key: Key, layout: u64, ime: ImeState, commits: &mut Vec<TextCommit>) -> Typing {
-        if key.modifier.is_some() || matches!(key.virtual_key, 0x14 | 0x90 | 0x91) {
+        if key.modifier.is_some() || matches!(key.virtual_key, VK_CAPITAL | VK_NUMLOCK | VK_SCROLL) {
             return Typing::NonText;
         }
         if ime == ImeState::Composing {
@@ -177,29 +190,30 @@ impl KeyboardText {
         }
         let Some(scan) = key.scan else { return Typing::Unknown };
         let mut state = [0_u8; 256];
-        for modifier in [
-            Modifier::LeftShift, Modifier::RightShift, Modifier::LeftCtrl, Modifier::RightCtrl,
-            Modifier::LeftAlt, Modifier::RightAlt, Modifier::LeftWin, Modifier::RightWin,
-        ] {
-            state[usize::from(modifier_vk(modifier))] = if pressed(modifier) { 0x80 } else { 0 };
+        let index = |vk: u16| usize::from(vk);
+        for modifier in Modifier::ALL {
+            state[index(modifier.vk())] = if pressed(modifier) { KEY_DOWN } else { 0 };
         }
-        state[0x10] = state[0xa0] | state[0xa1];
-        state[0x11] = state[0xa2] | state[0xa3] | if alt_gr { 0x80 } else { 0 };
-        state[0x12] = state[0xa4] | state[0xa5];
-        if alt_gr { state[0xa2] = 0x80; }
-        let Some(key_state) = state.get_mut(usize::from(key.virtual_key)) else { return Typing::Unknown };
-        *key_state |= 0x80;
-        state[0x14] = u8::from(held.caps_lock.unwrap_or(false));
-        let hkl = layout as usize as HKL;
+        state[index(VK_SHIFT)] = state[index(VK_LSHIFT)] | state[index(VK_RSHIFT)];
+        state[index(VK_CONTROL)] = state[index(VK_LCONTROL)] | state[index(VK_RCONTROL)] | if alt_gr { KEY_DOWN } else { 0 };
+        state[index(VK_MENU)] = state[index(VK_LMENU)] | state[index(VK_RMENU)];
+        if alt_gr { state[index(VK_LCONTROL)] = KEY_DOWN; }
+        let Some(key_state) = state.get_mut(index(key.virtual_key)) else { return Typing::Unknown };
+        *key_state |= KEY_DOWN;
+        state[index(VK_CAPITAL)] = u8::from(held.caps_lock.unwrap_or(false));
+        // A 64-bit target always fits the layout handle.
+        let Some(layout) = hkl(layout) else { return Typing::Unknown };
         let mut units = [0_u16; 16];
+        // SAFETY: `state` is a 256-entry key state array and `units` a writable
+        // buffer of the passed length; both outlive the call.
         let translate = |state: &[u8; 256], units: &mut [u16; 16]| unsafe {
             ToUnicodeEx(u32::from(key.virtual_key), u32::from(scan.code), state.as_ptr(), units.as_mut_ptr(),
-                units.len() as i32, 0x5, hkl)
+                units.len() as i32, TO_UNICODE_FLAGS, layout)
         };
         let count = translate(&state, &mut units);
         if held.caps_lock.is_none() {
             let mut toggled = [0_u16; 16];
-            state[0x14] = 1;
+            state[index(VK_CAPITAL)] = 1;
             if translate(&state, &mut toggled) != count
                 || toggled.get(..count.unsigned_abs() as usize) != units.get(..count.unsigned_abs() as usize)
             {
@@ -283,7 +297,7 @@ fn packet_unit(input: &HeldInput) -> Option<u16> {
     if correlated.correlation != Correlation::Matched {
         return None;
     }
-    std::iter::once(&correlated.first).chain(&correlated.partners).find_map(|slot| match slot.packet.sample {
+    correlated.slots().find_map(|slot| match slot.packet.sample {
         InputSample::HookKey(key) if injected_hook(&slot.packet.sample) && key.virtual_key == u32::from(VK_PACKET) =>
             u16::try_from(key.scan_code).ok(),
         _ => None,
@@ -297,6 +311,8 @@ fn normalize(base: char, mark: Option<char>, form: i32) -> Option<String> {
         length += mark.encode_utf16(&mut source[length..]).len();
     }
     let mut output = [0_u16; 8];
+    // SAFETY: `source` holds `length` valid UTF-16 units and `output` is a
+    // writable buffer of the passed length; both outlive the call.
     let count = unsafe { NormalizeString(form, source.as_ptr(), length as i32, output.as_mut_ptr(), output.len() as i32) };
     String::from_utf16(output.get(..usize::try_from(count).ok()?)?).ok()
 }

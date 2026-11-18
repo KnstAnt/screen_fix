@@ -1,8 +1,6 @@
 //! Native UI Automation reads and subscriptions on one owning MTA thread.
 
 use std::{
-    marker::PhantomData,
-    rc::Rc,
     sync::{Arc, atomic::{AtomicU64, Ordering::Release}},
     time::{Duration, Instant},
 };
@@ -11,7 +9,7 @@ use windows::{
     Win32::{
         Foundation::{HWND, POINT},
         System::{
-            Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize},
+            Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance},
             Variant::{VT_BOOL, VT_UNKNOWN, VariantToBoolean},
         },
         UI::{Accessibility::*, WindowsAndMessaging::{IsHungAppWindow, WindowFromPhysicalPoint}},
@@ -34,6 +32,7 @@ const MAX_CONNECT: Duration = Duration::from_millis(250);
 const MIN_CALL: Duration = Duration::from_millis(10);
 
 use crate::{
+    com::ComApartment,
     hung::is_ghost,
     identity::{MetadataScrubber, WindowProcess},
     uia_commits::{CommitScope, Handler, Queue as CommitQueue},
@@ -110,21 +109,6 @@ fn qpc() -> Option<QpcTick> {
         .then_some(QpcTick(value))
 }
 
-struct Apartment(PhantomData<Rc<()>>);
-
-impl Apartment {
-    fn initialize() -> windows::core::Result<Self> {
-        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok()?;
-        Ok(Self(PhantomData))
-    }
-}
-
-impl Drop for Apartment {
-    fn drop(&mut self) {
-        unsafe { CoUninitialize() };
-    }
-}
-
 #[implement(IUIAutomationFocusChangedEventHandler)]
 struct FocusNotification(Arc<AtomicU64>);
 
@@ -154,7 +138,7 @@ pub struct Client {
     text_edit: Option<IUIAutomation3>,
     subscription: Option<TextEditSubscription>,
     pending_subscription: Option<(Request, IUIAutomationElement)>,
-    _apartment: Apartment,
+    _apartment: ComApartment,
 }
 
 impl Client {
@@ -168,7 +152,7 @@ impl Client {
 
     fn open_inner(revision: Arc<AtomicU64>, scoped: bool) -> windows::core::Result<Self> {
         // The apartment guard is the last field to drop.
-        let _apartment = Apartment::initialize()?;
+        let _apartment = ComApartment::initialize(COINIT_MULTITHREADED)?;
         let automation: IUIAutomation2 = unsafe { CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) }?;
         unsafe {
             automation.SetConnectionTimeout(MAX_CONNECT.as_millis() as u32)?;
@@ -205,68 +189,53 @@ impl Client {
         &mut self, request: Request, scrubber: Option<&MetadataScrubber>, invalid: &impl Fn(Request) -> Option<ReadUnavailable>,
     ) -> Read {
         let started = qpc();
+        self.read_checked(request, scrubber, invalid, started)
+            .unwrap_or_else(|reason| Read::outcome(started, reason))
+    }
+
+    /// The read itself. Every checkpoint that ends it is an `Err`.
+    fn read_checked(
+        &mut self, request: Request, scrubber: Option<&MetadataScrubber>,
+        invalid: &impl Fn(Request) -> Option<ReadUnavailable>, started: Option<QpcTick>,
+    ) -> Result<Read, ReadUnavailable> {
         if Instant::now() >= request.expires {
-            return Read::outcome(started, ReadUnavailable::TimedOut);
+            return Err(ReadUnavailable::TimedOut);
         }
-        let Some(window) = request.query.window() else {
-            return Read::outcome(started, ReadUnavailable::Stale);
-        };
+        let window = request.query.window().ok_or(ReadUnavailable::Stale)?;
         let root = root_window(window.hwnd());
         if unsafe { IsHungAppWindow(window.hwnd()) }.as_bool()
             || (!root.0.is_null() && unsafe { IsHungAppWindow(root) }.as_bool())
         {
-            return Read::outcome(started, ReadUnavailable::Hung);
+            return Err(ReadUnavailable::Hung);
         }
-        if let Some(status) = invalid(request) {
-            return Read::outcome(started, status);
-        }
+        let guard = ReadGuard { request, window, invalid };
+        guard.valid()?;
         let discovery = if self.scoped { &self.identification } else { &self.cache };
-        if let Err(status) = self.budget(request) {
-            return Read::outcome(started, status);
-        }
+        self.budget(request)?;
         let element = unsafe {
             match request.query {
                 Query::Focus { .. } => self.automation.GetFocusedElementBuildCache(discovery),
                 Query::Pointer { point, .. } => self.automation.ElementFromPointBuildCache(point_native(point), discovery),
             }
         };
-        if Instant::now() >= request.expires {
-            return Read::outcome(started, ReadUnavailable::TimedOut);
-        }
-        if let Some(status) = invalid(request) {
-            return Read::outcome(started, status);
-        }
-        if request.query.window() != Some(window) {
-            return Read::outcome(started, ReadUnavailable::Stale);
-        }
-        let element = match element {
-            Ok(element) => element,
-            Err(error) => return Read::outcome(started, call_status(&error, ReadUnavailable::Unavailable)),
-        };
-        match self.matches(&element, window, request, invalid) {
-            Ok(true) => {}
-            Ok(false) => return Read::outcome(started, ReadUnavailable::OutsideApproval),
-            Err(status) => return Read::outcome(started, status),
+        guard.live()?;
+        let element = element.map_err(|error| call_status(&error, ReadUnavailable::Unavailable))?;
+        if !self.matches(&element, &guard)? {
+            return Err(ReadUnavailable::OutsideApproval);
         }
         let native_password = match request.query {
             Query::Focus { native, .. } => native.and_then(|native| native.focus.password_style),
             Query::Pointer { .. } => password_style(window.hwnd()),
         };
         let element = if self.scoped {
-            if let Some(status) = invalid(request) {
-                return Read::outcome(started, status);
+            guard.valid()?;
+            self.budget(request)?;
+            let element = unsafe { element.BuildUpdatedCache(&self.classification) }
+                .map_err(|error| call_status(&error, ReadUnavailable::Stale))?;
+            if !self.matches(&element, &guard)? {
+                return Err(ReadUnavailable::Stale);
             }
-            if let Err(status) = self.budget(request) {
-                return Read::outcome(started, status);
-            }
-            match unsafe { element.BuildUpdatedCache(&self.classification) } {
-                Ok(element) => match self.matches(&element, window, request, invalid) {
-                    Ok(true) => element,
-                    Ok(false) => return Read::outcome(started, ReadUnavailable::Stale),
-                    Err(status) => return Read::outcome(started, status),
-                },
-                Err(error) => return Read::outcome(started, call_status(&error, ReadUnavailable::Stale)),
-            }
+            element
         } else {
             element
         };
@@ -283,7 +252,7 @@ impl Client {
             // D-4d: an element without keyboard focus is a stale read, which
             // the owner re-issues once within the classification wait.
             Query::Focus { .. } if keyboard_focus == Some(false) && password != Some(true) =>
-                return Read::outcome(started, ReadUnavailable::Stale),
+                return Err(ReadUnavailable::Stale),
             // An unsupported property is resolved by the focused-element query
             // when the native snapshot, taken from hwndFocus, shows the same window.
             Query::Focus { native, .. } => keyboard_focus == Some(true) || keyboard_focus.is_none()
@@ -293,50 +262,20 @@ impl Client {
             Query::Pointer { .. } => keyboard_focus == Some(true),
         };
         let editable = if password == Some(false) {
-            match self.editable(&element, request, invalid) {
-                Ok(editable) => editable,
-                Err(status) => return Read::outcome(started, status),
-            }
+            self.editable(&element, &guard)?
         } else {
             Writability::Undetermined
         };
-        // D-4 (C2): each undetermined case has one decision point here.
-        let target = match (password, editable, focused) {
-            (Some(true), _, _) => TextClassification::Password,
-            (Some(false), Writability::Writable, true) => TextClassification::Editable,
-            (Some(false), Writability::ReadOnly, true) => TextClassification::NonText,
-            (Some(false), Writability::Mixed, true) => TextClassification::TypingUnknown,
-            _ => TextClassification::PossiblySensitive,
-        };
-        let editable = match editable {
-            Writability::Writable => Some(true),
-            Writability::ReadOnly => Some(false),
-            Writability::Undetermined | Writability::Mixed => None,
-        };
+        let target = classify(password, editable, focused);
+        let editable = editable.reported();
         let Some(scrubber) = scrubber else {
-            return if Instant::now() < request.expires && invalid(request).is_none() && request.query.window() == Some(window) {
-                Read { started, completed: qpc(), status: Ok(()), target, element: None }
-            } else {
-                Read::outcome(started, ReadUnavailable::Stale)
-            };
+            // Every failed check of the final checkpoint is a stale read here.
+            guard.live().map_err(|_| ReadUnavailable::Stale)?;
+            return Ok(Read { started, completed: qpc(), status: Ok(()), target, element: None });
         };
         let allow_strings = password == Some(false)
             && (!matches!(request.query, Query::Focus { .. }) || target != TextClassification::PossiblySensitive);
-        let strings = if allow_strings && invalid(request).is_none() {
-            if self.scoped {
-                // Strings are optional; a call without budget leaves them out.
-                self.budget(request).ok()
-                    .and_then(|()| unsafe { element.BuildUpdatedCache(&self.strings) }.ok())
-                    .filter(|candidate| {
-                        self.matches(candidate, window, request, invalid) == Ok(true)
-                            && property_bool(candidate, UIA_IsPasswordPropertyId) == Some(false)
-                    })
-            } else {
-                Some(element.clone())
-            }
-        } else {
-            None
-        };
+        let strings = if allow_strings { self.fetch_strings(&element, &guard) } else { None };
         let mut fields = Element {
             name: strings.as_ref().and_then(|element| bounded(unsafe { element.CachedName() }, scrubber)),
             automation_id: strings.as_ref().and_then(|element| bounded(unsafe { element.CachedAutomationId() }, scrubber)),
@@ -348,23 +287,36 @@ impl Client {
             ancestor_names: Vec::new(), password, editable,
         };
         if strings.is_some() && matches!(request.query, Query::Pointer { .. }) {
-            self.ancestors(element.clone(), window, request, invalid, scrubber, &mut fields.ancestor_names);
+            self.ancestors(element.clone(), &guard, scrubber, &mut fields.ancestor_names);
         }
-        if Instant::now() >= request.expires {
-            return Read::outcome(started, ReadUnavailable::TimedOut);
-        }
-        if let Some(status) = invalid(request) {
-            return Read::outcome(started, status);
-        }
-        if request.query.window() != Some(window) {
-            return Read::outcome(started, ReadUnavailable::Stale);
-        }
+        guard.live()?;
         if target == TextClassification::Editable && matches!(request.query, Query::Focus { .. })
             && property_bool(&element, UIA_IsTextEditPatternAvailablePropertyId) == Some(true)
         {
             self.pending_subscription = Some((request, element));
         }
-        Read { started, completed: qpc(), status: Ok(()), target, element: Some(fields) }
+        Ok(Read { started, completed: qpc(), status: Ok(()), target, element: Some(fields) })
+    }
+
+    /// The element whose cached strings may be read, unless the request is
+    /// invalid. A scoped read caches them anew and keeps them only when the
+    /// element still belongs to the window and is not a password field.
+    fn fetch_strings(
+        &self, element: &IUIAutomationElement, guard: &ReadGuard<'_, impl Fn(Request) -> Option<ReadUnavailable>>,
+    ) -> Option<IUIAutomationElement> {
+        if guard.invalidated() {
+            return None;
+        }
+        if !self.scoped {
+            return Some(element.clone());
+        }
+        // Strings are optional; a call without budget leaves them out.
+        self.budget(guard.request).ok()
+            .and_then(|()| unsafe { element.BuildUpdatedCache(&self.strings) }.ok())
+            .filter(|candidate| {
+                self.matches(candidate, guard) == Ok(true)
+                    && property_bool(candidate, UIA_IsPasswordPropertyId) == Some(false)
+            })
     }
 
     /// A candidate may be subscribed only after its result is queued for the owner.
@@ -433,21 +385,22 @@ impl Client {
 
     /// Whether the element belongs to the approved window. An exhausted budget
     /// or a provider timeout is reported as such, not as a mismatch.
-    fn matches(&self, element: &IUIAutomationElement, window: WindowProcess, request: Request,
-        invalid: &impl Fn(Request) -> Option<ReadUnavailable>,
+    fn matches(
+        &self, element: &IUIAutomationElement, guard: &ReadGuard<'_, impl Fn(Request) -> Option<ReadUnavailable>>,
     ) -> Result<bool, ReadUnavailable> {
-        if invalid(request).is_some() || !belongs_to(element, window) { return Ok(false); }
+        let window = guard.window;
+        if guard.invalidated() || !belongs_to(element, window) { return Ok(false); }
         if !self.scoped { return Ok(true); }
         let mut cursor = element.clone();
         let Ok(walker) = (unsafe { self.automation.ControlViewWalker() }) else { return Ok(false); };
         for index in 0..=MAX_UIA_ANCESTORS {
-            if invalid(request).is_some() || !belongs_to(&cursor, window) { return Ok(false); }
+            if guard.invalidated() || !belongs_to(&cursor, window) { return Ok(false); }
             let Ok(hwnd) = (unsafe { cursor.CachedNativeWindowHandle() }) else { return Ok(false); };
             if !hwnd.0.is_null() {
-                return Ok(same_root(hwnd, window) && invalid(request).is_none());
+                return Ok(same_root(hwnd, window) && !guard.invalidated());
             }
             if index == MAX_UIA_ANCESTORS { return Ok(false); }
-            self.budget(request)?;
+            self.budget(guard.request)?;
             cursor = match unsafe { walker.GetParentElementBuildCache(&cursor, &self.identification) } {
                 Ok(parent) => parent,
                 Err(error) if is_timeout(&error) => return Err(ReadUnavailable::TimedOut),
@@ -464,7 +417,7 @@ impl Client {
     /// undetermined when an attribute of a possibly present pattern is
     /// unavailable (D-4b), which also covers an unknown Value pattern presence.
     fn editable(
-        &self, element: &IUIAutomationElement, request: Request, invalid: &impl Fn(Request) -> Option<ReadUnavailable>,
+        &self, element: &IUIAutomationElement, guard: &ReadGuard<'_, impl Fn(Request) -> Option<ReadUnavailable>>,
     ) -> Result<Writability, ReadUnavailable> {
         let Some(focusable) = property_bool(element, UIA_IsKeyboardFocusablePropertyId) else {
             return Ok(Writability::Undetermined);
@@ -482,7 +435,7 @@ impl Client {
             return Ok(Writability::Writable);
         }
         let text = match unsafe { element.GetCachedPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) } {
-            Ok(text) => Some(self.text_writability(&text, request, invalid)?),
+            Ok(text) => Some(self.text_writability(&text, guard)?),
             Err(_) => None,
         };
         let present = [value, text];
@@ -498,14 +451,14 @@ impl Client {
     }
 
     fn text_writability(
-        &self, text: &IUIAutomationTextPattern, request: Request, invalid: &impl Fn(Request) -> Option<ReadUnavailable>,
+        &self, text: &IUIAutomationTextPattern, guard: &ReadGuard<'_, impl Fn(Request) -> Option<ReadUnavailable>>,
     ) -> Result<Writability, ReadUnavailable> {
-        self.budget(request)?;
-        let Some(range) = after_call(unsafe { text.DocumentRange() }, request, invalid)? else {
+        self.budget(guard.request)?;
+        let Some(range) = after_call(unsafe { text.DocumentRange() }, guard)? else {
             return Ok(Writability::Undetermined);
         };
-        self.budget(request)?;
-        let Some(read_only) = after_call(unsafe { range.GetAttributeValue(UIA_IsReadOnlyAttributeId) }, request, invalid)? else {
+        self.budget(guard.request)?;
+        let Some(read_only) = after_call(unsafe { range.GetAttributeValue(UIA_IsReadOnlyAttributeId) }, guard)? else {
             return Ok(Writability::Undetermined);
         };
         // A mixed range returns the reserved mixed-attribute object, compared
@@ -527,25 +480,26 @@ impl Client {
     }
 
     /// Optional ancestor names. Any exhausted budget ends the walk.
-    fn ancestors(&self, mut element: IUIAutomationElement, window: WindowProcess, request: Request,
-        invalid: &impl Fn(Request) -> Option<ReadUnavailable>, scrubber: &MetadataScrubber, names: &mut Vec<String>,
+    fn ancestors(
+        &self, mut element: IUIAutomationElement, guard: &ReadGuard<'_, impl Fn(Request) -> Option<ReadUnavailable>>,
+        scrubber: &MetadataScrubber, names: &mut Vec<String>,
     ) {
         let Ok(walker) = (unsafe { self.automation.ControlViewWalker() }) else { return };
         for _ in 0..MAX_UIA_ANCESTORS {
-            if invalid(request).is_some() || self.budget(request).is_err() {
+            if guard.invalidated() || self.budget(guard.request).is_err() {
                 break;
             }
             let discovery = if self.scoped { &self.identification } else { &self.cache };
             let Ok(parent) = (unsafe { walker.GetParentElementBuildCache(&element, discovery) }) else { break };
-            if self.matches(&parent, window, request, invalid) != Ok(true) { break; }
+            if self.matches(&parent, guard) != Ok(true) { break; }
             let metadata = if self.scoped {
-                if self.budget(request).is_err() { break; }
+                if self.budget(guard.request).is_err() { break; }
                 let Ok(traits) = (unsafe { parent.BuildUpdatedCache(&self.classification) }) else { break; };
-                if self.matches(&traits, window, request, invalid) != Ok(true)
+                if self.matches(&traits, guard) != Ok(true)
                     || property_bool(&traits, UIA_IsPasswordPropertyId) != Some(false) { break; }
-                if self.budget(request).is_err() { break; }
+                if self.budget(guard.request).is_err() { break; }
                 let Ok(text) = (unsafe { parent.BuildUpdatedCache(&self.strings) }) else { break; };
-                if self.matches(&text, window, request, invalid) != Ok(true) { break; }
+                if self.matches(&text, guard) != Ok(true) { break; }
                 text
             } else {
                 parent.clone()
@@ -658,16 +612,68 @@ impl Writability {
     fn from_read_only(read_only: bool) -> Self {
         if read_only { Self::ReadOnly } else { Self::Writable }
     }
+
+    /// The `editable` value a read reports.
+    fn reported(self) -> Option<bool> {
+        match self {
+            Self::Writable => Some(true),
+            Self::ReadOnly => Some(false),
+            Self::Undetermined | Self::Mixed => None,
+        }
+    }
+}
+
+/// D-4 (C2): the classification of a read element. Each undetermined case
+/// has one decision point here.
+fn classify(password: Option<bool>, editable: Writability, focused: bool) -> TextClassification {
+    match (password, editable, focused) {
+        (Some(true), _, _) => TextClassification::Password,
+        (Some(false), Writability::Writable, true) => TextClassification::Editable,
+        (Some(false), Writability::ReadOnly, true) => TextClassification::NonText,
+        (Some(false), Writability::Mixed, true) => TextClassification::TypingUnknown,
+        _ => TextClassification::PossiblySensitive,
+    }
+}
+
+/// The request one read serves, the window it was approved for, and the
+/// owner's invalidation check.
+struct ReadGuard<'a, F> {
+    request: Request,
+    window: WindowProcess,
+    invalid: &'a F,
+}
+
+impl<F: Fn(Request) -> Option<ReadUnavailable>> ReadGuard<'_, F> {
+    /// Whether the owner invalidated the request.
+    fn invalidated(&self) -> bool {
+        (self.invalid)(self.request).is_some()
+    }
+
+    /// The owner's invalidation status, if any, as an error.
+    fn valid(&self) -> Result<(), ReadUnavailable> {
+        (self.invalid)(self.request).map_or(Ok(()), Err)
+    }
+
+    /// The checkpoint after a provider call: the deadline has not passed, the
+    /// request is valid, and the query still finds the same window.
+    fn live(&self) -> Result<(), ReadUnavailable> {
+        if Instant::now() >= self.request.expires {
+            return Err(ReadUnavailable::TimedOut);
+        }
+        self.valid()?;
+        if self.request.query.window() != Some(self.window) {
+            return Err(ReadUnavailable::Stale);
+        }
+        Ok(())
+    }
 }
 
 /// After one provider call: an invalidated request or a provider timeout ends
 /// the read; another failure leaves the attribute undetermined.
 fn after_call<T>(
-    result: windows::core::Result<T>, request: Request, invalid: &impl Fn(Request) -> Option<ReadUnavailable>,
+    result: windows::core::Result<T>, guard: &ReadGuard<'_, impl Fn(Request) -> Option<ReadUnavailable>>,
 ) -> Result<Option<T>, ReadUnavailable> {
-    if let Some(status) = invalid(request) {
-        return Err(status);
-    }
+    guard.valid()?;
     match result {
         Ok(value) => Ok(Some(value)),
         Err(error) if is_timeout(&error) => Err(ReadUnavailable::TimedOut),

@@ -42,13 +42,11 @@ impl FocusSnapshot {
     }
 
     pub fn read(foreground: WindowProcess) -> Option<Self> {
-        let crate::focus::FocusAt {
-            gui, window: crate::focus::FocusWindow { hwnd: focused, active_fallback }, thread, keyboard_layout: layout,
-        } = crate::focus::focus_at(foreground.thread, foreground.process.pid)?;
+        let at = crate::focus::focus_at(foreground.thread, foreground.process.pid)?;
         if WindowProcess::foreground() != Some(foreground) {
             return None;
         }
-        let hwnd = HWND(focused);
+        let (gui, focused, active_fallback) = (at.gui, at.window.hwnd, at.window.active_fallback);
         let caret = (!gui.hwndCaret.is_null()).then(|| {
             let window = HWND(gui.hwndCaret);
             let start = physical_client_point(window, gui.rcCaret.left, gui.rcCaret.top)?;
@@ -56,11 +54,7 @@ impl FocusSnapshot {
             PhysicalRect::new(start.x, start.y, end.x, end.y)
         }).flatten();
         Some(Self {
-            focus: FocusAtReceipt {
-                window: WindowId(focused as usize as u64), thread, keyboard_layout: layout as usize as u64,
-                // The active window's style says nothing about the field that receives keys.
-                password_style: if active_fallback { None } else { password_style(hwnd) },
-            },
+            focus: at.receipt(),
             caret, caret_window: (!gui.hwndCaret.is_null()).then_some(WindowId(gui.hwndCaret as usize as u64)),
             gui_flags: gui.flags, hung: unsafe { IsHungAppWindow(focused) != 0 }, active_fallback,
         })

@@ -1,18 +1,10 @@
-#[cfg(target_os = "windows")]
 use std::path::Path;
 
-use crate::{CaptureError, config::DisplayKey};
+use crate::{CaptureError, config::{DisplayKey, ResolvedCaptureConfig}, session::SessionHandle};
 
-#[cfg(target_os = "windows")]
-use crate::{config::ResolvedCaptureConfig, session::SessionHandle};
-
-#[cfg(target_os = "windows")]
 pub(crate) mod windows;
 
-#[cfg(target_os = "windows")]
 pub use screen_fix_elevated::restrict_dll_search as restrict_release_dll_search;
-
-pub const VIDEO_RECORDING_AVAILABLE: bool = cfg!(target_os = "windows");
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WindowsEvidence {
@@ -42,54 +34,38 @@ pub struct Display {
 }
 
 pub fn displays() -> Result<Vec<Display>, CaptureError> {
-    #[cfg(target_os = "windows")]
-    {
-        windows::displays().map_err(|error| error.into_error(crate::package::diagnostics::FailureComponent::Capture))
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        Ok(Vec::new())
-    }
+    windows::displays().map_err(|error| error.to_error(crate::package::diagnostics::FailureComponent::Capture))
 }
 
-#[cfg(target_os = "windows")]
 pub struct ApprovedWindows {
     pub monitors: Vec<DisplayKey>,
     pub evidence_incomplete: bool,
 }
 
-#[cfg(target_os = "windows")]
 pub fn resolve_executable(path: &Path) -> Result<crate::config::ExecutableIdentity, CaptureError> {
     windows::preflight::resolve_executable(path)
 }
 
-#[cfg(target_os = "windows")]
 pub fn approved_windows(approved: &crate::config::ExecutableIdentity) -> Result<ApprovedWindows, CaptureError> {
     windows::preflight::approved_windows(approved)
 }
 
-#[cfg(target_os = "windows")]
 pub use windows::ui_window::RecorderWindow;
 
-#[cfg(target_os = "windows")]
 pub fn attach_recorder_window(id: crate::protocol::WindowId) -> Result<RecorderWindow, CaptureError> {
     RecorderWindow::attach(id)
 }
 
-#[cfg(target_os = "windows")]
 pub use windows::hotkeys::RecorderHotkeys;
 
-#[cfg(target_os = "windows")]
 pub fn start_recording_with_hotkeys(
     config: ResolvedCaptureConfig,
     hotkeys: &RecorderHotkeys,
     trigger: Option<crate::session::hotkey::HotkeyActivation>,
 ) -> Result<SessionHandle, CaptureError> {
-    use crate::{config::EffectiveCapabilities, session::windows as controller};
+    use crate::platform::windows::controller;
 
-    if !config.calibrations().is_empty()
-        || config.capabilities() != EffectiveCapabilities::awaiting_probe()
-    {
+    if !config.calibrations().is_empty() {
         return Err(CaptureError::unsupported_configuration(
             "The selected capture configuration requires the M1 recording backend."
         ));

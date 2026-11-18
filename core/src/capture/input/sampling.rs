@@ -43,7 +43,7 @@ pub(crate) struct MotionSampler {
 
 impl MotionSampler {
     pub fn push(&mut self, input: HeldInput, mut resolve: impl FnMut(Sampled)) {
-        let first = &input.normalized.correlated.first;
+        let first = input.first();
         let t = first.time.recv_t_us;
         self.expire(t);
         self.emit_ready(&mut resolve);
@@ -60,7 +60,7 @@ impl MotionSampler {
                 capabilities
             }
             InputSample::Hid(report) => {
-                if report.pen_continuity_uncertain() {
+                if super::pen::continuity_uncertain(report) {
                     self.close_pen(report.device);
                 }
                 None
@@ -150,12 +150,12 @@ impl MotionSampler {
     }
 
     pub fn unresolved_before(&self) -> Option<SessionTimeUs> {
-        self.prefix.front().map(|slot| slot.input.normalized.correlated.first.time.recv_t_us)
+        self.prefix.front().map(|slot| slot.input.receipt())
     }
 }
 
 fn hover(report: &HidReport) -> Option<(Lane, u16)> {
-    let (link, false) = report.pen_tip()? else { return None };
+    let (link, false) = super::pen::tip(report)? else { return None };
     let HidReportResult::Report(decoded) = &report.result else { return None };
     let mut coordinates = 0;
     let mut switches = 0;

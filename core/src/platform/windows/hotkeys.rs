@@ -2,16 +2,15 @@
 
 use std::{
     collections::VecDeque,
-    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
-    ptr::{null, null_mut},
+    ptr::null_mut,
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
-        mpsc,
     },
     thread,
-    time::Duration,
 };
+
+use screen_fix_native_observation::{owner::{self, StartupError}, wake::WakeEvent};
 
 use crate::{
     CaptureError,
@@ -20,16 +19,14 @@ use crate::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{GetLastError, WAIT_FAILED},
-    System::Threading::{CreateEventW, SetEvent},
+    Foundation::GetLastError,
     UI::{
         Input::KeyboardAndMouse::{
             GetKeyboardLayoutList, HKL, MAPVK_VK_TO_VSC, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
             MapVirtualKeyExW, RegisterHotKey, ToUnicodeEx, UnregisterHotKey, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_MENU,
         },
         WindowsAndMessaging::{
-            DispatchMessageW, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_NOREMOVE, PM_REMOVE,
-            PeekMessageW, QS_ALLINPUT, WM_HOTKEY, WM_QUIT,
+            DispatchMessageW, MSG, PM_NOREMOVE, PM_REMOVE, PeekMessageW, WM_HOTKEY, WM_QUIT,
         },
     },
 };
@@ -39,7 +36,6 @@ use super::clock;
 /// The longest wait for a message before the pump renews its progress mark.
 /// It stays well below the controller's 250 ms hotkey progress gap.
 const PROGRESS_INTERVAL_MS: u32 = 50;
-const STARTUP_WAIT: Duration = Duration::from_secs(2);
 const MAX_LAYOUTS: usize = 64;
 const MAX_PENDING: usize = 16;
 /// `ToUnicodeEx` flag bit 2: do not change the keyboard state.
@@ -61,20 +57,15 @@ pub type HotkeyNotifier = Arc<dyn Fn() + Send + Sync>;
 struct Shared {
     stop: AtomicBool,
     /// A manual-reset event set with `stop`, so the pump leaves its wait at once.
-    wake: OwnedHandle,
+    wake: WakeEvent,
     inbox: Mutex<HotkeyInbox>,
     notify: HotkeyNotifier,
 }
 
 impl Shared {
     fn new(notify: HotkeyNotifier) -> Result<Self, CaptureError> {
-        let event = unsafe { CreateEventW(null(), 1, 0, null()) };
-        if event.is_null() {
-            let error = std::io::Error::last_os_error();
-            return Err(CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, "Start recorder hotkeys", error.raw_os_error(), error.to_string()));
-        }
-        // CreateEventW returned a new unnamed event that this owner alone closes.
-        let wake = unsafe { OwnedHandle::from_raw_handle(event) };
+        let wake = WakeEvent::new(true)
+            .map_err(|error| controller_error("Start recorder hotkeys", error.raw_os_error(), error.to_string()))?;
         Ok(Self { stop: AtomicBool::new(false), wake, inbox: Mutex::default(), notify })
     }
 
@@ -87,7 +78,7 @@ impl Shared {
     fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
         // A failed signal leaves the pump to notice `stop` within one interval.
-        unsafe { SetEvent(self.wake.as_raw_handle()) };
+        let _ = self.wake.set();
     }
 }
 
@@ -167,24 +158,23 @@ impl RecorderHotkeys {
     pub fn open(bindings: HotkeyBindings, notify: HotkeyNotifier) -> Result<Self, CaptureError> {
         let shared = Arc::new(Shared::new(notify)?);
         let owner_data = Arc::clone(&shared);
-        let (ready, initialized) = mpsc::sync_channel(1);
-        let owner = thread::Builder::new().name("recorder-hotkeys".into()).spawn(move || {
+        let started = owner::spawn("recorder-hotkeys", false, || {}, move |ready| {
             match Registration::open(bindings) {
                 Ok(registration) => {
-                    let initialized = ready.try_send(Ok(()));
-                    if initialized.is_ok() {
-                        pump(&owner_data, &registration);
+                    if ready.ready(()) && pump(&owner_data, &registration).is_err() {
+                        owner_data.fail();
                     }
                 }
-                Err(error) => { let _ = ready.try_send(Err(error)); }
+                Err(error) => ready.fail(error),
             }
-        }).map_err(|error| CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, "Start recorder hotkeys", error.raw_os_error(), error.to_string()))?;
-        match initialized.recv_timeout(STARTUP_WAIT) {
-            Ok(Ok(())) => Ok(Self(Arc::new(Owner { shared, thread: Some(owner), keys: bindings.virtual_keys() }))),
-            Ok(Err(error)) => Err(error),
-            Err(_) => {
+        });
+        match started {
+            Ok((owner, ())) => Ok(Self(Arc::new(Owner { shared, thread: Some(owner.handle), keys: bindings.virtual_keys() }))),
+            Err(StartupError::Spawn(error)) => Err(controller_error("Start recorder hotkeys", error.raw_os_error(), error.to_string())),
+            Err(StartupError::Failed(error)) => Err(error),
+            Err(StartupError::Timeout) => {
                 shared.request_stop();
-                Err(CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, "Register recorder hotkeys", None, "Hotkey preflight did not complete.".into()))
+                Err(controller_error("Register recorder hotkeys", None, "Hotkey preflight did not complete."))
             }
         }
     }
@@ -221,10 +211,10 @@ impl RecorderHotkeys {
     pub(crate) fn claim(&self) -> Result<ActiveHotkeys, CaptureError> {
         let mut inbox = self.0.shared.inbox.lock().unwrap_or_else(PoisonError::into_inner);
         if inbox.active {
-            return Err(CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, "Use recorder hotkeys", None, "An attempt already owns the hotkey input.".into()));
+            return Err(controller_error("Use recorder hotkeys", None, "An attempt already owns the hotkey input."));
         }
         if !inbox.ready_for_start() {
-            return Err(CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, "Use recorder hotkeys", None, "The previous hotkey commands are still clearing. Try Start again.".into()));
+            return Err(controller_error("Use recorder hotkeys", None, "The previous hotkey commands are still clearing. Try Start again."));
         }
         inbox.active = true;
         Ok(ActiveHotkeys(self.clone()))
@@ -277,7 +267,7 @@ impl Registration {
         if count <= 0 || count as usize > MAX_LAYOUTS
             || unsafe { GetKeyboardLayoutList(MAX_LAYOUTS as i32, layouts.as_mut_ptr()) } != count
         {
-            return Err(CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, "Read installed keyboard layouts", None, "The hotkey layout inventory is unavailable.".into()));
+            return Err(controller_error("Read installed keyboard layouts", None, "The hotkey layout inventory is unavailable."));
         }
         for (index, action) in RecorderAction::ALL.into_iter().enumerate() {
             let vk = bindings.virtual_key(action);
@@ -328,13 +318,23 @@ fn yields_character(vk: u16, layout: HKL) -> bool {
         output.len() as i32, TO_UNICODE_KEEP_STATE, layout) }) != 0
 }
 
+/// A hotkey failure, owned by the controller.
+fn controller_error(operation: &'static str, native_code: Option<i32>, message: impl Into<String>) -> CaptureError {
+    CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, operation, native_code, message.into())
+}
+
 fn chord_failure(action: RecorderAction, vk: u16, code: Option<i32>, message: &str) -> CaptureError {
-    CaptureError::owned(crate::package::diagnostics::FailureComponent::Controller, "Validate recorder hotkeys", code, format!(
+    controller_error("Validate recorder hotkeys", code, format!(
         "{} (Ctrl+Alt+F{}). {message}", action.name(), HotkeyBindings::function_of(vk),
     ))
 }
 
-fn pump(shared: &Shared, registration: &Registration) {
+/// The pump stopped for good: the thread's queue quit, a clock or wait call
+/// failed, or the activation sequence ran out.
+struct PumpFailed;
+
+/// Deliver the hotkey activations until stop.
+fn pump(shared: &Shared, registration: &Registration) -> Result<(), PumpFailed> {
     let mut sequence = 0_u64;
     while !shared.stop.load(Ordering::Acquire) {
         let observed = clock::qpc();
@@ -343,8 +343,7 @@ fn pump(shared: &Shared, registration: &Registration) {
             let mut message = MSG::default();
             if unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) } == 0 { break; }
             if message.message == WM_QUIT {
-                shared.fail();
-                return;
+                return Err(PumpFailed);
             }
             if message.message != WM_HOTKEY {
                 unsafe { DispatchMessageW(&message) };
@@ -356,13 +355,9 @@ fn pump(shared: &Shared, registration: &Registration) {
             if vk != registration.virtual_keys[index] || flags as u32 & (MOD_CONTROL | MOD_ALT) != (MOD_CONTROL | MOD_ALT) {
                 continue;
             }
-            let Ok(at) = clock::qpc() else {
-                shared.fail();
-                return;
-            };
+            let at = clock::qpc().map_err(|_| PumpFailed)?;
             if sequence == (1 << 63) - 1 {
-                shared.fail();
-                return;
+                return Err(PumpFailed);
             }
             sequence += 1;
             let activation = HotkeyActivation {
@@ -377,25 +372,15 @@ fn pump(shared: &Shared, registration: &Registration) {
             for (event, received_ms) in received {
                 startable |= inbox.accept(event, received_ms);
             }
-            match observed {
-                Ok(before) => inbox.batch.before = Some(before),
-                Err(_) => {
-                    drop(inbox);
-                    shared.fail();
-                    return;
-                }
-            }
+            // An early return releases the inbox before the caller fails the pump.
+            inbox.batch.before = Some(observed.map_err(|_| PumpFailed)?);
             startable
         };
         if startable {
             (shared.notify)();
         }
         // Wake on a queued message, on stop, or after the progress interval.
-        let wake = shared.wake.as_raw_handle();
-        let waited = unsafe { MsgWaitForMultipleObjectsEx(1, &wake, PROGRESS_INTERVAL_MS, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
-        if waited == WAIT_FAILED {
-            shared.fail();
-            return;
-        }
+        shared.wake.wait_messages(PROGRESS_INTERVAL_MS).map_err(|_| PumpFailed)?;
     }
+    Ok(())
 }

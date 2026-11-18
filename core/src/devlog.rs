@@ -6,8 +6,11 @@
 //! ignored. The file is not part of the attempt inventory and is not listed in
 //! the manifest.
 //!
-//! Privacy: only timing, counters, ids, enum reasons, error stages and sizes
-//! are logged; never key codes, text, window titles, paths or user names.
+//! Privacy: only timing, counters, ids, enum reasons, error stages, the
+//! user-facing error messages, sizes and the class names of foreground
+//! windows of the approved process are logged; never the class of another
+//! process's window, key codes, text, window titles, paths or user names
+//! (spec addendum A7.5).
 
 use std::{fmt::Arguments, path::Path};
 

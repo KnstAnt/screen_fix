@@ -617,7 +617,7 @@ If condition 3 is not yet met, the record waits within the existing classificati
    - password, possibly sensitive, unresolved, or a deadline expiry → the record is counted into the visit's redacted aggregate. It is never published per key.
 6. **Uncertain focus.** If condition 4 fails, meaning a focus change is inside the uncertainty interval, the record is treated as possibly sensitive and is not published per key. If either adjacent visit has an open redacted aggregate, the record is counted into it. Otherwise it is counted as a Sensitive `focus_uncertain` suppression: a count only, with no times (§6.1).
 
-Pointer records require only conditions 1–3.
+Pointer records require only conditions 1–3. Since the per-process approval decision of 2026-11-18 (SPEC addendum A7.8), a pointer or other non-key record that carries Raw Input evidence, raw only or raw plus hook, needs only the approved process instance in the foreground at its raw receipt, whatever its focus. A key with a hook part still needs a known focus. Hook-only records keep the window-level visit conditions above.
 
 Timeline capacity: one entry per transition, pruned below the Receiver's published prefix. It is bounded by the existing context notification cap.
 
@@ -702,6 +702,7 @@ Ties are broken by (`recv_t_us`, monitor, slot). D-10 A changes only d_k and whi
 - **No per-stage compilation.** One `cargo check --workspace --all-targets` runs after all stages are implemented, and its errors are fixed then. Completion criteria are checked statically during the work.
 - **Testing is done by the user.**
   - Stage T2 (unit tests and fixture packages) and stage T4 (execution campaign) are removed. The test lists in T2 remain as guidance for the user's own testing.
+  - Superseded in part on 2026-11-18 (SPEC addendum A7.6): a minimal test set is allowed, namely golden byte tests of journal rows, `validate_gates` on a synthetic attempt and `FramePolicy` unit tests. The user runs them.
   - Stage T1 is reduced to extending the existing `PackageReader::validate_v5_artifacts` (and its v6 successor in R1) with the gate 1–4 checks. No separate test framework or tool binary is added.
   - Stage T3 stays (the M1-08 trusted fixture Save producer), at its minimal form.
 - **Minimal code.**
@@ -1082,7 +1083,7 @@ Stages that are not blocked can run in parallel within these dependencies. A sug
 - **`InputHelper::drop`.** The wait is bounded by the ordinary 750 ms cleanup bound, after the job close.
 - **`pen_pressure`.** Map the opt-in-disabled state to the PDF enum (`unavailable_unknown`) with a separate `pen_hid_collection_enabled:false` extension field.
 
-**Affected modules.** `native-observation/src/input/{device.rs,raw.rs,hooks.rs,hid.rs}`, `native-observation/src/input.rs`, `protocol/src/ipc/shared.rs`, `core/src/platform/windows/input_helper.rs`, `core/src/platform/windows/input/hid.rs`, `core/src/capture/input/evidence.rs`, `metadata.rs`.
+**Affected modules.** `native-observation/src/input/{device.rs,raw.rs,hooks.rs,hid.rs}`, `native-observation/src/input.rs`, `core/capture/native-observation/src/channel.rs`, `core/src/platform/windows/input_helper.rs`, `core/src/platform/windows/input/hid.rs`, `core/src/capture/input/evidence.rs`, `metadata.rs`.
 
 **Completion criteria (static).**
 - No `CreateFileW`, `HidD_*` or `SetupDi*` call is reachable from the Raw Input message handler.
@@ -1213,7 +1214,7 @@ Stages that are not blocked can run in parallel within these dependencies. A sug
 ### Stage C4. Context fidelity
 
 **Changes.**
-- **Ghost windows (IMG-8, PRIV-2).** A Ghost window that has verifiably replaced a hung approved window (the existing hung-tracker association) counts as the approved app for foreground approval and frame admission. UIA reads to it are disabled, and its row carries `ghost_replacement:true`. An unresolved Ghost stays unapproved.
+- **Ghost windows (IMG-8, PRIV-2).** A Ghost window that has verifiably replaced a hung approved window (the existing hung-tracker association) counts as the approved app for foreground approval and frame admission. UIA reads to it are disabled, and its row carries `ghost_replacement:true`. An unresolved Ghost stays unapproved. Under per-process approval (SPEC addendum A7.8) a foreground notice for a Ghost window still interrupts the approval: a new frame-approval generation starts even when the Ghost counts as the approved app.
 - **LOCATIONCHANGE.** The limiter keeps per-window "dirty" state. When the 100 ms window ends with suppressed notices, re-read the window geometry once (trailing edge) and update the visit geometry.
 - **Hint records.** MINIMIZESTART/END, SWITCHSTART/END and IME_SHOW/HIDE/CHANGE produce typed context hint records (window identity only for approved windows), as for the existing menu and dialog hints.
 - **Pointer reads.** A click while a pointer query at another point is pending gets an element link with reason `pointer_query_busy`. A click at the same point links that pending read when it completes, before the click's own deadline.

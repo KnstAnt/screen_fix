@@ -32,12 +32,36 @@ pub(super) struct Recording {
     path: PathBuf,
 }
 
+const CLAIM_OPEN: u8 = 0;
+const CLAIM_PUBLISHING: u8 = 1;
+const CLAIM_ABANDONED: u8 = 2;
+
 /// The claim on a handed-off part: the verifier publishes it only if the
 /// video worker has not abandoned it, and the worker abandons it only if its
 /// publication has not begun.
-pub(super) const CLAIM_OPEN: u8 = 0;
-const CLAIM_PUBLISHING: u8 = 1;
-pub(super) const CLAIM_ABANDONED: u8 = 2;
+#[derive(Clone)]
+pub(super) struct Claim(Arc<AtomicU8>);
+
+impl Claim {
+    fn open() -> Self {
+        Self(Arc::new(AtomicU8::new(CLAIM_OPEN)))
+    }
+
+    /// The worker abandons the part: false once its publication began or
+    /// it was already abandoned.
+    pub(super) fn try_abandon(&self) -> bool {
+        self.0.compare_exchange(CLAIM_OPEN, CLAIM_ABANDONED, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+
+    /// The verifier begins publication: false once the worker abandoned the part.
+    fn try_publish(&self) -> bool {
+        self.0.compare_exchange(CLAIM_OPEN, CLAIM_PUBLISHING, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+
+    pub(super) fn is_abandoned(&self) -> bool {
+        self.0.load(Ordering::Acquire) == CLAIM_ABANDONED
+    }
+}
 
 pub(super) const DEADLINE: &str = "The MP4 publication deadline expired";
 const ABANDONED: &str = "The video owner abandoned the overdue segment verification";
@@ -52,7 +76,7 @@ pub(super) struct SegmentToVerify {
     size: [u32; 2],
     /// Whether the media, with the decoded end once known, is still authorized.
     authorized: Box<dyn Fn(Option<i64>) -> bool + Send>,
-    pub claim: Arc<AtomicU8>,
+    pub claim: Claim,
 }
 
 /// A verified and published segment: its decoded timing and extent.
@@ -127,13 +151,9 @@ impl Recording {
                 .map_err(|error| io_error("Flush the finalized MP4", error))?;
             check()
         })();
-        match closed {
-            Ok(()) => Ok(Some(SegmentToVerify {
-                segment, pending, path: self.path, expected, size, authorized, claim: Arc::new(AtomicU8::new(CLAIM_OPEN)),
-            })),
-            Err(error) if error.kind() == ProbeKind::Revoked => { remove_part(&pending)?; Ok(None) }
-            Err(error) => Err(error),
-        }
+        Ok(unless_revoked(closed, &pending)?.map(|()| SegmentToVerify {
+            segment, pending, path: self.path, expected, size, authorized, claim: Claim::open(),
+        }))
     }
 }
 
@@ -148,6 +168,14 @@ fn revoked() -> ProbeError {
     unavailable(REVOKED).with_kind(ProbeKind::Revoked)
 }
 
+/// A revoked part is removed: `Ok(None)`.
+fn unless_revoked<T>(result: Result<T, ProbeError>, pending: &Path) -> Result<Option<T>, ProbeError> {
+    match result {
+        Err(error) if error.kind() == ProbeKind::Revoked => { remove_part(pending)?; Ok(None) }
+        result => result.map(Some),
+    }
+}
+
 /// The per-monitor segment verifier. It decodes each handed-off part, with a
 /// hardware decoder on its own D3D11 device when available, and publishes it
 /// by renaming it to `.mp4` only after verification. The video worker keeps
@@ -156,7 +184,7 @@ pub(super) fn verify_segments(
     adapter: IDXGIAdapter1, parts: Receiver<SegmentToVerify>, verdicts: SyncSender<Verdict>,
     deadline: impl Fn() -> Option<std::time::Instant>,
 ) {
-    let _apartment = match super::Apartment::initialize() {
+    let _apartment = match super::com_apartment() {
         Ok(apartment) => apartment,
         Err(error) => {
             // Without COM no part can be verified. The first part's verdict
@@ -186,11 +214,8 @@ impl SegmentToVerify {
     fn publish(
         self, decoder: Option<&IMFDXGIDeviceManager>, deadline: &impl Fn() -> Option<std::time::Instant>,
     ) -> Result<Option<Published>, ProbeError> {
-        match self.verify_and_rename(decoder, deadline) {
-            Err(error) if error.kind() == ProbeKind::Revoked => { remove_part(&self.pending)?; Ok(None) }
-            // A rejected or abandoned part stays `.part`.
-            result => result.map(Some),
-        }
+        // A rejected or abandoned part stays `.part`.
+        unless_revoked(self.verify_and_rename(decoder, deadline), &self.pending)
     }
 
     fn verify_and_rename(
@@ -198,7 +223,7 @@ impl SegmentToVerify {
     ) -> Result<Published, ProbeError> {
         let decoded_end = Cell::new(None);
         let check = || {
-            if self.claim.load(Ordering::Acquire) == CLAIM_ABANDONED {
+            if self.claim.is_abandoned() {
                 return Err(unavailable(ABANDONED));
             }
             if !(self.authorized)(decoded_end.get()) {
@@ -226,7 +251,7 @@ impl SegmentToVerify {
         check()?;
         // Publication is the commit point: once claimed, the worker waits for
         // this verdict, and a published file is never returned to `.part`.
-        if self.claim.compare_exchange(CLAIM_OPEN, CLAIM_PUBLISHING, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        if !self.claim.try_publish() {
             return Err(unavailable(ABANDONED));
         }
         let mut retries = 0;
@@ -260,6 +285,15 @@ fn remove_part(path: &Path) -> Result<(), ProbeError> {
     }
 }
 
+/// The decode part of gate 2 for a published segment (M1-10): it decodes in
+/// software and compares each picture with the `(PTS, duration)` of its
+/// `encoded:true` frames row, in 100 ns, within 1 ms. It only reads the file.
+pub(crate) fn verify_segment_decoding(path: &Path, expected: &[(i64, i64)], size: [u32; 2]) -> Result<(), ProbeError> {
+    let _apartment = super::com_apartment()?;
+    let _runtime = mf::Runtime::initialize()?;
+    verify_decoded_frames(path, &mut expected.to_vec(), size, &|| Ok(()), None).map(drop)
+}
+
 fn verify_decoded_frames(
     path: &Path, expected: &mut [(i64, i64)], size: [u32; 2],
     check: &impl Fn() -> Result<(), ProbeError>, decoder: Option<&IMFDXGIDeviceManager>,
@@ -272,7 +306,7 @@ fn verify_decoded_frames(
     stage(unsafe { reader.SetCurrentMediaType(0, None, &output) }, "Configure MP4 decoding")?;
     let media_type = stage(unsafe { reader.GetCurrentMediaType(0) }, "Read the decoded segment format")?;
     let actual = stage(unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE) }, "Read the decoded segment dimensions")?;
-    if actual != ((u64::from(size[0]) << 32) | u64::from(size[1])) {
+    if actual != mf::pack(size[0], size[1]) {
         return Err(unavailable("The decoded segment dimensions do not match the manifest"));
     }
     let mut decoded = 0;

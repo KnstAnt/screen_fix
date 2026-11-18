@@ -46,20 +46,26 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongW, SetWindowLongW
 #[cfg(target_pointer_width = "64")]
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLongPtrW};
 
+use screen_fix_native_observation::wake::WakeEvent;
+
 use crate::{
     CaptureError,
-    platform::windows::{clock, on_input_desktop},
-    protocol::{QpcTick, ipc::EnvironmentChange},
+    protocol::{QpcFrequency, QpcTick, ipc::EnvironmentChange},
+    session::PauseReason,
 };
+
+use crate::platform::windows::{clock, on_input_desktop};
 
 const CLASS_NAME: *const u16 = w!("ScreenFixControllerNotifications");
 const DESKTOP_POLL: Duration = Duration::from_millis(100);
+/// The poll period of the session-end hold and of the owner loop after a
+/// failed wait.
 const PUMP_INTERVAL: Duration = Duration::from_millis(10);
 pub(super) const SESSION_END_BUDGET: Duration = Duration::from_millis(3800);
 pub(super) const SUSPEND_BUDGET: Duration = Duration::from_secs(2);
-pub(super) const LOCK_SCREEN: u32 = 1;
-pub(super) const SLEEP: u32 = 2;
-pub(super) const SECURE_DESKTOP: u32 = 4;
+const LOCK_SCREEN: u32 = 1;
+const SLEEP: u32 = 2;
+const SECURE_DESKTOP: u32 = 4;
 const EDGE_SHIFT: u32 = 8;
 const ASSERT_EDGES: u32 = (LOCK_SCREEN | SLEEP | SECURE_DESKTOP) << EDGE_SHIFT;
 
@@ -96,9 +102,9 @@ impl SuspendMarks {
     /// `since` is the suspend `sequence` read at or after `from`: a later suspend
     /// beyond the latest one leaves earlier suspends in the interval unmeasured.
     pub(crate) fn awake_elapsed(
-        &self, from: QpcTick, to: QpcTick, since: u64, frequency: crate::protocol::QpcFrequency,
+        &self, from: QpcTick, to: QpcTick, since: u64, frequency: QpcFrequency,
     ) -> AwakeElapsed {
-        let ticks = |from: QpcTick, to: QpcTick| u128::try_from(to.0.saturating_sub(from.0).max(0)).unwrap_or(0);
+        let ticks = |from: QpcTick, to: QpcTick| u64::try_from(to.0.saturating_sub(from.0)).unwrap_or(0);
         let total = ticks(from, to);
         let excluded = if self.sequence == 0 {
             0
@@ -115,8 +121,35 @@ impl SuspendMarks {
                 _ => return AwakeElapsed::Unknown,
             }
         };
-        let nanos = total.saturating_sub(excluded).saturating_mul(1_000_000_000) / u128::from(frequency.0.get());
-        AwakeElapsed::Known(Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)))
+        AwakeElapsed::Known(frequency.duration(total.saturating_sub(excluded)))
+    }
+
+    /// QPC time from `mark` to `to` excluding the latest suspend interval.
+    pub(crate) fn since(&self, mark: AwakeMark, to: QpcTick, frequency: QpcFrequency) -> AwakeElapsed {
+        self.awake_elapsed(mark.qpc, to, mark.suspends, frequency)
+    }
+}
+
+/// A QPC progress mark with the suspend `sequence` read at or after it: the
+/// start of an interval measured with sleep excluded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AwakeMark {
+    pub qpc: QpcTick,
+    pub suspends: u64,
+}
+
+/// The suspend `sequence` last seen by a deadline that restarts after each suspend.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SuspendWatch(u64);
+
+impl SuspendWatch {
+    pub(crate) fn new(marks: SuspendMarks) -> Self {
+        Self(marks.sequence)
+    }
+
+    /// A suspend happened since the previous check. The watch moves to `marks`.
+    pub(crate) fn slept(&mut self, marks: SuspendMarks) -> bool {
+        std::mem::replace(&mut self.0, marks.sequence) != marks.sequence
     }
 }
 
@@ -197,34 +230,64 @@ impl PowerMarks {
     }
 }
 
+/// The environment facts that the notification owner publishes to the
+/// controller and the recording owners.
+#[derive(Default)]
+pub(super) struct EnvironmentSignals {
+    /// Pending `EnvironmentChange` bits for the standard input helper.
+    pub(super) input: AtomicU32,
+    /// Pending `EnvironmentChange` bits for the elevated collector.
+    pub(super) elevated: AtomicU32,
+    pub(super) display_revision: AtomicU32,
+    /// When Windows announced that the session ends.
+    pub(super) session_end: OnceLock<Instant>,
+    /// Written only by the power callback; read through `PowerMarks::snapshot`.
+    pub(super) power: PowerMarks,
+}
+
+impl EnvironmentSignals {
+    /// Publish environment changes to the standard and the elevated owner.
+    fn publish(&self, bits: u32) {
+        self.input.fetch_or(bits, Release);
+        self.elevated.fetch_or(bits, Release);
+    }
+}
+
+/// One environment pause reason, read by `Notifications::reasons`.
+#[derive(Clone, Copy)]
+pub(super) struct ReasonState {
+    pub(super) reason: PauseReason,
+    /// The reason was asserted since the previous read, even if it has cleared.
+    pub(super) asserted: bool,
+    /// The reason holds now.
+    pub(super) active: bool,
+}
+
 pub(super) struct Notifications {
     signals: Arc<Signals>,
-    stop: SyncSender<()>,
     owner: thread::JoinHandle<()>,
 }
 
 struct Signals {
     reasons: AtomicU32,
-    environment: Arc<AtomicU32>,
-    elevated_environment: Arc<AtomicU32>,
-    display_revision: Arc<AtomicU32>,
-    session_end: Arc<OnceLock<Instant>>,
-    power: Arc<PowerMarks>,
+    shared: Arc<EnvironmentSignals>,
     complete: AtomicBool,
     wake: SyncSender<()>,
+    /// Manual-reset; set once `complete` is, so the owner's wait ends.
+    stop: WakeEvent,
 }
 
 impl Signals {
     fn reason(&self, bit: u32, active: bool) {
-        if active {
-            if self.reasons.fetch_update(AcqRel, Acquire, |before| {
+        let changed = if active {
+            self.reasons.fetch_update(AcqRel, Acquire, |before| {
                 (before & bit == 0).then_some(before | bit | (bit << EDGE_SHIFT))
-            }).is_ok() {
-                self.elevated_environment.fetch_or(EnvironmentChange::Session.bit(), Release);
-                let _ = self.wake.try_send(());
-            }
-        } else if self.reasons.fetch_and(!bit, AcqRel) & bit != 0 {
-            self.elevated_environment.fetch_or(EnvironmentChange::Session.bit(), Release);
+            }).is_ok()
+        } else {
+            self.reasons.fetch_and(!bit, AcqRel) & bit != 0
+        };
+        if changed {
+            self.shared.elevated.fetch_or(EnvironmentChange::Session.bit(), Release);
             let _ = self.wake.try_send(());
         }
     }
@@ -232,14 +295,11 @@ impl Signals {
 
 impl Notifications {
     pub(super) fn spawn(
-        environment: Arc<AtomicU32>, elevated_environment: Arc<AtomicU32>, display_revision: Arc<AtomicU32>,
-        session_end: Arc<OnceLock<Instant>>, power: Arc<PowerMarks>, wake: SyncSender<()>,
+        shared: Arc<EnvironmentSignals>, wake: SyncSender<()>,
     ) -> Result<(Self, Receiver<Result<(), CaptureError>>), CaptureError> {
-        let signals = Arc::new(Signals {
-            reasons: AtomicU32::new(0), environment, elevated_environment, display_revision, session_end,
-            power, complete: AtomicBool::new(false), wake,
-        });
-        let (stop, stopped) = mpsc::sync_channel(1);
+        let stop = WakeEvent::new(true)
+            .map_err(|error| window_error("Create the Windows notification stop event", error.raw_os_error()))?;
+        let signals = Arc::new(Signals { reasons: AtomicU32::new(0), shared, complete: AtomicBool::new(false), wake, stop });
         let (ready, initialized) = mpsc::sync_channel(1);
         let owned = Arc::clone(&signals);
         let owner = thread::Builder::new().name("recording-windows-notifications".into()).spawn(move || {
@@ -258,22 +318,37 @@ impl Notifications {
                     owned.reason(SECURE_DESKTOP, !on_input_desktop());
                     next_poll = now + DESKTOP_POLL;
                 }
-                if !matches!(stopped.recv_timeout(PUMP_INTERVAL), Err(mpsc::RecvTimeoutError::Timeout)) { break; }
+                // Wake on a message, on stop, or at the next desktop poll
+                // (at most DESKTOP_POLL away). The event is manual-reset, so
+                // a stop set before this wait ends it at once.
+                let timeout = next_poll.saturating_duration_since(Instant::now()).min(DESKTOP_POLL);
+                // Round up, so that less than a millisecond left does not spin.
+                let timeout_ms = u32::try_from(timeout.as_micros().div_ceil(1000)).unwrap_or(u32::MAX);
+                if owned.stop.wait_messages(timeout_ms).is_err() {
+                    thread::park_timeout(PUMP_INTERVAL);
+                }
+                if owned.complete.load(Acquire) { break; }
             }
         }).map_err(|error| window_error("Start the Windows notification owner", error.raw_os_error()))?;
-        Ok((Self { signals, stop, owner }, initialized))
+        Ok((Self { signals, owner }, initialized))
     }
 
-    pub(super) fn reasons(&self) -> (u32, u32) {
+    /// Take the assertion edges and read each environment reason: sleep, lock
+    /// screen, then secure desktop.
+    pub(super) fn reasons(&self) -> impl Iterator<Item = ReasonState> + use<> {
         let reasons = self.signals.reasons.fetch_and(!ASSERT_EDGES, AcqRel);
-        (reasons & !ASSERT_EDGES, (reasons & ASSERT_EDGES) >> EDGE_SHIFT)
+        let (active, asserted) = (reasons & !ASSERT_EDGES, (reasons & ASSERT_EDGES) >> EDGE_SHIFT);
+        [(SLEEP, PauseReason::Sleep), (LOCK_SCREEN, PauseReason::LockScreen), (SECURE_DESKTOP, PauseReason::SecureDesktop)]
+            .into_iter()
+            .map(move |(bit, reason)| ReasonState { reason, asserted: asserted & bit != 0, active: active & bit != 0 })
     }
 
     pub(super) fn running(&self) -> bool { !self.owner.is_finished() }
 
     pub(super) fn finished(&self) {
         if !self.signals.complete.swap(true, AcqRel) {
-            let _ = self.stop.try_send(());
+            // A failed set leaves the owner to see `complete` within DESKTOP_POLL.
+            let _ = self.signals.stop.set();
             self.owner.thread().unpark();
         }
     }
@@ -397,11 +472,11 @@ unsafe extern "system" fn power_changed(context: *const c_void, event: u32, _set
     // only atomics and the bounded wake channel; it takes no lock of its own.
     let _ = catch_unwind(AssertUnwindSafe(|| match event {
         PBT_APMSUSPEND => {
-            signals.power.suspended(clock::qpc().ok());
+            signals.shared.power.suspended(clock::qpc().ok());
             signals.reason(SLEEP, true);
         }
         PBT_APMRESUMEAUTOMATIC => {
-            signals.power.resumed(clock::qpc().ok());
+            signals.shared.power.resumed(clock::qpc().ok());
             signals.reason(SLEEP, false);
         }
         _ => {}
@@ -457,9 +532,8 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
         }
         WM_ENDSESSION if wparam != 0 => {
             if let Some(signals) = signals {
-                let started = *signals.session_end.get_or_init(Instant::now);
-                signals.environment.fetch_or(EnvironmentChange::SessionEnding.bit(), Release);
-                signals.elevated_environment.fetch_or(EnvironmentChange::SessionEnding.bit(), Release);
+                let started = *signals.shared.session_end.get_or_init(Instant::now);
+                signals.shared.publish(EnvironmentChange::SessionEnding.bit());
                 let _ = signals.wake.try_send(());
                 while !signals.complete.load(Acquire) {
                     let remaining = SESSION_END_BUDGET.saturating_sub(started.elapsed());
@@ -474,10 +548,9 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
     };
     if let Some(signals) = signals {
         if matches!(message, WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE) {
-            signals.display_revision.fetch_add(1, Release);
+            signals.shared.display_revision.fetch_add(1, Release);
         }
-        signals.environment.fetch_or(bits, Release);
-        signals.elevated_environment.fetch_or(bits, Release);
+        signals.shared.publish(bits);
     }
     0
 }

@@ -23,7 +23,7 @@ use windows_sys::Win32::{
     },
 };
 
-use super::{CoreToHelper, HelperToCore, MAX_PACKET_BYTES, PacketError};
+use screen_fix_protocol::ipc::{CoreToHelper, HelperToCore, MAX_PACKET_BYTES, PacketError};
 
 const COMMAND_SLOTS: usize = 8;
 const EVIDENCE_SLOTS: usize = 256;

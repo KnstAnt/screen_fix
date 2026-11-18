@@ -9,7 +9,9 @@ use std::{
     time::Duration,
 };
 
-use screen_fix_protocol::{QpcTick, WindowId, ipc::elevated::WindowInstance};
+use screen_fix_protocol::{
+    MESSAGE_TICK_UNCERTAINTY_MS, MessageTickMs, QpcTick, WindowId, ipc::elevated::{VisitBinding, WindowInstance},
+};
 use windows_sys::{
     Win32::{
         Foundation::{HANDLE, HWND, LPARAM, LRESULT, WAIT_FAILED, WPARAM},
@@ -33,10 +35,7 @@ use windows_sys::{
 };
 
 use crate::{deadline::{Cancellation, milliseconds}, process::Process, win::{Failure, Result}};
-use super::lifetime::qpc;
-
-/// The longest interval between two witness samples.
-const SAMPLE: Duration = Duration::from_millis(10);
+use super::{lifetime::qpc, timing::{MAX_TICK_AGE_MS, WITNESS_SAMPLE}};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Foreground {
@@ -72,6 +71,15 @@ pub(super) struct Snapshot {
     pub(super) observed: QpcTick,
     pub(super) before_change: QpcTick,
     pub(super) safe: bool,
+}
+
+impl Snapshot {
+    /// The sample is safe, shows `window` in the foreground, and has the
+    /// witness and focus revisions `visit` is bound to.
+    pub(super) fn binds(&self, visit: VisitBinding, window: Foreground) -> bool {
+        self.safe && self.foreground == Some(window)
+            && self.revision == visit.witness_revision && self.focus_revision == visit.focus_revision
+    }
 }
 
 pub(super) struct Witness {
@@ -363,7 +371,7 @@ fn observe(
         // polling of state that changes without a notification.
         let handles = [cancel.handle().raw()];
         let woken = unsafe {
-            MsgWaitForMultipleObjectsEx(handles.len() as u32, handles.as_ptr(), milliseconds(SAMPLE), QS_ALLINPUT,
+            MsgWaitForMultipleObjectsEx(handles.len() as u32, handles.as_ptr(), milliseconds(WITNESS_SAMPLE), QS_ALLINPUT,
                 MWMO_INPUTAVAILABLE)
         };
         if woken == WAIT_FAILED { return Err(Failure::Witness); }
@@ -374,13 +382,12 @@ fn observe(
 /// A WinEvent or input message tick can wrap and is coarser than QPC.
 pub(super) fn coarse_lower(tick: u32, lifetime: &super::lifetime::Lifetime) -> Option<QpcTick> {
     let start = qpc().ok()?;
-    let anchor = unsafe { GetTickCount64() } as u32;
+    let anchor = unsafe { GetTickCount64() };
     let end = qpc().ok()?;
     if end < start { return None; }
-    let elapsed = anchor.wrapping_sub(tick);
-    if elapsed > 1_000 { return None; }
-    let uncertainty_ms = 16;
-    let range = Duration::from_millis(u64::from(elapsed) + uncertainty_ms);
+    let delta = MessageTickMs(tick).delta_from(anchor)?;
+    let elapsed = u64::try_from(-i64::from(delta)).ok().filter(|elapsed| *elapsed <= MAX_TICK_AGE_MS)?;
+    let range = Duration::from_millis(elapsed + MESSAGE_TICK_UNCERTAINTY_MS);
     Some(QpcTick(start.0.checked_sub(lifetime.ticks(range).ok()?)?))
 }
 

@@ -7,16 +7,21 @@ pub mod hotkey;
 use crate::{
     CaptureError,
     package::diagnostics::ReportOutcome,
-    protocol::{AdmissionEpoch, ClockOrigin, MonitorId, QpcTick, SessionTimeUs, TokenIdentityCheck, TokenIdentityFailure},
+    protocol::{MonitorId, SourceFailureReason, TokenIdentityCheck},
 };
 
-#[cfg(target_os = "windows")]
-pub(crate) mod fault;
-#[cfg(target_os = "windows")]
-pub(crate) mod windows;
+pub use crate::package::source::{AdmissionBoundary, DiskPreflight, PauseReason, SourceFailure, SourceStage};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) mod fault;
+pub(crate) mod labels;
+
+// The platform controller behind a `SessionHandle`: the only
+// `platform::windows` item that this platform-neutral API names.
+use crate::platform::windows::controller::Control;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SessionPhase {
+    #[default]
     Starting,
     Recording,
     Paused,
@@ -38,17 +43,6 @@ pub struct SessionResult {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PauseReason {
-    User,
-    LockScreen,
-    Sleep,
-    SecureDesktop,
-    LowDisk,
-    ElevationTransition,
-}
-
 /// Only the source that owns a pause condition may clear that reason. In
 /// particular, a user Resume clears User and requests a new disk-space check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,13 +57,6 @@ pub enum CommandError {
     PauseUnavailable,
     Busy,
     ControllerUnavailable,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AdmissionBoundary {
-    pub epoch: AdmissionEpoch,
-    pub qpc: QpcTick,
-    pub time: SessionTimeUs,
 }
 
 /// An activity that stopped for the rest of the attempt while recording continues.
@@ -96,175 +83,50 @@ pub struct VideoReport {
     pub outcome: ReportOutcome,
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct DiskPreflight {
-    pub available_bytes: u64,
-    pub minimum_bytes: u64,
-    /// M1 has no task duration from which to calculate this reserve.
-    pub duration_reserve_bytes: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceStage {
-    Foreground,
-    Consent,
-    Readiness,
-    Activation,
-    Capture,
-    Cleanup,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceFailureReason {
-    DeploymentRequired,
-    InstalledPath,
-    InstalledPermissions,
-    InstalledSignature,
-    RevocationUnknown,
-    ReleaseMismatch,
-    ProcessIdentity,
-    TokenIdentity,
-    Arguments,
-    Busy,
-    ConsentDenied,
-    ConsentLaunch,
-    ConsentDeadline,
-    ReadinessDeadline,
-    CleanupDeadline,
-    Cancelled,
-    PeerExited,
-    PipeSecurity,
-    PipeConnection,
-    PipePeer,
-    Transport,
-    Protocol,
-    Cryptography,
-    Supervisor,
-    LeaseExpired,
-    Witness,
-    TargetChanged,
-    TargetAccess,
-    ScopeClosed,
-    RequiredRegistration,
-    StandardHelperUnavailable,
-    RequiredHook,
-    NativeProducer,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct SourceFailure {
-    pub stage: SourceStage,
-    pub reason: SourceFailureReason,
-    pub admitted: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native: Option<crate::protocol::ipc::HelperFailure>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_identity: Option<TokenIdentityFailure>,
-}
-
-impl SourceFailure {
-    pub(crate) fn without_report_detail(mut self) -> Self {
-        self.token_identity = None;
-        if let Some(native) = &mut self.native {
-            native.raw_input_registration = None;
-        }
-        self
-    }
-
-    pub fn guidance(self) -> &'static str {
-        use SourceFailureReason::*;
-        match self.reason {
-            DeploymentRequired | InstalledPath | InstalledPermissions | InstalledSignature | ReleaseMismatch =>
-                "Install or repair the matching signed Recorder and collector using the official machine-wide installer.",
-            RevocationUnknown =>
-                "Windows could not confirm from its cached revocation data that the installed publisher certificate is not revoked. Check the diagnostic report, then retry after Windows has refreshed its certificate revocation data.",
-            TokenIdentity => match self.token_identity.map(|detail| detail.check) {
-                Some(TokenIdentityCheck::ProtectedProcess) =>
-                    "The target application uses Windows process protection. Select a supported application.",
-                Some(TokenIdentityCheck::DifferentUser) =>
-                    "Run Screen Fix and the approved application under the same signed-in Windows account.",
-                Some(TokenIdentityCheck::DifferentLogon) =>
-                    "Open Screen Fix and the approved application from the same interactive Windows sign-in.",
-                Some(TokenIdentityCheck::SystemAccount) =>
-                    "Use a signed-in Windows user account for Screen Fix and the approved application.",
-                Some(TokenIdentityCheck::UnsupportedIntegrity) =>
-                    "The approved application runs at a higher integrity level than Screen Fix. Open the approved application normally from the interactive desktop and retry.",
-                Some(TokenIdentityCheck::NoInteractiveSession | TokenIdentityCheck::DifferentSession | TokenIdentityCheck::NotInteractive) =>
-                    "Run Screen Fix and the approved application in the same unlocked interactive Windows session.",
-                Some(TokenIdentityCheck::UnsupportedSplitPair | TokenIdentityCheck::LinkedLogonMismatch) =>
-                    "Windows did not report a supported linked token pair. Reopen the approved application in the same interactive sign-in and retry.",
-                _ => "Windows could not verify the process token. Check the diagnostic report for the failed verification step.",
-            },
-            ConsentDenied =>
-                "Windows elevation consent was declined. Start again and approve the prompt if you want to record the elevated application.",
-            ConsentDeadline =>
-                "Windows elevation consent timed out. Start again and answer the Windows prompt before it expires.",
-            ReadinessDeadline =>
-                "The elevated collector did not become ready in time. Bring the approved application forward and retry.",
-            CleanupDeadline =>
-                "The elevated collector did not finish closing in time. Check the diagnostic report and restart the Recorder before retrying.",
-            TargetChanged | ProcessIdentity | ScopeClosed =>
-                "The approved application or its capture scope changed. Bring the approved window to the foreground and retry.",
-            TargetAccess | Witness =>
-                "The collector could not verify access to the approved window on the interactive desktop. Return to that desktop and retry.",
-            ConsentLaunch | Busy | PeerExited | Supervisor | LeaseExpired | PipeSecurity | PipeConnection | PipePeer
-            | Transport | Protocol | Arguments | Cryptography | RequiredRegistration | RequiredHook | NativeProducer =>
-                "The protected collector or its required input channel failed. Check the diagnostic report and restart the Recorder before retrying.",
-            StandardHelperUnavailable =>
-                "The standard input helper could not resume capture. Restart the Recorder before trying again.",
-            Cancelled => "The protected capture request was cancelled. Start again to request a new capture.",
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    pub(crate) fn elevated(stage: SourceStage, failure: screen_fix_elevated::Failure, admitted: bool) -> Self {
-        use screen_fix_elevated::Failure;
-        use SourceFailureReason as Reason;
-        let reason = match failure {
-            Failure::DeploymentRequired => Reason::DeploymentRequired,
-            Failure::InstalledPath => Reason::InstalledPath,
-            Failure::InstalledPermissions => Reason::InstalledPermissions,
-            Failure::InstalledSignature => Reason::InstalledSignature,
-            Failure::RevocationUnknown => Reason::RevocationUnknown,
-            Failure::ReleaseMismatch => Reason::ReleaseMismatch,
-            Failure::ProcessIdentity => Reason::ProcessIdentity,
-            Failure::TokenIdentity(_) => Reason::TokenIdentity,
-            Failure::Arguments => Reason::Arguments,
-            Failure::Busy => Reason::Busy,
-            Failure::ConsentDenied => Reason::ConsentDenied,
-            Failure::ConsentLaunch => Reason::ConsentLaunch,
-            Failure::ConsentDeadline => Reason::ConsentDeadline,
-            Failure::ReadinessDeadline => Reason::ReadinessDeadline,
-            Failure::CleanupDeadline => Reason::CleanupDeadline,
-            Failure::Cancelled => Reason::Cancelled,
-            Failure::PeerExited => Reason::PeerExited,
-            Failure::PipeSecurity => Reason::PipeSecurity,
-            Failure::PipeConnection => Reason::PipeConnection,
-            Failure::PipePeer => Reason::PipePeer,
-            Failure::Transport => Reason::Transport,
-            Failure::Protocol => Reason::Protocol,
-            Failure::Cryptography => Reason::Cryptography,
-            Failure::Supervisor => Reason::Supervisor,
-            Failure::LeaseExpired => Reason::LeaseExpired,
-            Failure::Witness => Reason::Witness,
-            Failure::TargetChanged => Reason::TargetChanged,
-            Failure::TargetAccess => Reason::TargetAccess,
-            Failure::ScopeClosed => Reason::ScopeClosed,
-            Failure::RequiredRegistration => Reason::RequiredRegistration,
-            Failure::StandardHelperUnavailable => Reason::StandardHelperUnavailable,
-            Failure::NativeOwnerLost | Failure::NativeProducer(_) => Reason::NativeProducer,
-        };
-        let native = match failure {
-            Failure::NativeProducer(failure) => Some(failure),
-            _ => None,
-        };
-        let token_identity = match failure {
-            Failure::TokenIdentity(detail) => Some(detail),
-            _ => None,
-        };
-        Self { stage, reason, admitted, native, token_identity }
+/// What the user can do about `failure`. This is Recorder UI text, not part
+/// of the manifest vocabulary.
+pub(crate) fn source_failure_guidance(failure: SourceFailure) -> &'static str {
+    use SourceFailureReason::*;
+    match failure.reason {
+        DeploymentRequired | InstalledPath | InstalledPermissions | InstalledSignature | ReleaseMismatch =>
+            "Install or repair the matching signed Recorder and collector using the official machine-wide installer.",
+        RevocationUnknown =>
+            "Windows could not confirm from its cached revocation data that the installed publisher certificate is not revoked. Check the diagnostic report, then retry after Windows has refreshed its certificate revocation data.",
+        TokenIdentity => match failure.token_identity.map(|detail| detail.check) {
+            Some(TokenIdentityCheck::ProtectedProcess) =>
+                "The target application uses Windows process protection. Select a supported application.",
+            Some(TokenIdentityCheck::DifferentUser) =>
+                "Run Screen Fix and the approved application under the same signed-in Windows account.",
+            Some(TokenIdentityCheck::DifferentLogon) =>
+                "Open Screen Fix and the approved application from the same interactive Windows sign-in.",
+            Some(TokenIdentityCheck::SystemAccount) =>
+                "Use a signed-in Windows user account for Screen Fix and the approved application.",
+            Some(TokenIdentityCheck::UnsupportedIntegrity) =>
+                "The approved application runs at a higher integrity level than Screen Fix. Open the approved application normally from the interactive desktop and retry.",
+            Some(TokenIdentityCheck::NoInteractiveSession | TokenIdentityCheck::DifferentSession | TokenIdentityCheck::NotInteractive) =>
+                "Run Screen Fix and the approved application in the same unlocked interactive Windows session.",
+            Some(TokenIdentityCheck::UnsupportedSplitPair | TokenIdentityCheck::LinkedLogonMismatch) =>
+                "Windows did not report a supported linked token pair. Reopen the approved application in the same interactive sign-in and retry.",
+            _ => "Windows could not verify the process token. Check the diagnostic report for the failed verification step.",
+        },
+        ConsentDenied =>
+            "Windows elevation consent was declined. Start again and approve the prompt if you want to record the elevated application.",
+        ConsentDeadline =>
+            "Windows elevation consent timed out. Start again and answer the Windows prompt before it expires.",
+        ReadinessDeadline =>
+            "The elevated collector did not become ready in time. Bring the approved application forward and retry.",
+        CleanupDeadline =>
+            "The elevated collector did not finish closing in time. Check the diagnostic report and restart the Recorder before retrying.",
+        TargetChanged | ProcessIdentity | ScopeClosed =>
+            "The approved application or its capture scope changed. Bring the approved window to the foreground and retry.",
+        TargetAccess | Witness =>
+            "The collector could not verify access to the approved window on the interactive desktop. Return to that desktop and retry.",
+        ConsentLaunch | Busy | PeerExited | Supervisor | LeaseExpired | PipeSecurity | PipeConnection | PipePeer
+        | Transport | Protocol | Arguments | Cryptography | RequiredRegistration | RequiredHook | NativeProducer =>
+            "The protected collector or its required input channel failed. Check the diagnostic report and restart the Recorder before retrying.",
+        StandardHelperUnavailable =>
+            "The standard input helper could not resume capture. Restart the Recorder before trying again.",
+        Cancelled => "The protected capture request was cancelled. Start again to request a new capture.",
     }
 }
 
@@ -282,19 +144,17 @@ pub enum SourceStatus {
 }
 
 impl SourceStatus {
-    #[cfg(target_os = "windows")]
     pub(crate) fn failure(self) -> Option<SourceFailure> {
         match self {
             Self::Unavailable(failure) | Self::FailedPrefix(failure) => Some(failure),
             _ => None,
         }
     }
-
-
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum StartupStep {
+    #[default]
     Windows,
     ApprovedApplication,
     OutputSpace,
@@ -320,7 +180,8 @@ pub struct ReadyVideo {
     pub software: bool,
 }
 
-#[derive(Debug, Clone)]
+/// A snapshot of the attempt for the Recorder UI.
+#[derive(Debug, Clone, Default)]
 pub struct SessionStatus {
     pub phase: SessionPhase,
     pub outcome: Option<SessionOutcome>,
@@ -335,11 +196,8 @@ pub struct SessionStatus {
     pub windows: Option<crate::platform::WindowsEvidence>,
     pub window_coverage: Option<WindowCoverage>,
     pub disk_available_bytes: Option<u64>,
+    /// The active pause reasons, in `PauseReason` order.
     pub pause_reasons: Vec<PauseReason>,
-    pub clock: Option<ClockOrigin>,
-    pub opened: Option<AdmissionBoundary>,
-    pub closed: Option<AdmissionBoundary>,
-    pub stop: Option<AdmissionBoundary>,
     pub video_unavailable: Vec<MonitorId>,
     pub video_reports: Vec<VideoReport>,
     pub input_unavailable: Option<&'static str>,
@@ -350,64 +208,98 @@ pub struct SessionStatus {
     pub degraded: Vec<DegradedActivity>,
 }
 
-impl Default for SessionStatus {
-    fn default() -> Self {
-        Self {
-            phase: SessionPhase::Starting,
-            outcome: None,
-            final_publication_pending: false,
-            countdown_seconds: None,
-            startup: StartupStep::Windows,
-            source: SourceStatus::Unselected,
-            ready_video: Vec::new(),
-            input_helper_ready: false,
-            input_ready: None,
-            windows: None,
-            window_coverage: None,
-            disk_available_bytes: None,
-            pause_reasons: Vec::new(),
-            clock: None,
-            opened: None,
-            closed: None,
-            stop: None,
-            video_unavailable: Vec::new(),
-            video_reports: Vec::new(),
-            input_unavailable: None,
-            input_report: None,
-            hotkeys_unavailable: false,
-            last_hotkey: None,
-            degraded: Vec::new(),
+impl SessionStatus {
+    /// The attempt's state as the Recorder UI and the recording indicator
+    /// present it. Each surface chooses its own wording.
+    pub fn summary(&self) -> StatusSummary {
+        let wait = match self.source {
+            SourceStatus::AwaitingConsent => Some(SourceWait::Consent),
+            SourceStatus::AwaitingReadiness => Some(SourceWait::Readiness),
+            _ => None,
+        };
+        match self.phase {
+            SessionPhase::Starting => StatusSummary::Starting(wait),
+            SessionPhase::Recording => StatusSummary::Recording(RecordingSummary {
+                source: match self.source {
+                    SourceStatus::Ordinary => RecordingSource::Standard,
+                    SourceStatus::Enhanced => RecordingSource::Enhanced,
+                    SourceStatus::Activating => RecordingSource::Activating,
+                    SourceStatus::FailedPrefix(_) => RecordingSource::FailedPrefix,
+                    _ => RecordingSource::Other,
+                },
+                input_lost: self.input_unavailable.is_some(),
+                video_lost: !self.video_unavailable.is_empty(),
+            }),
+            SessionPhase::Paused => StatusSummary::Paused(wait),
+            SessionPhase::Stopping => StatusSummary::Stopping,
+            SessionPhase::Finished => StatusSummary::Finished { incomplete: self.outcome == Some(SessionOutcome::Incomplete) },
+            SessionPhase::Failed => StatusSummary::Failed,
         }
     }
+}
+
+/// `SessionStatus::summary`: the phase with the details that its labels show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusSummary {
+    /// Before Start, possibly waiting for the elevated source.
+    Starting(Option<SourceWait>),
+    Recording(RecordingSummary),
+    /// Paused, possibly waiting for the next elevated source.
+    Paused(Option<SourceWait>),
+    Stopping,
+    Finished { incomplete: bool },
+    Failed,
+}
+
+/// The elevated source step that a starting or paused attempt waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceWait {
+    Consent,
+    Readiness,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordingSummary {
+    pub source: RecordingSource,
+    /// Input capture stopped for the rest of the attempt.
+    pub input_lost: bool,
+    /// Video stopped on at least one monitor.
+    pub video_lost: bool,
+}
+
+/// The capture source of a recording attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordingSource {
+    Standard,
+    Enhanced,
+    /// The elevated source waits for certified input.
+    Activating,
+    /// A source failure is closing the admitted prefix.
+    FailedPrefix,
+    /// No selected source is reported.
+    Other,
 }
 
 pub struct SessionHandle {
     result: mpsc::Receiver<Result<SessionResult, CaptureError>>,
-    #[cfg(target_os = "windows")]
-    control: windows::Control,
+    control: Control,
 }
 
 impl SessionHandle {
-    #[cfg(target_os = "windows")]
-    pub(crate) fn indicator_control(&self) -> windows::Control {
+    pub(crate) fn new(result: mpsc::Receiver<Result<SessionResult, CaptureError>>, control: Control) -> Self {
+        Self { result, control }
+    }
+
+    pub(crate) fn indicator_control(&self) -> Control {
         self.control.clone()
     }
     /// A short-lived status lock can be busy. Keep displaying the last snapshot.
     pub fn status(&self) -> Option<SessionStatus> {
-        #[cfg(target_os = "windows")]
-        { self.control.status() }
-        #[cfg(not(target_os = "windows"))]
-        { None }
+        self.control.status()
     }
 
     pub fn submit(&self, command: SessionCommand) -> Result<(), CommandError> {
-        #[cfg(target_os = "windows")]
-        { self.control.submit(command) }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = command;
-            Err(CommandError::ControllerUnavailable)
-        }
+        self.control.submit(command)
     }
 
     /// Submit the fixture's independent confirmation to this recording attempt.
@@ -415,13 +307,7 @@ impl SessionHandle {
     pub fn confirm_fixture_save(
         &self, confirmation: crate::capture::save::FixtureSave,
     ) -> Result<mpsc::Receiver<crate::capture::save::FixtureSaveResult>, crate::capture::save::FixtureSaveError> {
-        #[cfg(target_os = "windows")]
-        { self.control.confirm_fixture_save(confirmation) }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = confirmation;
-            Err(crate::capture::save::FixtureSaveError::ControllerUnavailable)
-        }
+        self.control.confirm_fixture_save(confirmation)
     }
 
     pub fn try_result(&self) -> Result<Result<SessionResult, CaptureError>, mpsc::TryRecvError> {

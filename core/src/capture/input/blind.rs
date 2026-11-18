@@ -3,13 +3,13 @@
 //! when it closes, or at the closing boundary while still open, once every
 //! input row before its end is published.
 
-use crate::{package::metadata::InputBlindReason, protocol::{SessionTimeUs, ipc::Producer}};
+use crate::{package::{metadata::InputBlindReason, row::BlindRow}, protocol::{SessionTimeUs, ipc::Producer}};
 
 /// Closed intervals waiting for the pump to write them.
 const MAX_CLOSED: usize = 32;
 
 #[derive(Clone, Debug)]
-pub(super) struct BlindInterval {
+pub(crate) struct BlindInterval {
     pub reason: InputBlindReason,
     pub start: SessionTimeUs,
     pub end: SessionTimeUs,
@@ -18,14 +18,8 @@ pub(super) struct BlindInterval {
 }
 
 impl BlindInterval {
-    pub fn row(&self) -> serde_json::Value {
-        let mut row = serde_json::json!({
-            "kind": "blind", "reason": self.reason, "start_us": self.start, "end_us": self.end,
-        });
-        if !self.producers.is_empty() {
-            row["producers"] = serde_json::json!(self.producers);
-        }
-        row
+    pub fn row(&self) -> serde_json::Result<serde_json::Value> {
+        BlindRow::new(self.reason, self.start, self.end, &self.producers).value()
     }
 }
 
@@ -48,7 +42,7 @@ fn add_producers(into: &mut Vec<Producer>, producers: impl IntoIterator<Item = P
 }
 
 #[derive(Default)]
-pub(super) struct Blinds {
+pub(crate) struct Blinds {
     open: Vec<OpenBlind>,
     closed: Vec<BlindInterval>,
 }
@@ -121,5 +115,28 @@ impl Blinds {
             self.closed = merged;
         }
         self.closed.push(blind);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Receiver's blind rows: `producers` only for a partial interval.
+    #[test]
+    fn blind_row_bytes() -> serde_json::Result<()> {
+        let mut blinds = Blinds::default();
+        blinds.open_for(InputBlindReason::ProducerStall, SessionTimeUs(100), &[Producer::PointerHook]);
+        blinds.open(InputBlindReason::DeviceRemoved, SessionTimeUs(150));
+        blinds.close(InputBlindReason::ProducerStall, SessionTimeUs(300));
+        blinds.close(InputBlindReason::DeviceRemoved, SessionTimeUs(200));
+        let rows = blinds.take_ready(Some(SessionTimeUs(300)), None).iter().map(|blind| {
+            blind.row().and_then(|row| serde_json::to_string(&row))
+        }).collect::<serde_json::Result<Vec<_>>>()?;
+        assert_eq!(rows, [
+            r#"{"end_us":300,"kind":"blind","producers":["pointer_hook"],"reason":"producer_stall","start_us":100}"#,
+            r#"{"end_us":200,"kind":"blind","reason":"device_removed","start_us":150}"#,
+        ]);
+        Ok(())
     }
 }

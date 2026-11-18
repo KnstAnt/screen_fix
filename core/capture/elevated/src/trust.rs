@@ -22,7 +22,7 @@ use windows_sys::Win32::{
     UI::Shell::{FOLDERID_ProgramFilesX64, SHGetKnownFolderPath},
 };
 
-use crate::{process::Process, win::{Failure, Handle, Result, wide}};
+use crate::{process::Process, win::{Failure, Handle, Result, read_wide, wide, wide_no_nul}};
 
 pub(crate) use signature::{ImageRole, Release};
 
@@ -132,12 +132,9 @@ fn program_files() -> Result<PathBuf> {
 }
 
 fn windows_directory() -> Result<PathBuf> {
-    let mut path = vec![0u16; 32768];
-    let length = unsafe { GetSystemWindowsDirectoryW(path.as_mut_ptr(), path.len() as u32) } as usize;
-    if length == 0 || length >= path.len() {
-        return Err(Failure::InstalledPath);
-    }
-    Ok(PathBuf::from(OsString::from_wide(&path[..length])))
+    let path = read_wide(|buffer, capacity| unsafe { GetSystemWindowsDirectoryW(buffer, capacity) })
+        .ok_or(Failure::InstalledPath)?;
+    Ok(PathBuf::from(OsString::from_wide(&path)))
 }
 
 fn drive_root(path: &Path) -> Result<PathBuf> {
@@ -168,12 +165,10 @@ struct Item {
 impl Item {
     fn open(path: &Path, directory: bool) -> Result<Self> {
         let item = Self::open_item(path, directory)?;
-        let name = wide(path);
+        let name = wide_no_nul(path);
         let final_dos = item.final_path(0)?;
-        let dos_prefix = wide(r"\\?\");
-        if !final_dos.starts_with(&dos_prefix[..dos_prefix.len() - 1])
-            || !same_path(&final_dos[dos_prefix.len() - 1..], &name[..name.len() - 1])?
-        {
+        let dos_prefix = wide_no_nul(r"\\?\");
+        if !final_dos.starts_with(&dos_prefix) || !same_path(&final_dos[dos_prefix.len()..], &name)? {
             return Err(Failure::InstalledPath);
         }
         Ok(item)
@@ -226,37 +221,29 @@ impl Item {
         let dll = wide("ntdll.dll");
         let module = unsafe { GetModuleHandleW(dll.as_ptr()) };
         if module.is_null() { return Err(Failure::InstalledPath) }
-        let mut mapped = vec![0u16; 32768];
-        let length = unsafe {
-            K32GetMappedFileNameW(GetCurrentProcess(), module.cast(), mapped.as_mut_ptr(), mapped.len() as u32)
-        } as usize;
-        if length == 0 || length >= mapped.len() { return Err(Failure::InstalledPath) }
+        let mapped = read_wide(|buffer, capacity| unsafe {
+            K32GetMappedFileNameW(GetCurrentProcess(), module.cast(), buffer, capacity)
+        }).ok_or(Failure::InstalledPath)?;
         let mut prefix = nt_root;
         if prefix.last() != Some(&(b'\\' as u16)) {
             prefix.push(b'\\' as u16);
         }
-        if length <= prefix.len() || !same_path(&mapped[..prefix.len()], &prefix)? {
+        if mapped.len() <= prefix.len() || !same_path(&mapped[..prefix.len()], &prefix)? {
             return Err(Failure::InstalledPath);
         }
         Ok(())
     }
 
     fn final_path(&self, flags: u32) -> Result<Vec<u16>> {
-        let mut path = vec![0u16; 32768];
-        let length = unsafe { GetFinalPathNameByHandleW(self.handle.raw(), path.as_mut_ptr(), path.len() as u32, flags) } as usize;
-        if length == 0 || length >= path.len() {
-            return Err(Failure::InstalledPath);
-        }
-        path.truncate(length);
-        Ok(path)
+        read_wide(|buffer, capacity| unsafe { GetFinalPathNameByHandleW(self.handle.raw(), buffer, capacity, flags) })
+            .ok_or(Failure::InstalledPath)
     }
 
     fn final_volume_path(&self) -> Result<Vec<u16>> {
         let path = self.final_path(VOLUME_NAME_GUID)?;
-        let prefix = wide(r"\\?\Volume{");
-        let prefix = &prefix[..prefix.len() - 1];
+        let prefix = wide_no_nul(r"\\?\Volume{");
         let guid_end = prefix.len() + 36;
-        if !path.starts_with(prefix)
+        if !path.starts_with(&prefix)
             || path.get(guid_end..guid_end + 2) != Some(&[b'}' as u16, b'\\' as u16])
         {
             return Err(Failure::InstalledPath);
@@ -296,8 +283,7 @@ impl Item {
         if process.native_image() != native.as_slice() {
             return Err(Failure::ProcessIdentity);
         }
-        let mut reported = wide(r"\\?\GLOBALROOT");
-        reported.pop();
+        let mut reported = wide_no_nul(r"\\?\GLOBALROOT");
         reported.extend_from_slice(process.native_image());
         let reported = PathBuf::from(OsString::from_wide(&reported));
         let actual = Item::open_item(&reported, false).map_err(|_| Failure::ProcessIdentity)?;

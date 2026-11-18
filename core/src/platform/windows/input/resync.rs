@@ -11,17 +11,12 @@ pub(super) fn read() -> Option<HeldSynchronization> {
 pub(super) fn from_snapshot(snapshot: held::HeldSnapshot) -> HeldSynchronization {
     let mut modifiers = 0;
     let mut physical_buttons = 0;
-    for (modifier, pressed) in [Modifier::LeftShift, Modifier::RightShift, Modifier::LeftCtrl,
-        Modifier::RightCtrl, Modifier::LeftAlt, Modifier::RightAlt, Modifier::LeftWin,
-        Modifier::RightWin].into_iter().zip(snapshot.modifiers)
-    {
+    for (modifier, pressed) in Modifier::ALL.into_iter().zip(snapshot.modifiers) {
         if pressed {
             modifiers |= modifier_bit(modifier);
         }
     }
-    for (button, pressed) in [Button::Left, Button::Right, Button::Middle, Button::X1, Button::X2]
-        .into_iter().zip(snapshot.physical_buttons)
-    {
+    for (button, pressed) in Button::ALL.into_iter().zip(snapshot.physical_buttons) {
         if pressed {
             physical_buttons |= button_bit(button);
         }

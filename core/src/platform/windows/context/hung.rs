@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use screen_fix_native_observation::hung::{self, CandidateEvidence};
+use screen_fix_native_observation::{focus::window_owner, hung::{self, CandidateEvidence}};
 use serde_json::{Value, json};
 use windows_sys::Win32::Foundation::HWND;
 
@@ -12,6 +12,7 @@ pub(super) use hung::is_ghost;
 use crate::{
     capture::context::BusyReasons,
     protocol::{WindowId, ipc::ProcessInstance},
+    util::push_bounded,
 };
 
 use super::identity::{ApprovedProcesses, WindowProcess};
@@ -109,9 +110,9 @@ impl Hung {
                 continue;
             }
             let hwnd = window.hwnd();
-            let owner = hung::native_owner(hwnd.0);
+            let owner = window_owner(hwnd.0);
             let proof = WindowProcess::read(hwnd);
-            let gone = owner != Some((window.process.pid.get(), window.thread.get()))
+            let gone = owner != Some(window.owner())
                 || proof.is_some_and(|proof| proof != window);
             if !gone && (!complete || proof.is_none() || hung::is_hung(hwnd.0)) {
                 // Prefer an existing interval over an untracked new one if
@@ -121,7 +122,7 @@ impl Hung {
                     let replace = next.iter().rposition(|new| !self.active.iter().any(|entry| entry.window == new.window));
                     if let Some(index) = replace { next.swap_remove(index); }
                 }
-                if next.len() < ACTIVE_LIMIT { next.push(*old); }
+                push_bounded(&mut next, *old, ACTIVE_LIMIT);
             } else {
                 let reason = if gone { "window_gone" }
                     else if ghost_unknown { "ghost_association_unknown" }
@@ -134,8 +135,7 @@ impl Hung {
             if previous.is_none() {
                 rows.push(hung_row(*new, true, "detected"));
             } else if new.ghost && previous.is_some_and(|old| !old.ghost) {
-                rows.push(json!({ "kind": "app_hung_ghost", "active": true, "association": "confirmed",
-                    "window": new.window.window, "process": new.window.process }));
+                rows.push(ghost_confirmed_row(new.window));
             }
         }
         if limited != self.coverage_limited {
@@ -158,14 +158,13 @@ impl Hung {
         next.retain(|item| item.window != window);
         if let Some(observed) = observed {
             if next.len() == ACTIVE_LIMIT {
-                rows.push(json!({ "kind": "app_hung_coverage", "complete": false, "source": "elevated" }));
+                rows.push(elevated_coverage_row());
                 return;
             }
             next.push(observed);
             if previous.is_none() { rows.push(hung_row(observed, true, "detected")); }
             if ghost && previous.is_none_or(|previous| !previous.ghost) {
-                rows.push(json!({ "kind": "app_hung_ghost", "active": true, "association": "confirmed",
-                    "window": window.window, "process": window.process }));
+                rows.push(ghost_confirmed_row(window));
             }
         } else if let Some(previous) = previous {
             rows.push(hung_row(previous, false, "responsive"));
@@ -233,6 +232,18 @@ impl Scan<'_, '_, '_> {
             self.observations.push(Observation { window, direct: !ghost, ghost });
         }
     }
+}
+
+/// The incomplete hung coverage of an elevated visit: a scoped read could
+/// not be held, or did not complete.
+pub(super) fn elevated_coverage_row() -> Value {
+    json!({ "kind": "app_hung_coverage", "complete": false, "source": "elevated" })
+}
+
+/// A Ghost window verifiably replaced the hung `window`.
+fn ghost_confirmed_row(window: WindowProcess) -> Value {
+    json!({ "kind": "app_hung_ghost", "active": true, "association": "confirmed",
+        "window": window.window, "process": window.process })
 }
 
 fn hung_row(observed: Observation, active: bool, reason: &str) -> Value {

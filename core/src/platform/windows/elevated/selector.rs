@@ -1,33 +1,38 @@
 use std::{
-    collections::VecDeque,
     num::NonZeroU64,
-    sync::{atomic::{AtomicBool, Ordering}, mpsc::{self, Receiver, SyncSender, TryRecvError}},
+    sync::{atomic::AtomicBool, mpsc::{self, Receiver, SyncSender, TryRecvError}},
     thread,
     time::{Duration, Instant},
 };
 
 use screen_fix_elevated::{Failure, READINESS, Result};
+use screen_fix_native_observation::{LossSpan, StaticLease};
 use screen_fix_protocol::{
     AdmissionEpoch, AttemptId, GeometryId, QpcFrequency, QpcTick, SessionId,
     ipc::{EnvironmentChange, FocusAtReceipt, InputRegistration, ProducerGap, elevated::{
-        ContextEvidence, HeldSnapshot, InputEvidence, NativeObservation, Query, ReadBinding, ReadUnavailable, VisitBinding,
-        WindowInstance, WindowNotice,
-        runtime::{CoverageLoss, CoverageReason, ContextGap, ContextGapCause, ContextProducer, EnvironmentRevision, IdentityClaim, Observation, Revocation, Status},
+        ContextEvidence, HeldSnapshot, InputEvidence, Query, ReadBinding, VisitBinding, WindowInstance,
+        runtime::{CoverageLoss, CoverageReason, ContextGap, EnvironmentRevision, IdentityClaim, Observation, Revocation, Status},
     }},
 };
 
 use crate::{
     config::ResolvedCaptureConfig,
     package::metadata::{SourceBlindInterval, SourceBlindReason},
-    session::{AdmissionBoundary, SourceStage, SourceStatus, windows::{SourcePreparation, WorkerSession}},
+    platform::windows::controller::{SourcePreparation, WorkerSession},
+    session::{AdmissionBoundary, SourceStage, SourceStatus},
+    util::keep_earlier,
 };
 
-use super::{CLEANUP, LaunchStatus, Ticket, ingress::{Ingress, InputCertificate, InputStagingLoss}, peer::{Peer, Progress}, visit::{Change, Host, add_time, matches_target}};
+use super::{
+    CLEANUP, LaunchStatus, Ticket, WORK_PER_POLL,
+    context_queue::{ContextDelivery, ContextQueue},
+    ingress::{Ingress, InputCertificate, InputStagingLoss},
+    peer::{Peer, Progress},
+    visit::{Change, Host, Recovered, add_time, matches_target},
+};
 use super::super::{clock, context::{ACCESS_RECHECK, FramePolicy, identity::WindowProcess}, display::topology::Topology,
     preflight::{Foreground, ForegroundApproval, classify_expected_foreground}};
 
-const WORK_PER_POLL: usize = 32;
-const CONTEXT_CAPACITY: usize = 1024;
 static CLASSIFIER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub(in crate::platform::windows) struct Selector<'a> {
@@ -46,22 +51,17 @@ pub(in crate::platform::windows) struct Selector<'a> {
     pending: Option<Pending>,
     opened: Option<OpenVisit>,
     ingress: Option<Ingress>,
-    observations: VecDeque<(QpcTick, ContextDelivery)>,
+    queue: ContextQueue,
     interrupted: Option<QpcTick>,
     closed_before: Option<QpcTick>,
     focus_deadline: Option<Instant>,
-    loss: Option<(VisitBinding, QpcTick, CoverageReason, Option<ProducerGap>)>,
-    recovered: Option<(VisitBinding, QpcTick, HeldSnapshot)>,
-    context_pressure: Option<ContextGap>,
-    optional_dropped: Option<(QpcTick, QpcTick, u32)>,
+    loss: Option<CoverageLossReport>,
+    recovered: Option<Recovered>,
     environment_sequence: u64,
     geometry_revision: Option<u64>,
     stopping: bool,
     stage: SourceStage,
-    /// A standard-helper registration check requested before returning to
-    /// the standard source: its preparation epoch, the suspend sequence, the
-    /// request QPC and the deadline (E4).
-    helper_check: Option<(AdmissionEpoch, u64, QpcTick, Instant)>,
+    helper_check: Option<HelperCheck>,
     /// The suspend count at the last tick that found the attached collector
     /// live (E4). A larger count means the system slept since.
     live_suspends: u64,
@@ -71,9 +71,26 @@ pub(in crate::platform::windows) struct Selector<'a> {
     collector_lost: bool,
 }
 
-pub(in crate::platform::windows) enum ContextDelivery {
-    Observation(Observation),
-    Rejected(ReadBinding, ReadUnavailable),
+/// The coverage an open visit lost when its input closed for a resync (E3).
+#[derive(Clone, Copy)]
+pub(in crate::platform::windows) struct CoverageLossReport {
+    pub(in crate::platform::windows) binding: VisitBinding,
+    /// The first receipt the visit no longer covers.
+    pub(in crate::platform::windows) before: QpcTick,
+    pub(in crate::platform::windows) cause: CoverageReason,
+    pub(in crate::platform::windows) gap: Option<ProducerGap>,
+}
+
+/// A standard-helper registration check requested before returning to the
+/// standard source (E4).
+#[derive(Clone, Copy)]
+struct HelperCheck {
+    /// The preparation epoch of the switch.
+    epoch: AdmissionEpoch,
+    /// The suspend sequence at the request; a sleep restarts the check.
+    suspends: u64,
+    requested: QpcTick,
+    until: Instant,
 }
 
 struct Pending {
@@ -100,8 +117,8 @@ impl<'a> Selector<'a> {
         Ok(Self {
             attempt, session, frequency, frames, session_status, blind: None, certified_epoch: None, classifier: Classifier::start(config)?,
             ticket: None, host: None, launched: false, withdrawn_dispatch: false, pending: None,
-            opened: None, ingress: None, observations: VecDeque::new(), interrupted: None,
-            closed_before: None, focus_deadline: None, loss: None, recovered: None, context_pressure: None, optional_dropped: None,
+            opened: None, ingress: None, queue: ContextQueue::default(), interrupted: None,
+            closed_before: None, focus_deadline: None, loss: None, recovered: None,
             environment_sequence: 0, geometry_revision: None, stopping: false, stage: SourceStage::Foreground,
             helper_check: None, live_suspends: 0, collector_lost: false,
         })
@@ -157,7 +174,7 @@ impl<'a> Selector<'a> {
             Some(Foreground::Unknown(error)) => error.source_failure(),
             _ => None,
         };
-        let elevated = matches!(foreground, Some(Foreground::Elevated(_)));
+        let elevated = foreground.is_some_and(Foreground::is_elevated);
         // D-8 A: only a failure of the current grant's required access fails
         // the source; any other unclassifiable foreground stays suppressed.
         let grant_target = self.classifier.current.as_ref().map(|(proof, _)| WindowInstance::from(*proof))
@@ -224,7 +241,7 @@ impl<'a> Selector<'a> {
             }
         } else if let Some(phase) = preparation {
             let candidate = match self.classifier.current.as_ref().map(|(_, classification)| classification) {
-                Some(Foreground::Ordinary(approval) | Foreground::Elevated(approval)) => Some(approval.clone()),
+                Some(Foreground::Approved(approval)) => Some(approval.clone()),
                 _ => None,
             };
             self.prepare(topology, phase, candidate, progress, ordinary)?;
@@ -309,7 +326,7 @@ impl<'a> Selector<'a> {
         // A native notice can sit behind an optional completion in receipt
         // order. An unmaterialized notice reserves its conservative source
         // interval even if a later lane watermark already covers it.
-        let cutoff = earliest_notice(&self.observations).map_or(cutoff,
+        let cutoff = self.queue.earliest_notice().map_or(cutoff,
             |first| Some(cutoff.map_or(first, |bound| bound.min(first))));
         self.ingress.as_ref()?.certificate(cutoff)
     }
@@ -334,47 +351,13 @@ impl<'a> Selector<'a> {
     }
 
     pub(in crate::platform::windows) fn deferred_read(&self, expected: ReadBinding) -> bool {
-        self.observations.iter().any(|(arrived, item)| {
-            *arrived < expected.deadline_qpc
-                && matches!(item, ContextDelivery::Observation(Observation::Item { evidence, .. })
-                    if evidence.read_binding() == Some(expected))
-        })
+        self.queue.deferred_read(expected)
     }
 
+    /// The staged context deliveries ready at `at` (`ContextQueue::ready`).
     pub(in crate::platform::windows) fn observations(&mut self, at: QpcTick) -> Vec<(QpcTick, ContextDelivery)> {
         let before = self.context_before();
-        let mut ready = Vec::new();
-        let mut retained = VecDeque::new();
-        let mut optional_waiting = false;
-        for _ in 0..self.observations.len() {
-            if ready.len() == WORK_PER_POLL { break; }
-            let Some((arrived, item)) = self.observations.pop_front() else { break; };
-            let item = match &item {
-                ContextDelivery::Observation(Observation::Item { evidence, .. }) => {
-                    let essential = matches!(evidence, ContextEvidence::Notice(_));
-                    let covered = before.is_some_and(|before| evidence.source().1 < before);
-                    if arrived > at || (!essential && optional_waiting) || !covered {
-                        optional_waiting |= !essential;
-                        retained.push_back((arrived, item));
-                        continue;
-                    }
-                    if let Some(read) = evidence.read_binding() && arrived >= read.deadline_qpc {
-                        ContextDelivery::Rejected(read, ReadUnavailable::TimedOut)
-                    } else {
-                        item
-                    }
-                }
-                _ if arrived > at || optional_waiting => {
-                    retained.push_back((arrived, item));
-                    continue;
-                }
-                _ => item,
-            };
-            ready.push((arrived, item));
-        }
-        retained.append(&mut self.observations);
-        self.observations = retained;
-        ready
+        self.queue.ready(before, at)
     }
 
     pub(in crate::platform::windows) fn take_input(&mut self, certificate: InputCertificate, accept: impl FnMut(InputEvidence)) {
@@ -385,7 +368,7 @@ impl<'a> Selector<'a> {
 
     pub(in crate::platform::windows) fn take_interruption(&mut self) -> Option<QpcTick> { self.interrupted.take() }
 
-    pub(in crate::platform::windows) fn take_loss(&mut self) -> Option<(VisitBinding, QpcTick, CoverageReason, Option<ProducerGap>)> {
+    pub(in crate::platform::windows) fn take_loss(&mut self) -> Option<CoverageLossReport> {
         self.loss.take()
     }
 
@@ -399,14 +382,14 @@ impl<'a> Selector<'a> {
     }
 
     pub(in crate::platform::windows) fn take_context_pressure(&mut self) -> Option<ContextGap> {
-        self.context_pressure.take()
+        self.queue.take_pressure()
     }
 
-    pub(in crate::platform::windows) fn take_optional_loss(&mut self) -> Option<(QpcTick, QpcTick, u32)> {
-        self.optional_dropped.take()
+    pub(in crate::platform::windows) fn take_optional_loss(&mut self) -> Option<LossSpan> {
+        self.queue.take_optional_loss()
     }
 
-    pub(in crate::platform::windows) fn take_recovered(&mut self) -> Option<(VisitBinding, QpcTick, HeldSnapshot)> {
+    pub(in crate::platform::windows) fn take_recovered(&mut self) -> Option<Recovered> {
         self.recovered.take()
     }
 
@@ -431,7 +414,7 @@ impl<'a> Selector<'a> {
     /// source change (E1). Stopping is not a latch: its standard records stay
     /// inventory-only.
     pub(in crate::platform::windows) fn source_latched(&self) -> bool {
-        !self.stopping && !self.collector_lost && matches!(self.classifier.current.as_ref().map(|(_, value)| value), Some(Foreground::Elevated(_)))
+        !self.stopping && !self.collector_lost && self.classifier.current.as_ref().is_some_and(|(_, value)| value.is_elevated())
     }
 
     /// Records of an interrupted visit past its certified prefix (E1). They
@@ -460,7 +443,7 @@ impl<'a> Selector<'a> {
         // The host stays attached: `stop` still sends Control::Stop and waits
         // for the terminal acknowledgement within the cleanup bound (E4).
         self.opened = None;
-        retire_observations(&mut self.observations, &mut self.closed_before, self.frames, self.session_status);
+        self.retire_queue();
         self.focus_deadline = None;
         self.recovered = None;
     }
@@ -477,6 +460,8 @@ impl<'a> Selector<'a> {
         let now = clock::qpc().map_err(|_| Failure::Supervisor)?;
         let cleanup_deadline_qpc = add_time(now, self.frequency, deadline.saturating_duration_since(Instant::now()))?;
         host.send_stop(cutoff.min(now), cleanup_deadline_qpc)?;
+        let frames = self.frames;
+        let restrict = |visit, before| restrict_visit(frames, session, visit, before);
         let mut stopped = false;
         loop {
             for _ in 0..WORK_PER_POLL {
@@ -489,20 +474,15 @@ impl<'a> Selector<'a> {
                     {
                         return Err(Failure::Protocol);
                     }
-                    if let Some((visit, before)) = status_restriction(status, now) {
-                        restrict_visit(self.frames, self.session_status, visit, before);
-                        if self.ingress.as_ref().is_some_and(|ingress| ingress.visit() == visit) {
-                            keep_earlier(&mut self.closed_before, before);
-                        }
-                    }
+                    apply_status_restriction(status, now, self.ingress.as_ref(), &mut self.closed_before, restrict);
                 }
                 match status {
-                    Some(screen_fix_protocol::ipc::elevated::runtime::Status::Stopped) => {
+                    Some(Status::Stopped) => {
                         if !closed { return Err(Failure::Protocol); }
                         session.update_elevated_evidence(|evidence| evidence.stopped = true);
                         stopped = true;
                     }
-                    Some(screen_fix_protocol::ipc::elevated::runtime::Status::Closed { visit, before_qpc })
+                    Some(Status::Closed { visit, before_qpc })
                         if active.is_some_and(|active| same_grant(active, visit)) =>
                     {
                         keep_earlier(&mut self.closed_before, before_qpc);
@@ -577,16 +557,18 @@ impl<'a> Selector<'a> {
                 if self.host.is_some() {
                     // The request belongs to this switch; a sleep restarts it.
                     let suspends = session.suspend_marks().sequence;
-                    let current = self.helper_check.filter(|(epoch, sequence, _, _)| *epoch == phase.epoch && *sequence == suspends);
-                    let (_, _, requested, until) = match current {
+                    let current = self.helper_check.filter(|check| check.epoch == phase.epoch && check.suspends == suspends);
+                    let check = match current {
                         Some(check) => check,
                         None => {
                             session.request_input_check();
-                            *self.helper_check.insert((phase.epoch, suspends, progress.now, Instant::now() + READINESS))
+                            *self.helper_check.insert(HelperCheck {
+                                epoch: phase.epoch, suspends, requested: progress.now, until: Instant::now() + READINESS,
+                            })
                         }
                     };
-                    if checked <= requested {
-                        if Instant::now() < until { return Ok(()); }
+                    if checked <= check.requested {
+                        if Instant::now() < check.until { return Ok(()); }
                         self.stage = SourceStage::Readiness;
                         return Err(Failure::StandardHelperUnavailable);
                     }
@@ -708,178 +690,176 @@ impl<'a> Selector<'a> {
     }
 
     fn poll_host(&mut self, active: Option<AdmissionBoundary>) -> Result<()> {
-        let session = self.session_status;
-        let Some(host) = self.host.as_mut() else { return Ok(()); };
+        if self.host.is_none() { return Ok(()); }
+        self.poll_status(active)?;
+        self.poll_observations()?;
+        self.poll_input(active)?;
+        self.revoke_on_pressure()
+    }
+
+    /// Apply up to `WORK_PER_POLL` collector statuses.
+    fn poll_status(&mut self, active: Option<AdmissionBoundary>) -> Result<()> {
+        let (frames, session) = (self.frames, self.session_status);
+        let restrict = |visit, before| restrict_visit(frames, session, visit, before);
         for _ in 0..WORK_PER_POLL {
+            let Some(host) = self.host.as_mut() else { break; };
             let Some(status) = host.next_status()? else { break; };
             let now = clock::qpc().map_err(|_| Failure::Supervisor)?;
-            if let Some((visit, before)) = status_restriction(&status, now) {
-                restrict_visit(self.frames, self.session_status, visit, before);
-                if self.ingress.as_ref().is_some_and(|ingress| ingress.visit() == visit) {
-                    keep_earlier(&mut self.closed_before, before);
+            apply_status_restriction(&status, now, self.ingress.as_ref(), &mut self.closed_before, restrict);
+            let change = host.status(status, now)?;
+            self.apply_change(change, active, now)?;
+        }
+        Ok(())
+    }
+
+    /// Apply the grant change of one collector status, applied at `now`.
+    fn apply_change(&mut self, change: Change, active: Option<AdmissionBoundary>, now: QpcTick) -> Result<()> {
+        let session = self.session_status;
+        match change {
+            Change::None => {}
+            Change::Configured => session.update_elevated_evidence(|evidence| evidence.configured = true),
+            Change::Registered { binding, at, registration, held } => {
+                session.elevated_registration(binding.epoch, at, registration, held);
+            }
+            Change::ReadRejected { read, reason } => {
+                if self.opened.is_some_and(|opened| opened.binding == read.visit) {
+                    let frames = self.frames;
+                    self.queue.push(now, ContextDelivery::Rejected(read, reason),
+                        |visit, before| restrict_visit(frames, session, visit, before));
                 }
             }
-            match host.status(status, now)? {
-                Change::None => {}
-                Change::Configured => session.update_elevated_evidence(|evidence| evidence.configured = true),
-                Change::Registered { binding, at, registration, held } => {
-                    session.elevated_registration(binding.epoch, at, registration, held);
+            Change::InputOpened { binding, focus, completed, snapshot, coverage, registration } => {
+                self.queue.clear();
+                self.opened = Some(OpenVisit { binding, completed, held: snapshot, focus, coverage, registration });
+                self.ingress = Some(Ingress::new(binding, focus, completed, coverage.before_qpc));
+                self.closed_before = None;
+                self.focus_deadline = None;
+                self.pending = None;
+            }
+            Change::InputClosed { binding, before, loss } => {
+                self.retire_queue();
+                self.opened = None;
+                keep_earlier(&mut self.interrupted, before);
+                keep_earlier(&mut self.closed_before, before);
+                if let Some((cause, gap)) = loss {
+                    self.loss = Some(CoverageLossReport { binding, before, cause, gap });
                 }
-                Change::ReadRejected { read, reason } => {
-                    if self.opened.is_some_and(|opened| opened.binding == read.visit) {
-                        if self.observations.len() == CONTEXT_CAPACITY {
-                            drop_optional(&mut self.optional_dropped, read.requested_qpc);
-                        } else {
-                            self.observations.push_back((now, ContextDelivery::Rejected(read, reason)));
-                        }
-                    }
+            }
+            Change::Invalidated { binding, before, reason } => {
+                self.retire_queue();
+                self.opened = None;
+                keep_earlier(&mut self.interrupted, before);
+                keep_earlier(&mut self.closed_before, before);
+                self.focus_deadline = None;
+                match reason {
+                    Revocation::Requested | Revocation::Environment | Revocation::Stopping => {}
+                    // D-8 A: a target change is a transition. Before admission the
+                    // candidate is prepared again within its readiness budget.
+                    Revocation::Foreground | Revocation::Focus | Revocation::LateNotice
+                        if session.started() => session.require_source_change(binding.epoch),
+                    Revocation::Foreground | Revocation::Focus | Revocation::LateNotice => {}
+                    reason => return Err(revocation_failure(reason).ok_or(Failure::Protocol)?),
                 }
-                Change::InputOpened { binding, focus, completed, snapshot, coverage, registration } => {
-                    self.observations.clear();
-                    self.opened = Some(OpenVisit { binding, completed, held: snapshot, focus, coverage, registration });
-                    self.ingress = Some(Ingress::new(binding, focus, completed, coverage.before_qpc));
-                    self.closed_before = None;
-                    self.focus_deadline = None;
+            }
+            Change::Closed { binding, before } => {
+                keep_earlier(&mut self.interrupted, before);
+                keep_earlier(&mut self.closed_before, before);
+                self.focus_deadline = None;
+                self.geometry_revision = None;
+                // Before admission the startup candidate stays pending (D-8 A).
+                if active.is_none() && session.started()
+                    && self.pending.as_ref().is_some_and(|pending| pending.epoch == binding.epoch)
+                {
+                    session.abandon_source_preparation(binding.epoch);
                     self.pending = None;
                 }
-                Change::InputClosed { binding, before, loss } => {
-                    retire_observations(&mut self.observations, &mut self.closed_before, self.frames, self.session_status);
-                    self.opened = None;
-                    keep_earlier(&mut self.interrupted, before);
-                    keep_earlier(&mut self.closed_before, before);
-                    if let Some((cause, gap)) = loss {
-                        self.loss = Some((binding, before, cause, gap));
-                    }
-                }
-                Change::Invalidated { binding, before, reason } => {
-                    retire_observations(&mut self.observations, &mut self.closed_before, self.frames, self.session_status);
-                    self.opened = None;
-                    keep_earlier(&mut self.interrupted, before);
-                    keep_earlier(&mut self.closed_before, before);
-                    self.focus_deadline = None;
-                    match reason {
-                        Revocation::Requested | Revocation::Environment | Revocation::Stopping => {}
-                        // D-8 A: a target change is a transition. Before admission the
-                        // candidate is prepared again within its readiness budget.
-                        Revocation::Foreground | Revocation::Focus | Revocation::LateNotice
-                            if session.started() => session.require_source_change(binding.epoch),
-                        Revocation::Foreground | Revocation::Focus | Revocation::LateNotice => {}
-                        reason => return Err(revocation_failure(reason).ok_or(Failure::Protocol)?),
-                    }
-                }
-                Change::Closed { binding, before } => {
-                    keep_earlier(&mut self.interrupted, before);
-                    keep_earlier(&mut self.closed_before, before);
-                    self.focus_deadline = None;
-                    self.geometry_revision = None;
-                    // Before admission the startup candidate stays pending (D-8 A).
-                    if active.is_none() && session.started()
-                        && self.pending.as_ref().is_some_and(|pending| pending.epoch == binding.epoch)
-                    {
-                        session.abandon_source_preparation(binding.epoch);
-                        self.pending = None;
-                    }
-                }
-                // D-8 A: a target change during preparation is a transition.
-                // Before admission the candidate is prepared again within its
-                // readiness budget. After admission the preparation is dropped,
-                // the epoch stays closed and the foreground is classified fresh.
-                Change::PrepareRejected { binding } => {
-                    if session.started() {
-                        if active.is_some() || self.pending.as_ref().is_none_or(|pending| pending.epoch != binding.epoch) {
-                            return Err(Failure::Protocol);
-                        }
-                        session.abandon_source_preparation(binding.epoch);
-                        self.pending = None;
-                    }
-                }
-                Change::Stopped => return Err(Failure::PeerExited),
             }
+            // D-8 A: a target change during preparation is a transition.
+            // Before admission the candidate is prepared again within its
+            // readiness budget. After admission the preparation is dropped,
+            // the epoch stays closed and the foreground is classified fresh.
+            Change::PrepareRejected { binding } => {
+                if session.started() {
+                    if active.is_some() || self.pending.as_ref().is_none_or(|pending| pending.epoch != binding.epoch) {
+                        return Err(Failure::Protocol);
+                    }
+                    session.abandon_source_preparation(binding.epoch);
+                    self.pending = None;
+                }
+            }
+            Change::Stopped => return Err(Failure::PeerExited),
         }
-        let frames = self.frames;
-        let session_status = self.session_status;
-        let restrict = |visit, before| restrict_visit(frames, session_status, visit, before);
+        Ok(())
+    }
+
+    /// Hand up to `WORK_PER_POLL` collector observations to the ingress and
+    /// stage the open visit's context deliveries.
+    fn poll_observations(&mut self) -> Result<()> {
+        let Some(host) = self.host.as_mut() else { return Ok(()); };
+        let (frames, session) = (self.frames, self.session_status);
+        let restrict = |visit, before| restrict_visit(frames, session, visit, before);
         for _ in 0..WORK_PER_POLL {
             let Some((arrived, observation)) = host.next_observation()? else { break; };
-            if let Some((visit, completed, snapshot)) = host.observation(&observation, arrived)?
-                && self.ingress.as_ref().is_some_and(|ingress| ingress.can_synchronize(visit, completed))
+            if let Some(recovered) = host.observation(&observation, arrived)?
+                && self.ingress.as_ref().is_some_and(|ingress| ingress.can_synchronize(recovered.binding, recovered.completed))
             {
                 host.recovered();
-                self.recovered = Some((visit, completed, snapshot));
+                self.recovered = Some(recovered);
             }
             let same_visit = if let Some(ingress) = &mut self.ingress {
                 ingress.observation(&observation, arrived, restrict)?
             } else { false };
-            if same_visit && self.opened.is_none()
-                && let Observation::Item { evidence: ContextEvidence::Notice(notice), .. } = &observation
-            {
-                keep_earlier(&mut self.closed_before, notice.first_qpc);
-                restrict(notice.visit, notice.first_qpc);
+            if same_visit && self.opened.is_none() {
+                cut_at_notice(&observation, &mut self.closed_before, restrict);
             }
             if same_visit && self.opened.is_some()
                 && !matches!(observation, Observation::Progress { .. } | Observation::Item { evidence: ContextEvidence::Held(_), .. })
             {
-                if self.observations.len() == CONTEXT_CAPACITY {
-                    match observation {
-                        Observation::Item { producer: ContextProducer::Notices, position, evidence: ContextEvidence::Notice(notice) } => {
-                            restrict(notice.visit, notice.first_qpc);
-                            if let Some(gap) = &mut self.context_pressure {
-                                gap.last_position = position;
-                                gap.first_qpc = gap.first_qpc.min(notice.first_qpc);
-                                gap.last_qpc = gap.last_qpc.max(notice.observed_qpc);
-                            } else {
-                                self.context_pressure = Some(ContextGap { visit: notice.visit, producer: ContextProducer::Notices,
-                                    cause: ContextGapCause::Overflow, first_position: position, last_position: position, first_qpc: notice.first_qpc,
-                                    last_qpc: notice.observed_qpc });
-                            }
-                        }
-                        Observation::Gap(gap) if gap.producer == ContextProducer::Notices => {
-                            if let Some(previous) = &mut self.context_pressure {
-                                previous.last_position = gap.last_position;
-                                previous.first_qpc = previous.first_qpc.min(gap.first_qpc);
-                                previous.last_qpc = previous.last_qpc.max(gap.last_qpc);
-                            } else {
-                                self.context_pressure = Some(gap);
-                            }
-                        }
-                        Observation::Item { evidence, .. } => drop_optional(&mut self.optional_dropped, evidence.source().1),
-                        Observation::Gap(gap) => drop_optional(&mut self.optional_dropped, gap.first_qpc),
-                        _ => {}
-                    }
-                } else {
-                    self.observations.push_back((arrived, ContextDelivery::Observation(observation)));
-                }
+                self.queue.push(arrived, ContextDelivery::Observation(observation), restrict);
             }
         }
+        Ok(())
+    }
+
+    /// Hand the collector's input to the ingress while a visit is open, or
+    /// while the closing visit's input still drains before admission.
+    fn poll_input(&mut self, active: Option<AdmissionBoundary>) -> Result<()> {
+        let Some(host) = self.host.as_ref() else { return Ok(()); };
         if self.opened.is_some() || (active.is_none() && self.closed_before.is_some()
             && (host.awaiting_close() || host.binding().is_none()))
         {
-            for _ in 0..WORK_PER_POLL {
-                let Some(record) = host.next_input()? else { break; };
-                let now = clock::qpc().map_err(|_| Failure::Supervisor)?;
-                if let Some(ingress) = &mut self.ingress {
-                    match record {
-                        Some(record) => ingress.input(record, now, restrict)?,
-                        None => ingress.malformed(restrict),
-                    }
-                }
-            }
+            let (frames, session) = (self.frames, self.session_status);
+            drain_input(host, &mut self.ingress, |visit, before| restrict_visit(frames, session, visit, before), false)?;
         }
+        Ok(())
+    }
+
+    /// Staging pressure ends the open visit before its first unstaged
+    /// record: the visit is restricted, interrupted and revoked.
+    fn revoke_on_pressure(&mut self) -> Result<()> {
+        let Some(host) = self.host.as_mut() else { return Ok(()); };
+        let (frames, session) = (self.frames, self.session_status);
+        let restrict = |visit, before| restrict_visit(frames, session, visit, before);
         let pressure = self.ingress.as_ref().and_then(Ingress::pressure_before);
         if let Some(before) = pressure { keep_earlier(&mut self.closed_before, before); }
-        let local_cutoff = pressure
-            .into_iter().chain(self.context_pressure.map(|gap| gap.first_qpc)).min();
+        let local_cutoff = pressure.into_iter().chain(self.queue.pressure_first()).min();
         if let Some(before) = local_cutoff
             && let Some(opened) = self.opened.take()
         {
             restrict(opened.binding, before);
             keep_earlier(&mut self.interrupted, before);
             keep_earlier(&mut self.closed_before, before);
-            retire_observations(&mut self.observations, &mut self.closed_before, self.frames, self.session_status);
+            self.queue.retire(&mut self.closed_before, restrict);
             session.require_source_change(opened.binding.epoch);
             host.revoke(before)?;
         }
         Ok(())
+    }
+
+    /// Drop the staged context deliveries (`ContextQueue::retire`).
+    fn retire_queue(&mut self) {
+        let (frames, session) = (self.frames, self.session_status);
+        self.queue.retire(&mut self.closed_before, |visit, before| restrict_visit(frames, session, visit, before));
     }
 
     fn environment(&mut self, bits: u32, at: QpcTick, limit: Option<Instant>) -> Result<()> {
@@ -912,7 +892,7 @@ impl<'a> Selector<'a> {
     }
 
     fn interrupt(&mut self, before: QpcTick) {
-        retire_observations(&mut self.observations, &mut self.closed_before, self.frames, self.session_status);
+        self.retire_queue();
         if self.opened.take().is_some() {
             keep_earlier(&mut self.interrupted, before);
         }
@@ -942,19 +922,28 @@ fn drain_closed_lanes(
             Err(failure) => return Err(failure),
         };
         let Some(ingress) = ingress.as_mut() else { continue; };
-        if ingress.observation(&record, arrived, restrict)?
-            && let Observation::Item { evidence: ContextEvidence::Notice(notice), .. } = record
-        {
-            keep_earlier(cutoff, notice.first_qpc);
-            restrict(notice.visit, notice.first_qpc);
+        if ingress.observation(&record, arrived, restrict)? {
+            cut_at_notice(&record, cutoff, restrict);
         }
     }
-    let mut input_exited = false;
+    let input_exited = drain_input(host, ingress, restrict, stopped)?;
+    if let Some(before) = ingress.as_ref().and_then(Ingress::pressure_before) {
+        keep_earlier(cutoff, before);
+    }
+    Ok(context_exited && input_exited)
+}
+
+/// Hand up to `WORK_PER_POLL` input records to the `ingress`; without one a
+/// record is dropped. Returns whether the input lane exited, which ends the
+/// drain only once the collector `stopped`.
+fn drain_input(
+    host: &Host, ingress: &mut Option<Ingress>, restrict: impl Fn(VisitBinding, QpcTick) + Copy, stopped: bool,
+) -> Result<bool> {
     for _ in 0..WORK_PER_POLL {
         let record = match host.next_input() {
             Ok(Some(record)) => record,
             Ok(None) => break,
-            Err(Failure::PeerExited) if stopped => { input_exited = true; break; }
+            Err(Failure::PeerExited) if stopped => return Ok(true),
             Err(failure) => return Err(failure),
         };
         let Some(ingress) = ingress.as_mut() else { continue; };
@@ -964,45 +953,31 @@ fn drain_closed_lanes(
             None => ingress.malformed(restrict),
         }
     }
-    if let Some(before) = ingress.as_ref().and_then(Ingress::pressure_before) {
-        keep_earlier(cutoff, before);
-    }
-    Ok(context_exited && input_exited)
+    Ok(false)
 }
 
-fn drop_optional(loss: &mut Option<(QpcTick, QpcTick, u32)>, at: QpcTick) {
-    if let Some((first, last, count)) = loss {
-        *first = (*first).min(at);
-        *last = (*last).max(at);
-        *count = count.saturating_add(1);
-    } else {
-        *loss = Some((at, at, 1));
-    }
-}
-
-/// The native notices among the undelivered observations.
-fn pending_notices(
-    observations: &VecDeque<(QpcTick, ContextDelivery)>,
-) -> impl Iterator<Item = &NativeObservation<WindowNotice>> + '_ {
-    observations.iter().filter_map(|(_, delivery)| match delivery {
-        ContextDelivery::Observation(Observation::Item { evidence: ContextEvidence::Notice(notice), .. }) => Some(notice),
-        _ => None,
-    })
-}
-
-fn earliest_notice(observations: &VecDeque<(QpcTick, ContextDelivery)>) -> Option<QpcTick> {
-    pending_notices(observations).map(|notice| notice.first_qpc).min()
-}
-
-fn retire_observations(
-    observations: &mut VecDeque<(QpcTick, ContextDelivery)>, cutoff: &mut Option<QpcTick>,
-    frames: &FramePolicy, session: &WorkerSession,
-) {
-    if let Some(notice) = pending_notices(observations).min_by_key(|notice| notice.first_qpc) {
+/// A native notice of a visit whose input closed ends its coverage, and the
+/// closing `cutoff`, before the notice's first possible receipt.
+fn cut_at_notice(observation: &Observation, cutoff: &mut Option<QpcTick>, restrict: impl Fn(VisitBinding, QpcTick)) {
+    if let Observation::Item { evidence: ContextEvidence::Notice(notice), .. } = observation {
         keep_earlier(cutoff, notice.first_qpc);
-        restrict_visit(frames, session, notice.visit, notice.first_qpc);
+        restrict(notice.visit, notice.first_qpc);
     }
-    observations.clear();
+}
+
+/// Restrict the visit that `status` closed, invalidated, suspended or sent
+/// to a resync, before the stamp it names; the closing `cutoff` of the
+/// staging `ingress` visit falls to that stamp too.
+fn apply_status_restriction(
+    status: &Status, now: QpcTick, ingress: Option<&Ingress>, cutoff: &mut Option<QpcTick>,
+    restrict: impl Fn(VisitBinding, QpcTick),
+) {
+    if let Some((visit, before)) = status_restriction(status, now) {
+        restrict(visit, before);
+        if ingress.is_some_and(|ingress| ingress.visit() == visit) {
+            keep_earlier(cutoff, before);
+        }
+    }
 }
 
 fn revocation_failure(reason: Revocation) -> Option<Failure> {
@@ -1031,10 +1006,6 @@ fn same_grant(left: VisitBinding, right: VisitBinding) -> bool {
         && left.foreground == right.foreground && left.witness_revision == right.witness_revision
 }
 
-fn keep_earlier(slot: &mut Option<QpcTick>, before: QpcTick) {
-    *slot = Some(slot.map_or(before, |old| old.min(before)));
-}
-
 fn required_registration(registration: InputRegistration, pen_hid: bool) -> bool {
     registration.required_ready() && (!pen_hid || registration.pen_hid)
 }
@@ -1058,18 +1029,9 @@ struct Classifier {
     checked_at: Option<Instant>,
 }
 
-struct ClassificationOwner;
-
-impl Drop for ClassificationOwner {
-    fn drop(&mut self) { CLASSIFIER_ACTIVE.store(false, Ordering::Release); }
-}
-
 impl Classifier {
     fn start(config: &ResolvedCaptureConfig) -> Result<Self> {
-        if CLASSIFIER_ACTIVE.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            return Err(Failure::Busy);
-        }
-        let owner = ClassificationOwner;
+        let owner = StaticLease::claim(&CLASSIFIER_ACTIVE).ok_or(Failure::Busy)?;
         let config = config.clone();
         let (request, incoming) = mpsc::sync_channel(1);
         let (done, completed) = mpsc::sync_channel(1);
@@ -1092,7 +1054,7 @@ impl Classifier {
             Ok((proof, value)) => {
                 self.pending = None;
                 let consistent = match &value {
-                    Foreground::Ordinary(approval) | Foreground::Elevated(approval) => approval.window() == proof,
+                    Foreground::Approved(approval) => approval.window() == proof,
                     _ => true,
                 };
                 if consistent && Some(proof) == foreground {

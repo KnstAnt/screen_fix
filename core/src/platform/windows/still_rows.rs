@@ -11,20 +11,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde_json::Value;
-
 use crate::{
     capture::frame::FrameCoverage,
     package::{
         diagnostics::{Failure, FailureComponent},
-        journal::{HealthRecord, JournalIngress, Submit},
+        journal::{Flush, HealthRecord, JournalIngress, Submit},
         outcome::{HealthKind, LossEvidence, LossReason},
     },
     protocol::{QpcFrequency, QpcTick, SessionTimeUs},
-    session::windows::{AwakeElapsed, SuspendMarks},
+    platform::windows::controller::{AwakeElapsed, PauseProducer, SuspendMarks, WorkerSession},
+    session::AdmissionBoundary,
 };
 
-use super::{ProbeError, package_journal_error, unavailable};
+use super::{ProbeError, clock, stills::StillRow, unavailable};
 
 const SLOTS: usize = 1024;
 const WAIT: Duration = Duration::from_secs(15);
@@ -76,7 +75,7 @@ impl Drop for Charge {
 
 #[derive(Default)]
 struct SharedSlot {
-    fallback: Option<Value>,
+    fallback: Option<StillRow>,
     expired: bool,
 }
 
@@ -91,34 +90,18 @@ impl StillCoverage {
 }
 
 struct Completed {
-    row: Value,
+    row: StillRow,
     coverage: Option<StillCoverage>,
 }
 
 impl Completed {
-    fn publishable(mut self) -> Value {
+    /// The row, withdrawn when its still is past its elevated visit's certified bound.
+    fn publishable(mut self) -> StillRow {
         if self.coverage.as_ref().is_some_and(|coverage| !coverage.allows()) {
-            self.row["kind"] = serde_json::json!("still_dropped");
-            for field in ["source_t_us", "frame_obs_id", "file", "width", "height", "frame", "settled_confirmed_t_us"] {
-                self.row[field] = Value::Null;
-            }
-            self.row["reason"] = serde_json::json!("elevated_frame_uncertified");
-            self.row["outcome"] = serde_json::json!({ "kind": "dropped", "reason": "elevated_frame_uncertified" });
+            self.row.withdraw_uncertified();
         }
         self.row
     }
-}
-
-/// One row per trigger (IMG-2): the before half's row with the seen frame's
-/// id, and the seen file only when it differs from the row's file.
-fn with_seen(mut row: Value, seen: Value) -> Value {
-    row["seen_obs_id"] = seen["frame_obs_id"].clone();
-    if let Some(file) = seen["file"].as_str().filter(|file| row["file"].as_str() != Some(*file)) {
-        row["seen_file"] = file.into();
-    }
-    row["seen_frame"] = seen["frame"].clone();
-    row["seen_outcome"] = seen["outcome"].clone();
-    row
 }
 
 /// A handle that finishes one half of its slot: the only half, or the
@@ -132,7 +115,7 @@ pub(super) struct Reservation {
 impl Reservation {
     /// Transition a private slot after the causal input has a durable EventRef.
     /// The producer owns the terminal row even if a monitor has stopped.
-    pub fn approve(&self, fallback: Value) -> bool {
+    pub fn approve(&self, fallback: StillRow) -> bool {
         let mut shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
         if shared.expired { return false; }
         shared.fallback = Some(fallback);
@@ -143,11 +126,11 @@ impl Reservation {
         let _ = self.result.try_send((self.half, None));
     }
 
-    pub fn finish(self, row: Value) {
+    pub fn finish(self, row: StillRow) {
         self.finish_frame(row, None);
     }
 
-    pub fn finish_frame(self, row: Value, coverage: Option<StillCoverage>) {
+    pub fn finish_frame(self, row: StillRow, coverage: Option<StillCoverage>) {
         let _ = self.result.try_send((self.half, Some(Completed { row, coverage })));
     }
 }
@@ -165,11 +148,11 @@ struct Slot {
 
 impl Slot {
     /// The slot's row once every half is in; none when it was suppressed.
-    fn row(self) -> Option<Value> {
+    fn row(self) -> Option<StillRow> {
         let [row, seen] = self.halves;
         let row = row?.publishable();
         Some(match seen {
-            Some(seen) => with_seen(row, seen.publishable()),
+            Some(seen) => row.join_seen(seen.publishable()),
             None => row,
         })
     }
@@ -199,12 +182,12 @@ pub(super) struct Rows(Arc<Producer>);
 
 impl Rows {
     /// A failed reservation reports why, so a public caller can account it with `note_loss`.
-    pub fn reserve(&self, at: SessionTimeUs, fallback: Option<Value>) -> Result<Reservation, LossReason> {
+    pub fn reserve(&self, at: SessionTimeUs, fallback: Option<StillRow>) -> Result<Reservation, LossReason> {
         self.reserve_halves(at, fallback, 1)
     }
 
     /// Reserve a public row; a failure is accounted as a loss.
-    pub fn reserve_public(&self, at: SessionTimeUs, fallback: Value) -> Option<Reservation> {
+    pub fn reserve_public(&self, at: SessionTimeUs, fallback: StillRow) -> Option<Reservation> {
         self.reserve(at, Some(fallback)).inspect_err(|reason| self.note_loss(at, *reason)).ok()
     }
 
@@ -216,7 +199,7 @@ impl Rows {
         Ok([before, seen])
     }
 
-    fn reserve_halves(&self, at: SessionTimeUs, fallback: Option<Value>, halves: u8) -> Result<Reservation, LossReason> {
+    fn reserve_halves(&self, at: SessionTimeUs, fallback: Option<StillRow>, halves: u8) -> Result<Reservation, LossReason> {
         let producer = &self.0;
         if producer.progress.excluded.load(Ordering::Acquire) {
             return Err(LossReason::ProducerStall);
@@ -256,10 +239,10 @@ struct Lane {
 }
 
 /// QPC time for the lane-stall watch, which excludes sleep (S0).
-pub(super) struct Awake {
-    pub now: QpcTick,
-    pub marks: SuspendMarks,
-    pub frequency: QpcFrequency,
+struct Awake {
+    now: QpcTick,
+    marks: SuspendMarks,
+    frequency: QpcFrequency,
 }
 
 impl Awake {
@@ -268,7 +251,61 @@ impl Awake {
     }
 }
 
-pub(super) struct Merge {
+/// The still journal's writer: the receipt-ordered merge of the producer
+/// lanes, and the pause cutoff and journal flush revision it last flushed for.
+pub(super) struct StillJournal {
+    merge: Merge,
+    flushed: Option<AdmissionBoundary>,
+    revision: u64,
+}
+
+impl StillJournal {
+    /// One producer lane per `count`.
+    pub fn new(count: usize) -> (Vec<Rows>, Self) {
+        let (rows, merge) = Merge::new(count);
+        (rows, Self { merge, flushed: None, revision: 0 })
+    }
+
+    /// Take the controller's current journal flush revision as served.
+    pub fn open(&mut self, session: &WorkerSession) {
+        self.revision = session.journal_flush_revision();
+    }
+
+    /// Publish the certified prefix. Once it includes the cutoff of a pause,
+    /// flush the journal to disk and finish the pause for the stills; flush
+    /// it again for each new journal flush revision.
+    pub fn service(&mut self, journal: &mut JournalIngress, session: &WorkerSession, frequency: QpcFrequency)
+        -> Result<(), ProbeError>
+    {
+        let awake = Awake { now: clock::qpc()?, marks: session.suspend_marks(), frequency };
+        self.merge.publish(journal, Instant::now(), &awake)?;
+        if let Some(pause) = session.paused_cutoff().filter(|pause| self.flushed != Some(*pause))
+            && self.merge.includes(pause.time)
+        {
+            journal.flush_wait(Flush::Os, pause.time)?;
+            self.flushed = Some(pause);
+            session.finish_pause(pause, PauseProducer::Stills);
+        }
+        let latest = session.journal_flush_revision();
+        if latest != self.revision {
+            journal.flush_wait(Flush::Os, self.merge.latest_receipt())?;
+            self.revision = latest;
+        }
+        Ok(())
+    }
+
+    /// Publish the rest of the journal once every lane closed.
+    pub fn finish(&mut self, journal: &mut JournalIngress) -> Result<(), ProbeError> {
+        self.merge.finish(journal)
+    }
+
+    /// Whether a row queued to the journal names this image (`file` relative to `raw/`).
+    pub fn references(&self, file: &str) -> bool {
+        self.merge.references(file)
+    }
+}
+
+struct Merge {
     receive: Receiver<Slot>,
     lanes: Vec<Lane>,
     budget: Arc<Budget>,
@@ -281,7 +318,7 @@ pub(super) struct Merge {
 }
 
 impl Merge {
-    pub fn new(count: usize) -> (Vec<Rows>, Self) {
+    fn new(count: usize) -> (Vec<Rows>, Self) {
         let (send, receive) = sync_channel(SLOTS);
         let budget = Arc::new(Budget::default());
         let mut rows = Vec::with_capacity(count);
@@ -297,7 +334,7 @@ impl Merge {
         })
     }
 
-    pub fn finish(&mut self, journal: &mut JournalIngress) -> Result<(), ProbeError> {
+    fn finish(&mut self, journal: &mut JournalIngress) -> Result<(), ProbeError> {
         if self.lanes.iter().any(|lane| !lane.progress.closed.load(Ordering::Acquire)) {
             return Err(unavailable("A still producer did not close before journal finalization"));
         }
@@ -310,18 +347,17 @@ impl Merge {
         Ok(())
     }
 
-    pub fn publish(&mut self, journal: &mut JournalIngress, now: Instant, awake: &Awake) -> Result<(), ProbeError> {
+    fn publish(&mut self, journal: &mut JournalIngress, now: Instant, awake: &Awake) -> Result<(), ProbeError> {
         self.publish_prefix(journal, now, Some(awake))
     }
 
-    pub fn latest_receipt(&self) -> SessionTimeUs { self.last }
+    fn latest_receipt(&self) -> SessionTimeUs { self.last }
 
-    /// Whether a row queued to the journal names this image (`file` relative to `raw/`).
-    pub fn references(&self, file: &str) -> bool {
+    fn references(&self, file: &str) -> bool {
         self.referenced.contains(file)
     }
 
-    pub fn includes(&self, cutoff: SessionTimeUs) -> bool {
+    fn includes(&self, cutoff: SessionTimeUs) -> bool {
         self.certified_before > cutoff && self.ordered.first_key_value().is_none_or(|(key, _)| key.0 > cutoff)
     }
 
@@ -345,7 +381,7 @@ impl Merge {
                 // A coalesced public loss occupies its terminal receipt.
                 // Earlier valid rows keep their own receipt order.
                 let loss = LossEvidence::ordinary(reason, None, gap.count, gap.first, gap.last);
-                journal.record_loss(loss, at).map_err(package_journal_error)?;
+                journal.record_loss(loss, at)?;
                 self.last = at;
             }
             let Some(mut entry) = self.ordered.first_entry() else { break; };
@@ -378,11 +414,7 @@ impl Merge {
                     shared.expired = true;
                     let mut fallback = shared.fallback.take();
                     if error == TryRecvError::Empty && let Some(row) = fallback.as_mut() {
-                        let reason = row["reason"].take();
-                        row["fallback_reason"] = reason;
-                        row["reason"] = serde_json::json!(
-                            if finishing { "still_owner_closed" } else { "still_ordered_deadline" }
-                        );
+                        row.deadline(finishing);
                     }
                     fallback
                 }
@@ -391,8 +423,9 @@ impl Merge {
                 if key.0 < self.last {
                     self.budget.omit(key.0, LossReason::LateRow);
                 } else {
-                    let files = images(&row);
-                    if journal.try_submit(key.0, row).map_err(package_journal_error)? == Submit::Queued {
+                    let files: Vec<String> = row.images().map(str::to_owned).collect();
+                    let row = row.value().map_err(|_| unavailable("Encode a still row"))?;
+                    if journal.try_submit(key.0, row)? == Submit::Queued {
                         self.referenced.extend(files);
                     }
                     self.last = key.0;
@@ -404,9 +437,9 @@ impl Merge {
                 kind: HealthKind::StillProgressStall,
                 failure: Failure::new(FailureComponent::Stills, "Advance the still producer progress", None),
                 detected: self.last, first_affected: None, ongoing: true, monitor: None, count: Some(stalled),
-            }).map_err(package_journal_error)?;
+            })?;
         }
-        journal.offer_gap(self.last).map_err(package_journal_error)?;
+        journal.offer_gap(self.last)?;
         Ok(())
     }
 
@@ -444,7 +477,38 @@ impl Merge {
     }
 }
 
-/// The image files a still row names, relative to `raw/`.
-fn images(row: &Value) -> Vec<String> {
-    ["file", "seen_file"].into_iter().filter_map(|field| row[field].as_str().map(str::to_owned)).collect()
+#[cfg(test)]
+mod tests {
+    use std::num::{NonZeroU32, NonZeroU64};
+
+    use super::*;
+    use crate::{platform::windows::stills::saved_row, protocol::{
+        AdmissionEpoch, ClockOrigin, FocusGeneration, WindowId,
+        ipc::{ProcessInstance, elevated::{VisitBinding, WindowInstance}},
+    }};
+
+    fn coverage(before: QpcTick, last: SessionTimeUs) -> StillCoverage {
+        let visit = VisitBinding {
+            epoch: AdmissionEpoch(1), source_generation: NonZeroU64::MIN, grant: NonZeroU64::MIN, witness_revision: 0,
+            foreground: WindowInstance {
+                window: WindowId(1), process: ProcessInstance { pid: NonZeroU32::MIN, creation_filetime: 0 }, thread: NonZeroU32::MIN,
+            },
+            focus_generation: FocusGeneration(0), focus_revision: 0, resync_revision: NonZeroU64::MIN,
+        };
+        let clock = ClockOrigin { origin_qpc: QpcTick(0), qpc_frequency: QpcFrequency(NonZeroU64::MIN.saturating_add(999_999)) };
+        let visit = FrameCoverage::new(visit, clock);
+        visit.restrict(before);
+        StillCoverage { visit: Arc::new(visit), last }
+    }
+
+    /// A still past its elevated visit's certified bound becomes a dropped row.
+    #[test]
+    fn publishable_bytes() -> serde_json::Result<()> {
+        let uncertified = Completed { row: saved_row(), coverage: Some(coverage(QpcTick(50), SessionTimeUs(100))) };
+        assert_eq!(serde_json::to_string(&uncertified.publishable().value()?)?,
+            r#"{"adjustment":null,"admission_epoch":3,"element":null,"event_ref":null,"file":null,"frame":null,"frame_obs_id":null,"geometry":{"epoch":2,"monitor":1},"height":null,"kind":"still_dropped","monitor":1,"outcome":{"kind":"dropped","reason":"elevated_frame_uncertified"},"reason":"elevated_frame_uncertified","role":"before","save":null,"scroll_device":null,"settled_confirmed_t_us":null,"source_t_us":null,"trigger":"pre_action","trigger_t_us":1000,"width":null}"#);
+        let certified = Completed { row: saved_row(), coverage: Some(coverage(QpcTick(200), SessionTimeUs(100))) };
+        assert_eq!(certified.publishable().value()?, saved_row().value()?);
+        Ok(())
+    }
 }

@@ -30,8 +30,10 @@ use crate::protocol::{EventRef, MonitorId, SessionTimeUs, StreamId, StreamSequen
 
 use super::{
     diagnostics::Failure,
-    outcome::{DroppedTotal, GapRecord, HealthKind, LossCount, LossEvidence, LossProducer, LossRange, LossReason, LossScope,
-        SuppressionClass, UiaOutcome, UiaRead},
+    metadata::InputBlind,
+    outcome::{DroppedTotal, HealthKind, LossCount, LossEvidence, LossProducer, LossRange, LossReason, LossScope,
+        OrdinaryLoss, SuppressionClass, UiaOutcome, UiaRead},
+    row::{BlindRow, RowCounts, RowKind, RowTally, stamp_receipt},
 };
 
 const BUFFER_INTERVAL: Duration = Duration::from_secs(1);
@@ -187,17 +189,11 @@ pub(crate) struct HealthRecord {
     pub(crate) count: Option<u64>,
 }
 
-/// The kind of a stream's health rows: input health conditions are
-/// `input_health` rows (INP-1, INP-12), like the per-second input counts.
-pub(super) fn health_kind(stream: StreamId) -> &'static str {
-    if stream == StreamId::Input { "input_health" } else { "health" }
-}
-
 impl HealthRecord {
     fn row(&self, stream: StreamId) -> Value {
         let failure = self.failure.without_report_detail();
         serde_json::json!({
-            "kind": health_kind(stream),
+            "kind": RowKind::health(stream),
             "health": self.kind,
             "component": failure.component(),
             "failure": failure,
@@ -215,7 +211,7 @@ impl HealthRecord {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum FinalRow {
     Health(HealthRecord),
-    Blind(super::metadata::InputBlind),
+    Blind(InputBlind),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,105 +220,17 @@ pub(crate) enum Submit {
     Dropped,
 }
 
-/// One pending ledger entry. Entries never merge across keys.
-#[derive(Clone, Copy, Debug)]
-struct PendingLoss {
-    reason: LossReason,
-    producer: Option<LossProducer>,
-    count: LossCount,
-    range: LossRange,
+/// Gap rows are written in ascending first loss time.
+fn gap_order(loss: &OrdinaryLoss) -> (SessionTimeUs, SessionTimeUs) {
+    (loss.range.first_t_us, loss.range.last_t_us)
 }
 
-impl PendingLoss {
-    fn merge(&mut self, other: Self) {
-        self.count = self.count.merge(other.count);
-        self.range = self.range.merge(other.range);
-    }
-
-    /// Gap rows are written in ascending first loss time.
-    fn order(&self) -> (SessionTimeUs, SessionTimeUs) {
-        (self.range.first_t_us, self.range.last_t_us)
-    }
-
-    fn record(&self) -> GapRecord {
-        let LossRange { first_t_us, last_t_us, source_seq, qpc } = self.range;
-        GapRecord {
-            reason: self.reason, producer: self.producer, count: self.count.known(),
-            count_known: self.count.known().is_some(), first_recv_t_us: first_t_us, last_recv_t_us: last_t_us,
-            first_source_seq: source_seq.map(|range| range[0]), last_source_seq: source_seq.map(|range| range[1]),
-            first_qpc: qpc.map(|range| range[0]), last_qpc: qpc.map(|range| range[1]),
-        }
-    }
-}
-
+/// Pending ledger entries never merge across keys.
 type LedgerKey = (LossReason, Option<LossProducer>);
 
 fn add_count<K: Ord>(totals: &mut BTreeMap<K, u64>, key: K, count: u64) {
     let total = totals.entry(key).or_default();
     *total = total.saturating_add(count);
-}
-
-/// The row kinds the manifest health summary reports. The writer tallies them
-/// when appending, so the summary and the reader's scan count the same rows.
-#[derive(Debug)]
-enum RowTally {
-    Plain,
-    Pause,
-    Blind,
-    /// A suppression interval with its duration in microseconds.
-    Suppressed(u64),
-    Unavailable(Unavailable),
-}
-
-impl RowTally {
-    fn of(value: &Value) -> Self {
-        match value.get("kind").and_then(Value::as_str) {
-            Some("pause") => Self::Pause,
-            Some("blind") => Self::Blind,
-            Some("suppressed_interval") => Self::Suppressed(suppressed_us(value)),
-            _ => Unavailable::of(value).map_or(Self::Plain, Self::Unavailable),
-        }
-    }
-}
-
-/// The duration of a `suppressed_interval` row, as the summary counts it.
-pub(super) fn suppressed_us(value: &Value) -> u64 {
-    value.get("end_t_us").and_then(Value::as_i64).zip(value.get("start_t_us").and_then(Value::as_i64))
-        .map_or(0, |(end, start)| end.saturating_sub(start).max(0) as u64)
-}
-
-/// A row that records an unavailable observation, for the rows whose stream
-/// defines an explicit outcome: a dropped still by its reason, and a focus or
-/// element read whose `uia` value is an outcome instead of an element.
-/// The reader applies the same rule.
-#[derive(Debug)]
-pub(super) enum Unavailable {
-    Still(Box<str>),
-    Uia(UiaRead, UiaOutcome),
-}
-
-impl Unavailable {
-    pub(super) fn of(value: &Value) -> Option<Self> {
-        let read = match value.get("kind").and_then(Value::as_str)? {
-            "still_dropped" => return Some(Self::Still(
-                value.get("reason").and_then(Value::as_str).unwrap_or("unspecified").into())),
-            "focus" => UiaRead::Focus,
-            "element" => UiaRead::Element,
-            _ => return None,
-        };
-        UiaOutcome::deserialize(value.get("uia")?).ok().map(|outcome| Self::Uia(read, outcome))
-    }
-
-    /// Count this row in a stream's unavailable totals.
-    pub(super) fn count(
-        &self, stills: &mut BTreeMap<String, u64>, uia: &mut BTreeMap<UiaRead, BTreeMap<UiaOutcome, u64>>,
-    ) {
-        let total = match self {
-            Self::Still(reason) => stills.entry(reason.to_string()).or_default(),
-            Self::Uia(read, outcome) => uia.entry(*read).or_default().entry(*outcome).or_default(),
-        };
-        *total += 1;
-    }
 }
 
 struct QueuedRow {
@@ -341,9 +249,19 @@ impl Drop for QueuedRow {
 enum Entry {
     Data(QueuedRow, Option<SyncSender<EventRef>>),
     Boundary(SessionTimeUs, Vec<(Box<[u8]>, RowTally)>),
-    Gaps(SessionTimeUs, Vec<PendingLoss>),
+    Gaps(SessionTimeUs, Vec<OrdinaryLoss>),
     Health(SessionTimeUs, Box<[u8]>),
     Flush(Flush, SyncSender<Result<(), JournalError>>),
+}
+
+impl Entry {
+    /// The step a disconnected writer fails for this entry.
+    fn step(&self) -> JournalStep {
+        match self {
+            Self::Flush(kind, _) => kind.step(),
+            _ => JournalStep::Append,
+        }
+    }
 }
 
 struct EntryCredit(Arc<AtomicUsize>);
@@ -379,19 +297,22 @@ struct IngressTotals {
 /// The single reserved message an ingress sends when it closes.
 struct IngressTail {
     admission: Option<SessionTimeUs>,
-    pending: Vec<PendingLoss>,
+    pending: Vec<OrdinaryLoss>,
     unreported_paused_health: BTreeMap<HealthKind, u64>,
     totals: IngressTotals,
 }
 
-/// How a gap batch may use the entry queue.
+/// How an entry may use the entry queue.
 #[derive(Clone, Copy)]
 enum Capacity {
-    /// Data-time emission; a full queue keeps the entries pending.
+    /// Within the normal entry limit; a full queue refuses the entry.
     Normal,
-    /// Lifecycle emission in the reserved room above the data limit; a full
-    /// reserve keeps the entries pending.
+    /// Lifecycle entries in the room reserved above the data limit; a full
+    /// reserve refuses the entry.
     Reserved,
+    /// Frames rows, outside the normal entry count: the frames queue has no
+    /// reserve, so its channel bound is the data limit.
+    Unreserved,
     /// Waits for room; only for owners that may wait on IO.
     Blocking,
 }
@@ -409,7 +330,7 @@ pub(crate) struct JournalIngress {
     peaks: Arc<QueuePeaks>,
     /// The latest receipt this ingress admitted: a queued or dropped row, or a ledger admission.
     last_admission: Option<SessionTimeUs>,
-    ledger: BTreeMap<LedgerKey, PendingLoss>,
+    ledger: BTreeMap<LedgerKey, OrdinaryLoss>,
     totals: IngressTotals,
     /// Health counted, not written, while the controller holds a pause.
     paused: Option<BTreeMap<HealthKind, u64>>,
@@ -435,18 +356,31 @@ impl JournalIngress {
         // for the resume rows (gate 4); they cover only receipts at or after the
         // pause cutoff, so a row admitted inside the pause keeps journal order.
         let ordered = self.paused.is_some() || self.emit_pending(receipt, Capacity::Normal)?;
-        if ordered && let Some(row) = row {
-            match self.offer_entry(Entry::Data(row, confirmation)) {
-                Ok(()) => return Ok(Submit::Queued),
-                Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Disconnected(_)) => return Err(self.error(JournalStep::Append, None)),
-            }
+        if ordered && let Some(row) = row && self.queue(Entry::Data(row, confirmation), Capacity::Normal)? {
+            return Ok(Submit::Queued);
         }
-        self.ledger_add(PendingLoss {
+        self.ledger_add(OrdinaryLoss {
             reason: LossReason::QueueOverflow, producer: None, count: LossCount::Known(std::num::NonZeroU64::MIN),
             range: LossRange { first_t_us: receipt, last_t_us: receipt, source_seq: None, qpc: None },
         }, receipt)?;
         Ok(Submit::Dropped)
+    }
+
+    /// Queue one entry in `room`. `false` means the room was full and the
+    /// entry was dropped; a disconnected writer is an error.
+    fn queue(&self, entry: Entry, room: Capacity) -> Result<bool, JournalError> {
+        let step = entry.step();
+        let sent = match room {
+            Capacity::Normal => self.offer_entry(entry),
+            Capacity::Reserved | Capacity::Unreserved => self.entries.try_send(QueuedEntry::priority(entry)),
+            Capacity::Blocking => self.entries.send(QueuedEntry::priority(entry))
+                .map_err(|mpsc::SendError(queued)| TrySendError::Disconnected(queued)),
+        };
+        match sent {
+            Ok(()) => Ok(true),
+            Err(TrySendError::Full(_)) => Ok(false),
+            Err(TrySendError::Disconnected(_)) => Err(self.error(step, None)),
+        }
     }
 
     fn offer_entry(&self, entry: Entry) -> Result<(), TrySendError<QueuedEntry>> {
@@ -526,7 +460,7 @@ impl JournalIngress {
                 Ok(())
             }
             LossScope::Ordinary(range) => {
-                let loss = PendingLoss { reason: evidence.reason, producer: evidence.producer, count: evidence.count, range };
+                let loss = OrdinaryLoss { reason: evidence.reason, producer: evidence.producer, count: evidence.count, range };
                 if !loss.record().is_valid(admitted) {
                     return Err(self.error(JournalStep::Order, None));
                 }
@@ -535,7 +469,7 @@ impl JournalIngress {
         }
     }
 
-    fn ledger_add(&mut self, loss: PendingLoss, admitted: SessionTimeUs) -> Result<(), JournalError> {
+    fn ledger_add(&mut self, loss: OrdinaryLoss, admitted: SessionTimeUs) -> Result<(), JournalError> {
         self.check_order(admitted)?;
         self.ledger.entry((loss.reason, loss.producer))
             .and_modify(|pending| pending.merge(loss))
@@ -551,18 +485,9 @@ impl JournalIngress {
         if self.ledger.is_empty() { return Ok(true); }
         self.check_order(admission)?;
         let mut gaps: Vec<_> = self.ledger.values().copied().collect();
-        gaps.sort_by_key(PendingLoss::order);
-        let entry = Entry::Gaps(admission, gaps);
-        let sent = match capacity {
-            Capacity::Normal => self.offer_entry(entry),
-            Capacity::Reserved => self.entries.try_send(QueuedEntry::priority(entry)),
-            Capacity::Blocking => self.entries.send(QueuedEntry::priority(entry))
-                .map_err(|mpsc::SendError(queued)| TrySendError::Disconnected(queued)),
-        };
-        match sent {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => return Ok(false),
-            Err(TrySendError::Disconnected(_)) => return Err(self.error(JournalStep::Append, None)),
+        gaps.sort_by_key(gap_order);
+        if !self.queue(Entry::Gaps(admission, gaps), capacity)? {
+            return Ok(false);
         }
         self.ledger.clear();
         self.last_admission = Some(admission);
@@ -580,10 +505,8 @@ impl JournalIngress {
 
     fn encode(&mut self, receipt: SessionTimeUs, mut value: Value) -> Result<Box<[u8]>, JournalError> {
         self.check_order(receipt)?;
-        let fields = value.as_object_mut().ok_or_else(|| self.error(JournalStep::Encode, None))?;
-        fields.remove("seq");
-        fields.insert("recv_t_us".into(), serde_json::json!(receipt));
-        fields.entry("source_t_us").or_insert(Value::Null);
+        value.as_object_mut().ok_or_else(|| self.error(JournalStep::Encode, None))?.remove("seq");
+        stamp_receipt(&mut value, receipt).map_err(|err| self.error(JournalStep::Encode, Some(err.into())))?;
         let mut row = RowBytes(Vec::new());
         serde_json::to_writer(&mut row, &value)
             .map_err(|err| self.error(JournalStep::Encode, Some(err.into())))?;
@@ -648,11 +571,11 @@ impl JournalIngress {
             return Ok(FlushRequest::Busy);
         }
         let (done, outcome) = mpsc::sync_channel(1);
-        match self.offer_entry(Entry::Flush(kind, done)) {
-            Ok(()) => Ok(FlushRequest::Queued(outcome)),
-            Err(TrySendError::Full(_)) => Ok(FlushRequest::Busy),
-            Err(TrySendError::Disconnected(_)) => Err(self.error(kind.step(), None)),
-        }
+        Ok(if self.queue(Entry::Flush(kind, done), Capacity::Normal)? {
+            FlushRequest::Queued(outcome)
+        } else {
+            FlushRequest::Busy
+        })
     }
 
     /// Only a non-capture worker can wait for this prefix.
@@ -664,8 +587,7 @@ impl JournalIngress {
                     self.emit_pending(admission, Capacity::Blocking)?;
                 }
                 let (done, outcome) = mpsc::sync_channel(1);
-                self.entries.send(QueuedEntry::priority(Entry::Flush(kind, done)))
-                    .map_err(|_| self.error(kind.step(), None))?;
+                self.queue(Entry::Flush(kind, done), Capacity::Blocking)?;
                 outcome
             }
         };
@@ -688,10 +610,10 @@ impl JournalIngress {
 
     /// Queue a lifecycle entry in the room reserved above the data limit.
     fn send_reserved(&self, entry: Entry) -> Result<(), JournalError> {
-        self.entries.try_send(QueuedEntry::priority(entry)).map_err(|error| match error {
-            TrySendError::Full(_) => self.error(JournalStep::Reserve, None),
-            TrySendError::Disconnected(_) => self.error(JournalStep::Append, None),
-        })
+        if !self.queue(entry, Capacity::Reserved)? {
+            return Err(self.error(JournalStep::Reserve, None));
+        }
+        Ok(())
     }
 
     fn error(&self, step: JournalStep, source: Option<io::Error>) -> JournalError {
@@ -727,15 +649,12 @@ impl VerifiedIngress {
     pub(crate) fn try_submit_verified(&mut self, receipt: SessionTimeUs, value: Value) -> Result<bool, JournalError> {
         let ingress = &mut self.0;
         let Some(record) = ingress.prepare(receipt, value)? else { return Ok(false) };
-        match ingress.entries.try_send(QueuedEntry::priority(Entry::Data(record, None))) {
-            Ok(()) => {
-                ingress.totals.offered = ingress.totals.offered.saturating_add(1);
-                Ok(true)
-            }
-            // The returned row releases its byte reservation when dropped.
-            Err(TrySendError::Full(_)) => Ok(false),
-            Err(TrySendError::Disconnected(_)) => Err(ingress.error(JournalStep::Append, None)),
+        // A refused row releases its byte reservation when dropped.
+        let queued = ingress.queue(Entry::Data(record, None), Capacity::Unreserved)?;
+        if queued {
+            ingress.totals.offered = ingress.totals.offered.saturating_add(1);
         }
+        Ok(queued)
     }
 
     /// Request an OS flush of the written prefix without waiting for it.
@@ -840,7 +759,9 @@ impl JournalOwner {
 struct JournalFile {
     stream: StreamId,
     file: BufWriter<File>,
+    /// The totals other than the row counts, which `counts` keeps.
     summary: StreamSummary,
+    counts: RowCounts,
 }
 
 fn write_stream(
@@ -849,7 +770,9 @@ fn write_stream(
 ) -> Result<StreamSummary, JournalError> {
     let file = File::create_new(path)
         .map_err(|source| JournalError { stream, step: JournalStep::Create, source: Some(source) })?;
-    let mut journal = JournalFile { stream, file: BufWriter::new(file), summary: StreamSummary::default() };
+    let mut journal = JournalFile {
+        stream, file: BufWriter::new(file), summary: StreamSummary::default(), counts: RowCounts::default(),
+    };
     let result = journal.drain(pending, tail, finals);
     // BufWriter's implicit drop must not attempt another write after failure.
     let _ = journal.file.into_parts();
@@ -893,7 +816,7 @@ impl JournalFile {
                 }
                 Ok(Entry::Health(receipt, row)) => {
                     self.append(Some(receipt), &row)?;
-                    self.summary.health_rows += 1;
+                    self.counts.count_health();
                 }
                 Ok(Entry::Flush(kind, done)) => {
                     match self.flush(kind) {
@@ -920,13 +843,20 @@ impl JournalFile {
         self.close(closed)?;
         if let Some(receiver) = finals {
             self.flush(Flush::Os)?;
-            let Ok(rows) = receiver.recv() else { return Ok(self.summary.clone()) };
+            let Ok(rows) = receiver.recv() else { return Ok(self.summary()) };
             for row in rows {
                 self.final_row(row)?;
             }
         }
         self.flush(Flush::Os)?;
-        Ok(self.summary.clone())
+        Ok(self.summary())
+    }
+
+    /// The closed totals with the row counts.
+    fn summary(&self) -> StreamSummary {
+        let mut summary = self.summary.clone();
+        self.counts.record_in(&mut summary);
+        summary
     }
 
     /// Pending ledger entries precede the stream's final health rows.
@@ -934,16 +864,16 @@ impl JournalFile {
         let IngressTail { admission, mut pending, unreported_paused_health, totals } = closed;
         if !pending.is_empty() {
             let admission = admission.ok_or_else(|| self.error(JournalStep::Order, None))?;
-            pending.sort_by_key(PendingLoss::order);
+            pending.sort_by_key(gap_order);
             for gap in pending {
                 self.gap(admission, gap)?;
             }
         }
         if !unreported_paused_health.is_empty() && let Some(receipt) = admission.or(self.summary.last_receipt) {
             self.append_row(receipt, serde_json::json!({
-                "kind": health_kind(self.stream), "health": HealthKind::PausedSummary, "counts": unreported_paused_health,
+                "kind": RowKind::health(self.stream), "health": HealthKind::PausedSummary, "counts": unreported_paused_health,
             }))?;
-            self.summary.health_rows += 1;
+            self.counts.count_health();
         }
         let IngressTotals { offered, suppressed, sensitive, paused_health } = totals;
         self.summary.offered = offered;
@@ -961,18 +891,7 @@ impl JournalFile {
         self.append(Some(receipt), object)?;
         self.summary.data_rows += 1;
         self.summary.last_data_receipt = Some(receipt);
-        match tally {
-            RowTally::Plain => {}
-            RowTally::Pause => self.summary.pause_rows += 1,
-            RowTally::Blind => self.summary.blind_rows += 1,
-            RowTally::Suppressed(duration) => {
-                self.summary.suppressed_interval_rows += 1;
-                self.summary.suppressed_interval_us = self.summary.suppressed_interval_us.saturating_add(*duration);
-            }
-            RowTally::Unavailable(unavailable) => {
-                unavailable.count(&mut self.summary.unavailable_by_reason, &mut self.summary.uia_unavailable);
-            }
-        }
+        self.counts.count_row(tally);
         Ok(())
     }
 
@@ -980,30 +899,26 @@ impl JournalFile {
         match row {
             FinalRow::Health(record) => {
                 self.append_row(record.detected, record.row(self.stream))?;
-                self.summary.health_rows += 1;
+                self.counts.count_health();
             }
             FinalRow::Blind(blind) => {
-                self.append_row(blind.end_t_us, serde_json::json!({
-                    "kind": "blind", "start_us": blind.start_t_us, "end_us": blind.end_t_us, "reason": blind.reason,
-                }))?;
-                self.summary.blind_rows += 1;
+                let row = BlindRow::new(blind.reason, blind.start_t_us, blind.end_t_us, &[]).value()
+                    .map_err(|err| self.error(JournalStep::Encode, Some(err.into())))?;
+                self.append_row(blind.end_t_us, row)?;
+                self.counts.count_row(&RowTally::Blind);
             }
         }
         Ok(())
     }
 
-    fn gap(&mut self, admission: SessionTimeUs, loss: PendingLoss) -> Result<(), JournalError> {
+    fn gap(&mut self, admission: SessionTimeUs, loss: OrdinaryLoss) -> Result<(), JournalError> {
         let record = loss.record();
         let mut row = serde_json::to_value(record).map_err(|err| self.error(JournalStep::Encode, Some(err.into())))?;
         row["kind"] = serde_json::json!("gap");
         self.append_row(admission, row)?;
-        let total = self.summary.dropped_by_reason.entry(loss.reason).or_default();
-        match record.count {
-            Some(count) => {
-                total.gap_items = total.gap_items.saturating_add(count);
-                self.summary.dropped = self.summary.dropped.saturating_add(count);
-            }
-            None => total.unknown_gaps = total.unknown_gaps.saturating_add(1),
+        self.counts.count_gap(&record);
+        if let Some(count) = record.count {
+            self.summary.dropped = self.summary.dropped.saturating_add(count);
         }
         self.summary.gap_rows += 1;
         Ok(())
@@ -1012,8 +927,7 @@ impl JournalFile {
     /// Append a writer-made row at `at`, raised to the last appended receipt.
     fn append_row(&mut self, at: SessionTimeUs, mut row: Value) -> Result<(), JournalError> {
         let receipt = self.summary.last_receipt.map_or(at, |last| last.max(at));
-        row["recv_t_us"] = serde_json::json!(receipt);
-        row["source_t_us"] = Value::Null;
+        stamp_receipt(&mut row, receipt).map_err(|err| self.error(JournalStep::Encode, Some(err.into())))?;
         let row = serde_json::to_vec(&row).map_err(|err| self.error(JournalStep::Encode, Some(err.into())))?;
         self.append(Some(receipt), &row)
     }

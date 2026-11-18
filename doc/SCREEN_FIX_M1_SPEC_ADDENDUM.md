@@ -109,6 +109,62 @@ These amendments follow the M1 remediation plan (`SCREEN_FIX_M1_REMEDIATION_PLAN
 - PDF section 17 lists the M1 scope without `checksums.sha256`, and M1 acceptance uses gates 1–4 only. Gate 8 first appears in the M2 acceptance (T18).
 - M1 packages carry no `checksums.sha256`. This is not an M1 defect.
 
+### A7. Round-2 amendments (user decisions, 2026-11-18)
+
+These amendments record the decisions taken during the round-2 refactor and the manual recordings that followed it. Where an item overrides the PDF or an earlier project document, it says so.
+
+**A7.1 WGC frame time is the present time (amends CLK-2 for frame receipts; ALG §13.14, plan §6.5).**
+- The WGC `SystemRelativeTime` is the DWM present (vblank) time. It is the frame's `source_t_us` and can lead the dequeue by about one refresh interval.
+- The frame's capture receipt is max(dequeue, present), so source ≤ receipt holds. A present time more than 42 ms (`MAX_PRESENT_LEAD_US`) after the dequeue is rejected. This overrides PDF CLK-2 ("when the recorder received it") for frame receipts: a capture receipt can lie up to 42 ms after the actual dequeue.
+- Frame approval is checked at the content time min(dequeue, present). An ordinary approval not yet observed through that time is awaited for up to 20 ms after it (`MAX_APPROVAL_CATCH_UP_US`) instead of dropping the frame. Elevated frames keep the staging and certificate path. Code: `CaptureOwner::admit_frame` and `CaptureOwner::await_approval` in `core/src/platform/windows/monitor.rs`.
+- A transient approval read (`Contended`, `NewerThanReceipt`) is retried for every source, not only elevated visits: frames within the same 20 ms bound, still openings and saves within `ELEVATED_FRAME_WAIT_US` (250 ms) of their receipt.
+
+**A7.2 Software pacing converts the first frame of each slot.**
+- With software encoding, the first approved frame of a video slot is converted at once; later frames of that slot are skipped and counted as `video_software_paced` (`convert` in `monitor.rs`).
+- The deferred newest-frame variant from the round-1 critic finding A3 was reverted by user decision. The rule stays simple and loses no frame at Pause or Stop.
+
+**A7.3 One video conversion in flight.**
+- Each monitor has at most one pending GPU video conversion. A frame that arrives while it is busy is counted as video pressure and marks its slot, which gets the reason `conversion_pressure` if it ends without an encoded sample.
+- A second conversion in flight is deferred: manual recordings measured about 0.4–0.9 % `conversion_pressure`. Revisit the decision if that rate grows.
+
+**A7.4 Windows-only workspace.**
+- The workspace builds only for Windows. The Recorder, the core, the standard helper, `screen-fix-native-observation` and `screen-fix-elevated` each fail on another target with `compile_error!`. There are no `cfg(not(windows))` stubs and no non-Windows dependencies. `screen-fix-protocol` holds only platform-independent values and has no such guard.
+- This supersedes the "unsupported capability" rule for other platforms in the [architecture addendum](SCREEN_FIX_M1_ARCHITECTURE_ADDENDUM.md#13-platform-boundary-and-dependencies). A later port reintroduces its own platform layer.
+
+**A7.5 Development log (`dev-log`).**
+- The `dev-log` cargo feature (`ui/Cargo.toml`, forwarded to `screen-fix-core/dev-log`) writes `dev.log` into each attempt directory. It is on by default for manual testing. The file is not listed in the manifest or the attempt inventory, and a failed write never affects the recording.
+- `compile_error!` in `ui/src/main.rs` rejects `dev-log` together with `elevated-release`. Release builds use `--no-default-features --features elevated-release` ([deployment instructions](../deploy/windows/README.md)).
+- The log records timing, counters, ids, reasons and error messages only: no window titles, text, key codes or paths. Only the class names of approved-process windows are logged. For a non-approved foreground the log records only the cause (`process_not_approved`, `foreground_unreadable` and so on); its class is never read (PDF CTX-2).
+
+**A7.6 Minimal tests are allowed.**
+- The allowed set is golden byte tests of journal rows, `PackageReader::validate_gates` on a synthetic attempt (`core/src/package/tests.rs`) and `FramePolicy` unit tests. The user runs them (`cargo test -p screen-fix-core`).
+- This supersedes the "testing is done by the user, stage T2 removed" execution mode of the [remediation plan](SCREEN_FIX_M1_REMEDIATION_PLAN.md#7-implementation-stages) (§7) as far as these tests go. Fixture packages and the T4 campaign stay out of scope.
+
+**A7.7 A verified segment is published during a pause.**
+- While rows of a closed epoch await verification, the video worker applies arrived verdicts during the pause and publishes a verified segment (`.part` → `.mp4`) at once, instead of only after Resume or Stop.
+- The overdue check is still not applied during a pause; overdue parts are judged at Resume or Stop as before (row 19).
+- A video-loss report caused by a verification failure during the pause can precede the resume rows in the journals.
+
+**A7.8 Approval is per approved process instance (amends the window binding of ALG §4 and §13.4 and plan §6.4).**
+- An ordinary frame approval belongs to the approved application process instance, not to one window. Another top-level window of the same process continues it: the generation and `since` are kept, video is not cut, and the stills approval interval is kept (`FramePolicy::publish` in `core/src/platform/windows/context/frame_policy.rs`).
+- A foreground notice for another process or an unreadable window, a non-approved foreground, a desktop switch, a lost notice, a new admission epoch or a stale observation starts a new generation or clears the approval. A Ghost window's foreground notice also starts a new generation; a Ghost that verifiably replaced a hung approved window stays approved, an unresolved one does not.
+- Elevated approvals stay bound to their visit and window.
+- Pointer and other non-key records need only the approved process in the foreground at receipt, also when they combine raw and hook evidence. A hook-only record still needs one window visit covering its 16 ms uncertainty interval (ALG §13.4). At a seam where the foreground passed between two ordinary visits of the same approved process instance in one sweep, with no other foreground in between, the record is focus-uncertain: a pointer record is attributed to the later visit's window, and a key is suppressed as `focus_uncertain` or joins the adjacent open redaction. The seam never joins an elevated visit. Keys stay strict: a key needs a known classified focus, password and unresolved fields are redacted, a key with an unknown focus is not published, and key privacy follows the actual focused window. Visits and focus generations stay window-level.
+- This matches the PDF's process-level approval (PRIV-1, PRIV-2); it amends only the window-level wording of the project addenda.
+
+**A7.9 Other accepted round-2 points.**
+- The `revocation_unknown` guidance states that Windows could not confirm non-revocation from its cached revocation data and asks to retry after Windows refreshes it (`source_failure_guidance` in `core/src/session.rs`).
+- Two trust checks became stricter when their copies were merged, accepted as fail-closed: a null security descriptor (DACL) is rejected in `core/capture/elevated/src/trust/permissions.rs`, and an empty process image path is a failure in `core/capture/elevated/src/process.rs`.
+- Audit findings H12 (a single integrity-RID check) and C15 (a single `overflow_at` policy) were left unchanged by user decision.
+- The M1 user interface stays the minimal M1-01 control window and recording indicator. The PDF's mockup interface (one window and a tray icon with the task list, pre-flight, floating bar, review and upload; PDF p. 2) is the v1 product and is built with the milestones that own its screens (PDF §17 build order: M2 tasks and pre-flight, M3 review and own-window exclusion, M4 upload). M1 does not change the product name, layout or visual style to match the mockups.
+
+**A7.10 Documented M1 narrowings (user decision, 2026-11-18).** These record deliberate M1 limits that were previously only in the remediation plan or the progress log.
+- **Encoder selection (amends the "startup" wording of A2 and M1-04).** The encoder is selected at Start and again at a monitor format change (resolution or size), using the same capability probe. After a format change, the remaining attempt may continue on the software 15 fps path. This is capability selection, not encoder recovery: an encoder failure still loses that monitor's video for the attempt (§6.2 row 9, ALG §13.10).
+- **INP-6 stroke tools are deferred to M2.** M1 keeps every motion sample while a button is held. The "configured stroke tool is active" condition depends on app-pack profiles, which arrive in M2.
+- **Gate 3 does not check pen continuity.** The reader's gate 3 checks key and button press boundaries only, as the PDF defines it. Pen tip and contact transitions (`pen` rows, `contact_transition`) are not checked for open strokes at a pause or Stop (schema §8).
+- **IMG-3 queue limits are narrower.** M1 runs one PNG worker (within IMG-3's "at most 4 threads", C2) with a queue of 12 jobs and at most 6 new images per second (`core/src/platform/windows/still_png.rs`). This is stricter than IMG-3's target bounds of 256 MB and 256 jobs. Overflow drops the lowest IMG-7 priority and writes a `still_dropped` record, as IMG-3 requires.
+- **REL-4 has no duration reserve.** M1 requires at least 20 GB free to start, pauses with `low_disk` below 5 GB, and resumes only on Resume with more than 6 GB free. The duration term of the pre-flight requirement (5 GB plus the task's expected hours × GB per monitor) needs the M2 task model, so the manifest records `disk_preflight.duration_reserve_bytes: null`.
+
 ## 3. Implementation contracts
 
 ### C1. Time and observations
@@ -298,6 +354,7 @@ The following is an implementation checklist, not a list of completed work.
 - Do not equate implemented instrumentation with completed hardware tests.
 - Existing restrictions on running builds, formatters and tests still apply until separately authorized.
 - For the elevated amendment, examine positive identity, trusted deployment, per-source registration, transitions, scoped reads and retained-prefix closure through real entry points. Record runtime, release-signing and hardware evidence separately.
+- Gates 1–4 run on a real attempt with the read-only verifier `cargo run --release -p screen-fix-core --example verify_attempt -- <attempt_dir>` (`package::verify_attempt`). It runs `PackageReader::validate_gates` and then the gate 2 decode comparison of each published segment (`verify_segment_decoding`, software decoding), and exits 0 on pass, 1 on a finding and 2 when the package cannot be opened. Under A7.6, `core/src/package/tests.rs` checks a complete synthetic attempt strictly, with one negative test per gate; its segment files are placeholders, so the decode part is not run there.
 
 ## 6. Revised M1 acceptance mapping
 

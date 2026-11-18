@@ -65,7 +65,7 @@ pub struct Failure {
     stream: Option<StreamId>,
     native_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) source: Option<crate::session::SourceFailure>,
+    pub(crate) source: Option<super::source::SourceFailure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) raw_input_registration: Option<crate::protocol::ipc::RawInputRegistrationMismatch>,
 }
@@ -73,7 +73,7 @@ pub struct Failure {
 impl Failure {
     pub(crate) fn without_report_detail(mut self) -> Self {
         self.raw_input_registration = None;
-        self.source = self.source.map(crate::session::SourceFailure::without_report_detail);
+        self.source = self.source.map(super::source::SourceFailure::without_report_detail);
         self
     }
 

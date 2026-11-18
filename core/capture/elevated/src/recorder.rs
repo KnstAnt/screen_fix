@@ -56,14 +56,11 @@ impl RecorderBootstrap {
     ) -> Result<Authenticated> {
         let Self { installation, parent, mut bootstrap_pipe, scope } = self;
         let ready_at = shell_returned + READINESS;
-        let initial = Deadline {
-            at: ready_at, expired: Failure::ReadinessDeadline, cancellation: cancel, grant: None, scope_current: None,
-            peer: None,
-        };
+        let initial = Deadline::new(ready_at, Failure::ReadinessDeadline, cancel);
         initial.check()?;
         let handle = unsafe { Handle::take(original_handle.into_raw_handle(), Failure::ConsentLaunch)? };
         let child = Process::inspect(Arc::new(handle))?;
-        let deadline = Deadline { peer: Some(&child), ..initial };
+        let deadline = initial.peer(&child);
         installation.verify_collector(&child)?;
         verify_linked_pair(&parent, &child)?;
 

@@ -2,18 +2,20 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use windows::{
-    Win32::{Foundation::HWND as NativeWindow, System::LibraryLoader::{GetModuleHandleW, GetProcAddress}},
-    core::{PCSTR, w},
-};
-use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM},
-    UI::WindowsAndMessaging::{
-        EnumWindows, GA_ROOT, GetAncestor, GetClassNameW, GetWindowThreadProcessId, IsHungAppWindow,
+// The UIA boundary: `WindowProcess::read` takes a `windows` window handle.
+use windows::Win32::Foundation::HWND as NativeWindow;
+use windows_sys::{
+    Win32::{
+        Foundation::{HWND, LPARAM},
+        System::LibraryLoader::{GetModuleHandleW, GetProcAddress},
+        UI::WindowsAndMessaging::{
+            EnumWindows, GA_ROOT, GetAncestor, GetClassNameW, IsHungAppWindow,
+        },
     },
+    w,
 };
 
-use crate::identity::WindowProcess;
+use crate::{focus::{WindowOwner, window_owner}, identity::WindowProcess};
 
 const CANDIDATE_LIMIT: usize = 512;
 type GhostLookup = unsafe extern "system" fn(HWND) -> HWND;
@@ -34,9 +36,10 @@ impl Probe {
         // These optional user32 exports are private. They resolve only from
         // the already loaded system DLL. Neither is needed for ordinary HWND
         // checks and class evidence alone never attributes a Ghost.
-        let user32 = unsafe { GetModuleHandleW(w!("user32.dll")) }.ok();
+        let user32 = unsafe { GetModuleHandleW(w!("user32.dll")) };
+        let user32 = (!user32.is_null()).then_some(user32);
         let lookup = |name: &'static [u8]| {
-            unsafe { GetProcAddress(user32?, PCSTR(name.as_ptr())) }
+            unsafe { GetProcAddress(user32?, name.as_ptr()) }
                 // SAFETY: both user32 exports have the signature `HWND -> HWND`
                 // with the stdcall ("system") ABI, which `GhostLookup` declares,
                 // and user32 stays loaded for the process lifetime.
@@ -50,7 +53,7 @@ impl Probe {
 
     pub fn observe_candidate(&self, candidate: Candidate) -> CandidateEvidence {
         let hwnd = candidate.window;
-        if native_owner(hwnd) != Some(candidate.owner) || !top_level(hwnd) || unsafe { IsHungAppWindow(hwnd) } == 0 {
+        if window_owner(hwnd) != Some(candidate.owner) || !top_level(hwnd) || unsafe { IsHungAppWindow(hwnd) } == 0 {
             return CandidateEvidence::Changed;
         }
         if is_ghost(hwnd) {
@@ -60,7 +63,7 @@ impl Probe {
                 CandidateEvidence::UnknownGhost
             }
         } else if let Some(window) = WindowProcess::read(NativeWindow(hwnd))
-            && candidate.owner == (window.process.pid.get(), window.thread.get())
+            && candidate.owner == window.owner()
             && !is_ghost(hwnd) && unsafe { IsHungAppWindow(hwnd) } != 0
         {
             CandidateEvidence::Window { window, ghost: false }
@@ -71,13 +74,13 @@ impl Probe {
 
     fn ghost_original(&self, ghost: HWND) -> Option<WindowProcess> {
         let reverse = self.ghost_to_original?;
-        let owner = native_owner(ghost)?;
+        let owner = window_owner(ghost)?;
         let original = unsafe { reverse(ghost) };
         let proof = WindowProcess::read(NativeWindow(original))?;
         let pair_matches = |forward: GhostLookup| unsafe { forward(original) == ghost };
         if original == ghost || !top_level(original) || is_ghost(original)
             || self.original_to_ghost.is_some_and(|forward| !pair_matches(forward))
-            || unsafe { reverse(ghost) } != original || native_owner(ghost) != Some(owner)
+            || unsafe { reverse(ghost) } != original || window_owner(ghost) != Some(owner)
             || !is_ghost(ghost) || !top_level(ghost) || unsafe { IsHungAppWindow(ghost) } == 0
             || WindowProcess::read(NativeWindow(original)) != Some(proof)
         {
@@ -97,7 +100,7 @@ pub fn candidates() -> (Vec<Candidate>, bool) {
 #[derive(Clone, Copy)]
 pub struct Candidate {
     pub window: HWND,
-    owner: (u32, u32),
+    owner: WindowOwner,
 }
 
 unsafe extern "system" fn read_window(hwnd: HWND, data: LPARAM) -> i32 {
@@ -109,7 +112,7 @@ unsafe extern "system" fn read_window(hwnd: HWND, data: LPARAM) -> i32 {
         if candidates.len() == CANDIDATE_LIMIT {
             return false;
         }
-        if let Some(owner) = native_owner(hwnd) {
+        if let Some(owner) = window_owner(hwnd) {
             candidates.push(Candidate { window: hwnd, owner });
         }
         true
@@ -125,12 +128,6 @@ pub fn is_ghost(window: HWND) -> bool {
 
 fn top_level(window: HWND) -> bool {
     !window.is_null() && unsafe { GetAncestor(window, GA_ROOT) } == window
-}
-
-pub fn native_owner(window: HWND) -> Option<(u32, u32)> {
-    let mut pid = 0;
-    let thread = unsafe { GetWindowThreadProcessId(window, &mut pid) };
-    (thread != 0 && pid != 0).then_some((pid, thread))
 }
 
 pub fn is_hung(hwnd: HWND) -> bool {

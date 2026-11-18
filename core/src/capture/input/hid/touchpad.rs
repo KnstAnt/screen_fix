@@ -10,6 +10,8 @@ use crate::protocol::{
 use super::{number, switch, unique};
 
 const MAX_CONTACTS: usize = 32;
+/// The longest span of one multi-report touchpad frame from its first report.
+const MAX_FRAME_SPAN_US: i64 = 100_000;
 
 pub(super) struct Frame {
     scan_time: i64,
@@ -39,7 +41,7 @@ pub(super) fn observe(
     }
     let interrupted = pending.as_ref().is_some_and(|old| {
         old.scan_time != scan || old.proof != proof || count != 0
-            || at.0.saturating_sub(old.first_receipt.0) > 100_000
+            || at.0.saturating_sub(old.first_receipt.0) > MAX_FRAME_SPAN_US
     });
     if interrupted {
         *pending = None;

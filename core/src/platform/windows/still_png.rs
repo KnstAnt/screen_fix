@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io,
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
@@ -17,17 +17,18 @@ use std::{
 use crate::{
     capture::frame::CaptureColor,
     package::{
-        ArtifactKind, ArtifactRef, ImageDigest,
+        ArtifactKind, ArtifactRef, ImageDigest, raw_relative,
         diagnostics::{Failure, FailureComponent},
-        journal::{Flush, JournalIngress},
+        journal::JournalIngress,
         metadata::{AttemptLayout, ImageFile, LostActivity, PngCounters},
         outcome::HealthKind,
     },
     protocol::MonitorId,
-    session::{fault::FaultReport, windows::{PauseProducer, WorkerSession}},
+    platform::windows::controller::WorkerSession,
+    session::fault::FaultReport,
 };
 
-use super::{ProbeError, clock, package_journal_error, readback::Pixels, still_rows::{Awake, Merge, Rows, StillCoverage}};
+use super::{ProbeError, clock, readback::Pixels, still_rows::{Rows, StillCoverage, StillJournal}};
 
 const JOBS: usize = 12;
 const MAX_NEW_IMAGES: usize = 6;
@@ -153,10 +154,32 @@ impl Drop for Ticket {
     }
 }
 
+/// The new images each monitor published within the last `WINDOW`.
+#[derive(Default)]
+struct RateWindow(HashMap<MonitorId, VecDeque<Instant>>);
+
+impl RateWindow {
+    /// Forget the images of `monitor` older than `WINDOW`; true while it may
+    /// publish another new image.
+    fn admits(&mut self, monitor: MonitorId) -> bool {
+        let rate = self.0.entry(monitor).or_default();
+        let now = Instant::now();
+        while rate.front().is_some_and(|old| now.duration_since(*old) >= WINDOW) {
+            rate.pop_front();
+        }
+        rate.len() < MAX_NEW_IMAGES
+    }
+
+    /// Count a new image of `monitor` published now.
+    fn record(&mut self, monitor: MonitorId) {
+        self.0.entry(monitor).or_default().push_back(Instant::now());
+    }
+}
+
 pub(super) struct Worker {
     input: Arc<Queue>,
-    rows: Merge,
-    rate: HashMap<MonitorId, VecDeque<Instant>>,
+    rows: StillJournal,
+    rate: RateWindow,
     /// The operation of the current PNG write failure episode, reported once.
     failing: Option<&'static str>,
     /// The encoder stopped after an unexpected exit; jobs are dropped (§6.2 row 16).
@@ -172,9 +195,9 @@ impl Worker {
     pub fn new(lanes: usize) -> (Inbox, Vec<Rows>, Self) {
         let input = Arc::new(Queue::default());
         input.senders.store(1, Ordering::Relaxed);
-        let (rows, merge) = Merge::new(lanes);
+        let (rows, journal) = StillJournal::new(lanes);
         (Inbox(Arc::clone(&input)), rows, Self {
-            input, rows: merge, rate: HashMap::new(), failing: None, encoder_lost: false, images: Vec::new(),
+            input, rows: journal, rate: RateWindow::default(), failing: None, encoder_lost: false, images: Vec::new(),
             revoked: HashSet::new(),
         })
     }
@@ -195,48 +218,12 @@ impl Worker {
     fn drain(&mut self, layout: &AttemptLayout, mut journal: JournalIngress, session: &WorkerSession,
         counters: &mut PngCounters,
     ) -> Result<(), ProbeError> {
-        let mut flushed = None;
-        let mut revision = session.journal_flush_revision();
+        self.rows.open(session);
         let frequency = clock::frequency()?;
         loop {
-            let awake = Awake { now: clock::qpc()?, marks: session.suspend_marks(), frequency };
-            self.rows.publish(&mut journal, Instant::now(), &awake)?;
-            if let Some(pause) = session.paused_cutoff().filter(|pause| flushed != Some(*pause))
-                && self.rows.includes(pause.time)
-            {
-                journal.flush_wait(Flush::Os, pause.time).map_err(package_journal_error)?;
-                flushed = Some(pause);
-                session.finish_pause(pause, PauseProducer::Stills);
-            }
-            let latest = session.journal_flush_revision();
-            if latest != revision {
-                journal.flush_wait(Flush::Os, self.rows.latest_receipt()).map_err(package_journal_error)?;
-                revision = latest;
-            }
+            self.rows.service(&mut journal, session, frequency)?;
             if let Some(mut job) = self.take_job() {
-                let started = Instant::now();
-                let waited = u64::try_from(started.duration_since(job.offered_at).as_micros()).unwrap_or(u64::MAX);
-                counters.queue_wait_max_us = counters.queue_wait_max_us.max(waited);
-                let outcome = self.encode(layout, &mut job, session);
-                let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                counters.processing_max_us = counters.processing_max_us.max(elapsed);
-                match &outcome {
-                    Outcome::Saved { reused: false, .. } => counters.new_images += 1,
-                    Outcome::Saved { reused: true, .. } => counters.deduplicated_jobs += 1,
-                    Outcome::Dropped(_) => counters.dropped_at_processing += 1,
-                    Outcome::Failed { .. } => counters.failed_jobs += 1,
-                }
-                match &outcome {
-                    Outcome::Saved { .. } => self.failing = None,
-                    Outcome::Failed { operation, native_code } if self.failing != Some(*operation) => {
-                        // One context health row per failure kind episode; each
-                        // still row keeps its own operation and native code.
-                        self.failing = Some(*operation);
-                        session.report_health(HealthKind::StillWriteFailure,
-                            Failure::new(FailureComponent::Stills, *operation, *native_code), None, false);
-                    }
-                    _ => {}
-                }
+                let outcome = self.process(layout, &mut job, session, counters);
                 // A slot that gave up the job after its image was published
                 // leaves the file without a row; it is kept and counted at the end.
                 let _ = job.reply.try_send(outcome);
@@ -247,12 +234,43 @@ impl Worker {
         self.rows.finish(&mut journal)
     }
 
+    /// Encode one job and count its wait, its processing time and its
+    /// outcome. The first failure of each failure episode is reported once.
+    fn process(&mut self, layout: &AttemptLayout, job: &mut Job, session: &WorkerSession, counters: &mut PngCounters)
+        -> Outcome
+    {
+        let started = Instant::now();
+        let waited = u64::try_from(started.duration_since(job.offered_at).as_micros()).unwrap_or(u64::MAX);
+        counters.queue_wait_max_us = counters.queue_wait_max_us.max(waited);
+        let outcome = self.encode(layout, job, session);
+        let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        counters.processing_max_us = counters.processing_max_us.max(elapsed);
+        match &outcome {
+            Outcome::Saved { reused: false, .. } => counters.new_images += 1,
+            Outcome::Saved { reused: true, .. } => counters.deduplicated_jobs += 1,
+            Outcome::Dropped(_) => counters.dropped_at_processing += 1,
+            Outcome::Failed { .. } => counters.failed_jobs += 1,
+        }
+        match &outcome {
+            Outcome::Saved { .. } => self.failing = None,
+            Outcome::Failed { operation, native_code } if self.failing != Some(*operation) => {
+                // One context health row per failure kind episode; each
+                // still row keeps its own operation and native code.
+                self.failing = Some(*operation);
+                session.report_health(HealthKind::StillWriteFailure,
+                    Failure::new(FailureComponent::Stills, *operation, *native_code), None, false);
+            }
+            _ => {}
+        }
+        outcome
+    }
+
     /// Image files that no journaled row names: published images whose slot
     /// gave up the job, fell back, was withdrawn or lost its row, and revoked
     /// images whose removal still fails. The files are kept.
     fn unreferenced_images(&self, layout: &AttemptLayout) -> u64 {
         let published = self.images.iter()
-            .filter(|image| image.file.strip_prefix("raw/").is_none_or(|file| !self.rows.references(file)))
+            .filter(|image| raw_relative(&image.file).is_none_or(|file| !self.rows.references(file)))
             .count();
         let revoked = self.revoked.iter()
             .filter(|digest| fs::remove_file(layout.path(ArtifactKind::StillImage(**digest)))
@@ -297,23 +315,11 @@ impl Worker {
         let expired = || cancelled.load(Ordering::Acquire)
             || session.stop_deadline().is_some_and(|deadline| Instant::now() >= deadline);
         if expired() { return Outcome::Dropped(Dropped::Deadline); }
-        let pixels = &mut job.pixels;
-        let metadata = pixels.metadata.clone();
+        let metadata = job.pixels.metadata.clone();
         let coverage = &job.coverage;
         let authorized = || metadata.covered() && coverage.as_ref().is_none_or(StillCoverage::allows);
         if !authorized() { return Outcome::Dropped(Dropped::ApprovalSuppressed); }
-        let mut hash = blake3::Hasher::new();
-        hash.update(b"screen-fix-still\0v1\0packed-bgra8\0");
-        hash.update(&metadata.extent.width.get().to_le_bytes());
-        hash.update(&metadata.extent.height.get().to_le_bytes());
-        hash.update(&[match metadata.color {
-            CaptureColor::Sdr => 1,
-            CaptureColor::HdrToneMappedToSdr => 2,
-            CaptureColor::HdrSystemBgra8 => 3,
-        }]);
-        hash.update(pixels.bgra());
-
-        let digest = ImageDigest(*hash.finalize().as_bytes());
+        let digest = digest(&job.pixels);
         let kind = ArtifactKind::StillImage(digest);
         let image = layout.path(kind);
         let reference = ArtifactRef { attempt: layout.id().clone(), kind };
@@ -338,36 +344,17 @@ impl Worker {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return failed("check_image_path", error),
         }
-        let rate = self.rate.entry(metadata.id.monitor).or_default();
-        let now = Instant::now();
-        while rate.front().is_some_and(|old| now.duration_since(*old) >= WINDOW) {
-            rate.pop_front();
-        }
-        if !job.exempt && rate.len() >= MAX_NEW_IMAGES {
+        let admitted = self.rate.admits(metadata.id.monitor);
+        if !job.exempt && !admitted {
             return Outcome::Dropped(Dropped::RateLimit);
         }
 
         let temporary = image.with_extension("png.pending");
-        let mut file = match OpenOptions::new().create_new(true).write(true).open(&temporary) {
+        let file = match OpenOptions::new().create_new(true).write(true).open(&temporary) {
             Ok(file) => file,
             Err(error) => return failed("create_temporary_image", error),
         };
-        for pixel in pixels.bgra_mut().chunks_exact_mut(4) {
-            pixel.swap(0, 2);
-        }
-        let result = (|| -> Result<u64, Outcome> {
-            let mut encoder = png::Encoder::new(&mut file, metadata.extent.width.get(), metadata.extent.height.get());
-            encoder.set_color(png::ColorType::Rgba);
-            encoder.set_depth(png::BitDepth::Eight);
-            encoder.set_compression(png::Compression::Fast);
-            let mut writer = encoder.write_header().map_err(|_| png_failure())?;
-            writer.write_image_data(pixels.bgra()).map_err(|_| png_failure())?;
-            writer.finish().map_err(|_| png_failure())?;
-            file.sync_all().map_err(|error| failed("flush_image", error))?;
-            file.metadata().map(|meta| meta.len()).map_err(|error| failed("inspect_image", error))
-        })();
-        drop(file);
-        let result = result.and_then(|bytes| {
+        let result = write_png(file, &mut job.pixels).and_then(|bytes| {
             if expired() { return Err(Outcome::Dropped(Dropped::Deadline)); }
             if !authorized() { return Err(Outcome::Dropped(Dropped::ApprovalSuppressed)); }
             move_new(&temporary, &image).map_err(|error| failed("publish_image", error))?;
@@ -388,12 +375,47 @@ impl Worker {
             }
         };
         if !job.exempt {
-            rate.push_back(Instant::now());
+            self.rate.record(metadata.id.monitor);
         }
         self.images.push(ImageFile { file: reference.relative_uri(), bytes,
             width: metadata.extent.width.get(), height: metadata.extent.height.get() });
         Outcome::Saved { reference, reused: false }
     }
+}
+
+/// The content digest of a still: its packed BGRA pixels, extent and color.
+fn digest(pixels: &Pixels) -> ImageDigest {
+    let metadata = &pixels.metadata;
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"screen-fix-still\0v1\0packed-bgra8\0");
+    hash.update(&metadata.extent.width.get().to_le_bytes());
+    hash.update(&metadata.extent.height.get().to_le_bytes());
+    hash.update(&[match metadata.color {
+        CaptureColor::Sdr => 1,
+        CaptureColor::HdrToneMappedToSdr => 2,
+        CaptureColor::HdrSystemBgra8 => 3,
+    }]);
+    hash.update(pixels.bgra());
+    ImageDigest(*hash.finalize().as_bytes())
+}
+
+/// Encode `pixels` as an RGBA PNG into the new temporary `file`, sync it and
+/// return its size. The pixels are converted to RGBA in place; the file is
+/// closed on return.
+fn write_png(mut file: File, pixels: &mut Pixels) -> Result<u64, Outcome> {
+    let (width, height) = (pixels.metadata.extent.width.get(), pixels.metadata.extent.height.get());
+    for pixel in pixels.bgra_mut().chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    let mut encoder = png::Encoder::new(&mut file, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Fast);
+    let mut writer = encoder.write_header().map_err(|_| png_failure())?;
+    writer.write_image_data(pixels.bgra()).map_err(|_| png_failure())?;
+    writer.finish().map_err(|_| png_failure())?;
+    file.sync_all().map_err(|error| failed("flush_image", error))?;
+    file.metadata().map(|meta| meta.len()).map_err(|error| failed("inspect_image", error))
 }
 
 fn png_failure() -> Outcome {

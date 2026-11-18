@@ -3,35 +3,35 @@ use std::{
     path::Path,
     sync::{Arc, Mutex, atomic::{AtomicBool, Ordering::{Acquire, Release}}, mpsc::{self, Receiver as Queue, SyncSender, TryRecvError}},
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use screen_fix_protocol::{
-    QpcFrequency, QpcTick,
+    AdmissionEpoch, QpcTick, RequestId,
     ipc::{
         EnvironmentChange,
-        elevated::{ContextEvidence, GrantedInput, InputEvidence, Query, ReadBinding, ReadEvidence, ReadOutcome, ReadUnavailable,
-            runtime::{ApprovalKey, ContextCommand, Control, CoverageLoss, CoverageReason, HeldReadiness, Lease, MAX_APPROVED_EXECUTABLES,
-                Observation, Revocation, Status, Transition}, VisitBinding},
+        elevated::{ContextEvidence, Query, ReadBinding, ReadEvidence, ReadOutcome, ReadUnavailable,
+            runtime::{Activation, ApprovalKey, ContextCommand, Control, CoverageLoss, CoverageReason, EnvironmentRevision,
+                GrantRequest, HeldReadiness, Lease, MAX_APPROVED_EXECUTABLES, Revocation, Status, Transition},
+            VisitBinding},
     },
 };
 
-use crate::{deadline::{CLEANUP, Cancellation, Deadline}, win::{Failure, Result}};
+use crate::{deadline::{CLEANUP, Cancellation, Deadline, READINESS}, process::Process, pipe::Pipe, win::{Failure, Result}};
 use super::{
     Connection, Links, Receiver, Sender, context, notices, outbox::Outbox,
-    grant::{ESSENTIAL_PROGRESS, Grant, InputLoss, INPUT_HOLDBACK, await_witness},
+    egress::{context_egress, input_egress},
+    grant::{Cut, Grant, Reopened, Session, await_witness},
     input::{self, Native},
-    lifetime::{LEASE, Lifetime, qpc},
-    witness::{View, Witness},
+    lifetime::{Lifetime, qpc},
+    timing::{INPUT_HOLDBACK, LEASE, LONG_WAIT, POLL},
+    witness::Witness,
 };
 
 const COMMANDS: usize = 8;
-const POLL: Duration = Duration::from_millis(4);
-/// Budget of the provider-backed egress gate of one context record.
-const GATE: Duration = Duration::from_millis(100);
 
 struct Configuration {
-    approved: Arc<[ApprovalKey]>,
+    approved: Box<[ApprovalKey]>,
     pen_hid: bool,
 }
 
@@ -44,8 +44,22 @@ struct Visit {
     held_result: Option<HeldResult>,
     last_request: u64,
     readiness: Instant,
-    resync_from: Option<QpcTick>,
-    resync_expires: Option<Instant>,
+    resync: Option<Resync>,
+}
+
+/// A resync in progress: the first QPC its coverage report must include,
+/// and the instant by which an expiring resync must be accepted.
+#[derive(Clone, Copy)]
+struct Resync {
+    from: QpcTick,
+    expires: Option<Instant>,
+}
+
+impl Resync {
+    /// A resync that must be accepted within the readiness bound.
+    fn bounded(from: QpcTick) -> Self {
+        Self { from, expires: Some(readiness()) }
+    }
 }
 
 struct HeldResult {
@@ -55,16 +69,21 @@ struct HeldResult {
     accepted: bool,
 }
 
+/// Whether the owner loop goes on after a control command.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Stopped,
+}
+
 struct Owner<'a> {
-    witness: View,
-    lifetime: &'a Arc<Lifetime>,
+    session: Arc<Session>,
     connection: &'a Arc<Connection>,
-    configuration: Configuration,
-    frequency: QpcFrequency,
+    pen_hid: bool,
     current: Option<Visit>,
     lease: Option<Lease>,
     grant_sequence: u64,
-    epoch: u64,
+    epoch: AdmissionEpoch,
     source_generation: u64,
     environment: Option<NonZeroU64>,
     cleanup_limit: Option<QpcTick>,
@@ -75,10 +94,88 @@ struct Owner<'a> {
     urgent: Arc<Urgent>,
 }
 
+/// The state the control reader shares with the owner to apply a due Stop,
+/// Revoke or Environment change ahead of the command queue.
 #[derive(Default)]
 struct Urgent {
     grant: Mutex<Option<Arc<Grant>>>,
     stopping: AtomicBool,
+}
+
+impl Urgent {
+    fn preempt(&self, command: &Control, lifetime: &Lifetime) -> Result<()> {
+        if !matches!(command, Control::Stop { .. } | Control::Revoke { .. } | Control::Environment(_)) {
+            return Ok(());
+        }
+        let relevant = self.grant.lock().map_err(|_| Failure::Supervisor)?;
+        let now = qpc()?;
+        if !urgent_due(command, now) { return Ok(()); }
+        match command {
+            Control::Stop { cleanup_deadline_qpc, .. } => {
+                self.stopping.store(true, Release);
+                if let Some(grant) = relevant.as_ref() { grant.revoke(); }
+                lifetime.begin_cleanup(now, *cleanup_deadline_qpc)?;
+            }
+            Control::Revoke { visit, .. } => {
+                if let Some(grant) = relevant.as_ref().filter(|grant| grant.visit() == *visit) {
+                    grant.revoke();
+                    lifetime.enter_cleanup(now)?;
+                }
+            }
+            Control::Environment(revision) => {
+                if revision.change == EnvironmentChange::SessionEnding {
+                    self.stopping.store(true, Release);
+                }
+                if let Some(grant) = relevant.as_ref() {
+                    grant.revoke();
+                    lifetime.begin_cleanup(now, revision.cleanup_deadline_qpc)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// A Stop, Revoke or Environment change whose effective QPC has passed. The
+/// owner additionally requires that QPC to be positive; the urgent path does
+/// not.
+fn urgent_due(command: &Control, now: QpcTick) -> bool {
+    match command {
+        Control::Stop { before_qpc, .. } | Control::Revoke { before_qpc, .. } => *before_qpc <= now,
+        Control::Environment(revision) => revision.changed_qpc <= now,
+        _ => false,
+    }
+}
+
+/// The workers of a visit that is still starting. Unless disarmed, dropping
+/// it revokes the grant and joins the started workers, notices first, under
+/// the cleanup deadline.
+struct VisitStart {
+    grant: Arc<Grant>,
+    /// `None` once disarmed.
+    context: Option<context::Owners>,
+    notices: Option<notices::Owner>,
+}
+
+impl VisitStart {
+    /// Hands the started workers over; the grant is no longer abandoned.
+    fn disarm(mut self) -> Result<(context::Owners, notices::Owner)> {
+        self.context.take().zip(self.notices.take()).ok_or(Failure::Supervisor)
+    }
+}
+
+impl Drop for VisitStart {
+    fn drop(&mut self) {
+        let Some(context) = self.context.take() else { return };
+        let notices = self.notices.take();
+        // The startup error is reported; a cleanup deadline that cannot be
+        // set fails the collector all the same.
+        let _ = self.grant.abandon(|| {
+            if let Some(notices) = notices { let _ = notices.join(); }
+            let _ = context.stop();
+        });
+    }
 }
 
 pub(crate) fn run(links: Links, lifetime: &Arc<Lifetime>, startup: Instant) -> Result<()> {
@@ -95,143 +192,43 @@ fn run_with_witness(links: Links, lifetime: &Arc<Lifetime>, startup: Instant, wi
     // means no renewal arrived within the lease.
     let mut control = Receiver::<Control>::new(&links.control, &links.connection, Failure::ReadinessDeadline);
     let mut status = Sender::<Status>::new(&links.control, &links.connection, Failure::Transport);
-    let configuration = configure(&mut control, startup)?;
+    let Configuration { approved, pen_hid } = configure(&mut control, startup)?;
     control.0.expired = Failure::LeaseExpired;
     await_witness(&witness.view, &links.connection.stop, startup)?;
     lifetime.witness.set(Arc::clone(&witness.progress)).map_err(|_| Failure::Supervisor)?;
+    let session = Arc::new(Session {
+        peer: Arc::clone(&links.connection.peer), witness: witness.view.clone(), lifetime: Arc::clone(lifetime),
+        stop: Arc::clone(&links.connection.stop), approved,
+    });
 
     let mut workers = Workers { stop: Arc::clone(&links.connection.stop), owners: Vec::with_capacity(5) };
     let urgent = Arc::new(Urgent::default());
-    let urgent_revoke = Arc::clone(&urgent);
-    let urgent_lifetime = Arc::clone(lifetime);
+    let urgent_reader = Arc::clone(&urgent);
+    let reader_lifetime = Arc::clone(lifetime);
     let (commands, incoming) = mpsc::sync_channel(COMMANDS);
     workers.spawn("elevated-control-in", move |cancel| {
-        while cancel.check().is_ok() {
-            let command = control.receive(Instant::now() + LEASE)?;
-            if matches!(&command, Control::Stop { .. } | Control::Revoke { .. } | Control::Environment(_)) {
-                let relevant = urgent_revoke.grant.lock().map_err(|_| Failure::Supervisor)?;
-                let now = qpc()?;
-                match &command {
-                    Control::Stop { before_qpc, cleanup_deadline_qpc } if *before_qpc <= now => {
-                        urgent_revoke.stopping.store(true, Release);
-                        if let Some(grant) = relevant.as_ref() { grant.revoke(); }
-                        urgent_lifetime.begin_cleanup(now, *cleanup_deadline_qpc)?;
-                    }
-                    Control::Revoke { visit, before_qpc } if *before_qpc <= now => {
-                        if let Some(grant) = relevant.as_ref().filter(|grant| grant.visit() == *visit) {
-                            grant.revoke();
-                            urgent_lifetime.enter_cleanup(now)?;
-                        }
-                    }
-                    Control::Environment(revision) if revision.changed_qpc <= now => {
-                        if revision.change == EnvironmentChange::SessionEnding {
-                            urgent_revoke.stopping.store(true, Release);
-                        }
-                        if let Some(grant) = relevant.as_ref() {
-                            grant.revoke();
-                            urgent_lifetime.begin_cleanup(now, revision.cleanup_deadline_qpc)?;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            commands.try_send(command).map_err(|_| Failure::Protocol)?;
-        }
-        Ok(())
+        control_reader(cancel, control, commands, &urgent_reader, &reader_lifetime)
     })?;
 
-    let mut context = Receiver::<ContextCommand>::new(&links.context, &links.connection, Failure::Transport);
+    let context = Receiver::<ContextCommand>::new(&links.context, &links.connection, Failure::Transport);
     let (queries, query_owner) = mpsc::sync_channel(COMMANDS);
-    workers.spawn("elevated-context-in", move |cancel| {
-        while cancel.check().is_ok() {
-            let command = context.receive(long_wait())?;
-            queries.try_send(command).map_err(|_| Failure::Protocol)?;
-        }
-        Ok(())
-    })?;
+    workers.spawn("elevated-context-in", move |cancel| context_reader(cancel, context, queries))?;
     let input_pipe = Arc::clone(&links.input);
     let peer = Arc::clone(&links.connection.peer);
-    workers.spawn("elevated-input-monitor", move |cancel| {
-        let deadline = Deadline {
-            at: long_wait(), expired: Failure::Transport, cancellation: cancel, grant: None, scope_current: None,
-            peer: Some(&peer),
-        };
-        input_pipe.read_message(&mut [0], deadline)?;
-        Err(Failure::Protocol)
-    })?;
+    workers.spawn("elevated-input-monitor", move |cancel| input_monitor(cancel, &input_pipe, &peer))?;
 
     let (input, outbound) = mpsc::sync_channel::<input::Item>(input::SLOTS);
-    let mut writer = Sender::<GrantedInput>::new(&links.input, &links.connection, Failure::Transport);
-    workers.spawn("elevated-input-out", move |cancel| {
-        while cancel.check().is_ok() {
-            let mut verified = None;
-            for item in batch(&outbound) {
-                verify_once(&mut verified, &item.grant);
-                // One outstanding write; later records wait in the bounded
-                // queue, whose producers drop newest with loss accounting.
-                // Only a write stalled past the essential coverage budget
-                // fails the lane (E3).
-                if item.grant.qualify_egress(item.record.visit, false)
-                    && writer.send_scoped(&item.record, Instant::now() + ESSENTIAL_PROGRESS, &item.grant, item.record.visit)?
-                {
-                    match item.record.evidence {
-                        InputEvidence::Progress(progress) => item.grant.input_progress(item.record.visit, progress),
-                        // A gap carried from the previous binding only counts;
-                        // a gap reaching past the floor needs a resync (E3).
-                        InputEvidence::Gap(gap) => if let Ok(floor) = item.grant.read_floor(false) && gap.last_qpc > floor {
-                            item.grant.input_loss(item.record.visit, InputLoss {
-                                before: gap.first_qpc.max(floor), reason: CoverageReason::NativeGap, gap: Some(gap),
-                            });
-                        },
-                        _ => {}
-                    }
-                }
-            }
-        }
-        Ok(())
-    })?;
+    let writer = Sender::new(&links.input, &links.connection, Failure::Transport);
+    workers.spawn("elevated-input-out", move |cancel| input_egress(cancel, outbound, writer))?;
 
     let (observation, pending) = Outbox::new();
-    let drain_losses = observation.clone();
-    let mut context_writer = Sender::<Observation>::new(&links.context, &links.connection, Failure::Transport);
-    workers.spawn("elevated-context-out", move |cancel| {
-        while cancel.check().is_ok() {
-            drain_losses.flush_losses()?;
-            let mut verified = None;
-            for mut item in batch(&pending) {
-                verify_once(&mut verified, &item.grant);
-                if let Some(delivery) = &item.delivery
-                    && item.visit == item.grant.visit() && item.grant.read_floor(false).is_ok()
-                {
-                    let deadline = qpc()?.0.checked_add(item.grant.lifetime.ticks(GATE)?).ok_or(Failure::Supervisor)?;
-                    if let Some(_provider) = item.grant.lifetime.provider(super::lifetime::ProviderKind::Egress, QpcTick(deadline)) {
-                        delivery.gate(&item.grant, &mut item.evidence)?;
-                    } else {
-                        return Err(Failure::Supervisor);
-                    }
-                }
-                if item.grant.qualify_egress(item.visit, item.allow_opening)
-                    && context_writer.send_scoped(&item.evidence, Instant::now() + ESSENTIAL_PROGRESS, &item.grant, item.visit)?
-                {
-                    match item.evidence {
-                        Observation::Progress { before_qpc, .. } => item.grant.context_progress(item.visit, before_qpc),
-                        Observation::Item { evidence: ContextEvidence::Held(read), .. } => {
-                            if let Some(end) = read.completed_qpc {
-                                item.grant.deliver_held(item.visit, read.binding.request, end);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        Ok(())
-    })?;
+    let losses = observation.clone();
+    let context_writer = Sender::new(&links.context, &links.connection, Failure::Transport);
+    workers.spawn("elevated-context-out", move |cancel| context_egress(cancel, pending, context_writer, losses))?;
     status.send(&Status::Configured, startup)?;
     let mut owner = Owner {
-        witness: witness.view.clone(), lifetime, connection: &links.connection, configuration,
-        frequency: links.connection.scope.qpc_frequency, current: None, lease: None,
-        grant_sequence: 0, epoch: 0, source_generation: 0, environment: None, cleanup_limit: None, revisions: (0, 0),
+        session, connection: &links.connection, pen_hid, current: None, lease: None,
+        grant_sequence: 0, epoch: AdmissionEpoch(0), source_generation: 0, environment: None, cleanup_limit: None, revisions: (0, 0),
         status, observation, input, urgent,
     };
     let result = owner.run(incoming, query_owner);
@@ -244,6 +241,37 @@ fn run_with_witness(links: Links, lifetime: &Arc<Lifetime>, startup: Instant, wi
     result
 }
 
+/// Reads the control lane. A due Stop, Revoke or Environment change is
+/// applied to the current grant before the command is queued for the owner.
+fn control_reader(
+    cancel: &Cancellation, mut control: Receiver<Control>, commands: SyncSender<Control>, urgent: &Urgent,
+    lifetime: &Lifetime,
+) -> Result<()> {
+    while cancel.check().is_ok() {
+        let command = control.receive(Instant::now() + LEASE)?;
+        urgent.preempt(&command, lifetime)?;
+        commands.try_send(command).map_err(|_| Failure::Protocol)?;
+    }
+    Ok(())
+}
+
+fn context_reader(
+    cancel: &Cancellation, mut context: Receiver<ContextCommand>, queries: SyncSender<ContextCommand>,
+) -> Result<()> {
+    while cancel.check().is_ok() {
+        let command = context.receive(long_wait())?;
+        queries.try_send(command).map_err(|_| Failure::Protocol)?;
+    }
+    Ok(())
+}
+
+/// The Recorder never writes to the input lane. This read ends only with a
+/// lane failure, the peer's exit, cancellation, or a protocol violation.
+fn input_monitor(cancel: &Cancellation, pipe: &Pipe, peer: &Process) -> Result<()> {
+    pipe.read_message(&mut [0], Deadline::new(long_wait(), Failure::Transport, cancel).peer(peer))?;
+    Err(Failure::Protocol)
+}
+
 impl Owner<'_> {
     /// A control write fails the lane only past the cleanup bound, the same
     /// bound within which the supervisor requires owner progress (E3).
@@ -254,11 +282,11 @@ impl Owner<'_> {
     fn run(&mut self, commands: Queue<Control>, queries: Queue<ContextCommand>) -> Result<()> {
         loop {
             self.connection.stop.check()?;
-            self.lifetime.owner_progress(qpc()?);
+            self.session.lifetime.owner_progress(qpc()?);
             self.witness_update()?;
             for _ in 0..COMMANDS {
                 match commands.try_recv() {
-                    Ok(command) => { if self.handle(command)? { return Ok(()); } }
+                    Ok(command) => { if self.handle(command)? == Flow::Stopped { return Ok(()); } }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => return Err(Failure::Transport),
                 }
@@ -278,186 +306,191 @@ impl Owner<'_> {
         }
     }
 
-    fn handle(&mut self, command: Control) -> Result<bool> {
+    fn handle(&mut self, command: Control) -> Result<Flow> {
         let now = qpc()?;
+        let due = urgent_due(&command, now);
         match command {
-            Control::Renew(lease) => {
-                self.lifetime.renew(self.lease, lease, now)?;
-                self.lease = Some(lease);
-                if let Some(visit) = &self.current && !visit.grant.stopped() {
-                    match visit.grant.renew(lease) {
-                        Ok(()) | Err(Failure::ScopeClosed) => {}
-                        Err(_) => {
-                            let notice = visit.grant.loss(now).unwrap_or((Revocation::Foreground, visit.grant.arm));
-                            self.close(Some(notice))?;
-                        }
-                    }
-                }
-            }
-            Control::Prepare(request) => {
-                let visit = request.visit;
-                if self.urgent.stopping.load(Acquire) || self.current.is_some() || visit.grant.get() <= self.grant_sequence
-                    // The same epoch may prepare again before admission (D-8 A);
-                    // grant and source generation still strictly increase.
-                    || visit.epoch.0 < self.epoch || visit.source_generation.get() <= self.source_generation
-                    || request.expires_qpc <= now
-                {
-                    self.transition_rejected(visit, Transition::Prepare,
-                        if request.expires_qpc <= now { ReadUnavailable::TimedOut } else { ReadUnavailable::Stale })?;
-                    return Ok(false);
-                }
-                self.grant_sequence = visit.grant.get();
-                self.epoch = visit.epoch.0;
-                self.source_generation = visit.source_generation.get();
-                let grant = match Grant::prepare(request, &self.configuration.approved,
-                    self.lease.ok_or(Failure::Protocol)?, Arc::clone(&self.connection.peer),
-                    self.witness.clone(), Arc::clone(self.lifetime), Arc::clone(&self.connection.stop))
-                {
-                    Ok(grant) => grant,
-                    Err(Failure::TargetChanged | Failure::ScopeClosed | Failure::ProcessIdentity | Failure::TokenIdentity(_) | Failure::PeerExited) => {
-                        self.send(&Status::Invalidated { visit, reason: Revocation::Foreground, before_qpc: now })?;
-                        self.send(&Status::Closed { visit, before_qpc: now })?;
-                        return Ok(false);
-                    }
-                    // The collector's canonical approval proof failed (E6).
-                    Err(Failure::TargetAccess) => {
-                        self.send(&Status::Invalidated { visit, reason: Revocation::RequiredAccess, before_qpc: now })?;
-                        self.send(&Status::Closed { visit, before_qpc: now })?;
-                        return Ok(false);
-                    }
-                    Err(error) => return Err(error),
-                };
-                let stopping = {
-                    let mut urgent = self.urgent.grant.lock().map_err(|_| Failure::Supervisor)?;
-                    let stopping = self.urgent.stopping.load(Acquire);
-                    if !stopping { *urgent = Some(Arc::clone(&grant)); }
-                    stopping
-                };
-                if stopping {
-                    // Every Prepare is acknowledged exactly once.
-                    self.transition_rejected(visit, Transition::Prepare, ReadUnavailable::Stale)?;
-                    return Ok(false);
-                }
-                let context = context::Owners::start(&grant, Arc::clone(&self.configuration.approved), self.observation.clone())?;
-                let posted = notices::Owner::start(Arc::clone(&grant), self.observation.clone(), Arc::clone(&context.seen));
-                let (notices, native) = match posted {
-                    Ok(notices) => match Native::start(Arc::clone(&grant), self.frequency, self.configuration.pen_hid, self.input.clone()) {
-                        Ok(native) => (notices, native),
-                        Err(error) => {
-                            grant.abandon(|| {
-                                let _ = notices.join();
-                                let _ = context.stop();
-                            })?;
-                            return Err(error);
-                        }
-                    },
-                    Err(error) => {
-                        grant.abandon(|| { let _ = context.stop(); })?;
-                        return Err(error);
-                    }
-                };
-                self.current = Some(Visit { last_request: 0, grant, native, context, notices, registered: false, held_result: None, readiness: Instant::now() + crate::deadline::READINESS, resync_from: None, resync_expires: None });
-            }
-            Control::Activate(activation) => {
-                let active = self.lease.filter(|active| active.sequence == activation.lease);
-                let current = self.current.as_ref().filter(|visit| visit.registered && visit.grant.visit() == activation.visit);
-                let activation_qpc = match current.zip(active).map(|(visit, lease)| visit.grant.activate(activation, lease)) {
-                    Some(Ok(tick)) => tick,
-                    Some(Err(Failure::Protocol)) => return Err(Failure::Protocol),
-                    _ => {
-                        self.transition_rejected(activation.visit, Transition::Activate, ReadUnavailable::Stale)?;
-                        return Ok(false);
-                    }
-                };
-                if let Some(current) = self.current.as_mut() {
-                    current.resync_from = Some(activation.opening_qpc);
-                    current.resync_expires = Some(Instant::now() + crate::deadline::READINESS);
-                }
-                self.send(&Status::Activated { visit: activation.visit, activation_qpc })?;
-            }
-            Control::RefreshFocus { previous, next, lease } => {
-                let active = self.lease.filter(|active| active.sequence == lease);
-                let current = self.current.as_mut().filter(|visit| visit.grant.visit() == previous);
-                let Some((current, active)) = current.zip(active) else {
-                    self.transition_rejected(next, Transition::RefreshFocus, ReadUnavailable::Stale)?;
-                    return Ok(false);
-                };
-                let (focus, resync_after_qpc) = match current.grant.refresh_focus(previous, next, active) {
-                    Ok(opened) => opened,
-                    Err(Failure::TargetChanged | Failure::ScopeClosed) => {
-                        self.transition_rejected(next, Transition::RefreshFocus, ReadUnavailable::Stale)?;
-                        return Ok(false);
-                    }
-                    Err(error) => return Err(error),
-                };
-                current.held_result = None;
-                current.resync_from.get_or_insert(resync_after_qpc);
-                current.resync_expires = Some(Instant::now() + crate::deadline::READINESS);
-                self.send(&Status::FocusRefreshed { visit: next, focus, resync_after_qpc })?;
-            }
-            Control::AcceptResync { visit, request, completed_qpc } => {
-                let result = self.current.as_mut().filter(|current| current.grant.visit() == visit)
-                    .and_then(|current| current.held_result.as_mut())
-                    .filter(|held| held.read.request == request && held.completed == completed_qpc && !held.accepted);
-                if let Some(result) = result {
-                    result.accepted = true;
-                } else {
-                    self.transition_rejected(visit, Transition::AcceptResync, ReadUnavailable::Stale)?;
-                }
-            }
-            Control::Revoke { visit, before_qpc } if before_qpc.0 > 0 && before_qpc <= now => {
-                if self.current.as_ref().is_some_and(|current| current.grant.visit() == visit) {
-                    self.close(Some((Revocation::Requested, before_qpc)))?;
-                } else {
-                    self.transition_rejected(visit, Transition::Revoke, ReadUnavailable::Stale)?;
-                }
-            }
-            Control::Environment(revision) if revision.changed_qpc.0 > 0 && revision.changed_qpc <= now => {
-                if self.environment.is_some_and(|old| old >= revision.sequence) {
-                    return Err(Failure::Protocol);
-                }
-                self.environment = Some(revision.sequence);
-                if revision.cleanup_deadline_qpc.is_some_and(|deadline| deadline.0 <= 0) {
-                    return Err(Failure::Protocol);
-                }
-                self.cleanup_limit = revision.cleanup_deadline_qpc;
-                self.close(Some((Revocation::Environment, revision.changed_qpc)))?;
-                if revision.change == EnvironmentChange::SessionEnding {
-                    return self.stopped();
-                }
-            }
-            Control::Stop { before_qpc, cleanup_deadline_qpc } if before_qpc.0 > 0 && before_qpc <= now
+            Control::Renew(lease) => self.renew(lease, now)?,
+            Control::Prepare(request) => self.prepare(request, now)?,
+            Control::Activate(activation) => self.activate(activation)?,
+            Control::RefreshFocus { previous, next, lease } => self.refresh_focus(previous, next, lease)?,
+            Control::AcceptResync { visit, request, completed_qpc } => self.accept_resync(visit, request, completed_qpc)?,
+            Control::Revoke { visit, before_qpc } if before_qpc.0 > 0 && due => self.revoke(visit, before_qpc)?,
+            Control::Environment(revision) if revision.changed_qpc.0 > 0 && due => return self.environment(revision),
+            Control::Stop { before_qpc, cleanup_deadline_qpc } if before_qpc.0 > 0 && due
                 && cleanup_deadline_qpc.is_none_or(|deadline| deadline.0 > 0) =>
             {
-                self.cleanup_limit = cleanup_deadline_qpc;
-                self.close(Some((Revocation::Stopping, before_qpc)))?;
-                return self.stopped();
+                return self.stop(before_qpc, cleanup_deadline_qpc);
             }
             _ => return Err(Failure::Protocol),
         }
-        Ok(false)
+        Ok(Flow::Continue)
     }
 
-    fn stopped(&mut self) -> Result<bool> {
+    fn renew(&mut self, lease: Lease, now: QpcTick) -> Result<()> {
+        self.session.lifetime.renew(self.lease, lease, now)?;
+        self.lease = Some(lease);
+        if let Some(visit) = &self.current && !visit.grant.stopped() {
+            match visit.grant.renew(lease) {
+                Ok(()) | Err(Failure::ScopeClosed) => {}
+                Err(_) => {
+                    let notice = visit.grant.loss(now)
+                        .unwrap_or(Cut { reason: Revocation::Foreground, before: visit.grant.armed_qpc() });
+                    self.close(Some(notice))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare(&mut self, request: GrantRequest, now: QpcTick) -> Result<()> {
+        let visit = request.visit;
+        if self.urgent.stopping.load(Acquire) || self.current.is_some() || visit.grant.get() <= self.grant_sequence
+            // The same epoch may prepare again before admission (D-8 A);
+            // grant and source generation still strictly increase.
+            || visit.epoch < self.epoch || visit.source_generation.get() <= self.source_generation
+            || request.expires_qpc <= now
+        {
+            return self.transition_rejected(visit, Transition::Prepare,
+                if request.expires_qpc <= now { ReadUnavailable::TimedOut } else { ReadUnavailable::Stale });
+        }
+        self.grant_sequence = visit.grant.get();
+        self.epoch = visit.epoch;
+        self.source_generation = visit.source_generation.get();
+        let grant = match Grant::prepare(request, self.lease.ok_or(Failure::Protocol)?, Arc::clone(&self.session)) {
+            Ok(grant) => grant,
+            Err(Failure::TargetChanged | Failure::ScopeClosed | Failure::ProcessIdentity | Failure::TokenIdentity(_) | Failure::PeerExited) =>
+                return self.refuse(visit, Revocation::Foreground, now),
+            // The collector's canonical approval proof failed (E6).
+            Err(Failure::TargetAccess) => return self.refuse(visit, Revocation::RequiredAccess, now),
+            Err(error) => return Err(error),
+        };
+        let stopping = {
+            let mut urgent = self.urgent.grant.lock().map_err(|_| Failure::Supervisor)?;
+            let stopping = self.urgent.stopping.load(Acquire);
+            if !stopping { *urgent = Some(Arc::clone(&grant)); }
+            stopping
+        };
+        if stopping {
+            // Every Prepare is acknowledged exactly once.
+            return self.transition_rejected(visit, Transition::Prepare, ReadUnavailable::Stale);
+        }
+        let context = context::Owners::start(&grant, self.observation.clone())?;
+        let seen = Arc::clone(&context.seen);
+        let mut start = VisitStart { grant: Arc::clone(&grant), context: Some(context), notices: None };
+        start.notices = Some(notices::Owner::start(Arc::clone(&grant), self.observation.clone(), seen)?);
+        let native = Native::start(
+            Arc::clone(&grant), self.connection.scope.qpc_frequency, self.pen_hid, self.input.clone(),
+        )?;
+        let (context, notices) = start.disarm()?;
+        self.current = Some(Visit {
+            last_request: 0, grant, native, context, notices, registered: false, held_result: None,
+            readiness: readiness(), resync: None,
+        });
+        Ok(())
+    }
+
+    /// Answers a Prepare whose grant could not be proven.
+    fn refuse(&mut self, visit: VisitBinding, reason: Revocation, now: QpcTick) -> Result<()> {
+        self.send(&Status::Invalidated { visit, reason, before_qpc: now })?;
+        self.send(&Status::Closed { visit, before_qpc: now })
+    }
+
+    fn activate(&mut self, activation: Activation) -> Result<()> {
+        let active = self.lease.filter(|active| active.sequence == activation.lease);
+        let current = self.current.as_ref().filter(|visit| visit.registered && visit.grant.visit() == activation.visit);
+        let activation_qpc = match current.zip(active).map(|(visit, lease)| visit.grant.activate(activation, lease)) {
+            Some(Ok(tick)) => tick,
+            Some(Err(Failure::Protocol)) => return Err(Failure::Protocol),
+            _ => return self.transition_rejected(activation.visit, Transition::Activate, ReadUnavailable::Stale),
+        };
+        if let Some(current) = self.current.as_mut() {
+            current.resync = Some(Resync::bounded(activation.opening_qpc));
+        }
+        self.send(&Status::Activated { visit: activation.visit, activation_qpc })
+    }
+
+    fn refresh_focus(&mut self, previous: VisitBinding, next: VisitBinding, lease: NonZeroU64) -> Result<()> {
+        let active = self.lease.filter(|active| active.sequence == lease);
+        let current = self.current.as_mut().filter(|visit| visit.grant.visit() == previous);
+        let Some((current, active)) = current.zip(active) else {
+            return self.transition_rejected(next, Transition::RefreshFocus, ReadUnavailable::Stale);
+        };
+        let (focus, resync_after_qpc) = match current.grant.refresh_focus(previous, next, active) {
+            Ok(opened) => opened,
+            Err(Failure::TargetChanged | Failure::ScopeClosed) =>
+                return self.transition_rejected(next, Transition::RefreshFocus, ReadUnavailable::Stale),
+            Err(error) => return Err(error),
+        };
+        current.held_result = None;
+        // A resync not yet accepted keeps its earlier start.
+        let from = current.resync.map_or(resync_after_qpc, |resync| resync.from);
+        current.resync = Some(Resync::bounded(from));
+        self.send(&Status::FocusRefreshed { visit: next, focus, resync_after_qpc })
+    }
+
+    fn accept_resync(&mut self, visit: VisitBinding, request: RequestId, completed_qpc: QpcTick) -> Result<()> {
+        let result = self.current.as_mut().filter(|current| current.grant.visit() == visit)
+            .and_then(|current| current.held_result.as_mut())
+            .filter(|held| held.read.request == request && held.completed == completed_qpc && !held.accepted);
+        if let Some(result) = result {
+            result.accepted = true;
+            Ok(())
+        } else {
+            self.transition_rejected(visit, Transition::AcceptResync, ReadUnavailable::Stale)
+        }
+    }
+
+    fn revoke(&mut self, visit: VisitBinding, before_qpc: QpcTick) -> Result<()> {
+        if self.current.as_ref().is_some_and(|current| current.grant.visit() == visit) {
+            self.close(Some(Cut { reason: Revocation::Requested, before: before_qpc }))
+        } else {
+            self.transition_rejected(visit, Transition::Revoke, ReadUnavailable::Stale)
+        }
+    }
+
+    fn environment(&mut self, revision: EnvironmentRevision) -> Result<Flow> {
+        if self.environment.is_some_and(|old| old >= revision.sequence) {
+            return Err(Failure::Protocol);
+        }
+        self.environment = Some(revision.sequence);
+        if revision.cleanup_deadline_qpc.is_some_and(|deadline| deadline.0 <= 0) {
+            return Err(Failure::Protocol);
+        }
+        self.cleanup_limit = revision.cleanup_deadline_qpc;
+        self.close(Some(Cut { reason: Revocation::Environment, before: revision.changed_qpc }))?;
+        if revision.change == EnvironmentChange::SessionEnding {
+            return self.stopped();
+        }
+        Ok(Flow::Continue)
+    }
+
+    fn stop(&mut self, before_qpc: QpcTick, cleanup_deadline_qpc: Option<QpcTick>) -> Result<Flow> {
+        self.cleanup_limit = cleanup_deadline_qpc;
+        self.close(Some(Cut { reason: Revocation::Stopping, before: before_qpc }))?;
+        self.stopped()
+    }
+
+    fn stopped(&mut self) -> Result<Flow> {
         self.send(&Status::Stopped)?;
         // Keep the original process and lanes live until the Recorder has
         // read the terminal record and closed the connection. Its sibling
         // lanes otherwise race peer-exit against the control acknowledgement.
         self.connection.stop.wait(CLEANUP);
-        Ok(true)
+        Ok(Flow::Stopped)
     }
 
     fn witness_update(&mut self) -> Result<()> {
         let now = qpc()?;
         if let Some(visit) = &self.current && let Some(loss) = visit.grant.loss(now) {
-            if loss.0 == Revocation::Focus {
+            if loss.reason == Revocation::Focus {
                 match visit.grant.suspend_focus() {
                     Ok(true) => {
                         let binding = visit.grant.visit();
-                        let before_qpc = visit.grant.certified(binding, loss.1);
+                        let before_qpc = visit.grant.certified(binding, loss.before);
                         if let Some(current) = self.current.as_mut() {
-                            current.resync_from = Some(before_qpc);
-                            current.resync_expires = None;
+                            // A suspended visit waits for its refresh without a bound.
+                            current.resync = Some(Resync { from: before_qpc, expires: None });
                         }
                         self.send(&Status::FocusSuspended { visit: binding, before_qpc })?;
                     }
@@ -468,7 +501,7 @@ impl Owner<'_> {
                 self.close(Some(loss))?;
             }
         }
-        let observed = self.witness.read()?.ok_or(Failure::Witness)?;
+        let observed = self.session.witness.read()?.ok_or(Failure::Witness)?;
         let next = (observed.revision, observed.focus_revision);
         if self.revisions != next {
             self.send(&Status::Witness {
@@ -483,7 +516,7 @@ impl Owner<'_> {
         let Some(visit) = self.current.as_mut() else { return Ok(()) };
         if visit.grant.stopped() { return Ok(()); }
         if visit.native.ended() || visit.context.ended() || visit.notices.ended() {
-            self.close(Some((Revocation::NativeFailure, qpc()?)))?;
+            self.close(Some(Cut { reason: Revocation::NativeFailure, before: qpc()? }))?;
             return Err(Failure::Transport);
         }
         if visit.registered { return Ok(()); }
@@ -498,7 +531,7 @@ impl Owner<'_> {
                 let (_, _, held) = match input::held(&visit.grant) {
                     Ok(result) => result,
                     Err(Failure::TargetAccess) => {
-                        self.close(Some((Revocation::RequiredAccess, qpc()?)))?;
+                        self.close(Some(Cut { reason: Revocation::RequiredAccess, before: qpc()? }))?;
                         return Ok(());
                     }
                     Err(error) => return Err(error),
@@ -541,7 +574,7 @@ impl Owner<'_> {
         let now = qpc()?;
         if read.request.0 == 0 || read.requested_qpc.0 <= 0 || read.requested_qpc > now
             || read.deadline_qpc <= read.requested_qpc
-            || read.deadline_qpc.0 - read.requested_qpc.0 > self.lifetime.ticks(LEASE)?
+            || read.deadline_qpc.0 - read.requested_qpc.0 > self.session.lifetime.ticks(LEASE)?
         {
             return Err(Failure::Protocol);
         }
@@ -584,7 +617,7 @@ impl Owner<'_> {
             Ok(result) => result,
             Err(Failure::TargetChanged | Failure::ScopeClosed | Failure::Cancelled) =>
                 return self.read_rejected(read, ReadUnavailable::Stale),
-            Err(Failure::TargetAccess) => return self.close(Some((Revocation::RequiredAccess, now))),
+            Err(Failure::TargetAccess) => return self.close(Some(Cut { reason: Revocation::RequiredAccess, before: now })),
             Err(error) => return Err(error),
         };
         if end >= read.deadline_qpc {
@@ -622,15 +655,14 @@ impl Owner<'_> {
     fn input_health(&mut self) -> Result<()> {
         let Some(current) = self.current.as_mut() else { return Ok(()) };
         let now = qpc()?;
-        if current.resync_expires.is_some_and(|until| Instant::now() >= until)
+        if current.resync.and_then(|resync| resync.expires).is_some_and(|until| Instant::now() >= until)
             || current.grant.essential_stalled(now)?
         {
-            return self.close(Some((Revocation::NativeFailure, now)));
+            return self.close(Some(Cut { reason: Revocation::NativeFailure, before: now }));
         }
         match current.grant.reopen_input() {
-            Ok(Some((previous, visit, loss, resync_after_qpc))) => {
-                current.resync_from = Some(loss.before);
-                current.resync_expires = Some(Instant::now() + crate::deadline::READINESS);
+            Ok(Some(Reopened { previous, visit, loss, resync_after_qpc })) => {
+                current.resync = Some(Resync::bounded(loss.before));
                 current.held_result = None;
                 self.send(&Status::ResyncRequired {
                     previous, visit, first_uncovered: loss.before, resync_after_qpc,
@@ -660,13 +692,12 @@ impl Owner<'_> {
         }
         match visit.grant.finish_opening(result.completed) {
             Ok(()) => {
-                let before = result.completed.0.checked_add(self.lifetime.ticks(INPUT_HOLDBACK)?).ok_or(Failure::Supervisor)?;
-                let first = visit.resync_from.take().unwrap_or(result.completed);
-                visit.resync_expires = None;
+                let before = self.session.lifetime.after(result.completed, INPUT_HOLDBACK)?;
+                let first = visit.resync.take().map_or(result.completed, |resync| resync.from);
                 self.send(&Status::ResyncAccepted {
                     visit: read.visit, after_qpc: result.completed, held: result.readiness,
                     input_coverage: CoverageLoss {
-                        first_qpc: first, before_qpc: QpcTick(before),
+                        first_qpc: first, before_qpc: before,
                         reason: if result.readiness == HeldReadiness::Unknown { CoverageReason::HeldUnknown } else { CoverageReason::Opening },
                     },
                 })
@@ -677,15 +708,16 @@ impl Owner<'_> {
         }
     }
 
-    fn close(&mut self, notice: Option<(Revocation, QpcTick)>) -> Result<()> {
+    fn close(&mut self, notice: Option<Cut>) -> Result<()> {
         let limit = self.cleanup_limit.take();
         let Some(visit) = self.current.take() else { return Ok(()) };
         visit.grant.revoke();
         let binding = visit.grant.visit();
         self.urgent.grant.lock().map_err(|_| Failure::Supervisor)?.take();
-        self.lifetime.begin_cleanup(qpc()?, limit)?;
-        let defer_native_failure = !visit.registered && matches!(notice, Some((Revocation::NativeFailure, _)));
-        let notify = if !defer_native_failure && let Some((reason, cut)) = notice {
+        self.session.lifetime.begin_cleanup(qpc()?, limit)?;
+        let defer_native_failure = !visit.registered
+            && matches!(notice, Some(Cut { reason: Revocation::NativeFailure, .. }));
+        let notify = if !defer_native_failure && let Some(Cut { reason, before: cut }) = notice {
             let before_qpc = visit.grant.certified(binding, cut);
             self.send(&Status::Invalidated { visit: binding, reason, before_qpc })
         } else { Ok(()) };
@@ -693,7 +725,7 @@ impl Owner<'_> {
         let context = visit.context.stop();
         let notices = visit.notices.join();
         if !self.urgent.stopping.load(Acquire) {
-            self.lifetime.end_cleanup();
+            self.session.lifetime.end_cleanup();
         }
         notify?;
         let failure = failure?;
@@ -703,7 +735,7 @@ impl Owner<'_> {
         }
         context?;
         notices?;
-        if let Some((reason, cut)) = notice {
+        if let Some(Cut { reason, before: cut }) = notice {
             let before_qpc = visit.grant.certified(binding, cut);
             if defer_native_failure {
                 self.send(&Status::Invalidated { visit: binding, reason, before_qpc })?;
@@ -738,23 +770,9 @@ fn configure(control: &mut Receiver<Control>, until: Instant) -> Result<Configur
     Ok(Configuration { approved: approved.into(), pen_hid })
 }
 
-fn long_wait() -> Instant { Instant::now() + Duration::from_secs(86_400) }
+fn long_wait() -> Instant { Instant::now() + LONG_WAIT }
 
-/// The records of one egress pass: the first waits up to a poll interval, the
-/// rest are already queued.
-fn batch<T>(queue: &Queue<T>) -> impl Iterator<Item = T> + '_ {
-    queue.recv_timeout(POLL).ok().into_iter().chain(std::iter::from_fn(move || queue.try_recv().ok())).take(input::SLOTS)
-}
-
-/// Token facts are queried once per egress batch and grant; per-record checks
-/// read the result latched in the grant (E3).
-fn verify_once(verified: &mut Option<Arc<Grant>>, grant: &Arc<Grant>) {
-    if verified.as_ref().is_none_or(|last| !Arc::ptr_eq(last, grant)) {
-        // A failure is latched; `qualify_egress` then refuses the records.
-        let _ = grant.verify_token();
-        *verified = Some(Arc::clone(grant));
-    }
-}
+fn readiness() -> Instant { Instant::now() + READINESS }
 
 struct Workers {
     stop: Arc<Cancellation>,

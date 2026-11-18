@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, mem::{size_of, size_of_val}, ptr::{null, null_mut}};
+use std::{
+    collections::BTreeMap,
+    mem::{size_of, size_of_val},
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    ptr::{null, null_mut},
+};
 
 use screen_fix_protocol::{
     BoundedText, DeviceId,
@@ -14,7 +19,7 @@ use windows_sys::Win32::{
         HumanInterfaceDevice::{HIDD_ATTRIBUTES, HidD_GetAttributes},
         Properties::{DEVPKEY_Device_DriverVersion, DEVPROP_TYPE_STRING},
     },
-    Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE, INVALID_HANDLE_VALUE},
+    Foundation::{ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE, INVALID_HANDLE_VALUE},
     Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING},
     System::Registry::REG_MULTI_SZ,
     UI::Input::{
@@ -57,10 +62,17 @@ pub(super) fn inventory() -> Result<Vec<RAWINPUTDEVICELIST>, NativeError> {
     Ok(devices)
 }
 
+/// A device as the Raw Input thread sees it.
+pub(super) struct ProbedDevice {
+    pub(super) descriptor: DeviceDescriptor,
+    /// The interface path, for the device worker, which alone opens it
+    /// (`identify`, I6).
+    pub(super) path: Option<Vec<u16>>,
+}
+
 /// The Raw Input thread's part of a descriptor, from Raw Input queries only:
-/// kind and hashed path. The interface path is returned for the device worker,
-/// which alone opens it (`identify`, I6).
-pub(super) fn descriptor(handle: HANDLE, known_kind: Option<u32>) -> Option<(DeviceDescriptor, Option<Vec<u16>>)> {
+/// kind and hashed path.
+pub(super) fn descriptor(handle: HANDLE, known_kind: Option<u32>) -> Option<ProbedDevice> {
     let id = id(handle)?;
     let mut info = RID_DEVICE_INFO::default();
     let mut size = size_of::<RID_DEVICE_INFO>() as u32;
@@ -81,10 +93,11 @@ pub(super) fn descriptor(handle: HANDLE, known_kind: Option<u32>) -> Option<(Dev
     };
     let path = name(handle);
     let hash = path.as_deref().and_then(path_hash);
-    Some((DeviceDescriptor {
+    let descriptor = DeviceDescriptor {
         id, kind, path_hash: hash, vendor_id: None, product_id: None, version: None,
         preparsed_data_available: false, driver_version: None, hid: None,
-    }, path))
+    };
+    Some(ProbedDevice { descriptor, path })
 }
 
 /// Device worker only: vendor, product and version (INP-8), and the pen
@@ -132,19 +145,19 @@ fn path_hash(path: &[u16]) -> Option<BoundedText<DEVICE_PATH_HASH_BYTES>> {
 
 fn hid_attributes(path: &[u16]) -> Option<(u16, u16, u16)> {
     // The HID interface is queried without opening it for reading or writing.
-    let handle = open_metadata_handle(path);
-    if handle == INVALID_HANDLE_VALUE { return None; }
+    let handle = open_metadata_handle(path)?;
     let mut attributes = HIDD_ATTRIBUTES { Size: size_of::<HIDD_ATTRIBUTES>() as u32, ..Default::default() };
-    let queried = unsafe { HidD_GetAttributes(handle, &mut attributes) as u8 } != 0;
-    unsafe { CloseHandle(handle) };
+    let queried = unsafe { HidD_GetAttributes(handle.as_raw_handle(), &mut attributes) as u8 } != 0;
     queried.then_some((attributes.VendorID, attributes.ProductID, attributes.VersionNumber))
 }
 
-fn open_metadata_handle(path: &[u16]) -> HANDLE {
-    unsafe {
+fn open_metadata_handle(path: &[u16]) -> Option<OwnedHandle> {
+    let handle = unsafe {
         CreateFileW(path.as_ptr(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
             null(), OPEN_EXISTING, 0, null_mut())
-    }
+    };
+    // CreateFileW returned a new handle unless it failed.
+    (handle != INVALID_HANDLE_VALUE).then(|| unsafe { OwnedHandle::from_raw_handle(handle) })
 }
 
 struct Devices(HDEVINFO);
@@ -246,24 +259,32 @@ impl DeviceIds {
         self.active.remove(&handle)
     }
 
-    /// Translate the record's native handle to its session device ID. `None`
-    /// when the inventory is full. `Some(Some((handle, id)))` names a handle
-    /// seen first in this record and its new session ID: the caller announces
-    /// it before the record.
-    pub(super) fn identify(&mut self, sample: &mut InputSample) -> Option<Option<(DeviceId, DeviceId)>> {
+    /// Translate the record's native handle to its session device ID.
+    pub(super) fn identify(&mut self, sample: &mut InputSample) -> Identified {
         let slot = match sample {
             InputSample::RawKey(key) => key.device.as_mut(),
             InputSample::RawPointer(pointer) => pointer.device.as_mut(),
             InputSample::Hid(report) => Some(&mut report.device),
             _ => None,
         };
-        let Some(slot) = slot else { return Some(None) };
+        let Some(slot) = slot else { return Identified::Known };
         let native = *slot;
         let first_seen = !self.active.contains_key(&native);
-        let id = self.assign(native)?;
+        let Some(id) = self.assign(native) else { return Identified::Full };
         *slot = id;
-        Some(first_seen.then_some((native, id)))
+        if first_seen { Identified::FirstSeen { native, id } } else { Identified::Known }
     }
+}
+
+/// How `DeviceIds::identify` resolved a record's device.
+pub(super) enum Identified {
+    /// The record names no device, or one that has a session ID already.
+    Known,
+    /// The record names `native`, seen first in this record, now under the
+    /// session ID `id`: the caller announces it before the record.
+    FirstSeen { native: DeviceId, id: DeviceId },
+    /// The inventory is full.
+    Full,
 }
 
 pub(super) fn preparsed(handle: HANDLE) -> Option<Box<[u64]>> {

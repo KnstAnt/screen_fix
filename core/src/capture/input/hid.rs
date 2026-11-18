@@ -18,9 +18,12 @@ const FIT_SAMPLES: usize = 32;
 const MAX_NDOF_BUTTON_CANDIDATES: usize = 32;
 const NDOF_KEY_WINDOW_US: i64 = 50_000;
 const MAX_INITIAL_INTERVAL_US: i64 = 100_000;
+/// The longest backward overlap of a touchpad contact report that still
+/// witnesses a null-device pointer row.
+const CONTACT_OVERLAP_US: i64 = 12_000;
 
 #[derive(Default)]
-pub(super) struct HidPublication {
+pub(crate) struct HidPublication {
     clocks: BTreeMap<DeviceId, ScanClock>,
     frames: BTreeMap<DeviceId, touchpad::Frame>,
     latest_contacts: BTreeMap<DeviceId, TouchpadContact>,
@@ -77,7 +80,7 @@ impl HidPublication {
         let gap = at.0.checked_sub(contact.at.0)?;
         // A short backward overlap, with no intervening loss or contact
         // report, avoids extrapolating beyond the approved contact prefix.
-        (contact.proof == proof && (0..=12_000).contains(&gap)).then_some(contact)
+        (contact.proof == proof && (0..=CONTACT_OVERLAP_US).contains(&gap)).then_some(contact)
     }
 
     pub fn ndof_key_candidates(&self, at: SessionTimeUs, proof: ForegroundAtReceipt) -> Option<Value> {
@@ -240,7 +243,7 @@ impl ReportKind {
     }
 }
 
-pub(super) struct TouchpadContact {
+pub(crate) struct TouchpadContact {
     pub at: SessionTimeUs,
     proof: ForegroundAtReceipt,
     pub reference: Option<String>,
@@ -334,7 +337,7 @@ fn angle(value: HidValue) -> (Option<f64>, Option<i64>) {
 }
 
 /// `raw` scaled to 0..=1 over a non-empty logical range that contains it.
-pub(super) fn normalize(raw: i64, [min, max]: [i64; 2]) -> Option<f64> {
+pub(crate) fn normalize(raw: i64, [min, max]: [i64; 2]) -> Option<f64> {
     (max > min && (min..=max).contains(&raw)).then(|| (raw - min) as f64 / (max - min) as f64)
 }
 

@@ -65,6 +65,13 @@ impl VideoFormat {
     }
 }
 
+/// An encoder's video format, and whether the software encoder takes it.
+#[derive(Clone, Copy)]
+pub(super) struct Encoding {
+    pub format: VideoFormat,
+    pub software: bool,
+}
+
 pub(super) struct Converter {
     device: ID3D11Device,
     video: ID3D11VideoDevice,
@@ -82,11 +89,7 @@ pub(super) struct Converter {
 }
 
 impl Converter {
-    pub(super) fn new(
-        device: &ID3D11Device,
-        format: VideoFormat,
-        software: bool,
-    ) -> Result<Self, ProbeError> {
+    pub(super) fn new(device: &ID3D11Device, Encoding { format, software }: Encoding) -> Result<Self, ProbeError> {
         let [width, height] = format.source;
         let [content_width, content_height] = format.content;
         let [encoded_width, encoded_height] = format.encoded;

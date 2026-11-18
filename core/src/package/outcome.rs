@@ -9,7 +9,7 @@ use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::{QpcTick, SessionTimeUs};
+use crate::protocol::{QpcTick, SessionTimeUs, ipc::GapCause};
 
 /// Closed vocabulary of reasons why items never reached a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -58,6 +58,15 @@ pub enum LossReason {
     NotificationOverflow,
     /// Elevated records past the certified prefix of an interrupted visit (E1).
     UncertifiedSource,
+}
+
+impl From<GapCause> for LossReason {
+    fn from(cause: GapCause) -> Self {
+        match cause {
+            GapCause::Overflow => Self::NativeQueueOverflow,
+            GapCause::Malformed => Self::MalformedPacket,
+        }
+    }
 }
 
 /// Typed identity of the producer whose items were lost, when it is known.
@@ -238,6 +247,34 @@ impl LossRange {
             last_t_us: self.last_t_us.max(other.last_t_us),
             source_seq: merge_bounds(self.source_seq, other.source_seq),
             qpc: merge_bounds(self.qpc, other.qpc),
+        }
+    }
+}
+
+/// An ordinary loss of one reason and producer: its count and receipt range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OrdinaryLoss {
+    pub(crate) reason: LossReason,
+    pub(crate) producer: Option<LossProducer>,
+    pub(crate) count: LossCount,
+    pub(crate) range: LossRange,
+}
+
+impl OrdinaryLoss {
+    /// Merge a loss with the same reason and producer (§6.1 merge rule).
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.count = self.count.merge(other.count);
+        self.range = self.range.merge(other.range);
+    }
+
+    /// The payload of this loss's `gap` row.
+    pub(crate) fn record(&self) -> GapRecord {
+        let LossRange { first_t_us, last_t_us, source_seq, qpc } = self.range;
+        GapRecord {
+            reason: self.reason, producer: self.producer, count: self.count.known(),
+            count_known: self.count.known().is_some(), first_recv_t_us: first_t_us, last_recv_t_us: last_t_us,
+            first_source_seq: source_seq.map(|range| range[0]), last_source_seq: source_seq.map(|range| range[1]),
+            first_qpc: qpc.map(|range| range[0]), last_qpc: qpc.map(|range| range[1]),
         }
     }
 }

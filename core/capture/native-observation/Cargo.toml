@@ -15,7 +15,7 @@ context = [
     "windows-sys/Win32_UI_Input_Ime",
 ]
 
-[target.'cfg(target_os = "windows")'.dependencies]
+[dependencies]
 screen-fix-protocol = { path = "../../../protocol" }
 blake3 = { version = "1", features = ["pure"] }
 serde = { version = "1", features = ["derive"], optional = true }
@@ -41,6 +41,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_Security",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_Performance",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",

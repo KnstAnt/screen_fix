@@ -10,10 +10,10 @@ use crate::{
     config::DisplayKey,
     package::metadata::MonitorCapture,
     protocol::{GeometryId, MonitorId, PhysicalRect, QpcTick},
-    session::windows::WorkerSession,
+    platform::windows::controller::WorkerSession,
 };
 
-use super::{Monitor, Survey, survey};
+use super::{AdapterId, Monitor, Survey, survey};
 use crate::platform::windows::{ProbeError, clock, io_error, stage};
 
 #[derive(Clone, PartialEq, Eq)]
@@ -22,7 +22,7 @@ pub(in crate::platform::windows) struct Output {
     // Used only to distinguish an updated Windows monitor item. Native owners
     // always re-resolve the actual HMONITOR before creating a capture item.
     pub identity: usize,
-    pub adapter: (u32, i32),
+    pub adapter: AdapterId,
     pub bounds: PhysicalRect,
     pub dpi_x: Option<NonZeroU32>,
     pub dpi_y: Option<NonZeroU32>,
@@ -38,11 +38,17 @@ impl Output {
     pub fn from_native(monitor: &Monitor) -> Result<Self, ProbeError> {
         let adapter = stage(unsafe { monitor.adapter.GetDesc1() }, "Identify the monitor's display adapter")?.AdapterLuid;
         Ok(Self {
-            key: monitor.key.clone(), identity: monitor.handle.0 as usize, adapter: (adapter.LowPart, adapter.HighPart),
+            key: monitor.key.clone(), identity: monitor.handle.0 as usize, adapter: adapter.into(),
             bounds: monitor.bounds, dpi_x: monitor.dpi_x, dpi_y: monitor.dpi_y, refresh: monitor.refresh,
             rotation: monitor.rotation, primary: monitor.primary, hdr: monitor.hdr, sdr_white: monitor.sdr_white,
             unavailable: monitor.unavailable.clone(),
         })
+    }
+
+    /// The same Windows monitor item on the same adapter: its capture item
+    /// and device carry over.
+    pub fn same_item(&self, other: &Self) -> bool {
+        self.identity == other.identity && self.adapter == other.adapter
     }
 }
 

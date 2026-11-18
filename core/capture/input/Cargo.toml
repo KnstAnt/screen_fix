@@ -12,8 +12,6 @@ elevated-release = []
 
 [dependencies]
 screen-fix-protocol = { path = "../../../protocol" }
-
-[target.'cfg(target_os = "windows")'.dependencies]
 screen-fix-native-observation = { path = "../native-observation" }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",

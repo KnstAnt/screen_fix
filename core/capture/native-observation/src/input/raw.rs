@@ -27,7 +27,7 @@ use windows_sys::{
             Input::KeyboardAndMouse::GetKeyboardLayout,
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow,
-                GetGUIThreadInfo, GetPhysicalCursorPos, GetSystemMetrics, GetWindowThreadProcessId,
+                GetGUIThreadInfo, GetPhysicalCursorPos, GetSystemMetrics,
                 HWND_MESSAGE, MSG, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
                 SM_CYVIRTUALSCREEN, SM_SWAPBUTTON, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
             },
@@ -58,9 +58,7 @@ pub(super) struct RawWindow {
     single: Vec<u64>,
     buffered: Vec<u64>,
     wow64: bool,
-    /// Separate sequences for the required Raw Input records and the
-    /// optional HID collections.
-    sequence: [u64; 2],
+    sequence: Sequences,
     /// Optional collections currently registered.
     optional: [bool; OptionalCollection::ALL.len()],
     lost_optional: Vec<OptionalCollection>,
@@ -94,7 +92,7 @@ impl RawWindow {
         }
         let mut window = Self {
             handle, pen_hid, hid: HidCollections::default(), single: vec![0; INITIAL_RAW_BYTES / 8], buffered: vec![0; INITIAL_RAW_BYTES / 8],
-            wow64: wow64 != 0 && cfg!(target_pointer_width = "32"), sequence: [0; 2],
+            wow64: wow64 != 0 && cfg!(target_pointer_width = "32"), sequence: Sequences::default(),
             optional: [false; OptionalCollection::ALL.len()], lost_optional: Vec::new(),
             last_registration_check: unsafe { GetTickCount64() }, foreground: None,
         };
@@ -237,7 +235,7 @@ impl RawWindow {
         &mut self, qpc: QpcTick, message_tick_ms: Option<MessageTickMs>, publish: &mut impl FnMut(RawRecord),
     ) -> Result<(), NativeError> {
         // A packet that cannot be classified belongs to the required producer.
-        let sequence = next_sequence(&mut self.sequence, Producer::RawInput)?;
+        let sequence = self.sequence.next(Producer::RawInput)?;
         publish(RawRecord::Malformed(Producer::RawInput, Receipt { sequence, qpc, message_tick_ms }));
         Ok(())
     }
@@ -367,17 +365,27 @@ pub(super) fn qpc() -> Result<QpcTick, NativeError> {
     Ok(QpcTick(qpc))
 }
 
-fn next_sequence(sequences: &mut [u64; 2], producer: Producer) -> Result<SourceSequence, NativeError> {
-    let sequence = &mut sequences[usize::from(producer == Producer::OptionalHid)];
-    *sequence = sequence.checked_add(1).ok_or_else(invalid_raw)?;
-    Ok(SourceSequence(*sequence))
+/// Separate sequences for the required Raw Input records and the optional
+/// HID collections.
+#[derive(Default)]
+struct Sequences {
+    raw_input: u64,
+    optional_hid: u64,
+}
+
+impl Sequences {
+    fn next(&mut self, producer: Producer) -> Result<SourceSequence, NativeError> {
+        let sequence = if producer == Producer::OptionalHid { &mut self.optional_hid } else { &mut self.raw_input };
+        *sequence = sequence.checked_add(1).ok_or_else(invalid_raw)?;
+        Ok(SourceSequence(*sequence))
+    }
 }
 
 fn stamp(
-    sequences: &mut [u64; 2], qpc: QpcTick, message_tick_ms: Option<MessageTickMs>,
+    sequences: &mut Sequences, qpc: QpcTick, message_tick_ms: Option<MessageTickMs>,
     foreground_at_receipt: Option<ForegroundAtReceipt>, sample: InputSample,
 ) -> Result<CollectedInput, NativeError> {
-    let sequence = next_sequence(sequences, sample.producer())?;
+    let sequence = sequences.next(sample.producer())?;
     let mut point = POINT::default();
     let position_at_receipt = (matches!(&sample, InputSample::RawPointer(_))
         || matches!(&sample, InputSample::Hid(report) if report.is_pen()))
@@ -406,9 +414,8 @@ impl RawWindow {
         if foreground.is_null() {
             return None;
         }
-        let mut pid = 0;
-        let thread = NonZeroU32::new(unsafe { GetWindowThreadProcessId(foreground, &mut pid) })?;
-        let pid = NonZeroU32::new(pid)?;
+        let owner = crate::focus::window_owner(foreground)?;
+        let (thread, pid) = (owner.thread, owner.pid);
         if self.foreground.as_ref().is_none_or(|cached| cached.pid != pid.get()) {
             self.foreground = None;
             let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid.get()) };
@@ -422,12 +429,8 @@ impl RawWindow {
         }
         let creation_filetime = self.foreground.as_ref()?.creation_filetime;
         let focus = sample_focus(thread, pid);
-        let mut checked_pid = 0;
-        let stable = unsafe {
-            GetForegroundWindow() == foreground
-                && GetWindowThreadProcessId(foreground, &mut checked_pid) == thread.get()
-                && checked_pid == pid.get()
-        };
+        let stable = unsafe { GetForegroundWindow() } == foreground
+            && crate::focus::window_owner(foreground) == Some(owner);
         if !stable {
             return None;
         }
@@ -440,22 +443,16 @@ impl RawWindow {
 }
 
 fn sample_focus(thread: NonZeroU32, pid: NonZeroU32) -> Option<FocusAtReceipt> {
-    let crate::focus::FocusAt {
-        mut gui, window: crate::focus::FocusWindow { hwnd: focus, active_fallback }, thread: focus_thread,
-        keyboard_layout: layout,
-    } = crate::focus::focus_at(thread, pid)?;
-    // The active window used when nothing has focus is layout evidence only.
-    let password_style = (!active_fallback).then(|| crate::focus::password_style(focus)).flatten();
+    let at = crate::focus::focus_at(thread, pid)?;
+    let receipt = at.receipt();
+    let mut gui = at.gui;
     if unsafe { GetGUIThreadInfo(thread.get(), &mut gui) } == 0
-        || crate::focus::focus_window(&gui).map(|current| current.hwnd) != Some(focus)
-        || unsafe { GetKeyboardLayout(focus_thread.get()) } != layout
+        || crate::focus::focus_window(&gui).map(|current| current.hwnd) != Some(at.window.hwnd)
+        || unsafe { GetKeyboardLayout(at.thread.get()) } != at.keyboard_layout
     {
         return None;
     }
-    Some(FocusAtReceipt {
-        window: WindowId(focus as usize as u64), thread: focus_thread,
-        keyboard_layout: layout as usize as u64, password_style,
-    })
+    Some(receipt)
 }
 
 fn absolute_desktop(flags: u16) -> Option<PhysicalRect> {

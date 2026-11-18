@@ -5,7 +5,7 @@ use crate::protocol::{DeviceId, ipc::{DeviceDescriptor, HelperToCore, InputSampl
 const ELEVATED_DEVICE: u64 = 1 << 63;
 
 #[derive(Default)]
-pub(super) struct Devices {
+pub(crate) struct Devices {
     ordinary: Inventory,
     elevated: Inventory,
     next: u64,
@@ -18,22 +18,27 @@ struct Inventory {
 }
 
 impl Devices {
-    pub(super) fn new_elevated_owner(&mut self) {
+    pub(crate) fn new_elevated_owner(&mut self) {
         self.elevated = Inventory::default();
     }
 
-    pub(super) fn current(&self, elevated: bool) -> impl Iterator<Item = &DeviceDescriptor> {
-        let inventory = if elevated { &self.elevated } else { &self.ordinary };
-        inventory.active.values()
+    /// The inventory of the elevated or the ordinary owner.
+    fn inventory(&self, elevated: bool) -> &Inventory {
+        if elevated { &self.elevated } else { &self.ordinary }
     }
 
-    pub(super) fn incomplete(&self, elevated: bool) -> bool {
-        let inventory = if elevated { &self.elevated } else { &self.ordinary };
-        inventory.incomplete
+    pub(crate) fn current(&self, elevated: bool) -> impl Iterator<Item = &DeviceDescriptor> {
+        self.inventory(elevated).active.values()
     }
 
-    pub(super) fn translate(&mut self, elevated: bool, mut record: HelperToCore) -> Option<HelperToCore> {
-        let inventory = if elevated { &mut self.elevated } else { &mut self.ordinary };
+    pub(crate) fn incomplete(&self, elevated: bool) -> bool {
+        self.inventory(elevated).incomplete
+    }
+
+    pub(crate) fn translate(&mut self, elevated: bool, mut record: HelperToCore) -> Option<HelperToCore> {
+        // Borrowed field by field: an elevated arrival also allocates from `next`.
+        let Self { ordinary, elevated: elevated_inventory, next } = self;
+        let inventory = if elevated { elevated_inventory } else { ordinary };
         match &mut record {
             HelperToCore::DeviceArrived { descriptor, .. } => {
                 let native = descriptor.id;
@@ -45,12 +50,12 @@ impl Devices {
                         return None;
                     }
                     if elevated {
-                        if self.next >= ELEVATED_DEVICE - 1 {
+                        if *next >= ELEVATED_DEVICE - 1 {
                             inventory.incomplete = true;
                             return None;
                         }
-                        self.next += 1;
-                        DeviceId(ELEVATED_DEVICE | self.next)
+                        *next += 1;
+                        DeviceId(ELEVATED_DEVICE | *next)
                     } else {
                         native
                     }

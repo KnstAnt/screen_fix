@@ -20,6 +20,30 @@ pub enum Evidence<T> {
     Unavailable(UnavailableReason),
 }
 
+impl<T> Evidence<T> {
+    /// `Observed` when `value` is present, otherwise `Unavailable(reason)`.
+    pub fn from_option(value: Option<T>, reason: UnavailableReason) -> Self {
+        value.map_or(Self::Unavailable(reason), Self::Observed)
+    }
+
+    /// The value, only when it was observed without uncertainty.
+    pub fn observed(self) -> Option<T> {
+        match self {
+            Self::Observed(value) => Some(value),
+            Self::Uncertain { .. } | Self::Unavailable(_) => None,
+        }
+    }
+
+    /// Applies `f` to the value, keeping the status and reason.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Evidence<U> {
+        match self {
+            Self::Observed(value) => Evidence::Observed(f(value)),
+            Self::Uncertain { value, reason } => Evidence::Uncertain { value: f(value), reason },
+            Self::Unavailable(reason) => Evidence::Unavailable(reason),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhysicalPoint {
     pub x: i32,
@@ -100,6 +124,45 @@ pub struct TokenIdentityFailure {
     pub check: TokenIdentityCheck,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_code: Option<u32>,
+}
+
+/// Why an elevated capture source failed or was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceFailureReason {
+    DeploymentRequired,
+    InstalledPath,
+    InstalledPermissions,
+    InstalledSignature,
+    RevocationUnknown,
+    ReleaseMismatch,
+    ProcessIdentity,
+    TokenIdentity,
+    Arguments,
+    Busy,
+    ConsentDenied,
+    ConsentLaunch,
+    ConsentDeadline,
+    ReadinessDeadline,
+    CleanupDeadline,
+    Cancelled,
+    PeerExited,
+    PipeSecurity,
+    PipeConnection,
+    PipePeer,
+    Transport,
+    Protocol,
+    Cryptography,
+    Supervisor,
+    LeaseExpired,
+    Witness,
+    TargetChanged,
+    TargetAccess,
+    ScopeClosed,
+    RequiredRegistration,
+    StandardHelperUnavailable,
+    RequiredHook,
+    NativeProducer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

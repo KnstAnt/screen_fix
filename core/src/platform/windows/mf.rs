@@ -87,6 +87,12 @@ impl Functions {
 }
 
 /// A Media Foundation system module; a load failure means the Media Feature Pack is missing.
+/// A Media Foundation `UINT64` attribute that holds two `UINT32`s, such as a
+/// frame size or rate: `high` is the high half.
+pub(super) const fn pack(high: u32, low: u32) -> u64 {
+    ((high as u64) << 32) | low as u64
+}
+
 fn load_system(name: PCWSTR) -> Result<HMODULE, LoadError> {
     unsafe { LoadLibraryExW(name, None, LOAD_LIBRARY_SEARCH_SYSTEM32) }
         .map_err(|error| LoadError { operation: MEDIA_FEATURES, code: error.code(), kind: ProbeKind::MediaFoundationMissing })
@@ -99,14 +105,10 @@ fn load_error(operation: &'static str) -> LoadError {
 fn functions() -> Result<&'static Functions, ProbeError> {
     static FUNCTIONS: OnceLock<Result<Functions, LoadError>> = OnceLock::new();
     FUNCTIONS.get_or_init(Functions::load).as_ref()
-        .map_err(|error| ProbeError {
-            stage: error.operation,
-            kind: error.kind,
-            source: Some(error.code.into()),
-            journal: None,
-            raw_input_registration: None,
-            owner: Some(crate::package::diagnostics::FailureComponent::Video),
-        })
+        .map_err(|error| ProbeError::new(error.operation)
+            .with_kind(error.kind)
+            .with_source(Some(error.code.into()))
+            .owned_by(crate::package::diagnostics::FailureComponent::Video))
 }
 
 pub(super) struct Runtime(&'static Functions);
@@ -178,7 +180,7 @@ pub(super) fn enum_on_adapter(
     flags: MFT_ENUM_FLAG, input: &MFT_REGISTER_TYPE_INFO, output: &MFT_REGISTER_TYPE_INFO,
     filter: &IMFAttributes,
 ) -> Result<Vec<IMFActivate>, ProbeError> {
-    use windows::{Win32::System::Com::CoTaskMemFree, core::Interface};
+    use windows::Win32::System::Com::CoTaskMemFree;
     let call = functions()?.enum_on_adapter
         .ok_or_else(|| unavailable("Adapter-specific Media Foundation encoder discovery is unavailable"))?;
     let mut entries = std::ptr::null_mut();
@@ -199,7 +201,6 @@ pub(super) fn enum_on_adapter(
 /// A reader of a finalized part. With a device manager the reader may use a
 /// hardware decoder; without one it decodes in software.
 pub(super) fn mp4_part_reader(url: PCWSTR, decoder: Option<&IMFDXGIDeviceManager>) -> Result<IMFSourceReader, ProbeError> {
-    use windows::core::Interface;
     let api = functions()?;
     let settings = decoder.map(|manager| {
         let settings = attributes(1)?;
@@ -225,7 +226,6 @@ pub(super) fn mp4_part_reader(url: PCWSTR, decoder: Option<&IMFDXGIDeviceManager
 pub(super) fn sink_writer(
     url: PCWSTR, attributes: Option<&IMFAttributes>,
 ) -> Result<IMFSinkWriter, ProbeError> {
-    use windows::core::Interface;
     let api = functions()?;
     create("Open the Media Foundation video writer", |out| unsafe {
         (api.writer)(url, std::ptr::null_mut(), attributes.map_or(std::ptr::null_mut(), Interface::as_raw), out)

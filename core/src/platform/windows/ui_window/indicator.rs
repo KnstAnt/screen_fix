@@ -16,7 +16,7 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::{CaptureError, session::{SessionHandle, SessionOutcome, SessionPhase, SourceStatus, windows::Control}};
+use crate::{CaptureError, platform::windows::controller::Control, session::{RecordingSource, SessionHandle, SourceWait, StatusSummary}};
 
 const TIMER: usize = 1;
 
@@ -129,26 +129,24 @@ impl State {
     fn refresh(&mut self, window: HWND) -> Result<(), CaptureError> {
         let Some(control) = &self.control else { return self.hide(window); };
         let Some(status) = control.status() else { return Ok(()); };
-        let label = match status.phase {
-            SessionPhase::Starting | SessionPhase::Paused if status.source == SourceStatus::AwaitingConsent =>
+        let label = match status.summary() {
+            StatusSummary::Starting(Some(SourceWait::Consent)) | StatusSummary::Paused(Some(SourceWait::Consent)) =>
                 "Screen Fix: waiting for Windows consent",
-            SessionPhase::Starting | SessionPhase::Paused if status.source == SourceStatus::AwaitingReadiness =>
+            StatusSummary::Starting(Some(SourceWait::Readiness)) | StatusSummary::Paused(Some(SourceWait::Readiness)) =>
                 "Screen Fix: verifying enhanced capture",
-            SessionPhase::Starting => "Screen Fix: preparing recording",
-            SessionPhase::Recording if status.source == SourceStatus::Activating =>
-                "Screen Fix: waiting for certified input",
-            SessionPhase::Recording if matches!(status.source, SourceStatus::FailedPrefix(_)) =>
-                "Screen Fix: finishing a failed recording",
-            SessionPhase::Recording if status.input_unavailable.is_some() || !status.video_unavailable.is_empty() =>
-                "Screen Fix: recording incomplete",
-            SessionPhase::Recording if status.source == SourceStatus::Enhanced => "Screen Fix: RECORDING (enhanced)",
-            SessionPhase::Recording => "Screen Fix: RECORDING",
-            SessionPhase::Paused => "Screen Fix: PAUSED",
-            SessionPhase::Stopping => "Screen Fix: finishing recording",
-            SessionPhase::Failed => "Screen Fix: FAILED - see recorder",
-            SessionPhase::Finished if status.outcome == Some(SessionOutcome::Incomplete) =>
-                "Screen Fix: INCOMPLETE - see recorder",
-            SessionPhase::Finished => return self.hide(window),
+            StatusSummary::Starting(None) => "Screen Fix: preparing recording",
+            StatusSummary::Recording(recording) => match recording.source {
+                RecordingSource::Activating => "Screen Fix: waiting for certified input",
+                RecordingSource::FailedPrefix => "Screen Fix: finishing a failed recording",
+                _ if recording.input_lost || recording.video_lost => "Screen Fix: recording incomplete",
+                RecordingSource::Enhanced => "Screen Fix: RECORDING (enhanced)",
+                RecordingSource::Standard | RecordingSource::Other => "Screen Fix: RECORDING",
+            },
+            StatusSummary::Paused(None) => "Screen Fix: PAUSED",
+            StatusSummary::Stopping => "Screen Fix: finishing recording",
+            StatusSummary::Failed => "Screen Fix: FAILED - see recorder",
+            StatusSummary::Finished { incomplete: true } => "Screen Fix: INCOMPLETE - see recorder",
+            StatusSummary::Finished { incomplete: false } => return self.hide(window),
         };
         if self.label != Some(label) {
             let text = super::super::wide(label);

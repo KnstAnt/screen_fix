@@ -1,23 +1,28 @@
 //! Capture-owner selectors. Every comparison uses an actual capture's source time.
 
 use crate::{
-    capture::frame::FrameMetadata,
+    capture::frame::{ApprovalGeneration, FrameMetadata},
     config::DeviceCalibration,
     protocol::{AdmissionEpoch, CaptureEpoch, GeometryId, SessionTimeUs},
 };
 
-use super::native::{NativeFrame, NativeImages};
+use super::{context::FrameApproval, native::{NativeFrame, NativeImages}};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct Interval {
     pub geometry: GeometryId,
     pub capture: CaptureEpoch,
     pub admission: AdmissionEpoch,
-    pub approval: u64,
+    pub approval: ApprovalGeneration,
     pub elevated_visit: Option<screen_fix_protocol::ipc::elevated::VisitBinding>,
 }
 
 impl Interval {
+    /// The interval of a capture under its frame approval.
+    pub fn approved(geometry: GeometryId, capture: CaptureEpoch, admission: AdmissionEpoch, approval: &FrameApproval) -> Self {
+        Self { geometry, capture, admission, approval: approval.generation, elevated_visit: approval.elevated_visit() }
+    }
+
     pub fn contains(self, frame: &FrameMetadata) -> bool {
         frame.geometry.id == self.geometry && frame.id.epoch == self.capture
             && frame.admission == self.admission && frame.approval_generation == self.approval

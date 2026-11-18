@@ -11,8 +11,8 @@ use crate::config::MAX_SELECTED_MONITORS;
 
 /// A UI checkpoint request has no confirmed-save semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CheckpointRequest {
-    pub id: RequestId,
+pub(crate) struct CheckpointRequest {
+    pub(crate) id: RequestId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -23,29 +23,29 @@ pub enum SaveKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfirmationSource {
+pub(crate) enum ConfirmationSource {
     Fixture,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SaveEvidence {
-    pub id: SaveId,
-    pub time: RecordTime,
-    pub kind: SaveKind,
-    pub source: ConfirmationSource,
-    pub executable: ExecutableIdentity,
-    pub request: Option<RequestId>,
+pub(crate) struct SaveEvidence {
+    pub(crate) id: SaveId,
+    pub(crate) time: RecordTime,
+    pub(crate) kind: SaveKind,
+    pub(crate) source: ConfirmationSource,
+    pub(crate) executable: ExecutableIdentity,
+    pub(crate) request: Option<RequestId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MonitorRoutingBasis {
+pub(crate) enum MonitorRoutingBasis {
     ApplicationGeometry,
     ApprovedWindowGeometry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SaveRouting {
+pub(crate) enum SaveRouting {
     Monitors {
         monitors: BoundedList<MonitorId, MAX_SELECTED_MONITORS>,
         basis: MonitorRoutingBasis,
@@ -54,14 +54,14 @@ pub enum SaveRouting {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfirmedSave {
+pub(crate) struct ConfirmedSave {
     attempt: AttemptId,
     evidence: SaveEvidence,
     routing: SaveRouting,
 }
 
 impl ConfirmedSave {
-    pub fn new(
+    pub(crate) fn new(
         attempt: AttemptId,
         config: &ResolvedCaptureConfig,
         evidence: SaveEvidence,
@@ -89,20 +89,8 @@ impl ConfirmedSave {
         Ok(Self { attempt, evidence, routing })
     }
 
-    pub fn routing(&self) -> &SaveRouting {
-        &self.routing
-    }
-
-    pub fn evidence(&self) -> &SaveEvidence {
-        &self.evidence
-    }
-
-    pub fn attempt(&self) -> &AttemptId {
-        &self.attempt
-    }
-
     /// A save observation can be requested only for a routed selected monitor.
-    pub fn for_monitor(&self, monitor: MonitorId) -> Option<SaveObservation> {
+    pub(crate) fn for_monitor(&self, monitor: MonitorId) -> Option<SaveObservation> {
         let SaveRouting::Monitors { monitors, basis } = &self.routing else {
             return None;
         };
@@ -110,7 +98,6 @@ impl ConfirmedSave {
             return None;
         }
         Some(SaveObservation {
-            attempt: self.attempt.clone(),
             save: self.evidence.id,
             kind: self.evidence.kind,
             time: self.evidence.time,
@@ -121,8 +108,7 @@ impl ConfirmedSave {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SaveObservation {
-    attempt: AttemptId,
+pub(crate) struct SaveObservation {
     save: SaveId,
     kind: SaveKind,
     time: RecordTime,
@@ -131,33 +117,29 @@ pub struct SaveObservation {
 }
 
 impl SaveObservation {
-    pub fn attempt(&self) -> &AttemptId {
-        &self.attempt
-    }
-
-    pub fn id(&self) -> SaveId {
+    pub(crate) fn id(&self) -> SaveId {
         self.save
     }
 
-    pub fn kind(&self) -> SaveKind {
+    pub(crate) fn kind(&self) -> SaveKind {
         self.kind
     }
 
-    pub fn time(&self) -> RecordTime {
+    pub(crate) fn time(&self) -> RecordTime {
         self.time
     }
 
-    pub fn monitor(&self) -> MonitorId {
+    pub(crate) fn monitor(&self) -> MonitorId {
         self.monitor
     }
 
-    pub fn routing_basis(&self) -> MonitorRoutingBasis {
+    pub(crate) fn routing_basis(&self) -> MonitorRoutingBasis {
         self.basis
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SaveSignalError {
+pub(crate) enum SaveSignalError {
     UnapprovedExecutable,
     EmptyRouting,
     UnselectedMonitor,
@@ -180,15 +162,15 @@ impl std::error::Error for SaveSignalError {}
 /// A checkpoint request may carry approved native context. Application or
 /// fixture proof is still required before it can become a confirmed save.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct SaveWindowContext {
-    pub window: crate::protocol::WindowId,
-    pub focus: crate::protocol::FocusGeneration,
-    pub geometries: BoundedList<crate::protocol::GeometryId, MAX_SELECTED_MONITORS>,
-    pub busy: crate::capture::context::BusyLevel,
+pub(crate) struct SaveWindowContext {
+    pub(crate) window: crate::protocol::WindowId,
+    pub(crate) focus: crate::protocol::FocusGeneration,
+    pub(crate) geometries: BoundedList<crate::protocol::GeometryId, MAX_SELECTED_MONITORS>,
+    pub(crate) busy: crate::capture::context::BusyLevel,
 }
 
 impl SaveWindowContext {
-    pub fn fallback_routing(&self) -> SaveRouting {
+    pub(crate) fn fallback_routing(&self) -> SaveRouting {
         if self.geometries.as_slice().is_empty() {
             return SaveRouting::Unavailable(UnavailableReason::NotObserved);
         }

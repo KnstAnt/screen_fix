@@ -86,6 +86,21 @@ Use a small workspace matching the PDF layers, not a crate per subsystem:
 
 The helpers depend on native observation and protocol. The Recorder links the Recorder-side protected endpoint code and owns input normalization for both sources. Protocol contains portable typed evidence, framing records and bounded validation.
 
+Current module layout of the core crate (`core/src/`):
+- `session.rs` and `session/{fault,hotkey,labels}.rs`: the public session values, fault log and hotkey bindings. `SessionHandle` → `Control` is the only entry into the controller.
+- `platform/windows/controller.rs` and `platform/windows/controller/{facts,lifecycle,transitions,startup,source,worker,environment,disk}.rs`: the controller thread, `Facts`, the lifecycle state machine and `WorkerSession`, the worker-facing view of the session.
+- `package.rs` and `package/{manifest,owner,error,source,finalize,row}.rs`, with `metadata`, `reader`, `journal`, `outcome` and `diagnostics`: manifest types and `MANIFEST_VERSION`, the metadata owner, package errors, the source, pause and admission values that the session re-exports, the final rows that the input and context journals write when an attempt closes, and the typed journal rows (`RowEnvelope`, `RowKind`, `RowCounts`). `package/tests.rs` holds the package golden and gate tests.
+- `platform/windows/stills/{mod,slot,work,settle,scroll,private}.rs`: the still owner.
+- `platform/windows/video.rs` with `video/{frames,segment}.rs`: the per-monitor video worker, the frames-journal merge owner and the open segment with its finalized parts awaiting verification.
+- `platform/windows/input.rs` with `input/{writer,elevated_lane,saves,rows,provisional,gate,receiver,resync,text}.rs`: the input pump and gate, its two journal writers, the elevated input lane, fixture and checkpoint Saves, the lifecycle rows and the provisional still requests.
+- `platform/windows/context.rs` with `context/{routes,clipboard_staging,timeline,location,frame_policy,…}.rs`: the context owner, display capture routes, the opt-in clipboard owner, the visit timeline, the location-row rate limit and frame approval.
+- `capture/input.rs` with `capture/input/{hid,blind,devices,hook_health,publication,loss,pen}.rs`: platform-free input domain logic: HID and touchpad decoding, blind intervals, the device inventory, hook health, the Windows-free publication policy of the gate, loss evidence by privacy class and the Recorder rules for pen HID reports.
+- `util.rs`: small shared helpers; `devlog.rs`: the optional development log.
+
+In `screen-fix-native-observation`, `owner` holds the owner-thread start handshake, `wake` the `WakeEvent`, `com` the `ComApartment` guard and `channel` the unnamed input channel between the Recorder and a helper.
+
+The workspace builds only for Windows: each crate except the platform-independent `screen-fix-protocol` fails on another target with `compile_error!`, and there are no non-Windows stubs (SPEC addendum A7.4). The desktop crate's default `dev-log` feature writes a development `dev.log` into each attempt directory. It is for manual testing only; a release build uses `--no-default-features`, and `elevated-release` together with `dev-log` is a compile error (A7.5).
+
 The PDF core/capture/screen, input, context, files; privacy; hub; package; packs; pipeline; tools remain logical locations. Cargo manifests and source paths can reflect them without one package per directory. Existing source files should be moved only when the ownership/dependency split needs it.
 
 Keep tools for inspection and verification out of default production runtime dependencies. Avoid adding framework dependencies merely to wrap threads, queues or file IO.
@@ -120,18 +135,19 @@ The observation selector is app-neutral. It does not normalize full training act
 No subsystem receives a universal CoreContext containing all queues, tasks and resources. Route only the commands and facts it consumes. Do not introduce a broadcast bus for every record or a shared mutable session object queried by every worker.
 
 **Permitted process-wide state (explicit exceptions to "no global mutable state").** Each item is an atomic latch or counter, a once-initialized immutable value or callback context for a native callback without a user-data pointer, with one documented purpose. In the core crate:
-- `RECORDING_OWNED` (`session/windows.rs`): the process-wide one-recording latch.
-- `REPORT_SERIAL` (`package/diagnostics.rs`): a counter that makes diagnostic report names unique.
-- `DESKTOP_SIGNALS` (`session/windows/environment.rs`, thread-local): the context of the out-of-context desktop WinEvent callback, which has no user-data pointer. The message loop clears it before removing the hook.
-- `IN_FLIGHT` (`platform/windows/elevated/launcher.rs`): the one-flight latch of the elevated launch. It stays set until the shell call returns, so consent prompts cannot stack across attempts.
-- `RESOLVER_ACTIVE` (`platform/windows/context/identity.rs`) and `CLASSIFIER_ACTIVE` (`platform/windows/elevated/selector.rs`): single-owner latches. No replacement resolver or classifier starts while an earlier one may still be blocked in a native call.
-- `FUNCTIONS` (`platform/windows/mf.rs`): the Media Foundation function table, loaded once and immutable afterwards.
+- `RECORDING_OWNED` (`core/src/platform/windows/controller.rs`): the process-wide one-recording latch.
+- `REPORT_SERIAL` (`core/src/package/diagnostics.rs`): a counter that makes diagnostic report names unique.
+- `DESKTOP_SIGNALS` (`core/src/platform/windows/controller/environment.rs`, thread-local): the context of the out-of-context desktop WinEvent callback, which has no user-data pointer. The message loop clears it before removing the hook.
+- `IN_FLIGHT` (`core/src/platform/windows/elevated/launcher.rs`): the one-flight latch of the elevated launch. It stays set until the shell call returns, so consent prompts cannot stack across attempts.
+- `RESOLVER_ACTIVE` (`core/src/platform/windows/context/identity.rs`) and `CLASSIFIER_ACTIVE` (`core/src/platform/windows/elevated/selector.rs`): single-owner latches. No replacement resolver or classifier starts while an earlier one may still be blocked in a native call.
+- `FUNCTIONS` (`core/src/platform/windows/mf.rs`): the Media Foundation function table, loaded once and immutable afterwards.
+- `SINK` (`core/src/devlog.rs`, only with the `dev-log` feature): the open `dev.log` of the current attempt.
 
 In the shared native crates `screen-fix-native-observation` and `screen-fix-elevated`, linked by the Recorder and, as applicable, the standard helper and the collector:
-- `KEYBOARD` and `POINTER` (`native-observation/src/input/hooks.rs`): the lock-free rings that the low-level hook callbacks write, because those callbacks have no user-data pointer. One hook owner per process holds them at a time, through an exclusive claim released when that owner is dropped; a second concurrent owner fails to start. `PROGRESS_PENDING` coalesces progress probes posted to the hook thread, and the thread-local `SCOPE` holds the hook thread's capture scope, set once before the hooks are installed.
-- `ACTIVE` (`native-observation/src/events.rs`, thread-local): the context of the WinEvent callback on its installing thread, cleared after unhooking.
-- `SERIAL` and `CHANGES` (`elevated/src/runtime/witness.rs`, thread-local): the context of the collector witness's WinEvent callbacks.
-- `DRAINING` (`elevated/src/pipe.rs`): a counter of abandoned overlapped pipe operations whose buffers are retained until the kernel acknowledges cancellation. While it is nonzero, no new attachment starts in that process.
+- `KEYBOARD` and `POINTER` (`core/capture/native-observation/src/input/hooks.rs`): the lock-free rings that the low-level hook callbacks write, because those callbacks have no user-data pointer. One hook owner per process holds them at a time, through an exclusive claim (`RINGS_CLAIMED`) released when that owner is dropped; a second concurrent owner fails to start. `PROGRESS_PENDING` coalesces progress probes posted to the hook thread, and the thread-local `SCOPE` holds the hook thread's capture scope, set once before the hooks are installed.
+- `ACTIVE` (`core/capture/native-observation/src/events.rs`, thread-local): the context of the WinEvent callback on its installing thread, cleared after unhooking.
+- `SERIAL` and `CHANGES` (`core/capture/elevated/src/runtime/witness.rs`, thread-local): the context of the collector witness's WinEvent callbacks.
+- `DRAINING` (`core/capture/elevated/src/pipe.rs`): a counter of abandoned overlapped pipe operations whose buffers are retained until the kernel acknowledges cancellation. While it is nonzero, no new attachment starts in that process.
 
 **Known M1 deviation: worker-mutated session facts (S4 reduced).** The controller-owned `Facts` are not yet mutated only by the controller. Workers change them through `WorkerSession` methods under the lifecycle lock. The full move to a bounded owner/message channel was deferred by the remediation plan because it fixes no observable defect. The mutating methods are:
 - source selection and evidence: `require_source_change`, `abandon_source_preparation`, `source_ready`, `source_pending`, `source_enhanced`, `update_standard_evidence`, `update_elevated_evidence`, `elevated_registration`, `record_source_coverage`, `restrict_source_coverage`, `record_uncertified_tail`, `record_source_blind`, `source_resynchronizing`, `fail_classified_source`, `fail_source`, `required_elevated_hook_failed`, `source_finalization_failed`;
@@ -139,7 +155,7 @@ In the shared native crates `screen-fix-native-observation` and `screen-fix-elev
 - lifecycle and boundaries: `request_stop`, `mark_input_prefix`, `finish_video_pause`, `finish_pause`, `complete_prefix`, `authorize_complete_publication`, `verify_startup`, `startup_step`, `video_ready`, `input_ready`, `window_coverage`, `windows_evidence`;
 - drained notices and environment: `take_fixture_saves`, `take_hotkeys`, `request_journal_flush`, `take_input_environment`, `take_elevated_environment`.
 
-The lifecycle state machine is one phase value with several latch flags, not one enum. Its states, transitions and latches are documented on `Facts` in `core/src/session/windows.rs`. Suspend data is read only through `WorkerSession::suspend_marks`. The power, desktop and window-message callbacks run inside `catch_unwind` and take no lock.
+The lifecycle state machine is one phase value with several latch flags, not one enum. Its states, transitions and latches are documented on `Facts` in `core/src/platform/windows/controller/facts.rs`. Suspend data is read only through `WorkerSession::suspend_marks`. The power, desktop and window-message callbacks run inside `catch_unwind` and take no lock.
 
 ## 5. Threads, blocking and queues
 
@@ -417,7 +433,7 @@ Retention/deletion follows acceptance and withdrawal rules, with reference-count
 
 Common Rust modules operate on IDs, times, rectangles, profiles, errors and artifact references. Windows implementation types (HWND, COM interfaces, D3D textures, MF samples, HANDLE) remain in Windows modules or private backend-specific leases.
 
-Use target_os cfg and target-specific Cargo dependencies for the actual operating system. Feature flags select optional capabilities, not pretend to switch an executable from one OS to another. Unimplemented platforms return an explicit unsupported capability; they must not build a fake successful recorder.
+The M1 workspace is Windows-only (SPEC addendum A7.4): every crate except `screen-fix-protocol` stops another target with `compile_error!`, so no fake successful recorder can be built. Feature flags select optional capabilities (`dev-log`, `elevated-release`, `fixture-save`), not pretend to switch an executable from one OS to another. A later port adds its own platform layer and target-specific dependencies.
 
 Define narrow platform boundaries for display discovery/capture, input backend, context/window events, time mapping, process identity, file sharing, window exclusion and verifier isolation. Use traits only where a real substitution/test boundary needs them; ordinary internal functions/modules are sufficient elsewhere.
 
