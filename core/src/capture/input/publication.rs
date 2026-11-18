@@ -89,12 +89,17 @@ impl ModifierKnowledge {
     }
 }
 
+/// The side-neutral modifier virtual keys `VK_SHIFT`, `VK_CONTROL` and `VK_MENU`.
+const VK_SHIFT: u16 = 0x10;
+const VK_CONTROL: u16 = 0x11;
+const VK_MENU: u16 = 0x12;
+
 pub(crate) fn modifier_bits(key: Key) -> u8 {
     match (key.modifier, key.virtual_key) {
         (Some(modifier), _) => modifier_bit(modifier),
-        (None, 0x10) => modifier_bit(Modifier::LeftShift) | modifier_bit(Modifier::RightShift),
-        (None, 0x11) => modifier_bit(Modifier::LeftCtrl) | modifier_bit(Modifier::RightCtrl),
-        (None, 0x12) => modifier_bit(Modifier::LeftAlt) | modifier_bit(Modifier::RightAlt),
+        (None, VK_SHIFT) => modifier_bit(Modifier::LeftShift) | modifier_bit(Modifier::RightShift),
+        (None, VK_CONTROL) => modifier_bit(Modifier::LeftCtrl) | modifier_bit(Modifier::RightCtrl),
+        (None, VK_MENU) => modifier_bit(Modifier::LeftAlt) | modifier_bit(Modifier::RightAlt),
         _ => 0,
     }
 }

@@ -53,26 +53,54 @@ enum State {
     Taken,
 }
 
-const BEFORE_DISPATCH: u8 = 0;
-const DISPATCHED: u8 = 1;
-const CANCELLED: u8 = 2;
+/// Whether the consent request was dispatched to the shell.
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum Dispatch {
+    Before,
+    Dispatched,
+    Cancelled,
+}
+
+/// A `Dispatch` shared between the launch owner and the shell worker.
+struct DispatchState(AtomicU8);
+
+impl DispatchState {
+    fn new() -> Self {
+        Self(AtomicU8::new(Dispatch::Before as u8))
+    }
+
+    fn store(&self, state: Dispatch) {
+        self.0.store(state as u8, Ordering::Release);
+    }
+
+    /// Move from `current` to `next`; false if the state was not `current`.
+    fn advance(&self, current: Dispatch, next: Dispatch) -> bool {
+        self.0.compare_exchange(current as u8, next as u8, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+
+    fn is(&self, state: Dispatch) -> bool {
+        self.0.load(Ordering::Acquire) == state as u8
+    }
+}
 
 struct Permit {
     cancellation: Cancellation,
-    dispatch: AtomicU8,
+    dispatch: DispatchState,
     consent_until: Instant,
 }
 
 impl Permit {
     fn cancel(&self) {
-        self.dispatch.store(CANCELLED, Ordering::Release);
+        self.dispatch.store(Dispatch::Cancelled);
         self.cancellation.cancel();
     }
 
     fn begin_dispatch(&self) -> Result<()> {
         Phase::Consent(self.consent_until).check(Instant::now())?;
-        self.dispatch.compare_exchange(BEFORE_DISPATCH, DISPATCHED, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| Failure::Cancelled)?;
+        if !self.dispatch.advance(Dispatch::Before, Dispatch::Dispatched) {
+            return Err(Failure::Cancelled);
+        }
         Phase::Consent(self.consent_until).check(Instant::now())?;
         self.cancellation.check()
     }
@@ -130,7 +158,7 @@ impl Ticket {
         let shared = Arc::new(Shared {
             permit: Arc::new(Permit {
                 cancellation: Cancellation::new()?,
-                dispatch: AtomicU8::new(BEFORE_DISPATCH),
+                dispatch: DispatchState::new(),
                 consent_until,
             }),
             state: Mutex::new(State::Pending(Phase::Consent(consent_until))),
@@ -145,23 +173,23 @@ impl Ticket {
 
     pub(super) fn poll(&mut self) -> LaunchStatus {
         let mut state = self.shared.lock();
-        match *state {
+        match std::mem::replace(&mut *state, State::Taken) {
             State::Pending(phase) => match phase.check(Instant::now()) {
-                Ok(()) => match phase {
-                    Phase::Consent(_) => LaunchStatus::AwaitingConsent,
-                    Phase::Binding(_) => LaunchStatus::Authenticating,
-                },
+                Ok(()) => {
+                    *state = State::Pending(phase);
+                    match phase {
+                        Phase::Consent(_) => LaunchStatus::AwaitingConsent,
+                        Phase::Binding(_) => LaunchStatus::Authenticating,
+                    }
+                }
                 Err(failure) => {
+                    // The state stays taken under the lock.
                     self.shared.permit.cancel();
-                    *state = State::Taken;
                     LaunchStatus::Complete { authenticating: matches!(phase, Phase::Binding(_)), result: Err(failure) }
                 }
             },
             State::Taken => LaunchStatus::Complete { authenticating: false, result: Err(Failure::Cancelled) },
-            State::Complete(_, _) => {
-                let State::Complete(phase, result) = std::mem::replace(&mut *state, State::Taken) else {
-                    unreachable!("checked the completed attachment state");
-                };
+            State::Complete(phase, result) => {
                 drop(state);
                 let result = result.and_then(|binding| {
                     phase.check(Instant::now())?;
@@ -182,7 +210,7 @@ impl Ticket {
 
     pub(super) fn withdraw_undispatched(&self) -> bool {
         let permit = &self.shared.permit;
-        if permit.dispatch.compare_exchange(BEFORE_DISPATCH, CANCELLED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        if permit.dispatch.advance(Dispatch::Before, Dispatch::Cancelled) {
             permit.cancellation.cancel();
             true
         } else {
@@ -191,7 +219,7 @@ impl Ticket {
     }
 
     pub(super) fn was_dispatched(&self) -> bool {
-        self.shared.permit.dispatch.load(Ordering::Acquire) == DISPATCHED
+        self.shared.permit.dispatch.is(Dispatch::Dispatched)
     }
 }
 

@@ -1,5 +1,7 @@
 //! Read the H.264 evidence needed to qualify an encoder and open a segment.
 
+use std::collections::BTreeMap;
+
 use windows::Win32::Media::MediaFoundation::{
     IMFMediaType, IMFSample, MF_MT_MPEG_SEQUENCE_HEADER,
 };
@@ -11,8 +13,10 @@ const MAX_SAMPLE_BYTES: u32 = 32 * 1024 * 1024;
 
 #[derive(Default)]
 pub(super) struct Headers {
-    sps: Vec<(u32, Vec<u8>)>,
-    pps: Vec<(u32, u32, Vec<u8>)>,
+    /// SPS NAL units by id.
+    sps: BTreeMap<u32, Vec<u8>>,
+    /// PPS NAL units by id, with the SPS id each refers to.
+    pps: BTreeMap<u32, (u32, Vec<u8>)>,
     length_width: Option<usize>,
 }
 
@@ -141,23 +145,12 @@ impl Headers {
                     Some(false) => return Err(unavailable("The H.264 SPS color signal conflicts with studio-range BT.709 gamma 2.2")),
                     Some(true) | None => {}
                 }
-                if let Some((_, previous)) = self.sps.iter_mut().find(|entry| entry.0 == id) {
-                    previous.clear();
-                    previous.extend_from_slice(nal);
-                } else {
-                    self.sps.push((id, nal.to_vec()));
-                }
+                self.sps.insert(id, nal.to_vec());
             }
             8 => {
                 let id = bits.ue().filter(|id| *id <= 255).ok_or_else(invalid)?;
                 let sps = bits.ue().filter(|id| *id <= 31).ok_or_else(invalid)?;
-                if let Some((_, previous_sps, previous)) = self.pps.iter_mut().find(|entry| entry.0 == id) {
-                    *previous_sps = sps;
-                    previous.clear();
-                    previous.extend_from_slice(nal);
-                } else {
-                    self.pps.push((id, sps, nal.to_vec()));
-                }
+                self.pps.insert(id, (sps, nal.to_vec()));
             }
             _ => {}
         }
@@ -169,8 +162,8 @@ impl Headers {
         if !picture.idr || picture.b_slice {
             return Err(unavailable("The H.264 segment boundary is not an IDR"));
         }
-        let (_, sps_id, pps) = self.pps.iter().find(|entry| entry.0 == picture.pps).ok_or_else(invalid)?;
-        let (_, sps) = self.sps.iter().find(|entry| entry.0 == *sps_id).ok_or_else(invalid)?;
+        let (sps_id, pps) = self.pps.get(&picture.pps).ok_or_else(invalid)?;
+        let sps = self.sps.get(sps_id).ok_or_else(invalid)?;
         let mut sequence = Vec::with_capacity(8 + sps.len() + pps.len());
         for nal in [sps, pps] {
             sequence.extend_from_slice(&[0, 0, 0, 1]);

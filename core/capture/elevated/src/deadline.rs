@@ -50,21 +50,43 @@ pub(crate) fn milliseconds(duration: Duration) -> u32 {
 
 #[derive(Clone, Copy)]
 pub(crate) struct Deadline<'a> {
-    pub(crate) at: Instant,
+    at: Instant,
     /// The failure reported when `at` passes; each bound names its own stage.
-    pub(crate) expired: Failure,
-    pub(crate) cancellation: &'a Cancellation,
-    pub(crate) grant: Option<&'a Cancellation>,
-    pub(crate) scope_current: Option<&'a dyn Fn() -> bool>,
-    pub(crate) peer: Option<&'a Process>,
+    expired: Failure,
+    cancellation: &'a Cancellation,
+    scope: Option<Scope<'a>>,
+    peer: Option<&'a Process>,
 }
 
-impl Deadline<'_> {
+/// The grant scope of an operation: its cancellation and a polled liveness
+/// predicate.
+#[derive(Clone, Copy)]
+struct Scope<'a> {
+    cancel: &'a Cancellation,
+    current: &'a dyn Fn() -> bool,
+}
+
+impl<'a> Deadline<'a> {
+    pub(crate) fn new(at: Instant, expired: Failure, cancellation: &'a Cancellation) -> Self {
+        Self { at, expired, cancellation, scope: None, peer: None }
+    }
+
+    /// Also fails once `peer` exits.
+    pub(crate) fn peer(self, peer: &'a Process) -> Self {
+        Self { peer: Some(peer), ..self }
+    }
+
+    /// Also fails with `ScopeClosed` once `cancel` is cancelled or `current`
+    /// returns false.
+    pub(crate) fn scoped(self, cancel: &'a Cancellation, current: &'a dyn Fn() -> bool) -> Self {
+        Self { scope: Some(Scope { cancel, current }), ..self }
+    }
+
+    pub(crate) fn has_scope(self) -> bool { self.scope.is_some() }
+
     pub(crate) fn check(self) -> Result<()> {
         self.cancellation.check()?;
-        if self.grant.is_some_and(|grant| grant.check().is_err())
-            || self.scope_current.is_some_and(|current| !current())
-        {
+        if self.scope.is_some_and(|scope| scope.cancel.check().is_err() || !(scope.current)()) {
             return Err(Failure::ScopeClosed);
         }
         if let Some(peer) = self.peer {
@@ -88,9 +110,9 @@ impl Deadline<'_> {
             handles.push(peer.raw());
             WAIT_OBJECT_0 + index
         });
-        let grant_wait = self.grant.map(|grant| {
+        let grant_wait = self.scope.map(|scope| {
             let index = handles.len() as u32;
-            handles.push(grant.event.raw());
+            handles.push(scope.cancel.event.raw());
             WAIT_OBJECT_0 + index
         });
         let first = handles.len() as u32;
@@ -101,7 +123,7 @@ impl Deadline<'_> {
             // Every other condition is a waited handle; only the scope
             // predicate has to be polled.
             let remaining = self.at.saturating_duration_since(Instant::now());
-            let remaining = if self.scope_current.is_some() { remaining.min(POLL) } else { remaining };
+            let remaining = if self.scope.is_some() { remaining.min(POLL) } else { remaining };
             let outcome = unsafe { WaitForMultipleObjects(limit, handles.as_ptr(), 0, milliseconds(remaining)) };
             match outcome {
                 WAIT_OBJECT_0 => return Err(Failure::Cancelled),

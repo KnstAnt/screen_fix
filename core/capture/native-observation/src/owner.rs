@@ -5,9 +5,9 @@
 //! report.
 //!
 //! Join rule: after a failed start or a failed stop, the starter joins the
-//! thread only when the thread is governed, that is, when it reads a capture
+//! thread only when the thread is scoped, that is, when it reads a capture
 //! scope the caller must outlive. Such a thread must end before the caller
-//! reports, even though the join can block. An ungoverned thread is left to
+//! reports, even though the join can block. An unscoped thread is left to
 //! end on its own, so a stuck thread cannot hang its starter.
 
 use std::{
@@ -100,7 +100,7 @@ impl<R> OwnerThread<R> {
 
     /// Post `WM_QUIT` to the thread, unless it already ended, and join it.
     /// A failed post returns its error; the thread is then joined only if
-    /// it is governed (see the module's join rule).
+    /// it is scoped (see the module's join rule).
     pub fn post_quit_and_join(self) -> io::Result<thread::Result<R>> {
         // The thread has a message queue once it reported ready.
         if !self.handle.is_finished() && unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) } == 0 {

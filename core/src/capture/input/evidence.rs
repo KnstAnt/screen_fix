@@ -5,7 +5,7 @@ use crate::{
 
 use super::{
     Action, Button, CorrelatedInput, Correlation, InputOrigin, Key, Motion, PendingInput,
-    PointerEvidence, matching::{PROMOTED_CURSOR_ID, PROMOTED_TOUCH, injected_hook, promoted},
+    PointerEvidence, matching::injected_hook, normalize::{PROMOTED_CURSOR_ID, PROMOTED_TOUCH, promoted},
 };
 
 /// The extra-information values AutoHotkey marks the input it sends with.

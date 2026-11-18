@@ -7,9 +7,7 @@ use screen_fix_protocol::{QpcFrequency, QpcTick, ipc::elevated::runtime::Lease};
 use windows_sys::Win32::System::Performance::QueryPerformanceCounter;
 
 use crate::win::{Failure, Result};
-
-pub const HEARTBEAT: Duration = Duration::from_millis(250);
-pub(crate) const LEASE: Duration = Duration::from_secs(1);
+use super::timing::{HEARTBEAT, LEASE};
 
 pub(crate) fn qpc() -> Result<QpcTick> {
     let mut tick = 0;
@@ -164,7 +162,6 @@ impl Lifetime {
         self.expiry.store(0, std::sync::atomic::Ordering::Release);
     }
 }
-
 
 pub(super) enum ProviderKind {
     Read,

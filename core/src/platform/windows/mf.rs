@@ -180,7 +180,7 @@ pub(super) fn enum_on_adapter(
     flags: MFT_ENUM_FLAG, input: &MFT_REGISTER_TYPE_INFO, output: &MFT_REGISTER_TYPE_INFO,
     filter: &IMFAttributes,
 ) -> Result<Vec<IMFActivate>, ProbeError> {
-    use windows::{Win32::System::Com::CoTaskMemFree, core::Interface};
+    use windows::Win32::System::Com::CoTaskMemFree;
     let call = functions()?.enum_on_adapter
         .ok_or_else(|| unavailable("Adapter-specific Media Foundation encoder discovery is unavailable"))?;
     let mut entries = std::ptr::null_mut();
@@ -201,7 +201,6 @@ pub(super) fn enum_on_adapter(
 /// A reader of a finalized part. With a device manager the reader may use a
 /// hardware decoder; without one it decodes in software.
 pub(super) fn mp4_part_reader(url: PCWSTR, decoder: Option<&IMFDXGIDeviceManager>) -> Result<IMFSourceReader, ProbeError> {
-    use windows::core::Interface;
     let api = functions()?;
     let settings = decoder.map(|manager| {
         let settings = attributes(1)?;
@@ -227,7 +226,6 @@ pub(super) fn mp4_part_reader(url: PCWSTR, decoder: Option<&IMFDXGIDeviceManager
 pub(super) fn sink_writer(
     url: PCWSTR, attributes: Option<&IMFAttributes>,
 ) -> Result<IMFSinkWriter, ProbeError> {
-    use windows::core::Interface;
     let api = functions()?;
     create("Open the Media Foundation video writer", |out| unsafe {
         (api.writer)(url, std::ptr::null_mut(), attributes.map_or(std::ptr::null_mut(), Interface::as_raw), out)

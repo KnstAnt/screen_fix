@@ -1,14 +1,16 @@
 use std::{
     sync::{Arc, atomic::{AtomicBool, Ordering::{Acquire, Release}}},
     thread::{self, JoinHandle},
-    time::Duration,
 };
 
 use screen_fix_native_observation::{events::Notifications, identity::WindowProcess, windows::FocusSnapshot};
 use screen_fix_protocol::{QpcTick, ipc::elevated::{ContextEvidence, NativeObservation, runtime::{CoverageReason, Revocation}}};
 
 use crate::win::{Failure, Result};
-use super::{context::SeenWindows, grant::{Grant, InputLoss}, outbox::Outbox, lifetime::qpc, witness::coarse_lower};
+use super::{
+    context::SeenWindows, grant::{Grant, InputLoss}, outbox::Outbox, lifetime::qpc,
+    timing::{NOTICE_HOLDBACK, NOTICE_POLL, NOTICE_STALL}, witness::coarse_lower,
+};
 
 pub(super) struct Owner {
     worker: JoinHandle<Result<()>>,
@@ -39,11 +41,13 @@ impl Owner {
 }
 
 fn poll(grant: &Arc<Grant>, send: &Outbox, seen: &SeenWindows, notices: &Notifications) -> Result<()> {
+    let lifetime = &grant.session().lifetime;
+    let target = grant.target();
     // Allow already-dispatched notifications to drain before advancing
     // receipt coverage. The separate witness still revokes on a late source
     // event even if it arrives beyond the materialization holdback.
-    let holdback = grant.lifetime.ticks(Duration::from_millis(64))?;
-    let stall = grant.lifetime.ticks(Duration::from_millis(500))?;
+    let holdback = lifetime.ticks(NOTICE_HOLDBACK)?;
+    let stall = lifetime.ticks(NOTICE_STALL)?;
     let mut last = None;
     while !grant.stopped() {
         let visit = grant.visit();
@@ -56,7 +60,7 @@ fn poll(grant: &Arc<Grant>, send: &Outbox, seen: &SeenWindows, notices: &Notific
             if notice.receipt <= floor || grant.read_floor(false).is_err() || grant.visit() != visit { continue; }
             if notice.window.0 != 0 && notice.source_tick.is_some() {
                 let native = WindowProcess {
-                    window: notice.window, process: grant.target.process.instance(), thread: grant.target.window.thread,
+                    window: notice.window, process: target.process.instance(), thread: target.window.thread,
                 }.hwnd();
                 if let Some(window) = WindowProcess::read(native)
                     && window.thread.get() == notice.thread && grant.read_floor(false).is_ok()
@@ -64,7 +68,7 @@ fn poll(grant: &Arc<Grant>, send: &Outbox, seen: &SeenWindows, notices: &Notific
                     seen.observe(window)?;
                 }
             }
-            let foreground = notice.window == grant.target.window.window && notice.thread == grant.target.window.thread.get();
+            let foreground = notice.window == target.window.window && notice.thread == target.window.thread.get();
             let active_focus = notice.object == windows_sys::Win32::UI::WindowsAndMessaging::OBJID_CARET as i32
                 && grant.expected_focus(visit).is_some_and(|expected| {
                     notice.thread == expected.thread.get() && FocusSnapshot::read(visit.foreground.into()).is_some_and(|native| {
@@ -74,16 +78,16 @@ fn poll(grant: &Arc<Grant>, send: &Outbox, seen: &SeenWindows, notices: &Notific
             if !foreground && !active_focus {
                 continue;
             }
-            let Some(lower) = notice.source_tick.and_then(|tick| coarse_lower(tick.0, &grant.lifetime)) else {
-                grant.mark_uncertain(visit, grant.arm);
+            let Some(lower) = notice.source_tick.and_then(|tick| coarse_lower(tick.0, lifetime)) else {
+                grant.mark_uncertain(visit, grant.armed_qpc());
                 continue;
             };
             if lower > notice.receipt {
-                grant.mark_uncertain(visit, grant.arm);
+                grant.mark_uncertain(visit, grant.armed_qpc());
                 continue;
             }
             if previous.is_some_and(|before| lower < before) {
-                grant.invalidate(visit, Revocation::LateNotice, lower.max(grant.arm));
+                grant.invalidate(visit, Revocation::LateNotice, lower.max(grant.armed_qpc()));
                 continue;
             }
             if lower <= floor { continue; }
@@ -94,7 +98,7 @@ fn poll(grant: &Arc<Grant>, send: &Outbox, seen: &SeenWindows, notices: &Notific
             }
         }
         let lost = notices.take_loss().is_some();
-        if floor.is_some() && lost { grant.mark_uncertain(visit, grant.arm); }
+        if floor.is_some() && lost { grant.mark_uncertain(visit, grant.armed_qpc()); }
         if !notices.running() { return Err(Failure::Witness); }
         if let Some((floor, witness_qpc)) = floor {
             let capped = ready.min(witness_qpc);
@@ -109,7 +113,7 @@ fn poll(grant: &Arc<Grant>, send: &Outbox, seen: &SeenWindows, notices: &Notific
                 last = Some((visit, before_qpc));
             }
         }
-        thread::park_timeout(Duration::from_millis(10));
+        thread::park_timeout(NOTICE_POLL);
     }
     Ok(())
 }

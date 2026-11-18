@@ -46,10 +46,7 @@ fn supervise_entry(supervisor: &Supervisor, until: Instant) -> Result<()> {
     supervisor.shared.parent.set(Arc::clone(&parent_handle)).map_err(|_| Failure::Supervisor)?;
     let parent = Process::inspect(parent_handle)?;
     if parent.instance() != args.parent { return Err(Failure::ProcessIdentity) }
-    let deadline = Deadline {
-        at: until, expired: Failure::ReadinessDeadline, cancellation: &supervisor.shared.cancel, grant: None,
-        scope_current: None, peer: Some(&parent),
-    };
+    let deadline = Deadline::new(until, Failure::ReadinessDeadline, &supervisor.shared.cancel).peer(&parent);
     deadline.check()?;
 
     let current = Process::current()?;

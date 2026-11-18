@@ -251,6 +251,34 @@ impl LossRange {
     }
 }
 
+/// An ordinary loss of one reason and producer: its count and receipt range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OrdinaryLoss {
+    pub(crate) reason: LossReason,
+    pub(crate) producer: Option<LossProducer>,
+    pub(crate) count: LossCount,
+    pub(crate) range: LossRange,
+}
+
+impl OrdinaryLoss {
+    /// Merge a loss with the same reason and producer (§6.1 merge rule).
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.count = self.count.merge(other.count);
+        self.range = self.range.merge(other.range);
+    }
+
+    /// The payload of this loss's `gap` row.
+    pub(crate) fn record(&self) -> GapRecord {
+        let LossRange { first_t_us, last_t_us, source_seq, qpc } = self.range;
+        GapRecord {
+            reason: self.reason, producer: self.producer, count: self.count.known(),
+            count_known: self.count.known().is_some(), first_recv_t_us: first_t_us, last_recv_t_us: last_t_us,
+            first_source_seq: source_seq.map(|range| range[0]), last_source_seq: source_seq.map(|range| range[1]),
+            first_qpc: qpc.map(|range| range[0]), last_qpc: qpc.map(|range| range[1]),
+        }
+    }
+}
+
 /// A sensitive loss belongs to a password, possibly sensitive or
 /// approval-unknown context. It is counted without any time or sequence range
 /// and never becomes a gap row (ALG §7.2, PRIV-5).

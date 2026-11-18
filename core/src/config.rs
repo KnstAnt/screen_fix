@@ -12,7 +12,7 @@ pub const MAX_SELECTED_MONITORS: usize = 32;
 const MAX_CALIBRATED_DEVICES: usize = 128;
 
 /// A stable display-selection key. Windows supplies the physical monitor device path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DisplayKey(Box<str>);
 
 impl DisplayKey {
@@ -34,8 +34,9 @@ pub enum ClipboardMode {
     OptIn,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CapturePace {
+    #[default]
     Fps30,
     Fps60,
 }
@@ -119,32 +120,6 @@ impl ResolvedProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VideoMode {
-    Hardware30,
-    Software15,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EffectiveCapabilities {
-    pub video: Evidence<VideoMode>,
-    pub raw_input: Evidence<()>,
-    pub low_level_hooks: Evidence<()>,
-    pub pen_hid: Evidence<()>,
-}
-
-impl EffectiveCapabilities {
-    pub fn awaiting_probe() -> Self {
-        let reason = UnavailableReason::NotObserved;
-        Self {
-            video: Evidence::Unavailable(reason),
-            raw_input: Evidence::Unavailable(reason),
-            low_level_hooks: Evidence::Unavailable(reason),
-            pen_hid: Evidence::Unavailable(reason),
-        }
-    }
-}
-
 /// Statistical p99.9 delay correction, with the source calibration revision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceCalibration {
@@ -165,7 +140,6 @@ pub struct ResolvedCaptureConfig {
     monitors: BoundedList<SelectedMonitor, MAX_SELECTED_MONITORS>,
     profile: ResolvedProfile,
     calibrations: BoundedList<DeviceCalibration, MAX_CALIBRATED_DEVICES>,
-    capabilities: EffectiveCapabilities,
 }
 
 impl ResolvedCaptureConfig {
@@ -174,7 +148,6 @@ impl ResolvedCaptureConfig {
         monitors: Vec<SelectedMonitor>,
         profile: ResolvedProfile,
         calibrations: Vec<DeviceCalibration>,
-        capabilities: EffectiveCapabilities,
     ) -> Result<Self, ConfigError> {
         if output_root.as_os_str().is_empty() {
             return Err(ConfigError::EmptyOutputRoot);
@@ -190,7 +163,7 @@ impl ResolvedCaptureConfig {
         if has_duplicate(calibrations.as_slice(), |previous, calibration| previous.device == calibration.device) {
             return Err(ConfigError::DuplicateCalibration);
         }
-        Ok(Self { output_root, monitors, profile, calibrations, capabilities })
+        Ok(Self { output_root, monitors, profile, calibrations })
     }
 
     pub fn output_root(&self) -> &Path {
@@ -214,9 +187,6 @@ impl ResolvedCaptureConfig {
             UnavailableReason::MissingCalibration)
     }
 
-    pub fn capabilities(&self) -> EffectiveCapabilities {
-        self.capabilities
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

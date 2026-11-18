@@ -1,14 +1,16 @@
 pub(crate) mod lifetime;
 mod context;
+mod egress;
 mod grant;
 mod input;
 mod notices;
 mod outbox;
 mod owner;
+mod timing;
 mod witness;
 
 pub(crate) use owner::run;
-pub use lifetime::HEARTBEAT;
+pub use timing::HEARTBEAT;
 pub use witness::normal_capture_desktop;
 
 use std::{marker::PhantomData, sync::{Arc, atomic::{AtomicU8, Ordering::{AcqRel, Acquire, Release}}}, time::Instant};
@@ -155,24 +157,28 @@ impl<T: Record> Sender<T> {
     }
 
     pub fn send(&mut self, value: &T, until: Instant) -> Result<()> {
-        self.send_inner(value, until, None, None).map(|_| ())
+        self.send_inner(value, until, None).map(|_| ())
     }
 
     fn send_scoped(&mut self, value: &T, until: Instant, grant: &grant::Grant, visit: VisitBinding) -> Result<bool> {
         let Some(cancel) = grant.evidence_cancel(visit) else { return Ok(false); };
         let live = || grant.witnessed_at(visit).is_some()
             && grant.evidence_cancel(visit).is_some() && grant.check(false).is_ok();
-        self.send_inner(value, until, Some(&cancel), Some(&live))
+        let scope: (&Cancellation, &dyn Fn() -> bool) = (&cancel, &live);
+        self.send_inner(value, until, Some(scope))
     }
 
+    /// `scope` is the grant cancellation and liveness predicate of a scoped
+    /// write.
     fn send_inner(
-        &mut self, value: &T, until: Instant,
-        grant: Option<&Cancellation>, scope_current: Option<&dyn Fn() -> bool>,
+        &mut self, value: &T, until: Instant, scope: Option<(&Cancellation, &dyn Fn() -> bool)>,
     ) -> Result<bool> {
         let lane = &mut self.0;
         let connection = &lane.connection;
-        let deadline = Deadline {
-            at: until, expired: lane.expired, cancellation: &connection.stop, grant, scope_current, peer: Some(&connection.peer),
+        let deadline = Deadline::new(until, lane.expired, &connection.stop).peer(&connection.peer);
+        let deadline = match scope {
+            Some((cancel, current)) => deadline.scoped(cancel, current),
+            None => deadline,
         };
         let encoded = runtime::encode(value, &connection.scope, connection.id, lane.next, &mut lane.frame)
             .map_err(|_| Failure::Protocol);
@@ -180,7 +186,7 @@ impl<T: Record> Sender<T> {
             Ok(len) => len,
             Err(error) => return lane.complete(Err(error)),
         };
-        if grant.is_some_and(|grant| grant.check().is_err()) {
+        if scope.is_some_and(|(cancel, _)| cancel.check().is_err()) {
             erase(&mut lane.frame);
             return Ok(false);
         }
@@ -215,21 +221,12 @@ impl<T: Record> Receiver<T> {
     pub fn receive_lossy(&mut self, until: Instant) -> Result<Option<T>> {
         let lane = &mut self.0;
         let connection = &lane.connection;
-        let deadline = Deadline {
-            at: until, expired: lane.expired, cancellation: &connection.stop, grant: None, scope_current: None,
-            peer: Some(&connection.peer),
-        };
+        let deadline = Deadline::new(until, lane.expired, &connection.stop).peer(&connection.peer);
         let result = (|| {
-            let len = if lane.pipe.is_server() {
-                lane.pipe.read_message(&mut lane.frame, deadline)?
-            } else {
-                lane.pipe.read_exact(&mut lane.frame[..HEADER_BYTES], deadline)?;
-                let payload = runtime::payload_len::<T>(&lane.frame[..HEADER_BYTES], connection.id, lane.next)
-                    .map_err(|_| Failure::Protocol)?;
-                let end = HEADER_BYTES + payload;
-                lane.pipe.read_exact(&mut lane.frame[HEADER_BYTES..end], deadline)?;
-                end
-            };
+            let (id, next) = (connection.id, lane.next);
+            let len = lane.pipe.read_frame(&mut lane.frame, HEADER_BYTES, |header| {
+                runtime::payload_len::<T>(header, id, next).map_err(|_| Failure::Protocol)
+            }, deadline)?;
             let framed = len >= HEADER_BYTES && runtime::payload_len::<T>(&lane.frame[..HEADER_BYTES], connection.id, lane.next)
                 .is_ok_and(|payload| HEADER_BYTES + payload == len);
             if !framed { return Err(Failure::Protocol); }

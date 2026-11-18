@@ -22,18 +22,23 @@ impl Devices {
         self.elevated = Inventory::default();
     }
 
+    /// The inventory of the elevated or the ordinary owner.
+    fn inventory(&self, elevated: bool) -> &Inventory {
+        if elevated { &self.elevated } else { &self.ordinary }
+    }
+
     pub(crate) fn current(&self, elevated: bool) -> impl Iterator<Item = &DeviceDescriptor> {
-        let inventory = if elevated { &self.elevated } else { &self.ordinary };
-        inventory.active.values()
+        self.inventory(elevated).active.values()
     }
 
     pub(crate) fn incomplete(&self, elevated: bool) -> bool {
-        let inventory = if elevated { &self.elevated } else { &self.ordinary };
-        inventory.incomplete
+        self.inventory(elevated).incomplete
     }
 
     pub(crate) fn translate(&mut self, elevated: bool, mut record: HelperToCore) -> Option<HelperToCore> {
-        let inventory = if elevated { &mut self.elevated } else { &mut self.ordinary };
+        // Borrowed field by field: an elevated arrival also allocates from `next`.
+        let Self { ordinary, elevated: elevated_inventory, next } = self;
+        let inventory = if elevated { elevated_inventory } else { ordinary };
         match &mut record {
             HelperToCore::DeviceArrived { descriptor, .. } => {
                 let native = descriptor.id;
@@ -45,12 +50,12 @@ impl Devices {
                         return None;
                     }
                     if elevated {
-                        if self.next >= ELEVATED_DEVICE - 1 {
+                        if *next >= ELEVATED_DEVICE - 1 {
                             inventory.incomplete = true;
                             return None;
                         }
-                        self.next += 1;
-                        DeviceId(ELEVATED_DEVICE | self.next)
+                        *next += 1;
+                        DeviceId(ELEVATED_DEVICE | *next)
                     } else {
                         native
                     }

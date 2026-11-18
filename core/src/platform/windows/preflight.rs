@@ -152,15 +152,21 @@ impl ForegroundApproval {
 }
 
 pub(super) enum Foreground {
-    Ordinary(ForegroundApproval),
-    Elevated(ForegroundApproval),
+    Approved(ForegroundApproval),
     Unapproved,
     Unknown(CaptureError),
 }
 
+impl Foreground {
+    /// An approved foreground that requires the elevated collector.
+    pub(super) fn is_elevated(&self) -> bool {
+        matches!(self, Self::Approved(approval) if approval.elevated.is_some())
+    }
+}
+
 pub(super) fn validate_foreground(config: &ResolvedCaptureConfig) -> Result<ForegroundApproval, CaptureError> {
     match classify_expected_foreground(config, None) {
-        Foreground::Ordinary(approval) | Foreground::Elevated(approval) => Ok(approval),
+        Foreground::Approved(approval) => Ok(approval),
         Foreground::Unapproved => Err(error("Bring the approved application to the foreground during the countdown, then retry.")),
         Foreground::Unknown(failure) => Err(failure),
     }
@@ -168,8 +174,7 @@ pub(super) fn validate_foreground(config: &ResolvedCaptureConfig) -> Result<Fore
 
 pub(super) fn classify_expected_foreground(config: &ResolvedCaptureConfig, expected: Option<WindowProcess>) -> Foreground {
     match foreground(config, expected) {
-        Ok(Some(approval)) if approval.elevated.is_some() => Foreground::Elevated(approval),
-        Ok(Some(approval)) => Foreground::Ordinary(approval),
+        Ok(Some(approval)) => Foreground::Approved(approval),
         Ok(None) => Foreground::Unapproved,
         Err(failure) => Foreground::Unknown(failure),
     }

@@ -1,16 +1,16 @@
-use windows::{
-    Win32::{
-        Foundation::{CloseHandle, HANDLE, HWND},
-        System::Threading::{
-            OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-            QueryFullProcessImageNameW,
-        },
-        UI::WindowsAndMessaging::GetForegroundWindow,
-    },
-    core::PWSTR,
+use std::{
+    num::NonZeroU32,
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
 };
 
-use std::num::NonZeroU32;
+// The UIA boundary: callers pass and receive `windows` window handles.
+use windows::Win32::Foundation::HWND;
+use windows_sys::Win32::{
+    System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    },
+    UI::WindowsAndMessaging::GetForegroundWindow,
+};
 
 use screen_fix_protocol::{WindowId, ipc::{ProcessInstance, elevated::WindowInstance}};
 
@@ -36,7 +36,7 @@ impl WindowProcess {
 
     pub fn foreground() -> Option<Self> {
         let window = unsafe { GetForegroundWindow() };
-        let proof = Self::read(window)?;
+        let proof = Self::read(HWND(window))?;
         (unsafe { GetForegroundWindow() } == window).then_some(proof)
     }
 
@@ -61,13 +61,14 @@ impl From<WindowInstance> for WindowProcess {
     }
 }
 
-pub struct ProcessHandle(HANDLE);
+/// A process handle with query access.
+pub struct ProcessHandle(OwnedHandle);
 
 impl ProcessHandle {
-    pub fn raw(&self) -> HANDLE { self.0 }
-
     pub fn open(pid: NonZeroU32) -> Option<Self> {
-        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid.get()) }.ok().map(Self)
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid.get()) };
+        // OpenProcess returns a new handle, or null on failure.
+        (!handle.is_null()).then(|| Self(unsafe { OwnedHandle::from_raw_handle(handle) }))
     }
 
     /// Open process `instance.pid` only while it is still that instance: a
@@ -77,21 +78,19 @@ impl ProcessHandle {
     }
 
     pub fn instance(&self, pid: NonZeroU32) -> Option<ProcessInstance> {
-        crate::process_instance(self.0.0, pid)
+        crate::process_instance(self.0.as_raw_handle(), pid)
     }
 
     /// Query the Windows-reported spelling without opening or resolving an image path.
     pub fn image_path(&self) -> Option<String> {
         let mut units = [0_u16; 4096];
         let mut length = units.len() as u32;
-        unsafe { QueryFullProcessImageNameW(self.0, PROCESS_NAME_WIN32, PWSTR(units.as_mut_ptr()), &mut length) }.ok()?;
+        if unsafe {
+            QueryFullProcessImageNameW(self.0.as_raw_handle(), PROCESS_NAME_WIN32, units.as_mut_ptr(), &mut length)
+        } == 0 {
+            return None;
+        }
         String::from_utf16(units.get(..length as usize)?).ok()
-    }
-}
-
-impl Drop for ProcessHandle {
-    fn drop(&mut self) {
-        let _ = unsafe { CloseHandle(self.0) };
     }
 }
 
@@ -102,29 +101,26 @@ impl Drop for ProcessHandle {
 /// or delete sharing while it is inspected; a directory is not an identity.
 pub fn canonical_image(path: &str) -> Option<String> {
     use windows_sys::Win32::{
-        Foundation::{CloseHandle as close, GENERIC_READ, HANDLE as RawHandle, INVALID_HANDLE_VALUE},
+        Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE},
         Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
             GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_EXISTING,
         },
     };
-    struct File(RawHandle);
-    impl Drop for File {
-        fn drop(&mut self) { unsafe { close(self.0) }; }
-    }
     let name: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     let raw = unsafe {
         CreateFileW(name.as_ptr(), GENERIC_READ, FILE_SHARE_READ, std::ptr::null(), OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL, std::ptr::null_mut())
     };
     if raw == INVALID_HANDLE_VALUE { return None; }
-    let file = File(raw);
+    // CreateFileW returned a new handle.
+    let file = unsafe { OwnedHandle::from_raw_handle(raw) };
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    if unsafe { GetFileInformationByHandle(file.0, &mut info) } == 0 || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
         return None;
     }
     let mut units = vec![0_u16; 32768];
-    let length = unsafe { GetFinalPathNameByHandleW(file.0, units.as_mut_ptr(), units.len() as u32, 0) } as usize;
+    let length = unsafe { GetFinalPathNameByHandleW(file.as_raw_handle(), units.as_mut_ptr(), units.len() as u32, 0) } as usize;
     if length == 0 || length >= units.len() { return None; }
     let text = String::from_utf16(&units[..length]).ok()?;
     Some(match text.strip_prefix(r"\\?\UNC\") {

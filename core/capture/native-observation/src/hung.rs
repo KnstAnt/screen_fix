@@ -2,15 +2,17 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use windows::{
-    Win32::{Foundation::HWND as NativeWindow, System::LibraryLoader::{GetModuleHandleW, GetProcAddress}},
-    core::{PCSTR, w},
-};
-use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM},
-    UI::WindowsAndMessaging::{
-        EnumWindows, GA_ROOT, GetAncestor, GetClassNameW, IsHungAppWindow,
+// The UIA boundary: `WindowProcess::read` takes a `windows` window handle.
+use windows::Win32::Foundation::HWND as NativeWindow;
+use windows_sys::{
+    Win32::{
+        Foundation::{HWND, LPARAM},
+        System::LibraryLoader::{GetModuleHandleW, GetProcAddress},
+        UI::WindowsAndMessaging::{
+            EnumWindows, GA_ROOT, GetAncestor, GetClassNameW, IsHungAppWindow,
+        },
     },
+    w,
 };
 
 use crate::{focus::{WindowOwner, window_owner}, identity::WindowProcess};
@@ -34,9 +36,10 @@ impl Probe {
         // These optional user32 exports are private. They resolve only from
         // the already loaded system DLL. Neither is needed for ordinary HWND
         // checks and class evidence alone never attributes a Ghost.
-        let user32 = unsafe { GetModuleHandleW(w!("user32.dll")) }.ok();
+        let user32 = unsafe { GetModuleHandleW(w!("user32.dll")) };
+        let user32 = (!user32.is_null()).then_some(user32);
         let lookup = |name: &'static [u8]| {
-            unsafe { GetProcAddress(user32?, PCSTR(name.as_ptr())) }
+            unsafe { GetProcAddress(user32?, name.as_ptr()) }
                 // SAFETY: both user32 exports have the signature `HWND -> HWND`
                 // with the stdcall ("system") ABI, which `GhostLookup` declares,
                 // and user32 stays loaded for the process lifetime.

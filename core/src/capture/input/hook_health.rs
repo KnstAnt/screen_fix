@@ -5,6 +5,20 @@ use crate::{
 
 const TRANSITIONS_WITHOUT_HOOK: u8 = 20;
 
+/// Which hook channels are suspected lost (INP-12).
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HookLoss {
+    pub keyboard: bool,
+    pub pointer: bool,
+}
+
+impl HookLoss {
+    /// Either channel lost in `self` or in `other`.
+    pub fn or(self, other: Self) -> Self {
+        Self { keyboard: self.keyboard || other.keyboard, pointer: self.pointer || other.pointer }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct HookHealth {
     keyboard: Channel,
@@ -29,19 +43,16 @@ struct Channel {
 
 impl HookHealth {
     pub fn note_callback(&mut self, producer: Producer, at: SessionTimeUs) {
-        let channel = match producer {
-            Producer::KeyboardHook => &mut self.keyboard,
-            Producer::PointerHook => &mut self.pointer,
-            _ => return,
-        };
-        channel.latest_callback = Some(at);
+        if let Some(channel) = self.channel_mut(producer) {
+            channel.latest_callback = Some(at);
+        }
     }
 
     /// The hook producer's progress stalled from `start`. Transitions received
     /// from then on are not evidence of hook loss until the stall ends, so a
     /// transient stall never escalates through INP-12 (§6.2 rule 1).
     pub fn begin_stall(&mut self, producer: Producer, start: SessionTimeUs) {
-        if let Some(channel) = self.channel(producer) {
+        if let Some(channel) = self.channel_mut(producer) {
             channel.stall = Some((start, None));
             channel.clear_streak();
         }
@@ -50,7 +61,7 @@ impl HookHealth {
     /// The hook producer's progress advanced again at `end`: the stall
     /// interval closes and counting restarts from an empty streak.
     pub fn end_stall(&mut self, producer: Producer, end: SessionTimeUs) {
-        if let Some(channel) = self.channel(producer)
+        if let Some(channel) = self.channel_mut(producer)
             && let Some((start, None)) = channel.stall
         {
             channel.stall = Some((start, Some(end)));
@@ -58,7 +69,15 @@ impl HookHealth {
         }
     }
 
-    fn channel(&mut self, producer: Producer) -> Option<&mut Channel> {
+    fn channel(&self, producer: Producer) -> Option<&Channel> {
+        match producer {
+            Producer::KeyboardHook => Some(&self.keyboard),
+            Producer::PointerHook => Some(&self.pointer),
+            _ => None,
+        }
+    }
+
+    fn channel_mut(&mut self, producer: Producer) -> Option<&mut Channel> {
         match producer {
             Producer::KeyboardHook => Some(&mut self.keyboard),
             Producer::PointerHook => Some(&mut self.pointer),
@@ -114,15 +133,14 @@ impl HookHealth {
     }
 
     pub fn pointer_lost(&self) -> bool { self.pointer.unavailable }
-    pub fn keyboard_lost(&self) -> bool { self.keyboard.unavailable }
+
+    pub fn loss(&self) -> HookLoss {
+        HookLoss { keyboard: self.keyboard.unavailable, pointer: self.pointer.unavailable }
+    }
 
     /// The first missed receipt of the hook's loss, the start of its blind interval.
     pub fn lost_at(&self, producer: Producer) -> Option<SessionTimeUs> {
-        match producer {
-            Producer::KeyboardHook => self.keyboard.lost_at,
-            Producer::PointerHook => self.pointer.lost_at,
-            _ => None,
-        }
+        self.channel(producer)?.lost_at
     }
 
     pub fn first_lost_at(&self) -> Option<SessionTimeUs> {
@@ -133,11 +151,13 @@ impl HookHealth {
         self.keyboard.lost_before.into_iter().chain(self.pointer.lost_before).min()
     }
 
-    pub fn take_reports(&mut self) -> [Option<Producer>; 2] {
+    /// The hooks newly found lost, each reported once. Both reports are
+    /// taken before the iterator is returned.
+    pub fn take_reports(&mut self) -> impl Iterator<Item = Producer> + use<> {
         [
             std::mem::take(&mut self.keyboard.report).then_some(Producer::KeyboardHook),
             std::mem::take(&mut self.pointer.report).then_some(Producer::PointerHook),
-        ]
+        ].into_iter().flatten()
     }
 }
 

@@ -1,4 +1,5 @@
 mod busy;
+mod clipboard_staging;
 mod cursor;
 mod events;
 mod elevated;
@@ -8,8 +9,11 @@ mod hung;
 mod ime;
 pub(super) use ime::State as ImeState;
 pub(super) mod identity;
+mod location;
 mod queries;
 pub(super) use queries::PointerLink;
+mod routes;
+mod timeline;
 mod uia;
 pub(super) use uia::FocusGuard;
 mod uia_commits;
@@ -17,7 +21,7 @@ mod settings;
 mod version;
 mod windows;
 
-use std::{collections::{BTreeMap, VecDeque}, time::{Duration, Instant}};
+use std::{collections::VecDeque, time::{Duration, Instant}};
 
 use serde_json::{Value, json};
 use screen_fix_native_observation::LossSpan;
@@ -26,48 +30,40 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_DESTROY, EVENT_OBJECT_FOCUS, EVENT_OBJECT_HIDE, EVENT_OBJECT_IME_CHANGE,
     EVENT_OBJECT_IME_HIDE, EVENT_OBJECT_IME_SHOW, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE,
     EVENT_OBJECT_SHOW, EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
-    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_SWITCHEND, EVENT_SYSTEM_SWITCHSTART, GA_ROOT, GetAncestor, GetForegroundWindow, OBJID_CARET, OBJID_CURSOR, OBJID_WINDOW,
+    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_SWITCHEND, EVENT_SYSTEM_SWITCHSTART, GetForegroundWindow, OBJID_CARET, OBJID_CURSOR, OBJID_WINDOW,
 };
 
 use crate::{
-    capture::{context::{BusyLevel, InputSettings, TextTarget}, frame::MonitorGeometry, save::SaveWindowContext},
-    config::{ClipboardMode, ResolvedCaptureConfig},
+    capture::{context::{BusyLevel, InputSettings, TextTarget}, save::SaveWindowContext},
+    config::ResolvedCaptureConfig,
     package::metadata::AttemptLayout,
     package::outcome::{LossEvidence, LossProducer, LossReason},
     package::row::MessageTick,
-    protocol::{BoundedList, ClockOrigin, CoarseTime, Evidence, FocusGeneration, GeometryId, PhysicalPoint, PhysicalRect, QpcTick, RequestId, SessionTimeUs, UnavailableReason, WindowId, ipc::{ForegroundAtReceipt, ProcessInstance}},
+    protocol::{BoundedList, ClockOrigin, CoarseTime, Evidence, FocusGeneration, GeometryId, MonitorId, PhysicalPoint, QpcTick, RequestId, SessionTimeUs, WindowId, ipc::{ForegroundAtReceipt, ProcessInstance}},
 };
 
 use self::{
+    clipboard_staging::ClipboardStaging,
     events::{DISPLAY_CHANGE, Notice, Notifications, SETTINGS_CHANGE},
     identity::{ApprovedProcesses, MetadataScrubber, ProcessHandle, WindowProcess},
+    location::LocationLimiter,
     queries::{Classification, PointerBackend, Queries},
+    routes::DisplayRoutes,
+    timeline::VisitTimeline,
     windows::{FocusSnapshot, WindowMetadata},
 };
 use crate::platform::windows::controller::Receipt;
 
-use super::{ProbeError, clipboard, clock, display, elevated::{InputCertificate, Selector}, unavailable};
+use super::{ProbeError, clock, display, unavailable};
 
 const WINDOW_REFRESH: Duration = Duration::from_millis(100);
-const DISPLAY_REFRESH: Duration = Duration::from_secs(1);
-const WINDOW_RATE_CACHE: usize = 64;
 const FUTURE_NOTICE_LIMIT: usize = 1024;
 /// How long a classified foreground access stays cached. The selector
 /// re-classifies the foreground at the same period.
 pub(super) const ACCESS_RECHECK: Duration = Duration::from_millis(250);
 const ACCESS_CACHE_LIMIT: usize = 64;
-/// Ended visits kept for receipt attribution.
-const PREVIOUS_VISIT_LIMIT: usize = 32;
-/// Approved input stamps kept to attribute an ownerless clipboard change.
-const APPROVED_ACTIVITY_LIMIT: usize = 64;
-/// Approved input attributes an ownerless clipboard change at most this long after it.
-const CLIPBOARD_ACTIVITY_US: i64 = 1_000_000;
 const CURSOR_STAGING_LIMIT: usize = 16;
-const CLIPBOARD_STAGING_LIMIT: usize = 8;
 const FUTURE_COMMIT_LIMIT: usize = 4;
-/// The receipt uncertainty of a hook-only record (remediation §6.4).
-const HOOK_UNCERTAINTY_MS: u64 = 16;
-const HOOK_UNCERTAINTY_US: i64 = HOOK_UNCERTAINTY_MS as i64 * 1_000;
 
 /// File metadata is sampled by the startup coordinator before input capture.
 /// This describes the approved file at startup, not a loaded process image.
@@ -163,6 +159,34 @@ pub(super) enum HookReceipt {
     Pending,
     /// The foreground at the receipt is unknown or was not approved.
     Unknown,
+}
+
+/// What ended an open elevated visit, from its earliest possible stamp.
+#[derive(Clone, Copy)]
+pub(super) enum Invalidation {
+    /// The foreground, the desktop or the displays may have changed, or a
+    /// notice loss may have hidden such a change: the visit closes.
+    Foreground(QpcTick),
+    /// Only the focus changed: the visit's input is suspended.
+    Focus(QpcTick),
+}
+
+impl Invalidation {
+    fn new(before: QpcTick, foreground: bool) -> Self {
+        if foreground { Self::Foreground(before) } else { Self::Focus(before) }
+    }
+
+    fn before(self) -> QpcTick {
+        match self {
+            Self::Foreground(before) | Self::Focus(before) => before,
+        }
+    }
+
+    /// The earlier stamp of both; a foreground change outweighs a focus change.
+    fn merge(self, other: Self) -> Self {
+        let foreground = matches!(self, Self::Foreground(_)) || matches!(other, Self::Foreground(_));
+        Self::new(self.before().min(other.before()), foreground)
+    }
 }
 
 pub(super) struct ConfirmedText {
@@ -272,53 +296,28 @@ pub(super) struct Context<'a> {
     health: Vec<ContextHealth>,
     uia_lost: bool,
     suppressions: Vec<Suppression>,
-    /// Windows whose location notices the rate limit dropped; each is re-read
-    /// once at the trailing edge (C4).
-    location_dirty: Vec<WindowId>,
+    location: LocationLimiter,
     queries: Queries,
     elevated: elevated::Observations,
     ime: ime::Reader,
     last_ime_focus: Option<(FocusGeneration, ImeState)>,
     future_text: Vec<uia_commits::Commit>,
-    clipboard: Option<clipboard::Worker>,
+    clipboard: ClipboardStaging,
     cursor: cursor::Tracker,
     busy: busy::Busy,
     executable_versions: ExecutableVersions,
-    visit_bounds: Option<(FocusGeneration, PhysicalRect, QpcTick)>,
     cursor_completions: Vec<cursor::Completion>,
-    routes_since: Option<QpcTick>,
-    routable: Vec<MonitorGeometry>,
-    visit_geometry: Option<(FocusGeneration, GeometryId, QpcTick)>,
-    clipboard_notices: VecDeque<clipboard::Notice>,
-    future_clipboard: Vec<clipboard::Read>,
-    approved_activity: VecDeque<(FocusGeneration, QpcTick)>,
+    routes: DisplayRoutes<'a>,
     future_notices: Vec<Notice>,
-    config: &'a ResolvedCaptureConfig,
-    topology: &'a display::topology::Topology,
-    topology_seen: Option<(QpcTick, u64)>,
-    unavailable_routes: BTreeMap<crate::protocol::MonitorId, GeometryId>,
-    reconfiguring_routes: BTreeMap<crate::protocol::MonitorId, GeometryId>,
     approvals: ApprovedProcesses<'a>,
     /// Foreground access per process, until its expiry.
     ordinary_access: VecDeque<(ProcessInstance, Instant, Result<screen_fix_elevated::ForegroundAccess, AccessUnknown>)>,
     scrubber: MetadataScrubber,
-    generation: u64,
-    current: Option<Visit>,
-    /// Ended visits: each with the last sweep that verified it unchanged and
-    /// the stamp at which its replacement was established.
-    previous_visits: VecDeque<(Visit, QpcTick, QpcTick)>,
-    /// The notice horizon of the latest window sweep. Every foreground or
-    /// focus change before it has replaced the current visit.
-    swept: Option<QpcTick>,
-    focus_boundary: Option<QpcTick>,
+    timeline: VisitTimeline,
     hung: hung::Hung,
     observed_foreground_window: WindowId,
     observed_foreground: Option<WindowProcess>,
     next_sweep: Instant,
-    next_displays: Instant,
-    display_rows: Option<Vec<Value>>,
-    displays_unavailable: bool,
-    window_rate: VecDeque<(WindowId, Instant)>,
     started: bool,
 }
 
@@ -328,59 +327,41 @@ impl<'a> Context<'a> {
         let now = Instant::now();
         let scrubber = MetadataScrubber::new();
         let queries = Queries::start(scrubber.clone())?;
-        let clipboard = (config.profile().clipboard() == ClipboardMode::OptIn)
-            .then(clipboard::Worker::start).transpose()?;
+        let clipboard = ClipboardStaging::start(config)?;
         Ok(Self {
             notifications: Notifications::start()?, losses: Losses::default(), text_losses: Losses::default(),
             health: Vec::new(), uia_lost: false,
-            suppressions: Vec::new(), location_dirty: Vec::new(), queries, elevated: elevated::Observations::default(), ime: ime::Reader::spawn()?, last_ime_focus: None,
+            suppressions: Vec::new(), location: LocationLimiter::new(), queries, elevated: elevated::Observations::default(), ime: ime::Reader::spawn()?, last_ime_focus: None,
             future_text: Vec::with_capacity(FUTURE_COMMIT_LIMIT),
             clipboard, cursor: cursor::Tracker::start(layout)?, busy: busy::Busy::default(),
-            executable_versions, visit_bounds: None,
+            executable_versions,
             cursor_completions: Vec::with_capacity(CURSOR_STAGING_LIMIT),
-            routes_since: None, routable: Vec::new(), visit_geometry: None,
-            clipboard_notices: VecDeque::with_capacity(CLIPBOARD_STAGING_LIMIT),
-            future_clipboard: Vec::with_capacity(CLIPBOARD_STAGING_LIMIT),
-            approved_activity: VecDeque::with_capacity(APPROVED_ACTIVITY_LIMIT),
+            routes: DisplayRoutes::new(config, topology, now),
             future_notices: Vec::with_capacity(FUTURE_NOTICE_LIMIT),
-            config, topology, topology_seen: None, unavailable_routes: BTreeMap::new(), reconfiguring_routes: BTreeMap::new(),
             approvals: ApprovedProcesses::new(config.profile())?, ordinary_access: VecDeque::with_capacity(ACCESS_CACHE_LIMIT), scrubber,
-            generation: 0, current: None, previous_visits: VecDeque::with_capacity(PREVIOUS_VISIT_LIMIT), swept: None, focus_boundary: None,
+            timeline: VisitTimeline::new(),
             hung: hung::Hung::new(now), observed_foreground_window: WindowId(0),
-            observed_foreground: None, next_sweep: now, next_displays: now,
-            display_rows: None, displays_unavailable: false, window_rate: VecDeque::with_capacity(WINDOW_RATE_CACHE),
+            observed_foreground: None, next_sweep: now,
             started: false,
         })
     }
 
     pub fn pause(&mut self, at: QpcTick) -> Result<(), ProbeError> {
-        self.generation = self.generation.checked_add(1)
-            .ok_or_else(|| unavailable("The focus generation counter overflowed"))?;
-        self.focus_boundary = Some(at);
-        self.current = None;
-        self.previous_visits.clear();
-        self.swept = None;
+        let generation = self.timeline.reset(at)?;
         // The final drain before the pause wrote every interval up to the cutoff.
         self.suppressions.clear();
-        self.location_dirty.clear();
+        self.location.reset();
         self.ordinary_access.clear();
-        self.queries.focus(FocusGeneration(self.generation), None, Instant::now())?;
+        self.queries.focus(generation, None, Instant::now())?;
         self.elevated = elevated::Observations::default();
         self.ime.focus_changed(None);
         self.last_ime_focus = None;
         self.future_text.clear();
-        self.clipboard_notices.clear();
-        self.future_clipboard.clear();
-        self.approved_activity.clear();
+        self.clipboard.reset();
         self.future_notices.clear();
         self.cursor_completions.clear();
         self.cursor.reset_observation();
-        self.visit_geometry = None;
-        self.visit_bounds = None;
-        self.routable.clear();
-        self.routes_since = None;
-        self.display_rows = None;
-        self.topology_seen = None;
+        self.routes.reset();
         self.observed_foreground_window = WindowId(0);
         self.observed_foreground = None;
         self.busy = busy::Busy::default();
@@ -397,7 +378,7 @@ impl<'a> Context<'a> {
         let notifications = self.notifications.drain().count() as u64;
         let lost = self.notifications.take_loss().map_or(0, |span| span.count);
         let _ = self.cursor.results();
-        let clipboard = self.clipboard.as_ref().map_or(0, |worker| worker.notices().count() as u64);
+        let clipboard = self.clipboard.discard_notices();
         notifications.saturating_add(lost).saturating_add(clipboard)
     }
 
@@ -414,40 +395,38 @@ impl<'a> Context<'a> {
     pub fn resume(&mut self) {
         let now = Instant::now();
         self.next_sweep = now;
-        self.next_displays = now;
+        self.routes.resume(now);
     }
 
     pub fn visit(&self) -> Option<Visit> {
-        self.current
+        self.timeline.current()
     }
 
     pub fn activate_elevated(&mut self, binding: VisitBinding, focus: FocusAtReceipt, at: QpcTick) -> Result<Visit, ProbeError> {
-        self.generation = self.generation.checked_add(1)
-            .ok_or_else(|| unavailable("The focus generation counter overflowed"))?;
+        let generation = self.timeline.next_generation()?;
         let foreground = binding.foreground.into();
-        let visit = Visit { generation: FocusGeneration(self.generation), started_at: at, foreground,
+        let visit = Visit { generation, started_at: at, foreground,
             native: None, uia_blocked: None, elevated: Some((binding, focus)) };
-        self.current = Some(visit);
+        self.timeline.activate(visit);
         self.elevated = elevated::Observations::default();
-        self.focus_boundary = Some(at);
         self.queries.focus(visit.generation, Some(visit), Instant::now())?;
         Ok(visit)
     }
 
     pub fn elevated_invalidation(
         &mut self, binding: VisitBinding, focus: FocusAtReceipt, after: QpcTick, receipt: Receipt,
-    ) -> Result<Option<(QpcTick, bool)>, screen_fix_elevated::Failure> {
+    ) -> Result<Option<Invalidation>, screen_fix_elevated::Failure> {
         if !self.notifications.running() {
             return Err(screen_fix_elevated::Failure::Witness);
         }
-        let mut invalidation: Option<(QpcTick, bool)> = None;
+        let mut invalidation: Option<Invalidation> = None;
         if let Some(span) = self.notifications.take_loss() {
             self.losses.note(LossReason::NotificationOverflow, span);
             // A loss that ended before the visit opened hid none of its
             // notices. A later loss may have hidden a foreground change, so
             // the visit is revoked from its first possible notice (D1).
             if span.last >= after {
-                invalidation = Some((span.first.max(after), true));
+                invalidation = Some(Invalidation::Foreground(span.first.max(after)));
             }
         }
         for notice in self.notifications.drain() {
@@ -469,7 +448,8 @@ impl<'a> Context<'a> {
             let interval = notice_interval(notice, receipt);
             if interval.is_some_and(|(_, latest)| latest < after) { continue; }
             let before = interval.map_or(after, |(lower, _)| lower.min(notice.receipt));
-            invalidation = Some(invalidation.map_or((before, foreground), |(old, close)| (old.min(before), close || foreground)));
+            let found = Invalidation::new(before, foreground);
+            invalidation = Some(invalidation.map_or(found, |known| known.merge(found)));
         }
         Ok(invalidation)
     }
@@ -494,11 +474,7 @@ impl<'a> Context<'a> {
             self.uia_lost = true;
             self.health.push(activity_lost(operation));
         }
-        if self.clipboard.as_ref().is_some_and(clipboard::Worker::exited) {
-            // Row 17: reported once; no replacement worker, so no later
-            // clipboard events are produced.
-            self.clipboard = None;
-            self.clipboard_notices.clear();
+        if self.clipboard.take_exited() {
             self.health.push(activity_lost("Observe the opt-in clipboard"));
         }
         if self.cursor.take_owner_lost() {
@@ -523,8 +499,8 @@ impl<'a> Context<'a> {
         let scan = self.scan_notices(&notices);
         let invalidated = lost != 0 || self.queries.changed() || scan.invalidated;
         let sweep = !self.started || invalidated || now >= self.next_sweep || scan.sweep;
-        let display_changed = now >= self.next_displays || scan.display;
-        let approval_changed = self.current.map(|visit| visit.foreground) != foreground.approved;
+        let display_changed = self.routes.due(now, scan.display);
+        let approval_changed = self.timeline.current().map(|visit| visit.foreground) != foreground.approved;
         let foreground_changed = !self.started || approval_changed || foreground.window != self.observed_foreground_window
             || foreground.observed != self.observed_foreground || scan.foreground;
         self.observed_foreground_window = foreground.window;
@@ -533,10 +509,7 @@ impl<'a> Context<'a> {
         if hung_sampled {
             self.queries.update_hung(&self.hung);
         }
-        if display_changed {
-            self.next_displays = now + DISPLAY_REFRESH;
-        }
-        self.refresh_displays(at, &mut output, display_changed);
+        self.routes.refresh(at, &mut output, display_changed);
         if sweep || foreground_changed || hung_sampled {
             let facts = PollFacts { foreground, invalidated, foreground_changed, display_changed };
             let approved = self.sweep_foreground(&facts, now, at, origin, &mut output)?;
@@ -545,24 +518,24 @@ impl<'a> Context<'a> {
                 output.push(row);
             }
         }
-        let process_hung = self.current.is_some_and(|visit| self.hung.contains(visit.foreground.process));
+        let process_hung = self.timeline.current().is_some_and(|visit| self.hung.contains(visit.foreground.process));
         output.extend(self.busy_row(process_hung, &notices, false, at, origin));
         output.extend(self.caret_change(&notices, receipt)?);
         let cursor_notified = cursor_notified(&notices);
         self.notice_rows(notices, now, at, receipt, &mut output)?;
         self.trailing_locations(now, at, &mut output)?;
-        if let Some(point) = self.queries.pointer_rest(now) && let Some(geometry) = self.point_geometry(point) {
+        if let Some(point) = self.queries.pointer_rest(now) && let Some(geometry) = self.routes.point_geometry(point) {
             self.pointer_query(point, geometry, origin, at, None)?;
         }
         self.sample_cursor(cursor_notified);
         self.ime.poll();
         let extras = queries::FocusExtras {
             cursor: self.cursor.current_hint(),
-            ime: self.current.and_then(|visit| self.ime.focus_state(visit.generation)),
+            ime: self.timeline.current().and_then(|visit| self.ime.focus_state(visit.generation)),
         };
         self.queries.poll(now, at, origin, Some(&extras), &mut output);
         self.cursor_rows(at, origin, &mut output);
-        if let Some(visit) = self.current && let Some(state) = self.ime.focus_state(visit.generation)
+        if let Some(visit) = self.timeline.current() && let Some(state) = self.ime.focus_state(visit.generation)
             && self.last_ime_focus != Some((visit.generation, state))
         {
             self.last_ime_focus = Some((visit.generation, state));
@@ -623,7 +596,7 @@ impl<'a> Context<'a> {
                 EVENT_OBJECT_FOCUS => {
                     // Ignore an unrelated process's focus event only if the
                     // native owner thread is known to differ.
-                    if self.current.is_none_or(|visit| notice.thread == 0
+                    if self.timeline.current().is_none_or(|visit| notice.thread == 0
                         || Some(notice.thread) == visit.native.map(|native| native.focus.thread.get())
                         || notice.thread == visit.foreground.thread.get())
                     {
@@ -656,12 +629,14 @@ impl<'a> Context<'a> {
             self.observed_foreground_window = WindowId(0);
         }
         let ended = self.replace_visit(verified, facts.invalidated, now, output)?;
-        if let Some(visit) = self.current && (facts.foreground_changed || self.visit_geometry.is_none() || facts.display_changed) {
+        if let Some(visit) = self.timeline.current()
+            && (facts.foreground_changed || !self.routes.has_visit_geometry() || facts.display_changed)
+        {
             self.observe_visit_geometry(visit, at)?;
         }
         self.update_suppression(observed, ended, at, origin)?;
         // Notices through `at` were processed and the reads above followed it.
-        self.swept = Some(at);
+        self.timeline.mark_swept(at);
         Ok(verified)
     }
 
@@ -672,31 +647,25 @@ impl<'a> Context<'a> {
     ) -> Result<Option<QpcTick>, ProbeError> {
         let native = approved.and_then(FocusSnapshot::read);
         let uia_blocked = approved.and_then(|proof| self.queries.blocked(proof.process));
-        let old = self.current.map(|visit| (visit.foreground, visit.native.map(|native| (native.focus, native.hung)), visit.uia_blocked));
+        let old = self.timeline.current()
+            .map(|visit| (visit.foreground, visit.native.map(|native| (native.focus, native.hung)), visit.uia_blocked));
         let new = approved.map(|proof| (proof, native.map(|native| (native.focus, native.hung)), uia_blocked));
         if !invalidated && old == new {
-            if let Some(visit) = &mut self.current {
+            if let Some(visit) = self.timeline.current_mut() {
                 visit.native = native;
             }
             return Ok(None);
         }
-        self.generation = self.generation.checked_add(1)
-            .ok_or_else(|| unavailable("The focus generation counter overflowed"))?;
+        let generation = self.timeline.next_generation()?;
         let stamp = clock::qpc()?;
-        self.focus_boundary = Some(stamp);
-        let ended = self.current.map(|known| self.verified(known));
-        if let Some(known) = self.current {
-            if self.previous_visits.len() == PREVIOUS_VISIT_LIMIT { self.previous_visits.pop_front(); }
-            self.previous_visits.push_back((known, self.verified(known), stamp));
-        }
-        self.current = approved.map(|foreground| Visit {
-            generation: FocusGeneration(self.generation), started_at: stamp, foreground, native, uia_blocked, elevated: None,
-        });
-        self.queries.focus(FocusGeneration(self.generation), self.current, now)?;
-        self.ime.focus_changed(self.current);
-        self.visit_geometry = None;
-        self.visit_bounds = None;
-        if let Some(visit) = self.current {
+        let ended = self.timeline.replace(approved.map(|foreground| Visit {
+            generation, started_at: stamp, foreground, native, uia_blocked, elevated: None,
+        }), stamp);
+        let current = self.timeline.current();
+        self.queries.focus(generation, current, now)?;
+        self.ime.focus_changed(current);
+        self.routes.forget_visit();
+        if let Some(visit) = current {
             output.push(json!({
                 "kind": "keyboard_layout", "generation": visit.generation,
                 "layout": visit.native.map(|value| value.focus.keyboard_layout),
@@ -711,9 +680,9 @@ impl<'a> Context<'a> {
         &mut self, observed: Option<WindowProcess>, ended: Option<QpcTick>, at: QpcTick, origin: ClockOrigin,
     ) -> Result<(), ProbeError> {
         let open = self.suppressions.last().is_some_and(|interval| interval.end.is_none());
-        match self.current {
+        match self.timeline.current() {
             None if !open => {
-                let start = origin.time(ended.unwrap_or(self.swept.unwrap_or(at)))?;
+                let start = origin.time(ended.unwrap_or(self.timeline.swept().unwrap_or(at)))?;
                 let reason = self.suppression_reason(observed);
                 if self.suppressions.len() == SUPPRESSION_LIMIT {
                     if let Some(last) = self.suppressions.last_mut() { last.end = None; }
@@ -778,13 +747,13 @@ impl<'a> Context<'a> {
         &mut self, process_hung: bool, notices: &[Notice], scoped: bool, at: QpcTick, origin: ClockOrigin,
     ) -> Option<Value> {
         let target = self.classified_target();
-        self.busy.refresh(self.current, process_hung, target, notices, scoped, at, origin)
+        self.busy.refresh(self.timeline.current(), process_hung, target, notices, scoped, at, origin)
             .map(|change| json!({ "kind": "app_busy", "approved": change.is_some(), "hint": change }))
     }
 
     /// A `caret` row for the latest caret notice of the current editable focus.
     fn caret_change(&self, notices: &[Notice], receipt: Receipt) -> Result<Option<Value>, ProbeError> {
-        if let Some(visit) = self.current
+        if let Some(visit) = self.timeline.current()
             && matches!(self.queries.classification(), Classification::Resolved(TextTarget::Editable, Some(_)))
             && let Some(focus) = visit.native
             && let Some(notice) = notices.iter().filter(|notice| {
@@ -829,12 +798,11 @@ impl<'a> Context<'a> {
                 continue;
             }
             if notice.event == EVENT_OBJECT_DESTROY {
-                self.window_rate.retain(|(window, _)| *window != notice.window);
+                self.location.forget(notice.window);
                 continue;
             }
             let Some(kind) = window_event_kind(notice.event) else { continue };
-            if kind == WindowRowKind::WindowLocation && self.location_limited(notice.window, now) {
-                self.mark_location_dirty(notice.window);
+            if kind == WindowRowKind::WindowLocation && self.location.defer(notice.window, now) {
                 continue;
             }
             // The notification callback keeps only top-level windows (CTX-1).
@@ -843,13 +811,15 @@ impl<'a> Context<'a> {
                 continue;
             }
             if let Some(mut row) = self.window_row(proof, kind) {
-                if kind == WindowRowKind::WindowLocation && let Some(visit) = self.current.filter(|visit| visit.foreground == proof) {
+                if kind == WindowRowKind::WindowLocation
+                    && let Some(visit) = self.timeline.current().filter(|visit| visit.foreground == proof)
+                {
                     self.observe_visit_geometry(visit, at)?;
                 }
                 add_win_event_timing(&mut row, notice, receipt)?;
                 row["source_event_tick_ms"] = json!(notice.source_tick);
                 if kind == WindowRowKind::WindowLocation {
-                    self.rate_location(notice.window, now);
+                    self.location.rate(notice.window, now);
                 }
                 output.push(row);
             }
@@ -859,32 +829,18 @@ impl<'a> Context<'a> {
 
     /// Trailing edge of the location rate limit: one re-read per dropped burst (C4).
     fn trailing_locations(&mut self, now: Instant, at: QpcTick, output: &mut Vec<Value>) -> Result<(), ProbeError> {
-        for window in self.due_locations(now) {
+        for window in self.location.due(now) {
             let Some(proof) = read_window(window) else { continue };
             if let Some(mut row) = self.window_row(proof, WindowRowKind::WindowLocation) {
-                if let Some(visit) = self.current.filter(|visit| visit.foreground == proof) {
+                if let Some(visit) = self.timeline.current().filter(|visit| visit.foreground == proof) {
                     self.observe_visit_geometry(visit, at)?;
                 }
                 row["trailing"] = json!(true);
-                self.rate_location(window, now);
+                self.location.rate(window, now);
                 output.push(row);
             }
         }
         Ok(())
-    }
-
-    /// Take the windows whose dropped location notices are now due a re-read.
-    fn due_locations(&mut self, now: Instant) -> Vec<WindowId> {
-        let due: Vec<_> = self.location_dirty.iter().copied().filter(|dirty| !self.location_limited(*dirty, now)).collect();
-        self.location_dirty.retain(|window| !due.contains(window));
-        due
-    }
-
-    /// Remember a window whose location notice the rate limit dropped.
-    fn mark_location_dirty(&mut self, window: WindowId) {
-        if !self.location_dirty.contains(&window) && self.location_dirty.len() < WINDOW_RATE_CACHE {
-            self.location_dirty.push(window);
-        }
     }
 
     /// Cursor changes received through `at` as rows; a later one stays staged.
@@ -907,21 +863,6 @@ impl<'a> Context<'a> {
         } else {
             self.losses.note(LossReason::StagingPressure, LossSpan::at(change.received()));
         }
-    }
-
-    fn location_limited(&self, window: WindowId, now: Instant) -> bool {
-        self.window_rate.iter().any(|(id, last)| *id == window && now.saturating_duration_since(*last) < WINDOW_REFRESH)
-    }
-
-    /// Record a location read of `window` for the rate limit. The read also
-    /// serves any pending trailing re-read of the window.
-    fn rate_location(&mut self, window: WindowId, now: Instant) {
-        self.location_dirty.retain(|dirty| *dirty != window);
-        self.window_rate.retain(|(id, _)| *id != window);
-        if self.window_rate.len() == WINDOW_RATE_CACHE {
-            self.window_rate.pop_front();
-        }
-        self.window_rate.push_back((window, now));
     }
 
     /// A context loss found outside this owner, such as elevated evidence the
@@ -970,13 +911,7 @@ impl<'a> Context<'a> {
 
     pub fn note_approved_input(&mut self, generation: FocusGeneration, at: QpcTick) {
         self.busy.activity(generation, at);
-        if self.clipboard.is_none() {
-            return;
-        }
-        if self.approved_activity.len() == APPROVED_ACTIVITY_LIMIT {
-            self.approved_activity.pop_front();
-        }
-        self.approved_activity.push_back((generation, at));
+        self.clipboard.note_activity(generation, at);
     }
 
     pub fn input_settings(&self) -> InputSettings {
@@ -1001,25 +936,19 @@ impl<'a> Context<'a> {
     /// pending focus change, the same foreground and, for an elevated visit,
     /// input certified past `at` and the same focus.
     fn confirmed_visit(&self, at: QpcTick) -> Option<Visit> {
-        let visit = self.current.filter(|visit| visit.started_at <= at)?;
+        let visit = self.timeline.current().filter(|visit| visit.started_at <= at)?;
         let confirmed = !self.queries.changed() && WindowProcess::foreground() == Some(visit.foreground)
             && (!visit.is_elevated() || self.has_certified_elevated_input(visit, at) && self.confirm_focus(visit));
         confirmed.then_some(visit)
     }
 
-    pub fn save_geometry(&self, monitor: crate::protocol::MonitorId, at: QpcTick) -> Option<GeometryId> {
-        if !self.routes_since.is_some_and(|since| since <= at) { return None; }
-        self.routable.iter().find(|geometry| geometry.id.monitor == monitor).map(|geometry| geometry.id)
+    pub fn save_geometry(&self, monitor: MonitorId, at: QpcTick) -> Option<GeometryId> {
+        self.routes.save_geometry(monitor, at)
     }
 
     pub fn checkpoint_context(&self, at: QpcTick, source: Option<VisitBinding>) -> Option<SaveWindowContext> {
         let visit = self.confirmed_visit(at).filter(|visit| visit.elevated_binding() == source)?;
-        let geometry = self.visit_bounds.filter(|(generation, _, observed)| {
-            *generation == visit.generation && *observed <= at && self.routes_since.is_some_and(|since| since <= at)
-        });
-        let geometries = geometry.map_or_else(Vec::new, |(_, bounds, _)| {
-            self.routable.iter().filter(|monitor| monitor.bounds.intersects(bounds)).map(|monitor| monitor.id).collect()
-        });
+        let geometries = self.routes.visit_geometries(visit.generation, at);
         let busy = self.busy.current().filter(|hint| hint.generation == visit.generation)
             .map_or(BusyLevel::Clear, |hint| hint.level);
         Some(SaveWindowContext { window: visit.foreground.window, focus: visit.generation,
@@ -1027,56 +956,18 @@ impl<'a> Context<'a> {
     }
 
     pub fn poll_clipboard(&mut self, receipt: Receipt, now: QpcTick) -> Vec<Value> {
-        let Some(worker) = &self.clipboard else { return Vec::new() };
-        take_clipboard_notices(worker, &mut self.clipboard_notices, &mut self.losses);
-        let safe_visit = self.current.filter(|visit| self.queries.clipboard_safe() && visit.clipboard_focus_is_current());
-        if let Some(visit) = safe_visit {
-            let mut pending = VecDeque::with_capacity(CLIPBOARD_STAGING_LIMIT);
-            for notice in self.clipboard_notices.drain(..) {
-                if notice.observed.elapsed() >= clipboard::MAX_AGE || notice.foreground != visit.foreground
-                    || notice.received < visit.started_at || notice.received < receipt.boundary.qpc
-                {
-                    continue;
-                }
-                if notice.received > now {
-                    pending.push_back(notice);
-                    continue;
-                }
-                if !clipboard_change_after_visit(notice, visit, receipt) {
-                    continue;
-                }
-                if notice.owner.is_none() {
-                    if !clipboard_activity(&self.approved_activity, notice, visit, receipt.clock) {
-                        pending.push_back(notice);
-                        continue;
-                    }
-                }
-                if !worker.grant(notice, visit, self.queries.clipboard_guard()) {
-                    self.losses.note(LossReason::ClipboardQueue, LossSpan::at(notice.received));
-                }
-            }
-            self.clipboard_notices = pending;
-        } else {
-            self.clipboard_notices.retain(|notice| notice.observed.elapsed() < clipboard::MAX_AGE
-                && self.current.is_some_and(|visit| visit.foreground == notice.foreground
-                    && notice.received >= visit.started_at));
-        }
-        let mut output = Vec::new();
-        for read in due_clipboard_reads(&mut self.future_clipboard, worker.results(), now, &mut self.losses) {
-            if safe_visit.is_some_and(|visit| visit.generation == read.visit.generation
-                && visit.foreground == read.notice.foreground)
-            {
-                output.push(clipboard_row(read, receipt.clock));
-            }
-        }
-        output
+        if !self.clipboard.stage_notices(&mut self.losses) { return Vec::new(); }
+        let current = self.timeline.current();
+        let safe = current.filter(|visit| self.queries.clipboard_safe() && visit.clipboard_focus_is_current());
+        self.clipboard.poll(safe, current, || self.queries.clipboard_guard(), receipt, now, &mut self.losses)
     }
 
     pub fn approve_receipt(
         &mut self, proof: ForegroundAtReceipt, native_receipt: QpcTick, first: QpcTick,
     ) -> Option<ReceiptFocus> {
         let original = native_receipt.min(first);
-        if let Some(visit) = self.current.filter(|visit| visit.elevated.is_some()) {
+        let current = self.timeline.current();
+        if let Some(visit) = current.filter(|visit| visit.elevated.is_some()) {
             if visit.receipt_proof() != proof || original < visit.started_at
                 || !self.has_certified_elevated_input(visit, native_receipt.max(first))
             {
@@ -1086,12 +977,9 @@ impl<'a> Context<'a> {
         }
         self.approvals.get_at(proof.process, original)?;
         if !self.ordinary_process(proof.process) { return None; }
-        let Some(visit) = self.current.filter(|visit| visit.receipt_proof() == proof && visit.started_at <= original
+        let Some(visit) = current.filter(|visit| visit.receipt_proof() == proof && visit.started_at <= original
             && !self.queries.changed()) else {
-            let historical = self.previous_visits.iter().rev().find(|(visit, _, ended)| {
-                visit.receipt_proof() == proof && visit.started_at <= original && native_receipt.max(first) < *ended
-            });
-            return Some(historical.map_or(ReceiptFocus::Unknown, |(visit, _, _)| ReceiptFocus::Historical(*visit)));
+            return Some(self.timeline.historical(proof, original, native_receipt.max(first)));
         };
         Some(self.classify_receipt(visit, proof))
     }
@@ -1115,7 +1003,7 @@ impl<'a> Context<'a> {
     /// are ordinary.
     pub fn take_confirmed_text(&mut self, receipt: Receipt, now: QpcTick) -> (Vec<ConfirmedText>, Vec<LossEvidence>) {
         use screen_fix_native_observation::uia_commits::CommitLossReason;
-        let visit = self.current;
+        let visit = self.timeline.current();
         let elevated = visit.is_some_and(Visit::is_elevated).then(|| self.take_elevated_text(now));
         let mut lost: Vec<_> = std::mem::take(&mut self.text_losses.0).into_iter()
             .filter_map(|(reason, span)| text_loss(receipt, reason, span)).collect();
@@ -1164,7 +1052,7 @@ impl<'a> Context<'a> {
     }
 
     pub fn confirm_text(&self, text: &ConfirmedText) -> bool {
-        self.current.is_some_and(|visit| visit.generation == text.visit.generation)
+        self.timeline.current().is_some_and(|visit| visit.generation == text.visit.generation)
             && text.source_read.map_or_else(
                 || self.queries.accepts_commit(text.visit.generation, text.revision),
                 |read| self.queries.accepts_remote_commit(read, text.callback_at),
@@ -1186,7 +1074,7 @@ impl<'a> Context<'a> {
 
     pub fn confirm_focus(&self, visit: Visit) -> bool {
         if let Some((binding, focus)) = visit.elevated {
-            return self.current.is_some_and(|current| current.elevated == Some((binding, focus)))
+            return self.timeline.current().is_some_and(|current| current.elevated == Some((binding, focus)))
                 && WindowProcess::foreground() == Some(visit.foreground)
                 && elevated_focus_matches(visit.foreground, focus);
         }
@@ -1198,67 +1086,25 @@ impl<'a> Context<'a> {
     }
 
     pub fn focus_end(&self, generation: FocusGeneration, clock: ClockOrigin) -> Option<SessionTimeUs> {
-        let (_, _, ended) = self.previous_visits.iter().find(|(visit, _, _)| visit.generation == generation)?;
-        clock.time(*ended).ok()
+        self.timeline.focus_end(generation, clock)
     }
 
-    /// The last stamp at which a sweep confirmed `visit` unchanged; no
-    /// earlier than its start. An elevated visit is never swept.
-    fn verified(&self, visit: Visit) -> QpcTick {
-        self.swept.filter(|_| !visit.is_elevated()).map_or(visit.started_at, |swept| swept.max(visit.started_at))
-    }
-
-    /// Attribute a hook-only receipt `at` (remediation §6.4). A visit covers
-    /// it when the visit started before the receipt's uncertainty interval
-    /// `[at − HOOK_UNCERTAINTY_MS, at]` and a sweep verified it unchanged through `at`.
+    /// Attribute a hook-only receipt `at` (remediation §6.4).
     pub fn hook_receipt(&self, at: QpcTick, clock: ClockOrigin) -> HookReceipt {
-        let uncertainty = i64::try_from(clock.qpc_frequency.0.get() / 1_000 * HOOK_UNCERTAINTY_MS).unwrap_or(i64::MAX);
-        let lower = QpcTick(at.0.saturating_sub(uncertainty));
-        if let Some(visit) = self.current.filter(|visit| visit.is_elevated()) {
-            // Elevated records reach the matcher only inside the certified visit.
-            return if visit.started_at <= lower { HookReceipt::Covered(visit) } else { HookReceipt::Unknown };
-        }
-        if self.swept.is_none_or(|swept| swept < at) {
-            return HookReceipt::Pending;
-        }
-        let current = self.current.map(|visit| (visit, self.verified(visit), None));
-        let mut before = None;
-        let mut after = None;
-        for (visit, verified, ended) in self.previous_visits.iter()
-            .map(|(visit, verified, ended)| (*visit, *verified, Some(*ended))).chain(current)
-        {
-            if visit.started_at <= lower {
-                if at <= verified {
-                    return HookReceipt::Covered(visit);
-                }
-                before = Some((visit, ended));
-            } else if after.is_none() {
-                after = Some(visit);
-            }
-        }
-        match (before, after) {
-            // The replacement was established in the same sweep, so no other
-            // foreground came between the two visits.
-            (Some((before, Some(ended))), Some(after)) if ended == after.started_at && before.foreground == after.foreground =>
-                HookReceipt::FocusUncertain { before: before.generation, after },
-            _ => HookReceipt::Unknown,
-        }
+        self.timeline.hook_receipt(at, clock)
     }
 
-    /// Drop ended visits that can no longer attribute an unpublished receipt:
-    /// they ended an uncertainty interval before the published input prefix.
-    /// The visit of the active key focus keeps its end for redaction.
+    /// Drop ended visits that can no longer attribute an unpublished receipt.
     pub fn prune_visits(&mut self, published: SessionTimeUs, clock: ClockOrigin, keep: Option<FocusGeneration>) {
-        self.previous_visits.retain(|(visit, _, ended)| Some(visit.generation) == keep
-            || clock.time(*ended).is_ok_and(|ended| ended.0.saturating_add(HOOK_UNCERTAINTY_US) >= published.0));
+        self.timeline.prune(published, clock, keep);
     }
 
     pub fn focus_boundary(&self) -> Option<QpcTick> {
-        self.focus_boundary
+        self.timeline.focus_boundary()
     }
 
     pub fn is_current(&self, proof: ForegroundAtReceipt, generation: Option<FocusGeneration>) -> bool {
-        self.current.is_some_and(|visit| visit.receipt_proof() == proof && generation == Some(visit.generation))
+        self.timeline.current().is_some_and(|visit| visit.receipt_proof() == proof && generation == Some(visit.generation))
     }
 
     pub fn finish_cursor(&mut self, cutoff: QpcTick, origin: ClockOrigin) -> Vec<Value> {
@@ -1274,8 +1120,8 @@ impl<'a> Context<'a> {
     }
 
     pub fn sample_cursor(&mut self, force: bool) {
-        let visit = self.current;
-        let selected = &self.routable;
+        let visit = self.timeline.current();
+        let selected = self.routes.routable();
         let approvals = &mut self.approvals;
         let change = self.cursor.sample(force, |point| {
             visit.is_some() && selected.iter().any(|geometry| geometry.bounds.contains(point))
@@ -1287,50 +1133,25 @@ impl<'a> Context<'a> {
     }
 
     pub fn pointer_geometry_at(&self, point: PhysicalPoint, at: QpcTick) -> Evidence<GeometryId> {
-        if !self.routes_since.is_some_and(|since| since <= at) {
-            return Evidence::Unavailable(UnavailableReason::NotObserved);
-        }
-        Evidence::from_option(self.point_geometry(point), UnavailableReason::NotObserved)
+        self.routes.pointer_geometry_at(point, at)
     }
 
     pub fn window_geometry_at(&self, proof: ForegroundAtReceipt, at: QpcTick) -> Evidence<GeometryId> {
-        let Some((generation, geometry, observed)) = self.visit_geometry else {
-            return Evidence::Unavailable(UnavailableReason::NotObserved);
-        };
-        if observed <= at && self.current.is_some_and(|visit| visit.generation == generation
-            && visit.started_at <= at && visit.receipt_proof() == proof)
-        {
-            Evidence::Observed(geometry)
-        } else {
-            Evidence::Unavailable(UnavailableReason::NotObserved)
-        }
+        self.routes.window_geometry_at(self.timeline.current(), proof, at)
     }
 
     fn observe_visit_geometry(&mut self, visit: Visit, lower_bound: QpcTick) -> Result<(), ProbeError> {
         let bounds = WindowMetadata::read(visit.foreground, &self.scrubber).and_then(|snapshot| snapshot.bounds);
         let measured = clock::qpc()?.max(lower_bound);
-        self.observe_bounds(visit, bounds, measured);
+        self.routes.observe_bounds(visit, bounds, measured);
         Ok(())
-    }
-
-    fn observe_bounds(&mut self, visit: Visit, bounds: Option<PhysicalRect>, measured: QpcTick) {
-        if !self.visit_bounds.is_some_and(|(generation, known, _)| generation == visit.generation && Some(known) == bounds) {
-            self.visit_bounds = bounds.map(|bounds| (visit.generation, bounds, measured));
-        }
-        if let Some(geometry) = bounds.and_then(|bounds| self.only_geometry(bounds)) {
-            if !self.visit_geometry.is_some_and(|(generation, id, _)| generation == visit.generation && id == geometry) {
-                self.visit_geometry = Some((visit.generation, geometry, measured));
-            }
-        } else {
-            self.visit_geometry = None;
-        }
     }
 
     pub fn pointer_query(
         &mut self, point: PhysicalPoint, geometry: GeometryId, origin: ClockOrigin, at: QpcTick, action_at: Option<QpcTick>,
     ) -> Result<Option<PointerLink>, ProbeError> {
-        if self.point_geometry(point) != Some(geometry) { return Ok(None); }
-        let Some(visit) = self.current else { return Ok(None); };
+        if self.routes.point_geometry(point) != Some(geometry) { return Ok(None); }
+        let Some(visit) = self.timeline.current() else { return Ok(None); };
         let Some(window) = uia::window_at(point).filter(|window| self.approvals.get(window.process).is_some()) else {
             self.queries.deny_pointer();
             return Ok(None);
@@ -1349,12 +1170,6 @@ impl<'a> Context<'a> {
             PointerBackend::Unavailable
         };
         self.queries.pointer(point, geometry, visit, window, root, backend, origin, at, action_at)
-    }
-
-    fn point_geometry(&self, point: PhysicalPoint) -> Option<GeometryId> {
-        let mut captures = self.routable.iter().filter(|capture| capture.bounds.contains(point));
-        let geometry = captures.next()?.id;
-        captures.next().is_none().then_some(geometry)
     }
 
     fn window_row(&mut self, proof: WindowProcess, kind: WindowRowKind) -> Option<Value> {
@@ -1377,7 +1192,7 @@ impl<'a> Context<'a> {
     ) -> Value {
         let version = self.executable_versions.0.iter().find(|(executable, _)| executable == identity)
             .and_then(|(_, version)| version.as_ref());
-        let geometry = window.bounds.and_then(|bounds| self.only_geometry(bounds));
+        let geometry = window.bounds.and_then(|bounds| self.routes.only_geometry(bounds));
         json!({
             "kind": kind, "approved": true, "window": proof.window, "pid": proof.process.pid,
             "exe": self.scrubber.scrub(identity.executable(), 4096),
@@ -1426,86 +1241,6 @@ impl<'a> Context<'a> {
         self.ordinary_access.push_back((proof, now + ACCESS_RECHECK, access));
         access
     }
-
-    fn only_geometry(&self, bounds: PhysicalRect) -> Option<GeometryId> {
-        let mut candidates = self.routable.iter().filter(|monitor| monitor.bounds.intersects(bounds));
-        let geometry = candidates.next()?.id;
-        candidates.next().is_none().then_some(geometry)
-    }
-
-    fn refresh_displays(&mut self, at: QpcTick, rows: &mut Vec<Value>, forced: bool) {
-        let Some(snapshot) = self.topology.snapshot() else { return };
-        let revision = self.topology.revision();
-        let observed = (snapshot.received, revision);
-        if !forced && self.topology_seen == Some(observed) { return; }
-        let Some(states) = self.topology.routes() else { return };
-        self.topology_seen = Some(observed);
-        use display::topology::Route;
-        for (&monitor, route) in &states {
-            match route {
-                Route::Missing(geometry) => {
-                    self.reconfiguring_routes.remove(&monitor);
-                    if self.unavailable_routes.insert(monitor, *geometry) != Some(*geometry) {
-                        rows.push(json!({ "kind": "monitor_missing", "monitor": monitor, "geometry": geometry }));
-                    }
-                }
-                Route::Active(capture) => {
-                    self.reconfiguring_routes.remove(&monitor);
-                    if self.unavailable_routes.remove(&monitor).is_some() {
-                        rows.push(json!({ "kind": "monitor_returned", "monitor": monitor, "geometry": capture.geometry.id }));
-                    }
-                }
-                Route::Reconfiguring(geometry) => {
-                    if self.reconfiguring_routes.insert(monitor, *geometry) != Some(*geometry)
-                        && !self.unavailable_routes.contains_key(&monitor)
-                    {
-                        rows.push(json!({ "kind": "display_reconfiguring", "monitor": monitor, "geometry": geometry }));
-                    }
-                }
-            }
-        }
-        if let Some(monitors) = &snapshot.outputs {
-            let mut routes = Vec::new();
-            let displays: Vec<_> = monitors.iter().map(|monitor| {
-                let selected = self.config.monitors().iter().find(|entry| entry.key == monitor.key);
-                let geometry = selected.and_then(|entry| states.get(&entry.id).and_then(Route::capture))
-                    .filter(|capture| {
-                        capture.geometry.bounds == monitor.bounds && capture.geometry.dpi_x == monitor.dpi_x
-                            && capture.geometry.dpi_y == monitor.dpi_y && capture.rotation == monitor.rotation
-                            && capture.hdr == monitor.hdr && capture.sdr_white_level == monitor.sdr_white
-                            && capture.refresh_numerator == monitor.refresh.map(|refresh| refresh.0)
-                            && capture.refresh_denominator == monitor.refresh.map(|refresh| refresh.1)
-                    }).map(|capture| capture.geometry);
-                routes.extend(geometry);
-                json!({
-                    "display_key": monitor.key.as_str(), "selected_monitor": selected.map(|entry| entry.id),
-                    "geometry": geometry.map(|value| value.id), "bounds": monitor.bounds,
-                    "dpi_x": monitor.dpi_x, "dpi_y": monitor.dpi_y, "refresh": monitor.refresh,
-                    "rotation": monitor.rotation, "hdr": monitor.hdr, "primary": monitor.primary,
-                    "unavailable": &monitor.unavailable,
-                })
-            }).collect();
-            if self.displays_unavailable || self.display_rows.as_ref() != Some(&displays) {
-                rows.push(json!({ "kind": "display", "available": true, "monitors": &displays }));
-                self.display_rows = Some(displays);
-            }
-            if self.routable != routes || self.routes_since.is_none() {
-                self.routable = routes;
-                self.routes_since = clock::qpc().ok().map(|sample| sample.max(at));
-                self.visit_geometry = None;
-                self.visit_bounds = None;
-            }
-            self.displays_unavailable = false;
-        } else if !self.displays_unavailable {
-            self.displays_unavailable = true;
-            self.routable.clear();
-            self.routes_since = None;
-            self.visit_geometry = None;
-            self.visit_bounds = None;
-            rows.push(json!({ "kind": "display", "available": false }));
-        }
-    }
-
 }
 
 /// The QPC interval in which a notice's source message tick was posted;
@@ -1602,74 +1337,9 @@ fn text_loss(receipt: Receipt, reason: LossReason, span: LossSpan) -> Option<Los
     Some(LossEvidence::ordinary(reason, Some(LossProducer::TextEdit), std::num::NonZeroU64::new(span.count)?, first, last))
 }
 
-/// The staged and newly completed clipboard reads completed through `now`.
-/// A later read stays staged, at most `CLIPBOARD_STAGING_LIMIT`; every
-/// other one is a `clipboard_queue` loss (C3).
-fn due_clipboard_reads(
-    staged: &mut Vec<clipboard::Read>, completed: impl IntoIterator<Item = clipboard::Read>, now: QpcTick,
-    losses: &mut Losses,
-) -> Vec<clipboard::Read> {
-    let mut reads = std::mem::take(staged);
-    reads.extend(completed);
-    let mut due = Vec::with_capacity(reads.len());
-    for read in reads {
-        if read.completed <= now {
-            due.push(read);
-        } else if staged.len() < CLIPBOARD_STAGING_LIMIT {
-            staged.push(read);
-        } else {
-            losses.note(LossReason::ClipboardQueue, LossSpan::at(read.completed));
-        }
-    }
-    due
-}
-
-fn clipboard_activity(
-    activity: &VecDeque<(FocusGeneration, QpcTick)>, notice: clipboard::Notice, visit: Visit, clock: ClockOrigin,
-) -> bool {
-    let received = clock.time(notice.received).ok();
-    activity.iter().rev().any(|(generation, at)| {
-        *generation == visit.generation && *at <= notice.received
-            && received.zip(clock.time(*at).ok())
-                .is_some_and(|(change, input)| change.0.saturating_sub(input.0) <= CLIPBOARD_ACTIVITY_US)
-    })
-}
-
-/// Queue the clipboard owner's notices, at most `CLIPBOARD_STAGING_LIMIT`;
-/// every notice it or this queue could not hold is a `clipboard_queue` loss (C3).
-fn take_clipboard_notices(worker: &clipboard::Worker, notices: &mut VecDeque<clipboard::Notice>, losses: &mut Losses) {
-    if let Some(span) = worker.take_loss() {
-        losses.note(LossReason::ClipboardQueue, span);
-    }
-    for notice in worker.notices() {
-        if notices.len() < CLIPBOARD_STAGING_LIMIT {
-            notices.push_back(notice);
-        } else {
-            losses.note(LossReason::ClipboardQueue, LossSpan::at(notice.received));
-        }
-    }
-}
-
 fn read_window(window: WindowId) -> Option<WindowProcess> {
     WindowProcess::read(::windows::Win32::Foundation::HWND(window.0 as usize as *mut _))
 }
-
-fn clipboard_row(read: clipboard::Read, clock: ClockOrigin) -> Value {
-    json!({
-        "kind": "clipboard_change", "approved": true,
-        "reason": read.text.is_none().then_some("too_large"), "text": read.text,
-        "sequence": read.notice.sequence, "owner_verified": read.notice.owner.is_some(),
-        "notification_receipt_t_us": clock.time(read.notice.received).ok(),
-        "completed_t_us": clock.time(read.completed).ok(),
-    })
-}
-
-fn clipboard_change_after_visit(notice: clipboard::Notice, visit: Visit, receipt: Receipt) -> bool {
-    let Ok(started) = receipt.clock.time(visit.started_at) else { return false };
-    clock::message_tick_estimate(receipt.clock, receipt.tick_anchor, CoarseTime::windows_message(notice.source_tick))
-        .is_some_and(|estimate| estimate.not_before(started))
-}
-
 
 #[cfg(test)]
 mod tests {

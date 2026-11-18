@@ -31,8 +31,8 @@ use crate::protocol::{EventRef, MonitorId, SessionTimeUs, StreamId, StreamSequen
 use super::{
     diagnostics::Failure,
     metadata::InputBlind,
-    outcome::{DroppedTotal, GapRecord, HealthKind, LossCount, LossEvidence, LossProducer, LossRange, LossReason, LossScope,
-        SuppressionClass, UiaOutcome, UiaRead},
+    outcome::{DroppedTotal, HealthKind, LossCount, LossEvidence, LossProducer, LossRange, LossReason, LossScope,
+        OrdinaryLoss, SuppressionClass, UiaOutcome, UiaRead},
     row::{BlindRow, RowCounts, RowKind, RowTally, stamp_receipt},
 };
 
@@ -220,37 +220,12 @@ pub(crate) enum Submit {
     Dropped,
 }
 
-/// One pending ledger entry. Entries never merge across keys.
-#[derive(Clone, Copy, Debug)]
-struct PendingLoss {
-    reason: LossReason,
-    producer: Option<LossProducer>,
-    count: LossCount,
-    range: LossRange,
+/// Gap rows are written in ascending first loss time.
+fn gap_order(loss: &OrdinaryLoss) -> (SessionTimeUs, SessionTimeUs) {
+    (loss.range.first_t_us, loss.range.last_t_us)
 }
 
-impl PendingLoss {
-    fn merge(&mut self, other: Self) {
-        self.count = self.count.merge(other.count);
-        self.range = self.range.merge(other.range);
-    }
-
-    /// Gap rows are written in ascending first loss time.
-    fn order(&self) -> (SessionTimeUs, SessionTimeUs) {
-        (self.range.first_t_us, self.range.last_t_us)
-    }
-
-    fn record(&self) -> GapRecord {
-        let LossRange { first_t_us, last_t_us, source_seq, qpc } = self.range;
-        GapRecord {
-            reason: self.reason, producer: self.producer, count: self.count.known(),
-            count_known: self.count.known().is_some(), first_recv_t_us: first_t_us, last_recv_t_us: last_t_us,
-            first_source_seq: source_seq.map(|range| range[0]), last_source_seq: source_seq.map(|range| range[1]),
-            first_qpc: qpc.map(|range| range[0]), last_qpc: qpc.map(|range| range[1]),
-        }
-    }
-}
-
+/// Pending ledger entries never merge across keys.
 type LedgerKey = (LossReason, Option<LossProducer>);
 
 fn add_count<K: Ord>(totals: &mut BTreeMap<K, u64>, key: K, count: u64) {
@@ -274,9 +249,19 @@ impl Drop for QueuedRow {
 enum Entry {
     Data(QueuedRow, Option<SyncSender<EventRef>>),
     Boundary(SessionTimeUs, Vec<(Box<[u8]>, RowTally)>),
-    Gaps(SessionTimeUs, Vec<PendingLoss>),
+    Gaps(SessionTimeUs, Vec<OrdinaryLoss>),
     Health(SessionTimeUs, Box<[u8]>),
     Flush(Flush, SyncSender<Result<(), JournalError>>),
+}
+
+impl Entry {
+    /// The step a disconnected writer fails for this entry.
+    fn step(&self) -> JournalStep {
+        match self {
+            Self::Flush(kind, _) => kind.step(),
+            _ => JournalStep::Append,
+        }
+    }
 }
 
 struct EntryCredit(Arc<AtomicUsize>);
@@ -312,19 +297,22 @@ struct IngressTotals {
 /// The single reserved message an ingress sends when it closes.
 struct IngressTail {
     admission: Option<SessionTimeUs>,
-    pending: Vec<PendingLoss>,
+    pending: Vec<OrdinaryLoss>,
     unreported_paused_health: BTreeMap<HealthKind, u64>,
     totals: IngressTotals,
 }
 
-/// How a gap batch may use the entry queue.
+/// How an entry may use the entry queue.
 #[derive(Clone, Copy)]
 enum Capacity {
-    /// Data-time emission; a full queue keeps the entries pending.
+    /// Within the normal entry limit; a full queue refuses the entry.
     Normal,
-    /// Lifecycle emission in the reserved room above the data limit; a full
-    /// reserve keeps the entries pending.
+    /// Lifecycle entries in the room reserved above the data limit; a full
+    /// reserve refuses the entry.
     Reserved,
+    /// Frames rows, outside the normal entry count: the frames queue has no
+    /// reserve, so its channel bound is the data limit.
+    Unreserved,
     /// Waits for room; only for owners that may wait on IO.
     Blocking,
 }
@@ -342,7 +330,7 @@ pub(crate) struct JournalIngress {
     peaks: Arc<QueuePeaks>,
     /// The latest receipt this ingress admitted: a queued or dropped row, or a ledger admission.
     last_admission: Option<SessionTimeUs>,
-    ledger: BTreeMap<LedgerKey, PendingLoss>,
+    ledger: BTreeMap<LedgerKey, OrdinaryLoss>,
     totals: IngressTotals,
     /// Health counted, not written, while the controller holds a pause.
     paused: Option<BTreeMap<HealthKind, u64>>,
@@ -368,18 +356,31 @@ impl JournalIngress {
         // for the resume rows (gate 4); they cover only receipts at or after the
         // pause cutoff, so a row admitted inside the pause keeps journal order.
         let ordered = self.paused.is_some() || self.emit_pending(receipt, Capacity::Normal)?;
-        if ordered && let Some(row) = row {
-            match self.offer_entry(Entry::Data(row, confirmation)) {
-                Ok(()) => return Ok(Submit::Queued),
-                Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Disconnected(_)) => return Err(self.error(JournalStep::Append, None)),
-            }
+        if ordered && let Some(row) = row && self.queue(Entry::Data(row, confirmation), Capacity::Normal)? {
+            return Ok(Submit::Queued);
         }
-        self.ledger_add(PendingLoss {
+        self.ledger_add(OrdinaryLoss {
             reason: LossReason::QueueOverflow, producer: None, count: LossCount::Known(std::num::NonZeroU64::MIN),
             range: LossRange { first_t_us: receipt, last_t_us: receipt, source_seq: None, qpc: None },
         }, receipt)?;
         Ok(Submit::Dropped)
+    }
+
+    /// Queue one entry in `room`. `false` means the room was full and the
+    /// entry was dropped; a disconnected writer is an error.
+    fn queue(&self, entry: Entry, room: Capacity) -> Result<bool, JournalError> {
+        let step = entry.step();
+        let sent = match room {
+            Capacity::Normal => self.offer_entry(entry),
+            Capacity::Reserved | Capacity::Unreserved => self.entries.try_send(QueuedEntry::priority(entry)),
+            Capacity::Blocking => self.entries.send(QueuedEntry::priority(entry))
+                .map_err(|mpsc::SendError(queued)| TrySendError::Disconnected(queued)),
+        };
+        match sent {
+            Ok(()) => Ok(true),
+            Err(TrySendError::Full(_)) => Ok(false),
+            Err(TrySendError::Disconnected(_)) => Err(self.error(step, None)),
+        }
     }
 
     fn offer_entry(&self, entry: Entry) -> Result<(), TrySendError<QueuedEntry>> {
@@ -459,7 +460,7 @@ impl JournalIngress {
                 Ok(())
             }
             LossScope::Ordinary(range) => {
-                let loss = PendingLoss { reason: evidence.reason, producer: evidence.producer, count: evidence.count, range };
+                let loss = OrdinaryLoss { reason: evidence.reason, producer: evidence.producer, count: evidence.count, range };
                 if !loss.record().is_valid(admitted) {
                     return Err(self.error(JournalStep::Order, None));
                 }
@@ -468,7 +469,7 @@ impl JournalIngress {
         }
     }
 
-    fn ledger_add(&mut self, loss: PendingLoss, admitted: SessionTimeUs) -> Result<(), JournalError> {
+    fn ledger_add(&mut self, loss: OrdinaryLoss, admitted: SessionTimeUs) -> Result<(), JournalError> {
         self.check_order(admitted)?;
         self.ledger.entry((loss.reason, loss.producer))
             .and_modify(|pending| pending.merge(loss))
@@ -484,18 +485,9 @@ impl JournalIngress {
         if self.ledger.is_empty() { return Ok(true); }
         self.check_order(admission)?;
         let mut gaps: Vec<_> = self.ledger.values().copied().collect();
-        gaps.sort_by_key(PendingLoss::order);
-        let entry = Entry::Gaps(admission, gaps);
-        let sent = match capacity {
-            Capacity::Normal => self.offer_entry(entry),
-            Capacity::Reserved => self.entries.try_send(QueuedEntry::priority(entry)),
-            Capacity::Blocking => self.entries.send(QueuedEntry::priority(entry))
-                .map_err(|mpsc::SendError(queued)| TrySendError::Disconnected(queued)),
-        };
-        match sent {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => return Ok(false),
-            Err(TrySendError::Disconnected(_)) => return Err(self.error(JournalStep::Append, None)),
+        gaps.sort_by_key(gap_order);
+        if !self.queue(Entry::Gaps(admission, gaps), capacity)? {
+            return Ok(false);
         }
         self.ledger.clear();
         self.last_admission = Some(admission);
@@ -579,11 +571,11 @@ impl JournalIngress {
             return Ok(FlushRequest::Busy);
         }
         let (done, outcome) = mpsc::sync_channel(1);
-        match self.offer_entry(Entry::Flush(kind, done)) {
-            Ok(()) => Ok(FlushRequest::Queued(outcome)),
-            Err(TrySendError::Full(_)) => Ok(FlushRequest::Busy),
-            Err(TrySendError::Disconnected(_)) => Err(self.error(kind.step(), None)),
-        }
+        Ok(if self.queue(Entry::Flush(kind, done), Capacity::Normal)? {
+            FlushRequest::Queued(outcome)
+        } else {
+            FlushRequest::Busy
+        })
     }
 
     /// Only a non-capture worker can wait for this prefix.
@@ -595,8 +587,7 @@ impl JournalIngress {
                     self.emit_pending(admission, Capacity::Blocking)?;
                 }
                 let (done, outcome) = mpsc::sync_channel(1);
-                self.entries.send(QueuedEntry::priority(Entry::Flush(kind, done)))
-                    .map_err(|_| self.error(kind.step(), None))?;
+                self.queue(Entry::Flush(kind, done), Capacity::Blocking)?;
                 outcome
             }
         };
@@ -619,10 +610,10 @@ impl JournalIngress {
 
     /// Queue a lifecycle entry in the room reserved above the data limit.
     fn send_reserved(&self, entry: Entry) -> Result<(), JournalError> {
-        self.entries.try_send(QueuedEntry::priority(entry)).map_err(|error| match error {
-            TrySendError::Full(_) => self.error(JournalStep::Reserve, None),
-            TrySendError::Disconnected(_) => self.error(JournalStep::Append, None),
-        })
+        if !self.queue(entry, Capacity::Reserved)? {
+            return Err(self.error(JournalStep::Reserve, None));
+        }
+        Ok(())
     }
 
     fn error(&self, step: JournalStep, source: Option<io::Error>) -> JournalError {
@@ -658,15 +649,12 @@ impl VerifiedIngress {
     pub(crate) fn try_submit_verified(&mut self, receipt: SessionTimeUs, value: Value) -> Result<bool, JournalError> {
         let ingress = &mut self.0;
         let Some(record) = ingress.prepare(receipt, value)? else { return Ok(false) };
-        match ingress.entries.try_send(QueuedEntry::priority(Entry::Data(record, None))) {
-            Ok(()) => {
-                ingress.totals.offered = ingress.totals.offered.saturating_add(1);
-                Ok(true)
-            }
-            // The returned row releases its byte reservation when dropped.
-            Err(TrySendError::Full(_)) => Ok(false),
-            Err(TrySendError::Disconnected(_)) => Err(ingress.error(JournalStep::Append, None)),
+        // A refused row releases its byte reservation when dropped.
+        let queued = ingress.queue(Entry::Data(record, None), Capacity::Unreserved)?;
+        if queued {
+            ingress.totals.offered = ingress.totals.offered.saturating_add(1);
         }
+        Ok(queued)
     }
 
     /// Request an OS flush of the written prefix without waiting for it.
@@ -876,7 +864,7 @@ impl JournalFile {
         let IngressTail { admission, mut pending, unreported_paused_health, totals } = closed;
         if !pending.is_empty() {
             let admission = admission.ok_or_else(|| self.error(JournalStep::Order, None))?;
-            pending.sort_by_key(PendingLoss::order);
+            pending.sort_by_key(gap_order);
             for gap in pending {
                 self.gap(admission, gap)?;
             }
@@ -923,7 +911,7 @@ impl JournalFile {
         Ok(())
     }
 
-    fn gap(&mut self, admission: SessionTimeUs, loss: PendingLoss) -> Result<(), JournalError> {
+    fn gap(&mut self, admission: SessionTimeUs, loss: OrdinaryLoss) -> Result<(), JournalError> {
         let record = loss.record();
         let mut row = serde_json::to_value(record).map_err(|err| self.error(JournalStep::Encode, Some(err.into())))?;
         row["kind"] = serde_json::json!("gap");

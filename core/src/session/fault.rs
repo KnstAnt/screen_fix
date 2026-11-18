@@ -105,8 +105,8 @@ impl FaultLog {
     /// Record a report in arrival order. A newly lost activity is returned for the status.
     pub(crate) fn record(&mut self, mut report: FaultReport, now: Option<SessionTimeUs>) -> Option<DegradedActivity> {
         report.detected = report.detected.or(now);
-        crate::devlog::devlog!("fault", "{:?} component={} operation={:?} native_code={:?} monitor={:?} detected_us={:?}",
-            report.class, report.failure().component().label(), report.failure().operation(),
+        crate::devlog::devlog!("fault", "{:?} component={} operation={:?} message={:?} native_code={:?} monitor={:?} detected_us={:?}",
+            report.class, report.failure().component().label(), report.failure().operation(), report.cause.message,
             report.failure().native_code().map(|code| format!("{:#010x}", code as u32)),
             report.monitor.map(|monitor| monitor.0), report.detected.map(|time| time.0));
         match report.class {

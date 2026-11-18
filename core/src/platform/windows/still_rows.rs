@@ -15,14 +15,15 @@ use crate::{
     capture::frame::FrameCoverage,
     package::{
         diagnostics::{Failure, FailureComponent},
-        journal::{HealthRecord, JournalIngress, Submit},
+        journal::{Flush, HealthRecord, JournalIngress, Submit},
         outcome::{HealthKind, LossEvidence, LossReason},
     },
     protocol::{QpcFrequency, QpcTick, SessionTimeUs},
-    platform::windows::controller::{AwakeElapsed, SuspendMarks},
+    platform::windows::controller::{AwakeElapsed, PauseProducer, SuspendMarks, WorkerSession},
+    session::AdmissionBoundary,
 };
 
-use super::{ProbeError, stills::StillRow, unavailable};
+use super::{ProbeError, clock, stills::StillRow, unavailable};
 
 const SLOTS: usize = 1024;
 const WAIT: Duration = Duration::from_secs(15);
@@ -238,10 +239,10 @@ struct Lane {
 }
 
 /// QPC time for the lane-stall watch, which excludes sleep (S0).
-pub(super) struct Awake {
-    pub now: QpcTick,
-    pub marks: SuspendMarks,
-    pub frequency: QpcFrequency,
+struct Awake {
+    now: QpcTick,
+    marks: SuspendMarks,
+    frequency: QpcFrequency,
 }
 
 impl Awake {
@@ -250,7 +251,61 @@ impl Awake {
     }
 }
 
-pub(super) struct Merge {
+/// The still journal's writer: the receipt-ordered merge of the producer
+/// lanes, and the pause cutoff and journal flush revision it last flushed for.
+pub(super) struct StillJournal {
+    merge: Merge,
+    flushed: Option<AdmissionBoundary>,
+    revision: u64,
+}
+
+impl StillJournal {
+    /// One producer lane per `count`.
+    pub fn new(count: usize) -> (Vec<Rows>, Self) {
+        let (rows, merge) = Merge::new(count);
+        (rows, Self { merge, flushed: None, revision: 0 })
+    }
+
+    /// Take the controller's current journal flush revision as served.
+    pub fn open(&mut self, session: &WorkerSession) {
+        self.revision = session.journal_flush_revision();
+    }
+
+    /// Publish the certified prefix. Once it includes the cutoff of a pause,
+    /// flush the journal to disk and finish the pause for the stills; flush
+    /// it again for each new journal flush revision.
+    pub fn service(&mut self, journal: &mut JournalIngress, session: &WorkerSession, frequency: QpcFrequency)
+        -> Result<(), ProbeError>
+    {
+        let awake = Awake { now: clock::qpc()?, marks: session.suspend_marks(), frequency };
+        self.merge.publish(journal, Instant::now(), &awake)?;
+        if let Some(pause) = session.paused_cutoff().filter(|pause| self.flushed != Some(*pause))
+            && self.merge.includes(pause.time)
+        {
+            journal.flush_wait(Flush::Os, pause.time)?;
+            self.flushed = Some(pause);
+            session.finish_pause(pause, PauseProducer::Stills);
+        }
+        let latest = session.journal_flush_revision();
+        if latest != self.revision {
+            journal.flush_wait(Flush::Os, self.merge.latest_receipt())?;
+            self.revision = latest;
+        }
+        Ok(())
+    }
+
+    /// Publish the rest of the journal once every lane closed.
+    pub fn finish(&mut self, journal: &mut JournalIngress) -> Result<(), ProbeError> {
+        self.merge.finish(journal)
+    }
+
+    /// Whether a row queued to the journal names this image (`file` relative to `raw/`).
+    pub fn references(&self, file: &str) -> bool {
+        self.merge.references(file)
+    }
+}
+
+struct Merge {
     receive: Receiver<Slot>,
     lanes: Vec<Lane>,
     budget: Arc<Budget>,
@@ -263,7 +318,7 @@ pub(super) struct Merge {
 }
 
 impl Merge {
-    pub fn new(count: usize) -> (Vec<Rows>, Self) {
+    fn new(count: usize) -> (Vec<Rows>, Self) {
         let (send, receive) = sync_channel(SLOTS);
         let budget = Arc::new(Budget::default());
         let mut rows = Vec::with_capacity(count);
@@ -279,7 +334,7 @@ impl Merge {
         })
     }
 
-    pub fn finish(&mut self, journal: &mut JournalIngress) -> Result<(), ProbeError> {
+    fn finish(&mut self, journal: &mut JournalIngress) -> Result<(), ProbeError> {
         if self.lanes.iter().any(|lane| !lane.progress.closed.load(Ordering::Acquire)) {
             return Err(unavailable("A still producer did not close before journal finalization"));
         }
@@ -292,18 +347,17 @@ impl Merge {
         Ok(())
     }
 
-    pub fn publish(&mut self, journal: &mut JournalIngress, now: Instant, awake: &Awake) -> Result<(), ProbeError> {
+    fn publish(&mut self, journal: &mut JournalIngress, now: Instant, awake: &Awake) -> Result<(), ProbeError> {
         self.publish_prefix(journal, now, Some(awake))
     }
 
-    pub fn latest_receipt(&self) -> SessionTimeUs { self.last }
+    fn latest_receipt(&self) -> SessionTimeUs { self.last }
 
-    /// Whether a row queued to the journal names this image (`file` relative to `raw/`).
-    pub fn references(&self, file: &str) -> bool {
+    fn references(&self, file: &str) -> bool {
         self.referenced.contains(file)
     }
 
-    pub fn includes(&self, cutoff: SessionTimeUs) -> bool {
+    fn includes(&self, cutoff: SessionTimeUs) -> bool {
         self.certified_before > cutoff && self.ordered.first_key_value().is_none_or(|(key, _)| key.0 > cutoff)
     }
 
@@ -428,7 +482,7 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
     use super::*;
-    use crate::{platform::windows::stills::tests::saved_row, protocol::{
+    use crate::{platform::windows::stills::saved_row, protocol::{
         AdmissionEpoch, ClockOrigin, FocusGeneration, WindowId,
         ipc::{ProcessInstance, elevated::{VisitBinding, WindowInstance}},
     }};

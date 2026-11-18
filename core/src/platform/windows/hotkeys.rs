@@ -161,8 +161,8 @@ impl RecorderHotkeys {
         let started = owner::spawn("recorder-hotkeys", false, || {}, move |ready| {
             match Registration::open(bindings) {
                 Ok(registration) => {
-                    if ready.ready(()) {
-                        pump(&owner_data, &registration);
+                    if ready.ready(()) && pump(&owner_data, &registration).is_err() {
+                        owner_data.fail();
                     }
                 }
                 Err(error) => ready.fail(error),
@@ -329,7 +329,12 @@ fn chord_failure(action: RecorderAction, vk: u16, code: Option<i32>, message: &s
     ))
 }
 
-fn pump(shared: &Shared, registration: &Registration) {
+/// The pump stopped for good: the thread's queue quit, a clock or wait call
+/// failed, or the activation sequence ran out.
+struct PumpFailed;
+
+/// Deliver the hotkey activations until stop.
+fn pump(shared: &Shared, registration: &Registration) -> Result<(), PumpFailed> {
     let mut sequence = 0_u64;
     while !shared.stop.load(Ordering::Acquire) {
         let observed = clock::qpc();
@@ -338,8 +343,7 @@ fn pump(shared: &Shared, registration: &Registration) {
             let mut message = MSG::default();
             if unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) } == 0 { break; }
             if message.message == WM_QUIT {
-                shared.fail();
-                return;
+                return Err(PumpFailed);
             }
             if message.message != WM_HOTKEY {
                 unsafe { DispatchMessageW(&message) };
@@ -351,13 +355,9 @@ fn pump(shared: &Shared, registration: &Registration) {
             if vk != registration.virtual_keys[index] || flags as u32 & (MOD_CONTROL | MOD_ALT) != (MOD_CONTROL | MOD_ALT) {
                 continue;
             }
-            let Ok(at) = clock::qpc() else {
-                shared.fail();
-                return;
-            };
+            let at = clock::qpc().map_err(|_| PumpFailed)?;
             if sequence == (1 << 63) - 1 {
-                shared.fail();
-                return;
+                return Err(PumpFailed);
             }
             sequence += 1;
             let activation = HotkeyActivation {
@@ -372,23 +372,15 @@ fn pump(shared: &Shared, registration: &Registration) {
             for (event, received_ms) in received {
                 startable |= inbox.accept(event, received_ms);
             }
-            match observed {
-                Ok(before) => inbox.batch.before = Some(before),
-                Err(_) => {
-                    drop(inbox);
-                    shared.fail();
-                    return;
-                }
-            }
+            // An early return releases the inbox before the caller fails the pump.
+            inbox.batch.before = Some(observed.map_err(|_| PumpFailed)?);
             startable
         };
         if startable {
             (shared.notify)();
         }
         // Wake on a queued message, on stop, or after the progress interval.
-        if shared.wake.wait_messages(PROGRESS_INTERVAL_MS).is_err() {
-            shared.fail();
-            return;
-        }
+        shared.wake.wait_messages(PROGRESS_INTERVAL_MS).map_err(|_| PumpFailed)?;
     }
+    Ok(())
 }

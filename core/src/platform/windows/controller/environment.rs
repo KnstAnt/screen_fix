@@ -48,7 +48,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLo
 
 use crate::{
     CaptureError,
-    protocol::{QpcTick, ipc::EnvironmentChange},
+    protocol::{QpcFrequency, QpcTick, ipc::EnvironmentChange},
+    session::PauseReason,
 };
 
 use crate::platform::windows::{clock, on_input_desktop};
@@ -58,9 +59,9 @@ const DESKTOP_POLL: Duration = Duration::from_millis(100);
 const PUMP_INTERVAL: Duration = Duration::from_millis(10);
 pub(super) const SESSION_END_BUDGET: Duration = Duration::from_millis(3800);
 pub(super) const SUSPEND_BUDGET: Duration = Duration::from_secs(2);
-pub(super) const LOCK_SCREEN: u32 = 1;
-pub(super) const SLEEP: u32 = 2;
-pub(super) const SECURE_DESKTOP: u32 = 4;
+const LOCK_SCREEN: u32 = 1;
+const SLEEP: u32 = 2;
+const SECURE_DESKTOP: u32 = 4;
 const EDGE_SHIFT: u32 = 8;
 const ASSERT_EDGES: u32 = (LOCK_SCREEN | SLEEP | SECURE_DESKTOP) << EDGE_SHIFT;
 
@@ -97,7 +98,7 @@ impl SuspendMarks {
     /// `since` is the suspend `sequence` read at or after `from`: a later suspend
     /// beyond the latest one leaves earlier suspends in the interval unmeasured.
     pub(crate) fn awake_elapsed(
-        &self, from: QpcTick, to: QpcTick, since: u64, frequency: crate::protocol::QpcFrequency,
+        &self, from: QpcTick, to: QpcTick, since: u64, frequency: QpcFrequency,
     ) -> AwakeElapsed {
         let ticks = |from: QpcTick, to: QpcTick| u64::try_from(to.0.saturating_sub(from.0)).unwrap_or(0);
         let total = ticks(from, to);
@@ -117,6 +118,34 @@ impl SuspendMarks {
             }
         };
         AwakeElapsed::Known(frequency.duration(total.saturating_sub(excluded)))
+    }
+
+    /// QPC time from `mark` to `to` excluding the latest suspend interval.
+    pub(crate) fn since(&self, mark: AwakeMark, to: QpcTick, frequency: QpcFrequency) -> AwakeElapsed {
+        self.awake_elapsed(mark.qpc, to, mark.suspends, frequency)
+    }
+}
+
+/// A QPC progress mark with the suspend `sequence` read at or after it: the
+/// start of an interval measured with sleep excluded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AwakeMark {
+    pub qpc: QpcTick,
+    pub suspends: u64,
+}
+
+/// The suspend `sequence` last seen by a deadline that restarts after each suspend.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SuspendWatch(u64);
+
+impl SuspendWatch {
+    pub(crate) fn new(marks: SuspendMarks) -> Self {
+        Self(marks.sequence)
+    }
+
+    /// A suspend happened since the previous check. The watch moves to `marks`.
+    pub(crate) fn slept(&mut self, marks: SuspendMarks) -> bool {
+        std::mem::replace(&mut self.0, marks.sequence) != marks.sequence
     }
 }
 
@@ -197,6 +226,39 @@ impl PowerMarks {
     }
 }
 
+/// The environment facts that the notification owner publishes to the
+/// controller and the recording owners.
+#[derive(Default)]
+pub(super) struct EnvironmentSignals {
+    /// Pending `EnvironmentChange` bits for the standard input helper.
+    pub(super) input: AtomicU32,
+    /// Pending `EnvironmentChange` bits for the elevated collector.
+    pub(super) elevated: AtomicU32,
+    pub(super) display_revision: AtomicU32,
+    /// When Windows announced that the session ends.
+    pub(super) session_end: OnceLock<Instant>,
+    /// Written only by the power callback; read through `PowerMarks::snapshot`.
+    pub(super) power: PowerMarks,
+}
+
+impl EnvironmentSignals {
+    /// Publish environment changes to the standard and the elevated owner.
+    fn publish(&self, bits: u32) {
+        self.input.fetch_or(bits, Release);
+        self.elevated.fetch_or(bits, Release);
+    }
+}
+
+/// One environment pause reason, read by `Notifications::reasons`.
+#[derive(Clone, Copy)]
+pub(super) struct ReasonState {
+    pub(super) reason: PauseReason,
+    /// The reason was asserted since the previous read, even if it has cleared.
+    pub(super) asserted: bool,
+    /// The reason holds now.
+    pub(super) active: bool,
+}
+
 pub(super) struct Notifications {
     signals: Arc<Signals>,
     stop: SyncSender<()>,
@@ -205,26 +267,22 @@ pub(super) struct Notifications {
 
 struct Signals {
     reasons: AtomicU32,
-    environment: Arc<AtomicU32>,
-    elevated_environment: Arc<AtomicU32>,
-    display_revision: Arc<AtomicU32>,
-    session_end: Arc<OnceLock<Instant>>,
-    power: Arc<PowerMarks>,
+    shared: Arc<EnvironmentSignals>,
     complete: AtomicBool,
     wake: SyncSender<()>,
 }
 
 impl Signals {
     fn reason(&self, bit: u32, active: bool) {
-        if active {
-            if self.reasons.fetch_update(AcqRel, Acquire, |before| {
+        let changed = if active {
+            self.reasons.fetch_update(AcqRel, Acquire, |before| {
                 (before & bit == 0).then_some(before | bit | (bit << EDGE_SHIFT))
-            }).is_ok() {
-                self.elevated_environment.fetch_or(EnvironmentChange::Session.bit(), Release);
-                let _ = self.wake.try_send(());
-            }
-        } else if self.reasons.fetch_and(!bit, AcqRel) & bit != 0 {
-            self.elevated_environment.fetch_or(EnvironmentChange::Session.bit(), Release);
+            }).is_ok()
+        } else {
+            self.reasons.fetch_and(!bit, AcqRel) & bit != 0
+        };
+        if changed {
+            self.shared.elevated.fetch_or(EnvironmentChange::Session.bit(), Release);
             let _ = self.wake.try_send(());
         }
     }
@@ -232,13 +290,9 @@ impl Signals {
 
 impl Notifications {
     pub(super) fn spawn(
-        environment: Arc<AtomicU32>, elevated_environment: Arc<AtomicU32>, display_revision: Arc<AtomicU32>,
-        session_end: Arc<OnceLock<Instant>>, power: Arc<PowerMarks>, wake: SyncSender<()>,
+        shared: Arc<EnvironmentSignals>, wake: SyncSender<()>,
     ) -> Result<(Self, Receiver<Result<(), CaptureError>>), CaptureError> {
-        let signals = Arc::new(Signals {
-            reasons: AtomicU32::new(0), environment, elevated_environment, display_revision, session_end,
-            power, complete: AtomicBool::new(false), wake,
-        });
+        let signals = Arc::new(Signals { reasons: AtomicU32::new(0), shared, complete: AtomicBool::new(false), wake });
         let (stop, stopped) = mpsc::sync_channel(1);
         let (ready, initialized) = mpsc::sync_channel(1);
         let owned = Arc::clone(&signals);
@@ -264,9 +318,14 @@ impl Notifications {
         Ok((Self { signals, stop, owner }, initialized))
     }
 
-    pub(super) fn reasons(&self) -> (u32, u32) {
+    /// Take the assertion edges and read each environment reason: sleep, lock
+    /// screen, then secure desktop.
+    pub(super) fn reasons(&self) -> impl Iterator<Item = ReasonState> + use<> {
         let reasons = self.signals.reasons.fetch_and(!ASSERT_EDGES, AcqRel);
-        (reasons & !ASSERT_EDGES, (reasons & ASSERT_EDGES) >> EDGE_SHIFT)
+        let (active, asserted) = (reasons & !ASSERT_EDGES, (reasons & ASSERT_EDGES) >> EDGE_SHIFT);
+        [(SLEEP, PauseReason::Sleep), (LOCK_SCREEN, PauseReason::LockScreen), (SECURE_DESKTOP, PauseReason::SecureDesktop)]
+            .into_iter()
+            .map(move |(bit, reason)| ReasonState { reason, asserted: asserted & bit != 0, active: active & bit != 0 })
     }
 
     pub(super) fn running(&self) -> bool { !self.owner.is_finished() }
@@ -397,11 +456,11 @@ unsafe extern "system" fn power_changed(context: *const c_void, event: u32, _set
     // only atomics and the bounded wake channel; it takes no lock of its own.
     let _ = catch_unwind(AssertUnwindSafe(|| match event {
         PBT_APMSUSPEND => {
-            signals.power.suspended(clock::qpc().ok());
+            signals.shared.power.suspended(clock::qpc().ok());
             signals.reason(SLEEP, true);
         }
         PBT_APMRESUMEAUTOMATIC => {
-            signals.power.resumed(clock::qpc().ok());
+            signals.shared.power.resumed(clock::qpc().ok());
             signals.reason(SLEEP, false);
         }
         _ => {}
@@ -457,9 +516,8 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
         }
         WM_ENDSESSION if wparam != 0 => {
             if let Some(signals) = signals {
-                let started = *signals.session_end.get_or_init(Instant::now);
-                signals.environment.fetch_or(EnvironmentChange::SessionEnding.bit(), Release);
-                signals.elevated_environment.fetch_or(EnvironmentChange::SessionEnding.bit(), Release);
+                let started = *signals.shared.session_end.get_or_init(Instant::now);
+                signals.shared.publish(EnvironmentChange::SessionEnding.bit());
                 let _ = signals.wake.try_send(());
                 while !signals.complete.load(Acquire) {
                     let remaining = SESSION_END_BUDGET.saturating_sub(started.elapsed());
@@ -474,10 +532,9 @@ unsafe fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPA
     };
     if let Some(signals) = signals {
         if matches!(message, WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE) {
-            signals.display_revision.fetch_add(1, Release);
+            signals.shared.display_revision.fetch_add(1, Release);
         }
-        signals.environment.fetch_or(bits, Release);
-        signals.elevated_environment.fetch_or(bits, Release);
+        signals.shared.publish(bits);
     }
     0
 }

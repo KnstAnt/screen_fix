@@ -18,6 +18,9 @@ const FIT_SAMPLES: usize = 32;
 const MAX_NDOF_BUTTON_CANDIDATES: usize = 32;
 const NDOF_KEY_WINDOW_US: i64 = 50_000;
 const MAX_INITIAL_INTERVAL_US: i64 = 100_000;
+/// The longest backward overlap of a touchpad contact report that still
+/// witnesses a null-device pointer row.
+const CONTACT_OVERLAP_US: i64 = 12_000;
 
 #[derive(Default)]
 pub(crate) struct HidPublication {
@@ -77,7 +80,7 @@ impl HidPublication {
         let gap = at.0.checked_sub(contact.at.0)?;
         // A short backward overlap, with no intervening loss or contact
         // report, avoids extrapolating beyond the approved contact prefix.
-        (contact.proof == proof && (0..=12_000).contains(&gap)).then_some(contact)
+        (contact.proof == proof && (0..=CONTACT_OVERLAP_US).contains(&gap)).then_some(contact)
     }
 
     pub fn ndof_key_candidates(&self, at: SessionTimeUs, proof: ForegroundAtReceipt) -> Option<Value> {

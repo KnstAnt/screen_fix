@@ -1,12 +1,15 @@
 //! References into one attempt's M1 artifact inventory.
 
 use std::fmt;
- 
+
 pub mod metadata;
 pub mod diagnostics;
+mod error;
 pub(crate) mod finalize;
 pub(crate) mod journal;
+mod manifest;
 pub(crate) mod outcome;
+mod owner;
 mod reader;
 pub(crate) mod row;
 pub(crate) mod source;

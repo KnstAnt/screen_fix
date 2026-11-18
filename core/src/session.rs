@@ -7,7 +7,7 @@ pub mod hotkey;
 use crate::{
     CaptureError,
     package::diagnostics::ReportOutcome,
-    protocol::{ClockOrigin, MonitorId, SourceFailureReason, TokenIdentityCheck},
+    protocol::{MonitorId, SourceFailureReason, TokenIdentityCheck},
 };
 
 pub use crate::package::source::{AdmissionBoundary, DiskPreflight, PauseReason, SourceFailure, SourceStage};
@@ -19,8 +19,9 @@ pub(crate) mod labels;
 // `platform::windows` item that this platform-neutral API names.
 use crate::platform::windows::controller::Control;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SessionPhase {
+    #[default]
     Starting,
     Recording,
     Paused,
@@ -151,8 +152,9 @@ impl SourceStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum StartupStep {
+    #[default]
     Windows,
     ApprovedApplication,
     OutputSpace,
@@ -178,7 +180,8 @@ pub struct ReadyVideo {
     pub software: bool,
 }
 
-#[derive(Debug, Clone)]
+/// A snapshot of the attempt for the Recorder UI.
+#[derive(Debug, Clone, Default)]
 pub struct SessionStatus {
     pub phase: SessionPhase,
     pub outcome: Option<SessionOutcome>,
@@ -193,11 +196,8 @@ pub struct SessionStatus {
     pub windows: Option<crate::platform::WindowsEvidence>,
     pub window_coverage: Option<WindowCoverage>,
     pub disk_available_bytes: Option<u64>,
+    /// The active pause reasons, in `PauseReason` order.
     pub pause_reasons: Vec<PauseReason>,
-    pub clock: Option<ClockOrigin>,
-    pub opened: Option<AdmissionBoundary>,
-    pub closed: Option<AdmissionBoundary>,
-    pub stop: Option<AdmissionBoundary>,
     pub video_unavailable: Vec<MonitorId>,
     pub video_reports: Vec<VideoReport>,
     pub input_unavailable: Option<&'static str>,
@@ -208,35 +208,76 @@ pub struct SessionStatus {
     pub degraded: Vec<DegradedActivity>,
 }
 
-impl Default for SessionStatus {
-    fn default() -> Self {
-        Self {
-            phase: SessionPhase::Starting,
-            outcome: None,
-            final_publication_pending: false,
-            countdown_seconds: None,
-            startup: StartupStep::Windows,
-            source: SourceStatus::Unselected,
-            ready_video: Vec::new(),
-            input_helper_ready: false,
-            input_ready: None,
-            windows: None,
-            window_coverage: None,
-            disk_available_bytes: None,
-            pause_reasons: Vec::new(),
-            clock: None,
-            opened: None,
-            closed: None,
-            stop: None,
-            video_unavailable: Vec::new(),
-            video_reports: Vec::new(),
-            input_unavailable: None,
-            input_report: None,
-            hotkeys_unavailable: false,
-            last_hotkey: None,
-            degraded: Vec::new(),
+impl SessionStatus {
+    /// The attempt's state as the Recorder UI and the recording indicator
+    /// present it. Each surface chooses its own wording.
+    pub fn summary(&self) -> StatusSummary {
+        let wait = match self.source {
+            SourceStatus::AwaitingConsent => Some(SourceWait::Consent),
+            SourceStatus::AwaitingReadiness => Some(SourceWait::Readiness),
+            _ => None,
+        };
+        match self.phase {
+            SessionPhase::Starting => StatusSummary::Starting(wait),
+            SessionPhase::Recording => StatusSummary::Recording(RecordingSummary {
+                source: match self.source {
+                    SourceStatus::Ordinary => RecordingSource::Standard,
+                    SourceStatus::Enhanced => RecordingSource::Enhanced,
+                    SourceStatus::Activating => RecordingSource::Activating,
+                    SourceStatus::FailedPrefix(_) => RecordingSource::FailedPrefix,
+                    _ => RecordingSource::Other,
+                },
+                input_lost: self.input_unavailable.is_some(),
+                video_lost: !self.video_unavailable.is_empty(),
+            }),
+            SessionPhase::Paused => StatusSummary::Paused(wait),
+            SessionPhase::Stopping => StatusSummary::Stopping,
+            SessionPhase::Finished => StatusSummary::Finished { incomplete: self.outcome == Some(SessionOutcome::Incomplete) },
+            SessionPhase::Failed => StatusSummary::Failed,
         }
     }
+}
+
+/// `SessionStatus::summary`: the phase with the details that its labels show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusSummary {
+    /// Before Start, possibly waiting for the elevated source.
+    Starting(Option<SourceWait>),
+    Recording(RecordingSummary),
+    /// Paused, possibly waiting for the next elevated source.
+    Paused(Option<SourceWait>),
+    Stopping,
+    Finished { incomplete: bool },
+    Failed,
+}
+
+/// The elevated source step that a starting or paused attempt waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceWait {
+    Consent,
+    Readiness,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordingSummary {
+    pub source: RecordingSource,
+    /// Input capture stopped for the rest of the attempt.
+    pub input_lost: bool,
+    /// Video stopped on at least one monitor.
+    pub video_lost: bool,
+}
+
+/// The capture source of a recording attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordingSource {
+    Standard,
+    Enhanced,
+    /// The elevated source waits for certified input.
+    Activating,
+    /// A source failure is closing the admitted prefix.
+    FailedPrefix,
+    /// No selected source is reported.
+    Other,
 }
 
 pub struct SessionHandle {

@@ -151,18 +151,17 @@ impl Bootstrap {
     ) -> Result<()> {
         let mut frame = Secret::<MAX_FRAME>::zeroed();
         let expected = HEADER_BYTES + transition.payload_len();
-        if pipe.is_server() {
-            if pipe.read_message(frame.bytes_mut(), deadline)? != expected {
-                return Err(Failure::Protocol);
-            }
-        } else {
-            pipe.read_exact(&mut frame.bytes_mut()[..HEADER_BYTES], deadline)?;
+        let check = |header: &[u8]| {
+            attachment::check_header(header, role, transition, self.connection).map_err(|_| Failure::Protocol)
+        };
+        // A client checks the header before it reads the payload.
+        let length = pipe.read_frame(frame.bytes_mut(), HEADER_BYTES, |header| {
+            check(header).map(|()| transition.payload_len())
+        }, deadline)?;
+        if length != expected {
+            return Err(Failure::Protocol);
         }
-        attachment::check_header(&frame.bytes()[..HEADER_BYTES], role, transition, self.connection)
-            .map_err(|_| Failure::Protocol)?;
-        if !pipe.is_server() {
-            pipe.read_exact(&mut frame.bytes_mut()[HEADER_BYTES..expected], deadline)?;
-        }
+        check(&frame.bytes()[..HEADER_BYTES])?;
         payload.bytes_mut()[..transition.payload_len()].copy_from_slice(&frame.bytes()[HEADER_BYTES..expected]);
         Ok(())
     }

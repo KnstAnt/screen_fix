@@ -21,19 +21,16 @@ use screen_fix_protocol::{
         CommitEvidence, CommitText, ContextEvidence, FocusEvidence, HungEvidence,
         ImeState, PointBinding, Query, ReadBinding, ReadEvidence, ReadOutcome, ReadUnavailable, TextClassification,
         UiaEvidence, VisitBinding, WindowEvidence, WindowInstance,
-        runtime::{ApprovalKey, ContextGap, ContextGapCause, ContextProducer, IdentityClaim, Observation},
+        runtime::{ContextGap, ContextGapCause, ContextProducer, IdentityClaim, Observation},
     }},
 };
 
 use crate::{deadline::CLEANUP, win::{Failure, Result}};
 use super::{
-    AtomicState, State, grant::Grant, outbox::Outbox, lifetime::{ProviderKind, qpc}, witness::{Foreground, Target},
+    AtomicState, State, grant::Grant, outbox::Outbox, lifetime::{ProviderKind, qpc},
+    timing::{IME_BUDGET, NATIVE_BUDGET, POLL, UIA_BUDGET}, witness::{Foreground, Target},
 };
 
-const POLL: Duration = Duration::from_millis(4);
-const UIA_BUDGET: Duration = Duration::from_millis(500);
-const IME_BUDGET: Duration = Duration::from_millis(50);
-const NATIVE_BUDGET: Duration = Duration::from_millis(250);
 const MAX_SEEN_WINDOWS: usize = 64;
 
 #[derive(Default)]
@@ -167,7 +164,7 @@ impl Delivery {
                     Some(ReadUnavailable::Stale)
                 } else { None };
                 if let Some(status) = status {
-                    let (started_qpc, completed_qpc) = read_times(evidence);
+                    let (started_qpc, completed_qpc) = read_span(evidence);
                     *evidence = ContextEvidence::Rejected(ReadEvidence {
                         binding: read.pending.read, started_qpc, completed_qpc,
                         outcome: ReadOutcome::Unavailable(status),
@@ -197,7 +194,7 @@ impl Drop for ReadDelivery {
 
 impl Proof {
     fn check(&self, grant: &Grant, intended: WindowInstance) -> bool {
-        self.target.as_ref().is_none_or(|target| target.recheck(&grant.parent).is_ok())
+        self.target.as_ref().is_none_or(|target| target.recheck(&grant.session().peer).is_ok())
             && self.focus.is_none_or(|focus| grant.native_focus() == Some(focus))
             && self.point.is_none_or(|point| uia::window_at(point.point).is_some_and(|hit| {
                 WindowInstance::from(hit) == intended && uia::window_root(hit).map(WindowInstance::from) == Some(point.root)
@@ -214,18 +211,21 @@ fn clear_slot(slots: &PendingReads, slot: Slot, pending: &Pending) {
     }
 }
 
-fn read_times(evidence: &ContextEvidence) -> (Option<QpcTick>, Option<QpcTick>) {
+/// The start and completion times of a read's evidence; evidence that
+/// answers no read has neither.
+fn read_span(evidence: &ContextEvidence) -> (Option<QpcTick>, Option<QpcTick>) {
+    fn span<T>(read: &ReadEvidence<T>) -> (Option<QpcTick>, Option<QpcTick>) {
+        (read.started_qpc, read.completed_qpc)
+    }
     match evidence {
-        ContextEvidence::Window(read) => (read.started_qpc, read.completed_qpc),
-        ContextEvidence::NativeFocus(read) => (read.started_qpc, read.completed_qpc),
-        ContextEvidence::HungRead(read) => (read.started_qpc, read.completed_qpc),
-        ContextEvidence::FocusUia(read) | ContextEvidence::PointerUia { read, .. } =>
-            (read.started_qpc, read.completed_qpc),
-        ContextEvidence::ImeFocus(read) | ContextEvidence::ImeKey { read, .. } =>
-            (read.started_qpc, read.completed_qpc),
-        ContextEvidence::ClipboardFence(read) | ContextEvidence::Rejected(read) =>
-            (read.started_qpc, read.completed_qpc),
-        _ => (None, None),
+        ContextEvidence::Window(read) => span(read),
+        ContextEvidence::NativeFocus(read) => span(read),
+        ContextEvidence::HungRead(read) => span(read),
+        ContextEvidence::Held(read) => span(read),
+        ContextEvidence::FocusUia(read) | ContextEvidence::PointerUia { read, .. } => span(read),
+        ContextEvidence::ImeFocus(read) | ContextEvidence::ImeKey { read, .. } => span(read),
+        ContextEvidence::ClipboardFence(read) | ContextEvidence::Rejected(read) => span(read),
+        ContextEvidence::Notice(_) | ContextEvidence::Commit(_) => (None, None),
     }
 }
 
@@ -245,16 +245,12 @@ pub(super) struct Owners {
 }
 
 impl Owners {
-    pub(super) fn start(
-        grant: &Arc<Grant>, approved: Arc<[ApprovalKey]>, send: Outbox,
-    ) -> Result<Self> {
+    pub(super) fn start(grant: &Arc<Grant>, send: Outbox) -> Result<Self> {
         let pending = Arc::new(Mutex::new(std::array::from_fn(|_| None)));
         let seen = Arc::new(SeenWindows::default());
         let (uia, uia_in) = mpsc::sync_channel(Slot::ALL.len() - Slot::IME);
         let (ime, ime_in) = mpsc::sync_channel(Slot::IME);
-        let common = Worker {
-            grant: Arc::clone(grant), approved, send, pending: Arc::clone(&pending), seen: Arc::clone(&seen),
-        };
+        let common = Worker { grant: Arc::clone(grant), send, pending: Arc::clone(&pending), seen: Arc::clone(&seen) };
         let uia_service = common.clone();
         let ui_worker = thread::Builder::new().name("elevated-context-uia".into())
             .spawn(move || uia_service.run_uia(uia_in)).map_err(|_| Failure::Supervisor)?;
@@ -332,7 +328,6 @@ impl Owners {
 #[derive(Clone)]
 struct Worker {
     grant: Arc<Grant>,
-    approved: Arc<[ApprovalKey]>,
     send: Outbox,
     pending: PendingReads,
     seen: Arc<SeenWindows>,
@@ -352,9 +347,9 @@ impl Worker {
             }
             Ok(())
         })();
-        uia.desired.store(0, Release);
+        uia.subscriber.desired.store(0, Release);
         if let Some(client) = uia.client.take() {
-            let _guard = self.grant.lifetime.teardown(qpc()?)?;
+            let _guard = self.grant.session().lifetime.teardown(qpc()?)?;
             drop(client);
         }
         result
@@ -430,7 +425,7 @@ impl Worker {
         let expected_revision = uia.revision.load(Acquire);
         let invalid = |_: uia::Request| {
             let current = self.live(&job.pending) && uia.revision.load(Acquire) == expected_revision
-                && secondary.as_ref().is_none_or(|target| target.recheck(&self.grant.parent).is_ok())
+                && secondary.as_ref().is_none_or(|target| target.recheck(&self.grant.session().peer).is_ok())
                 && expected.is_none_or(|expected| FocusSnapshot::read(window).is_some_and(|now| now.focus == expected));
             (!current).then_some(ReadUnavailable::Stale)
         };
@@ -444,43 +439,24 @@ impl Worker {
         };
         if invalid(native).is_some() { return send_error(ReadUnavailable::Stale); }
         if expected.is_some() {
-            uia.desired.store(0, Release);
+            uia.subscriber.drop_subscription();
             client.clear_subscription();
-            uia.subscription = None;
-            uia.editable = None;
         }
         let result = client.read(native, scrubber, &invalid);
-        let (dpi, dpi_awareness) = if invalid(native).is_none() && result.element.is_some() {
-            window_dpi(window)
-        } else { (None, None) };
-        let mut editable = false;
-        let outcome = if result.completed.is_none_or(|end| end >= read.deadline_qpc) {
-            ReadOutcome::Unavailable(ReadUnavailable::TimedOut)
-        } else if invalid(native).is_some() {
-            ReadOutcome::Unavailable(ReadUnavailable::Stale)
-        } else if let Some(element) = result.element {
-            editable = result.target == TextClassification::Editable
-                && focus.is_some_and(|focus| focus.focus.password_style == Some(false));
-            ReadOutcome::Observed(UiaEvidence { target: result.target, dpi, dpi_awareness,
-                element: element.try_into().map_err(|_| Failure::Protocol)? })
-        } else {
-            // A completed read without an element is reported as unavailable.
-            ReadOutcome::Unavailable(result.status.err().unwrap_or(ReadUnavailable::Unavailable))
-        };
-        let completed = result.completed;
+        let (started, completed) = (result.started, result.completed);
+        let (outcome, editable) = uia_outcome(result, read, window, focus, || invalid(native).is_some())?;
         let returned = self.publish_item(job, build(ReadEvidence {
-            binding: read, started_qpc: result.started, completed_qpc: completed, outcome,
+            binding: read, started_qpc: started, completed_qpc: completed, outcome,
         }), Proof {
             target: secondary.clone(), focus: expected,
             point: match job.query { Query::Pointer { point, .. } => Some(point), _ => None },
             automation: Some((Arc::clone(&uia.revision), expected_revision)),
         })?;
         if editable && returned && let Some(focus) = focus {
-            uia.editable = completed.map(|_| (read.visit, focus.focus, expected_revision));
-            uia.desired.store(read.visit.focus_generation.0, Release);
+            let subscription = Subscription { read, focus: focus.focus, revision: expected_revision };
+            uia.subscriber.arm_commits(subscription, completed);
             let scope = self.commit_scope(window, focus.focus, read.visit, Arc::clone(&uia.revision), expected_revision);
-            client.finish_scoped_read(true, &invalid, &uia.desired, &uia.revision, &uia.commits, Some(scope));
-            uia.subscription = Some((read, focus.focus, expected_revision));
+            client.finish_scoped_read(true, &invalid, &uia.subscriber.desired, &uia.revision, &uia.commits, Some(scope));
         }
         Ok(())
     }
@@ -524,7 +500,7 @@ impl Worker {
         } else { None };
         let post = || self.live(&job.pending) && details.as_ref().is_some_and(|(local, target)| {
             WindowProcess::read(local.hwnd()) == Some(*local)
-                && target.as_ref().is_none_or(|target| target.recheck(&self.grant.parent).is_ok())
+                && target.as_ref().is_none_or(|target| target.recheck(&self.grant.session().peer).is_ok())
         });
         let outcome = match job.query {
             Query::NativeFocus(_) => {
@@ -552,7 +528,7 @@ impl Worker {
             _ => return Err(Failure::Protocol),
         };
         let clipboard = match job.query {
-            Query::ClipboardFence(_) => uia.editable.map(|(_, focus, revision)| (focus, revision)),
+            Query::ClipboardFence(_) => uia.subscriber.editable.map(|(_, focus, revision)| (focus, revision)),
             _ => None,
         };
         let proof = Proof {
@@ -572,7 +548,7 @@ impl Worker {
 
     fn editable_fence(&self, job: &Job, uia: &mut Uia, window: WindowProcess, expires: Instant) -> bool {
         let read = job.pending.read;
-        let Some((visit, expected, revision)) = uia.editable else { return false; };
+        let Some((visit, expected, revision)) = uia.subscriber.editable else { return false; };
         if visit != read.visit || !self.safe_focus(window, expected) { return false; }
         let Some(focus) = FocusSnapshot::read(window).filter(|focus| focus.focus == expected) else { return false; };
         let current_revision = &uia.revision;
@@ -618,7 +594,7 @@ impl Worker {
     }
 
     fn commits(&self, uia: &mut Uia) -> Result<()> {
-        let Some((read, focus, revision)) = uia.subscription else { return Ok(()) };
+        let Some(Subscription { read, focus, revision }) = uia.subscriber.current else { return Ok(()) };
         let now = qpc()?;
         // Commit losses reach the Recorder per reason (E3).
         let lose = |cause, span: LossSpan| match NonZeroU64::new(span.count) {
@@ -635,14 +611,12 @@ impl Worker {
             }, loss.span)?;
         }
         if !self.commit_current(read.visit, focus, &uia.revision, revision) {
-            uia.desired.store(0, Release);
-            uia.subscription = None;
-            uia.editable = None;
+            uia.subscriber.drop_subscription();
             for commit in uia.commits.take() {
                 lose(ContextGapCause::Stale, LossSpan::at(commit.receipt))?;
             }
             if let Some(client) = uia.client.as_mut() {
-                let _call = self.grant.lifetime.teardown(now)?;
+                let _call = self.grant.session().lifetime.teardown(now)?;
                 client.clear_subscription();
             }
             return Ok(());
@@ -676,8 +650,9 @@ impl Worker {
         let sender_revision = Arc::clone(&revision);
         CommitScope {
             check_sender: Arc::new(move |sender, receipt| {
-                let Ok(deadline) = sender_proof.grant.lifetime.after(receipt, NATIVE_BUDGET) else { return false };
-                let Some(_call) = sender_proof.grant.lifetime.provider(ProviderKind::Callback, deadline) else { return false };
+                let lifetime = &sender_proof.grant.session().lifetime;
+                let Ok(deadline) = lifetime.after(receipt, NATIVE_BUDGET) else { return false };
+                let Some(_call) = lifetime.provider(ProviderKind::Callback, deadline) else { return false };
                 sender_proof.commit_current(visit, focus, &sender_revision, expected)
                     && uia::commit_sender(sender, foreground)
                     && sender_proof.commit_current(visit, focus, &sender_revision, expected)
@@ -713,7 +688,7 @@ impl Worker {
         }
         let claim = job.secondary.as_ref().ok_or(Failure::TargetChanged)?;
         let actual = Foreground::of(local.hwnd().0).ok_or(Failure::TargetChanged)?;
-        Ok(Some(Arc::new(self.grant.prove_other(actual, claim, &self.approved)?)))
+        Ok(Some(Arc::new(self.grant.prove_other(actual, claim)?)))
     }
 
     fn foreground(&self) -> WindowProcess {
@@ -725,17 +700,19 @@ impl Worker {
     /// between is stale, one still running at the slot deadline defeats
     /// cancellation and the supervisor terminates the collector.
     fn call(&self, kind: ProviderKind, request: QpcTick) -> Option<super::lifetime::Provider<'_>> {
-        let slot = self.grant.lifetime.after(request, CLEANUP).ok()?;
-        self.grant.lifetime.provider(kind, slot)
+        let lifetime = &self.grant.session().lifetime;
+        let slot = lifetime.after(request, CLEANUP).ok()?;
+        lifetime.provider(kind, slot)
     }
 
     /// The provider call deadline: the request deadline capped by `cap`, as
     /// a QPC tick and an instant; `None` when no time remains.
     fn deadline(&self, read: ReadBinding, cap: Duration) -> Result<Option<(QpcTick, Instant)>> {
+        let lifetime = &self.grant.session().lifetime;
         let start = qpc()?;
-        let capped = read.deadline_qpc.min(self.grant.lifetime.after(start, cap)?);
+        let capped = read.deadline_qpc.min(lifetime.after(start, cap)?);
         let Some(remaining) = capped.0.checked_sub(start.0).filter(|value| *value > 0) else { return Ok(None) };
-        Ok(Some((capped, self.grant.lifetime.instant_of(remaining)?)))
+        Ok(Some((capped, lifetime.instant_of(remaining)?)))
     }
 
     fn publish(&self, job: &Job, result: ContextEvidence) -> Result<()> {
@@ -763,19 +740,82 @@ impl Worker {
 struct Uia {
     client: Option<Client>,
     revision: Arc<AtomicU64>,
-    desired: Arc<AtomicU64>,
     commits: Arc<Commits>,
-    subscription: Option<(ReadBinding, FocusAtReceipt, u64)>,
-    editable: Option<(VisitBinding, FocusAtReceipt, u64)>,
+    subscriber: Subscriber,
 }
 
 impl Uia {
     fn new() -> Self {
         Self {
-            client: None, revision: Arc::new(AtomicU64::new(1)), desired: Arc::new(AtomicU64::new(0)),
-            commits: Arc::new(Commits::new()), subscription: None, editable: None,
+            client: None, revision: Arc::new(AtomicU64::new(1)), commits: Arc::new(Commits::new()),
+            subscriber: Subscriber::default(),
         }
     }
+}
+
+/// The commit subscription of the UIA worker.
+#[derive(Default)]
+struct Subscriber {
+    /// The focus generation whose commits the client may deliver; zero for
+    /// none.
+    desired: Arc<AtomicU64>,
+    current: Option<Subscription>,
+    /// The editable focus element of the latest completed focus read, and
+    /// its automation revision.
+    editable: Option<(VisitBinding, FocusAtReceipt, u64)>,
+}
+
+/// The focus read whose editable element delivers commits.
+#[derive(Clone, Copy)]
+struct Subscription {
+    read: ReadBinding,
+    focus: FocusAtReceipt,
+    /// The automation revision of the read.
+    revision: u64,
+}
+
+impl Subscriber {
+    /// Subscribes to the commits of the editable element a focus read
+    /// returned.
+    fn arm_commits(&mut self, subscription: Subscription, completed: Option<QpcTick>) {
+        let Subscription { read, focus, revision } = subscription;
+        self.editable = completed.map(|_| (read.visit, focus, revision));
+        self.desired.store(read.visit.focus_generation.0, Release);
+        self.current = Some(subscription);
+    }
+
+    /// Ends the subscription; no commit is desired any more.
+    fn drop_subscription(&mut self) {
+        self.desired.store(0, Release);
+        self.current = None;
+        self.editable = None;
+    }
+}
+
+/// The outcome of a UIA read, and whether it found an editable element of a
+/// focus that is not password style. `stale` rechecks the read's scope.
+fn uia_outcome(
+    result: uia::Read, read: ReadBinding, window: WindowProcess, focus: Option<FocusSnapshot>,
+    stale: impl Fn() -> bool,
+) -> Result<(ReadOutcome<UiaEvidence>, bool)> {
+    let (dpi, dpi_awareness) = if !stale() && result.element.is_some() {
+        window_dpi(window)
+    } else { (None, None) };
+    let mut editable = false;
+    let outcome = if result.completed.is_none_or(|end| end >= read.deadline_qpc) {
+        ReadOutcome::Unavailable(ReadUnavailable::TimedOut)
+    } else if stale() {
+        ReadOutcome::Unavailable(ReadUnavailable::Stale)
+    } else if let Some(element) = result.element {
+        editable = result.target == TextClassification::Editable
+            && focus.is_some_and(|focus| focus.focus.password_style == Some(false));
+        ReadOutcome::Observed(UiaEvidence { target: result.target, dpi, dpi_awareness,
+            element: element.try_into().map_err(|_| Failure::Protocol)? })
+    } else {
+        // A completed read without an element is reported as unavailable.
+        ReadOutcome::Unavailable(result.status.err().unwrap_or(ReadUnavailable::Unavailable))
+    };
+    Ok((outcome, editable))
 }
 
 fn unavailable<T>(read: ReadBinding, now: QpcTick, status: ReadUnavailable) -> ReadEvidence<T> {

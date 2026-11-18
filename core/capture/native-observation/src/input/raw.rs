@@ -58,9 +58,7 @@ pub(super) struct RawWindow {
     single: Vec<u64>,
     buffered: Vec<u64>,
     wow64: bool,
-    /// Separate sequences for the required Raw Input records and the
-    /// optional HID collections.
-    sequence: [u64; 2],
+    sequence: Sequences,
     /// Optional collections currently registered.
     optional: [bool; OptionalCollection::ALL.len()],
     lost_optional: Vec<OptionalCollection>,
@@ -94,7 +92,7 @@ impl RawWindow {
         }
         let mut window = Self {
             handle, pen_hid, hid: HidCollections::default(), single: vec![0; INITIAL_RAW_BYTES / 8], buffered: vec![0; INITIAL_RAW_BYTES / 8],
-            wow64: wow64 != 0 && cfg!(target_pointer_width = "32"), sequence: [0; 2],
+            wow64: wow64 != 0 && cfg!(target_pointer_width = "32"), sequence: Sequences::default(),
             optional: [false; OptionalCollection::ALL.len()], lost_optional: Vec::new(),
             last_registration_check: unsafe { GetTickCount64() }, foreground: None,
         };
@@ -237,7 +235,7 @@ impl RawWindow {
         &mut self, qpc: QpcTick, message_tick_ms: Option<MessageTickMs>, publish: &mut impl FnMut(RawRecord),
     ) -> Result<(), NativeError> {
         // A packet that cannot be classified belongs to the required producer.
-        let sequence = next_sequence(&mut self.sequence, Producer::RawInput)?;
+        let sequence = self.sequence.next(Producer::RawInput)?;
         publish(RawRecord::Malformed(Producer::RawInput, Receipt { sequence, qpc, message_tick_ms }));
         Ok(())
     }
@@ -367,17 +365,27 @@ pub(super) fn qpc() -> Result<QpcTick, NativeError> {
     Ok(QpcTick(qpc))
 }
 
-fn next_sequence(sequences: &mut [u64; 2], producer: Producer) -> Result<SourceSequence, NativeError> {
-    let sequence = &mut sequences[usize::from(producer == Producer::OptionalHid)];
-    *sequence = sequence.checked_add(1).ok_or_else(invalid_raw)?;
-    Ok(SourceSequence(*sequence))
+/// Separate sequences for the required Raw Input records and the optional
+/// HID collections.
+#[derive(Default)]
+struct Sequences {
+    raw_input: u64,
+    optional_hid: u64,
+}
+
+impl Sequences {
+    fn next(&mut self, producer: Producer) -> Result<SourceSequence, NativeError> {
+        let sequence = if producer == Producer::OptionalHid { &mut self.optional_hid } else { &mut self.raw_input };
+        *sequence = sequence.checked_add(1).ok_or_else(invalid_raw)?;
+        Ok(SourceSequence(*sequence))
+    }
 }
 
 fn stamp(
-    sequences: &mut [u64; 2], qpc: QpcTick, message_tick_ms: Option<MessageTickMs>,
+    sequences: &mut Sequences, qpc: QpcTick, message_tick_ms: Option<MessageTickMs>,
     foreground_at_receipt: Option<ForegroundAtReceipt>, sample: InputSample,
 ) -> Result<CollectedInput, NativeError> {
-    let sequence = next_sequence(sequences, sample.producer())?;
+    let sequence = sequences.next(sample.producer())?;
     let mut point = POINT::default();
     let position_at_receipt = (matches!(&sample, InputSample::RawPointer(_))
         || matches!(&sample, InputSample::Hid(report) if report.is_pen()))

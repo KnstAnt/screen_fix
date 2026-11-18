@@ -51,8 +51,8 @@ impl HidCollections {
         };
         let Some(collection) = collection else { return };
         descriptor.preparsed_data_available = true;
-        let profile = if collection.ndof.is_some() { HidProfile::SpaceMouse } else { profile };
-        let fields = collection.fields.iter().take(MAX_HID_FIELDS).map(|field| HidFieldDeclaration {
+        let profile = if matches!(collection.layout, Layout::Ndof(Some(_))) { HidProfile::SpaceMouse } else { profile };
+        let fields = collection.fields().iter().take(MAX_HID_FIELDS).map(|field| HidFieldDeclaration {
             report_id: field.id, link_collection: field.link, usage: field.usage,
             numerical_range: match field.kind { FieldKind::Number(spec) => Some(spec), _ => None },
         }).collect();
@@ -61,14 +61,14 @@ impl HidCollections {
         let missing = if pen {
             USAGES.iter().filter_map(|&(_, _, usage)| {
                 ((numeric_usage(usage, false) || switch_usage(usage, false))
-                    && !collection.fields.iter().any(|field| field.usage == usage)).then_some(usage)
+                    && !collection.fields().iter().any(|field| field.usage == usage)).then_some(usage)
             }).collect()
         } else {
             Vec::new()
         };
         let Ok(missing_fields) = BoundedList::new(missing) else { return };
         descriptor.hid = Some(HidCollectionEvidence {
-            profile, fields, fields_truncated: collection.fields.len() > MAX_HID_FIELDS, missing_fields,
+            profile, fields, fields_truncated: collection.fields().len() > MAX_HID_FIELDS, missing_fields,
             // HidD_GetFeature has no deadline on this Raw Input owner.
             touchpad_capabilities: (profile == HidProfile::PrecisionTouchpad)
                 .then_some(TouchpadCapabilities::UnavailableUnboundedDriverIo),
@@ -124,9 +124,16 @@ impl HidCollections {
 struct Collection {
     preparsed: Box<[u64]>,
     caps: HIDP_CAPS,
-    fields: Vec<FieldCap>,
-    known_report_ids: [bool; 256],
-    ndof: Option<ndof::Profile>,
+    layout: Layout,
+}
+
+/// How the reports of a collection are decoded, fixed by its usage at load.
+enum Layout {
+    /// A multi-axis controller, with its known report profile if identified.
+    Ndof(Option<ndof::Profile>),
+    /// Any other collection: the declared fields of interest, sorted by
+    /// report ID, link and usage, and every report ID the caps declare.
+    Fields { fields: Vec<FieldCap>, known_report_ids: [bool; 256] },
 }
 
 impl Collection {
@@ -138,119 +145,41 @@ impl Collection {
         if status as u32 != HIDP_STATUS_SUCCESS as u32 {
             return None;
         }
-        let multiaxis = (caps.UsagePage, caps.Usage) == OptionalCollection::MultiAxis.usage();
-        let mut collection = Self { preparsed, caps, fields: Vec::new(), known_report_ids: [false; 256], ndof: None };
-        if multiaxis {
-            let mut bytes = std::mem::size_of::<RID_DEVICE_INFO>() as u32;
-            let mut info = RID_DEVICE_INFO { cbSize: bytes, ..Default::default() };
-            let copied = unsafe {
-                GetRawInputDeviceInfoW(handle, RIDI_DEVICEINFO, (&mut info as *mut RID_DEVICE_INFO).cast(), &mut bytes)
-            };
-            if copied == std::mem::size_of::<RID_DEVICE_INFO>() as u32 && info.dwType == RIM_TYPEHID {
-                let native = unsafe { info.Anonymous.hid };
-                collection.ndof = ndof::Profile::identify(native.dwVendorId, native.dwProductId);
-            }
+        let layout = if (caps.UsagePage, caps.Usage) == OptionalCollection::MultiAxis.usage() {
+            Layout::Ndof(ndof_profile(handle))
         } else {
-            collection.load_fields()?;
-        }
-        Some(collection)
+            load_fields(&preparsed, &caps)?
+        };
+        Some(Self { preparsed, caps, layout })
     }
 
-    fn load_fields(&mut self) -> Option<()> {
-        let mut value_count = self.caps.NumberInputValueCaps;
-        let mut button_count = self.caps.NumberInputButtonCaps;
-        if usize::from(value_count) > MAX_NATIVE_CAPS || usize::from(button_count) > MAX_NATIVE_CAPS {
-            return None;
+    /// The declared fields of interest; none for a multi-axis controller.
+    fn fields(&self) -> &[FieldCap] {
+        match &self.layout {
+            Layout::Ndof(_) => &[],
+            Layout::Fields { fields, .. } => fields,
         }
-        let mut values = vec![HIDP_VALUE_CAPS::default(); value_count.into()];
-        let mut buttons = vec![HIDP_BUTTON_CAPS::default(); button_count.into()];
-        let preparsed = self.preparsed.as_ptr() as _;
-        if value_count != 0 && unsafe { HidP_GetValueCaps(
-            HidP_Input, values.as_mut_ptr(), &mut value_count, preparsed,
-        ) } as u32 != HIDP_STATUS_SUCCESS as u32 {
-            return None;
-        }
-        if button_count != 0 && unsafe { HidP_GetButtonCaps(
-            HidP_Input, buttons.as_mut_ptr(), &mut button_count, preparsed,
-        ) } as u32 != HIDP_STATUS_SUCCESS as u32 {
-            return None;
-        }
-        let touchpad = (self.caps.UsagePage, self.caps.Usage) == OptionalCollection::Touchpad.usage();
-        for cap in values.get(..usize::from(value_count))? {
-            self.known_report_ids[usize::from(cap.ReportID)] = true;
-            if cap.IsAlias {
-                continue;
-            }
-            // IsRange is the Windows discriminator of the caps union.
-            let [first, last] = unsafe {
-                if cap.IsRange {
-                    [cap.Anonymous.Range.UsageMin, cap.Anonymous.Range.UsageMax]
-                } else {
-                    [cap.Anonymous.NotRange.Usage; 2]
-                }
-            };
-            for &(page, code, usage) in USAGES {
-                if page != cap.UsagePage || !(first..=last).contains(&code) || !numeric_usage(usage, touchpad) {
-                    continue;
-                }
-                let distinct = u16::try_from(u32::from(last).saturating_sub(u32::from(first)) + 1).ok();
-                let spec = (distinct == Some(cap.ReportCount) && (1..=32).contains(&cap.BitSize)).then(|| HidValueSpec {
-                    logical: limits(cap.LogicalMin, cap.LogicalMax, cap.BitSize),
-                    physical: limits(cap.PhysicalMin, cap.PhysicalMax, cap.BitSize),
-                    bits: cap.BitSize as u8,
-                    unit: cap.Units,
-                    exponent: ((cap.UnitsExp as u8 & 15) as i8) << 4 >> 4,
-                });
-                self.fields.push(FieldCap {
-                    id: cap.ReportID, link: cap.LinkCollection, page, code, usage,
-                    kind: spec.map_or(FieldKind::Unsupported, FieldKind::Number),
-                });
-            }
-        }
-        for cap in buttons.get(..usize::from(button_count))? {
-            self.known_report_ids[usize::from(cap.ReportID)] = true;
-            if cap.IsAlias {
-                continue;
-            }
-            let [first, last] = unsafe {
-                if cap.IsRange {
-                    [cap.Anonymous.Range.UsageMin, cap.Anonymous.Range.UsageMax]
-                } else {
-                    [cap.Anonymous.NotRange.Usage; 2]
-                }
-            };
-            for &(page, code, usage) in USAGES {
-                if page != cap.UsagePage || !(first..=last).contains(&code) || !switch_usage(usage, touchpad) {
-                    continue;
-                }
-                self.fields.push(FieldCap {
-                    id: cap.ReportID, link: cap.LinkCollection, page, code, usage, kind: FieldKind::Switch,
-                });
-            }
-        }
-        self.fields.sort_unstable_by_key(|field| (field.id, field.link, field.usage));
-        Some(())
     }
 
     fn accepts_length(&self, length: usize) -> bool {
         let maximum = usize::from(self.caps.InputReportByteLength);
-        if (self.caps.UsagePage, self.caps.Usage) == OptionalCollection::MultiAxis.usage() {
-            (2..=maximum).contains(&length)
-        } else {
-            length == maximum
+        match self.layout {
+            Layout::Ndof(_) => (2..=maximum).contains(&length),
+            Layout::Fields { .. } => length == maximum,
         }
     }
 
     fn decode(&self, bytes: &[u8]) -> HidReportResult {
-        if (self.caps.UsagePage, self.caps.Usage) == OptionalCollection::MultiAxis.usage() {
-            return self.ndof.and_then(|profile| profile.decode(bytes))
-                .map_or(HidReportResult::UnsupportedReport, HidReportResult::Ndof);
-        }
+        let (fields, known_report_ids) = match &self.layout {
+            Layout::Ndof(profile) => return profile.and_then(|profile| profile.decode(bytes))
+                .map_or(HidReportResult::UnsupportedReport, HidReportResult::Ndof),
+            Layout::Fields { fields, known_report_ids } => (fields, known_report_ids),
+        };
         let id = bytes[0]; // HID parser buffers always reserve the leading Report ID byte.
-        let start = self.fields.partition_point(|cap| cap.id < id);
-        let end = self.fields.partition_point(|cap| cap.id <= id);
-        let fields = &self.fields[start..end];
-        if fields.is_empty() && self.known_report_ids[usize::from(id)] {
+        let start = fields.partition_point(|cap| cap.id < id);
+        let end = fields.partition_point(|cap| cap.id <= id);
+        let fields = &fields[start..end];
+        if fields.is_empty() && known_report_ids[usize::from(id)] {
             return HidReportResult::NoRelevantFields;
         }
         if fields.is_empty() || fields.len() > MAX_HID_FIELDS {
@@ -336,6 +265,100 @@ impl Collection {
             }
         }
     }
+}
+
+/// The known report profile of a multi-axis controller, by vendor and product.
+fn ndof_profile(handle: HANDLE) -> Option<ndof::Profile> {
+    let mut bytes = std::mem::size_of::<RID_DEVICE_INFO>() as u32;
+    let mut info = RID_DEVICE_INFO { cbSize: bytes, ..Default::default() };
+    let copied = unsafe {
+        GetRawInputDeviceInfoW(handle, RIDI_DEVICEINFO, (&mut info as *mut RID_DEVICE_INFO).cast(), &mut bytes)
+    };
+    if copied != std::mem::size_of::<RID_DEVICE_INFO>() as u32 || info.dwType != RIM_TYPEHID {
+        return None;
+    }
+    let native = unsafe { info.Anonymous.hid };
+    ndof::Profile::identify(native.dwVendorId, native.dwProductId)
+}
+
+/// The fields of interest the input caps declare.
+fn load_fields(preparsed: &[u64], caps: &HIDP_CAPS) -> Option<Layout> {
+    let mut value_count = caps.NumberInputValueCaps;
+    let mut button_count = caps.NumberInputButtonCaps;
+    if usize::from(value_count) > MAX_NATIVE_CAPS || usize::from(button_count) > MAX_NATIVE_CAPS {
+        return None;
+    }
+    let mut values = vec![HIDP_VALUE_CAPS::default(); value_count.into()];
+    let mut buttons = vec![HIDP_BUTTON_CAPS::default(); button_count.into()];
+    let preparsed = preparsed.as_ptr() as _;
+    if value_count != 0 && unsafe { HidP_GetValueCaps(
+        HidP_Input, values.as_mut_ptr(), &mut value_count, preparsed,
+    ) } as u32 != HIDP_STATUS_SUCCESS as u32 {
+        return None;
+    }
+    if button_count != 0 && unsafe { HidP_GetButtonCaps(
+        HidP_Input, buttons.as_mut_ptr(), &mut button_count, preparsed,
+    ) } as u32 != HIDP_STATUS_SUCCESS as u32 {
+        return None;
+    }
+    let touchpad = (caps.UsagePage, caps.Usage) == OptionalCollection::Touchpad.usage();
+    let mut fields = Vec::new();
+    let mut known_report_ids = [false; 256];
+    for cap in values.get(..usize::from(value_count))? {
+        known_report_ids[usize::from(cap.ReportID)] = true;
+        if cap.IsAlias {
+            continue;
+        }
+        // IsRange is the Windows discriminator of the caps union.
+        let range = unsafe {
+            if cap.IsRange {
+                [cap.Anonymous.Range.UsageMin, cap.Anonymous.Range.UsageMax]
+            } else {
+                [cap.Anonymous.NotRange.Usage; 2]
+            }
+        };
+        for (page, code, usage) in declared(cap.UsagePage, range, |usage| numeric_usage(usage, touchpad)) {
+            let [first, last] = range;
+            let distinct = u16::try_from(u32::from(last).saturating_sub(u32::from(first)) + 1).ok();
+            let spec = (distinct == Some(cap.ReportCount) && (1..=32).contains(&cap.BitSize)).then(|| HidValueSpec {
+                logical: limits(cap.LogicalMin, cap.LogicalMax, cap.BitSize),
+                physical: limits(cap.PhysicalMin, cap.PhysicalMax, cap.BitSize),
+                bits: cap.BitSize as u8,
+                unit: cap.Units,
+                exponent: signed(cap.UnitsExp & 15, 4) as i8,
+            });
+            fields.push(FieldCap {
+                id: cap.ReportID, link: cap.LinkCollection, page, code, usage,
+                kind: spec.map_or(FieldKind::Unsupported, FieldKind::Number),
+            });
+        }
+    }
+    for cap in buttons.get(..usize::from(button_count))? {
+        known_report_ids[usize::from(cap.ReportID)] = true;
+        if cap.IsAlias {
+            continue;
+        }
+        let range = unsafe {
+            if cap.IsRange {
+                [cap.Anonymous.Range.UsageMin, cap.Anonymous.Range.UsageMax]
+            } else {
+                [cap.Anonymous.NotRange.Usage; 2]
+            }
+        };
+        for (page, code, usage) in declared(cap.UsagePage, range, |usage| switch_usage(usage, touchpad)) {
+            fields.push(FieldCap { id: cap.ReportID, link: cap.LinkCollection, page, code, usage, kind: FieldKind::Switch });
+        }
+    }
+    fields.sort_unstable_by_key(|field| (field.id, field.link, field.usage));
+    Some(Layout::Fields { fields, known_report_ids })
+}
+
+/// The known usages on `page` within `[first, last]` that `wanted` accepts.
+fn declared(
+    page: u16, [first, last]: [u16; 2], wanted: impl Fn(HidUsage) -> bool,
+) -> impl Iterator<Item = (u16, u16, HidUsage)> {
+    USAGES.iter().copied()
+        .filter(move |&(usage_page, code, usage)| usage_page == page && (first..=last).contains(&code) && wanted(usage))
 }
 
 #[derive(Clone, Copy)]

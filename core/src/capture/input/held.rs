@@ -113,9 +113,49 @@ pub(crate) struct PhysicalHeld {
     /// it, and not released since, is down or unknown across the boundary.
     keys_up: [u64; 4],
     caps_lock: Option<bool>,
+    alt_gr: AltGrDetector,
+}
+
+/// Whether the held right Alt is an AltGr press: the system's left-Ctrl
+/// companion and the right Alt went down within `ALT_GR_COMPANION_US`.
+#[derive(Default)]
+struct AltGrDetector {
     companion_at: Option<SessionTimeUs>,
     right_alt_at: Option<SessionTimeUs>,
-    alt_gr: bool,
+    active: bool,
+}
+
+impl AltGrDetector {
+    /// Account one row's action at its receipt `at`.
+    fn observe(&mut self, first: &PendingInput, at: SessionTimeUs) {
+        let within = |earlier: SessionTimeUs| at.0.saturating_sub(earlier.0) <= ALT_GR_COMPANION_US;
+        if let Action::AltGrCompanion = first.action && let InputSample::HookKey(key) = first.packet.sample {
+            if key.flags & LLKHF_UP == 0 {
+                self.companion_at = Some(at);
+                self.active |= self.right_alt_at.is_some_and(within);
+            } else {
+                self.companion_at = None;
+                self.active = false;
+            }
+        }
+        if let Action::Key(Key { modifier: Some(Modifier::RightAlt), down, .. }) = first.action {
+            if down && self.right_alt_at.is_none() {
+                self.right_alt_at = Some(at);
+                self.active = self.companion_at.is_some_and(within);
+            } else if !down {
+                self.right_alt_at = None;
+                self.active = false;
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn active(&self) -> bool {
+        self.active
+    }
 }
 
 impl PhysicalHeld {
@@ -123,26 +163,7 @@ impl PhysicalHeld {
         let action = normalized.correlated.first.action;
         let device = normalized.origin.device.observed();
         let at = normalized.correlated.first.time.recv_t_us;
-        if let Action::AltGrCompanion = action
-            && let crate::protocol::ipc::InputSample::HookKey(key) = normalized.correlated.first.packet.sample
-        {
-            if key.flags & LLKHF_UP == 0 {
-                self.companion_at = Some(at);
-                self.alt_gr |= self.right_alt_at.is_some_and(|right| at.0.saturating_sub(right.0) <= ALT_GR_COMPANION_US);
-            } else {
-                self.companion_at = None;
-                self.alt_gr = false;
-            }
-        }
-        if let Action::Key(Key { modifier: Some(Modifier::RightAlt), down, .. }) = action {
-            if down && self.right_alt_at.is_none() {
-                self.right_alt_at = Some(at);
-                self.alt_gr = self.companion_at.is_some_and(|ctrl| at.0.saturating_sub(ctrl.0) <= ALT_GR_COMPANION_US);
-            } else if !down {
-                self.right_alt_at = None;
-                self.alt_gr = false;
-            }
-        }
+        self.alt_gr.observe(&normalized.correlated.first, at);
         let holding = match action {
             Action::Key(Key { virtual_key: vk, scan, modifier, down }) => {
                 Some((Holding::Key { vk, scan, modifier }, down))
@@ -192,7 +213,7 @@ impl PhysicalHeld {
         HeldSnapshot {
             modifiers, modifiers_known: self.modifiers_known | modifiers,
             buttons, buttons_known: self.buttons_known | buttons,
-            caps_lock: self.caps_lock, alt_gr: self.alt_gr,
+            caps_lock: self.caps_lock, alt_gr: self.alt_gr.active(),
         }
     }
 
@@ -203,9 +224,7 @@ impl PhysicalHeld {
         self.known_released.clear();
         self.keys_up = [0; 4];
         self.caps_lock = None;
-        self.companion_at = None;
-        self.right_alt_at = None;
-        self.alt_gr = false;
+        self.alt_gr.reset();
     }
 
     pub fn invalidate_pen(&mut self, device: DeviceId) {
@@ -233,9 +252,7 @@ impl PhysicalHeld {
         let prior = self.snapshot();
         self.keys_up = keys.map(|down| !down);
         self.caps_lock = Some(caps_lock);
-        self.companion_at = None;
-        self.right_alt_at = None;
-        self.alt_gr = false;
+        self.alt_gr.reset();
         self.held.retain(|entry| !matches!(entry.holding,
             Holding::Key { modifier: Some(_), .. } | Holding::Button { .. }));
         self.modifiers_known = MODIFIER_MASK;

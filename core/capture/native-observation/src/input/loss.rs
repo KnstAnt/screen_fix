@@ -149,6 +149,101 @@ impl PendingStatus {
     }
 }
 
+/// How the collector's queue took one record.
+pub enum Sent {
+    Accepted,
+    /// The queue has no room; the record comes back.
+    Full(HelperToCore),
+    /// The record cannot be encoded and is skipped; it comes back.
+    Malformed(HelperToCore),
+}
+
+/// What one collector still owes its queue: pending gaps per producer and
+/// pending status records. Each collector supplies only its `send`.
+#[derive(Default)]
+pub struct Backlog {
+    losses: Losses,
+    status: PendingStatus,
+}
+
+impl Backlog {
+    /// Send `record`, or account for it. A status record waits behind the
+    /// pending status records. Any other record follows its producer's pending
+    /// gaps and never overtakes one (E3): while a gap stays pending, and when
+    /// the queue refuses the record, the record joins a gap.
+    pub fn offer<E>(&mut self, record: HelperToCore, mut send: impl FnMut(HelperToCore) -> Result<Sent, E>) -> Result<(), E> {
+        // `producer` is `None` for status records, so deferring them first
+        // keeps the order of a collector that flushes gaps first.
+        let record = match self.status.defer(record) {
+            Ok(()) => return self.flush_status(send).map(drop),
+            Err(record) => record,
+        };
+        if let Some(producer) = producer(&record)
+            && !self.flush_losses(producer, &mut send)?
+        {
+            self.losses.drop_record(&record);
+            return Ok(());
+        }
+        match send(record)? {
+            Sent::Accepted => {}
+            Sent::Full(record) => self.losses.drop_record(&record),
+            Sent::Malformed(record) => self.losses.malformed_record(&record),
+        }
+        Ok(())
+    }
+
+    /// Account for a record that was never offered.
+    pub fn drop_record(&mut self, record: &HelperToCore) {
+        self.losses.drop_record(record);
+    }
+
+    /// See [`Losses::malformed`].
+    pub fn malformed(&mut self, producer: Producer, receipt: Receipt) {
+        self.losses.malformed(producer, receipt);
+    }
+
+    /// Deliver the producer's pending gaps in order. `false` when a gap is
+    /// still pending. A gap reported `Malformed` stays pending, as on `Full`.
+    pub fn flush_losses<E>(
+        &mut self, producer: Producer, mut send: impl FnMut(HelperToCore) -> Result<Sent, E>,
+    ) -> Result<bool, E> {
+        self.losses.flush(producer, |gap| Ok(matches!(send(HelperToCore::Gap(gap))?, Sent::Accepted)))
+    }
+
+    /// Deliver the pending status records (see [`PendingStatus::flush`]). A
+    /// record reported `Malformed` is skipped. `false` when one is still pending.
+    pub fn flush_status<E>(&mut self, mut send: impl FnMut(HelperToCore) -> Result<Sent, E>) -> Result<bool, E> {
+        self.status.flush(|record| Ok(!matches!(send(record)?, Sent::Full(_))))
+    }
+
+    /// Deliver the pending gaps of `producers` in turn, then the pending
+    /// status records. Stops at the first record still pending: `false`.
+    pub fn flush<E>(
+        &mut self, producers: impl IntoIterator<Item = Producer>, mut send: impl FnMut(HelperToCore) -> Result<Sent, E>,
+    ) -> Result<bool, E> {
+        for producer in producers {
+            if !self.flush_losses(producer, &mut send)? { return Ok(false); }
+        }
+        self.flush_status(send)
+    }
+
+    /// Drop a pending environment state that no longer applies.
+    pub fn discard_environment(&mut self) {
+        self.status.discard_environment();
+    }
+
+    /// Drop every pending status record; pending gaps stay (E3).
+    pub fn discard_status(&mut self) {
+        self.status = PendingStatus::default();
+    }
+
+    /// What is still pending when the producers stopped: the gaps, then the
+    /// status records.
+    pub fn finish(self) -> impl Iterator<Item = HelperToCore> {
+        self.losses.finish().map(HelperToCore::Gap).chain(self.status.finish())
+    }
+}
+
 pub fn producer(record: &HelperToCore) -> Option<Producer> {
     match record {
         HelperToCore::Gap(gap) => Some(gap.producer),

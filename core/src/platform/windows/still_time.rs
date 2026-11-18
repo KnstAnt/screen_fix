@@ -6,7 +6,7 @@ use crate::{
     protocol::{AdmissionEpoch, CaptureEpoch, GeometryId, SessionTimeUs},
 };
 
-use super::native::{NativeFrame, NativeImages};
+use super::{context::FrameApproval, native::{NativeFrame, NativeImages}};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct Interval {
@@ -18,6 +18,11 @@ pub(super) struct Interval {
 }
 
 impl Interval {
+    /// The interval of a capture under its frame approval.
+    pub fn approved(geometry: GeometryId, capture: CaptureEpoch, admission: AdmissionEpoch, approval: &FrameApproval) -> Self {
+        Self { geometry, capture, admission, approval: approval.generation, elevated_visit: approval.elevated_visit() }
+    }
+
     pub fn contains(self, frame: &FrameMetadata) -> bool {
         frame.geometry.id == self.geometry && frame.id.epoch == self.capture
             && frame.admission == self.admission && frame.approval_generation == self.approval

@@ -135,8 +135,7 @@ impl Hung {
             if previous.is_none() {
                 rows.push(hung_row(*new, true, "detected"));
             } else if new.ghost && previous.is_some_and(|old| !old.ghost) {
-                rows.push(json!({ "kind": "app_hung_ghost", "active": true, "association": "confirmed",
-                    "window": new.window.window, "process": new.window.process }));
+                rows.push(ghost_confirmed_row(new.window));
             }
         }
         if limited != self.coverage_limited {
@@ -159,14 +158,13 @@ impl Hung {
         next.retain(|item| item.window != window);
         if let Some(observed) = observed {
             if next.len() == ACTIVE_LIMIT {
-                rows.push(json!({ "kind": "app_hung_coverage", "complete": false, "source": "elevated" }));
+                rows.push(elevated_coverage_row());
                 return;
             }
             next.push(observed);
             if previous.is_none() { rows.push(hung_row(observed, true, "detected")); }
             if ghost && previous.is_none_or(|previous| !previous.ghost) {
-                rows.push(json!({ "kind": "app_hung_ghost", "active": true, "association": "confirmed",
-                    "window": window.window, "process": window.process }));
+                rows.push(ghost_confirmed_row(window));
             }
         } else if let Some(previous) = previous {
             rows.push(hung_row(previous, false, "responsive"));
@@ -234,6 +232,18 @@ impl Scan<'_, '_, '_> {
             self.observations.push(Observation { window, direct: !ghost, ghost });
         }
     }
+}
+
+/// The incomplete hung coverage of an elevated visit: a scoped read could
+/// not be held, or did not complete.
+pub(super) fn elevated_coverage_row() -> Value {
+    json!({ "kind": "app_hung_coverage", "complete": false, "source": "elevated" })
+}
+
+/// A Ghost window verifiably replaced the hung `window`.
+fn ghost_confirmed_row(window: WindowProcess) -> Value {
+    json!({ "kind": "app_hung_ghost", "active": true, "association": "confirmed",
+        "window": window.window, "process": window.process })
 }
 
 fn hung_row(observed: Observation, active: bool, reason: &str) -> Value {

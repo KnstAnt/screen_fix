@@ -68,8 +68,13 @@ impl Read {
             status: native.status, target, element: native.element, scoped_dpi: None }
     }
 
+    /// A read that ended with `status` and no evidence; its target stays possibly sensitive.
+    pub(super) fn unavailable(request: Request, completed: Option<QpcTick>, status: ReadUnavailable) -> Self {
+        Self { request, started: None, completed, status: Err(status), target: TextTarget::PossiblySensitive, element: None, scoped_dpi: None }
+    }
+
     fn outcome(request: Request, started: Option<QpcTick>, reason: ReadUnavailable) -> Self {
-        Self { request, started, completed: clock::qpc().ok(), status: Err(reason), target: TextTarget::PossiblySensitive, element: None, scoped_dpi: None }
+        Self { started, ..Self::unavailable(request, clock::qpc().ok(), reason) }
     }
 }
 

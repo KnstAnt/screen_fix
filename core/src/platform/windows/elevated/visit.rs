@@ -4,13 +4,14 @@ use screen_fix_elevated::{Failure, READINESS, Result, foreground_access, Foregro
 use screen_fix_protocol::{AdmissionEpoch, FocusGeneration, GeometryId, QpcFrequency, QpcTick, RequestId, ipc::{
     FocusAtReceipt, InputRegistration, ProducerGap,
     elevated::{ContextEvidence, GrantedInput, HeldSnapshot, Query, ReadBinding, ReadOutcome, ReadUnavailable, VisitBinding,
-        runtime::{Activation, ContextCommand, Control, CoverageLoss, CoverageReason, GrantRequest, HeldReadiness,
-            IdentityClaim, Observation, Revocation, Status, Transition}},
+        WindowInstance,
+        runtime::{Activation, ContextCommand, Control, CoverageLoss, CoverageReason, EnvironmentRevision, GrantRequest,
+            HeldReadiness, IdentityClaim, Lease, Observation, Revocation, Status, Transition}},
 }};
 
 use super::{CLEANUP, peer::{LeaseState, Peer, Progress}};
 use super::super::context::{elevated_focus_matches, identity::WindowProcess};
-use crate::{platform::windows::controller::SourceDispatch, util::keep_earlier};
+use crate::platform::windows::controller::SourceDispatch;
 
 const HELD_BUDGET: Duration = Duration::from_millis(250);
 const HELD_RETRY: Duration = Duration::from_millis(100);
@@ -30,9 +31,23 @@ pub(super) struct Host {
     focus_generation: FocusGeneration,
     grant: Option<Grant>,
     last_closed: Option<VisitBinding>,
-    retry: Option<ReadBinding>,
-    retry_after: Option<QpcTick>,
+    retry: HeldRetry,
     optional_reads: VecDeque<ReadBinding>,
+}
+
+/// The held read re-issued in an open visit whose held state is unknown.
+#[derive(Default)]
+struct HeldRetry {
+    /// The pending retry read.
+    read: Option<ReadBinding>,
+    /// When the next retry may be sent; none once the held state is known.
+    after: Option<QpcTick>,
+}
+
+impl HeldRetry {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -50,22 +65,32 @@ struct Grant {
     deadline: Instant,
     phase: Phase,
     lower: QpcTick,
+    /// The focus of the current binding; none while focus is suspended.
     focus: Option<FocusAtReceipt>,
+    /// The input registration, from Armed on.
     registration: Option<InputRegistration>,
-    closing_before: Option<QpcTick>,
 }
 
 #[derive(Clone, Copy)]
 enum Phase {
     Preparing,
-    Armed(InputRegistration),
+    Armed,
     Activating,
     HeldPending(ReadBinding),
     Accepting { completed: QpcTick, snapshot: Option<HeldSnapshot> },
     Open,
     FocusSuspended,
     Refreshing { next: VisitBinding },
-    Closing,
+    /// Revoked or invalidated: the visit's coverage ends `before`.
+    Closing { before: QpcTick },
+}
+
+/// A held snapshot that recovered the held state of an open visit.
+#[derive(Clone, Copy)]
+pub(in crate::platform::windows) struct Recovered {
+    pub(in crate::platform::windows) binding: VisitBinding,
+    pub(in crate::platform::windows) completed: QpcTick,
+    pub(in crate::platform::windows) snapshot: HeldSnapshot,
 }
 
 pub(super) enum Change {
@@ -87,7 +112,8 @@ impl Host {
     pub(super) fn new(peer: Peer, frequency: QpcFrequency) -> Result<Self> {
         Ok(Self {
             peer, lease: LeaseState::new(frequency)?, frequency, configured: false, witness: None,
-            sequence: 0, request: 0, focus_generation: FocusGeneration(0), grant: None, last_closed: None, retry: None, retry_after: None, optional_reads: VecDeque::new(),
+            sequence: 0, request: 0, focus_generation: FocusGeneration(0), grant: None, last_closed: None,
+            retry: HeldRetry::default(), optional_reads: VecDeque::new(),
         })
     }
 
@@ -116,14 +142,14 @@ impl Host {
     }
 
     pub(super) fn activating(&self) -> bool {
-        self.grant.as_ref().is_some_and(|grant| matches!(grant.phase, Phase::Armed(_)))
+        self.grant.as_ref().is_some_and(|grant| matches!(grant.phase, Phase::Armed))
     }
 
     pub(super) fn awaiting_close(&self) -> bool {
-        self.grant.as_ref().is_some_and(|grant| matches!(grant.phase, Phase::Closing))
+        self.grant.as_ref().is_some_and(|grant| matches!(grant.phase, Phase::Closing { .. }))
     }
 
-    pub(super) fn environment(&mut self, revision: screen_fix_protocol::ipc::elevated::runtime::EnvironmentRevision) -> Result<()> {
+    pub(super) fn environment(&mut self, revision: EnvironmentRevision) -> Result<()> {
         // Configuration is ordered ahead of every other control record.
         self.peer.send(Control::Environment(revision))?;
         self.mark_closing(revision.changed_qpc);
@@ -131,18 +157,14 @@ impl Host {
     }
 
     fn mark_closing(&mut self, before: QpcTick) {
-        self.retry = None;
-        self.retry_after = None;
+        self.retry.clear();
         if let Some(grant) = self.grant.as_mut() {
-            keep_earlier(&mut grant.closing_before, before);
-            if matches!(grant.phase, Phase::Closing) { return; }
-            grant.phase = Phase::Closing;
-            grant.deadline = Instant::now() + CLEANUP;
+            grant.close_before(before);
         }
     }
 
     pub(super) fn lease_epoch(&self) -> Option<AdmissionEpoch> {
-        self.grant.as_ref().filter(|grant| !matches!(grant.phase, Phase::Preparing | Phase::Armed(_) | Phase::Closing))
+        self.grant.as_ref().filter(|grant| !matches!(grant.phase, Phase::Preparing | Phase::Armed | Phase::Closing { .. }))
             .map(|grant| grant.binding.epoch)
     }
 
@@ -150,8 +172,8 @@ impl Host {
     /// selector prepares the candidate again within its readiness budget.
     pub(super) fn armed(&mut self, now: QpcTick) -> Result<Option<(InputRegistration, FocusAtReceipt)>> {
         let Some(grant) = self.grant.as_ref() else { return Ok(None); };
-        let Phase::Armed(registration) = grant.phase else { return Ok(None); };
-        let focus = grant.focus.ok_or(Failure::Protocol)?;
+        let Phase::Armed = grant.phase else { return Ok(None); };
+        let (registration, focus) = grant.registration.zip(grant.focus).ok_or(Failure::Protocol)?;
         if grant.current(self.witness)? && focus_current(grant.binding, focus) {
             return Ok(Some((registration, focus)));
         }
@@ -186,14 +208,14 @@ impl Host {
         };
         let expires_qpc = add_time(progress.now, self.frequency, PREPARE_EXPIRY)?;
         let sent = authorization.with_closed_phase(|| self.lease.renew(&self.peer, progress, None,
-            Some(|lease: screen_fix_protocol::ipc::elevated::runtime::Lease| {
+            Some(|lease: Lease| {
                 Control::Prepare(GrantRequest { foreground: claim.clone(), visit: binding, geometry, lease: lease.sequence, expires_qpc })
             })))?;
         if sent {
             self.sequence = sequence.get();
             self.focus_generation = focus_generation;
             self.grant = Some(Grant { claim: claim.clone(), binding, requested: progress.now,
-                deadline, phase: Phase::Preparing, lower: progress.now, focus: None, registration: None, closing_before: None });
+                deadline, phase: Phase::Preparing, lower: progress.now, focus: None, registration: None });
         }
         Ok(sent)
     }
@@ -201,7 +223,7 @@ impl Host {
     pub(super) fn activate(&mut self, epoch: AdmissionEpoch, opening: QpcTick, progress: Progress) -> Result<()> {
         let Some(grant) = self.grant.as_mut() else { return Err(Failure::Protocol); };
         if grant.binding.epoch != epoch || opening < grant.lower || opening > progress.now
-            || !matches!(grant.phase, Phase::Armed(_))
+            || !matches!(grant.phase, Phase::Armed)
         {
             return Err(Failure::Protocol);
         }
@@ -210,7 +232,7 @@ impl Host {
             return self.revoke(progress.now);
         }
         let binding = grant.binding;
-        if self.lease.renew(&self.peer, progress, Some(epoch), Some(|lease: screen_fix_protocol::ipc::elevated::runtime::Lease| {
+        if self.lease.renew(&self.peer, progress, Some(epoch), Some(|lease: Lease| {
             Control::Activate(Activation { visit: binding, lease: lease.sequence, opening_qpc: opening })
         }))? {
             grant.lower = opening;
@@ -227,7 +249,7 @@ impl Host {
             if !matches!(grant.phase, Phase::Open) && Instant::now() >= grant.deadline {
                 return Err(Failure::ReadinessDeadline);
             }
-            if self.lease.due(progress, epoch) && !matches!(grant.phase, Phase::Closing) && !matches_target(&grant.claim)? {
+            if self.lease.due(progress, epoch) && !matches!(grant.phase, Phase::Closing { .. }) && !matches_target(&grant.claim)? {
                 // D-8 A: the target left the foreground; revoke, not fail.
                 self.revoke(progress.now)?;
             }
@@ -242,7 +264,7 @@ impl Host {
 
     pub(super) fn revoke(&mut self, before: QpcTick) -> Result<()> {
         let Some(grant) = self.grant.as_ref() else { return Ok(()); };
-        if !matches!(grant.phase, Phase::Closing) {
+        if !matches!(grant.phase, Phase::Closing { .. }) {
             self.peer.send(Control::Revoke { visit: grant.binding, before_qpc: before })?;
             self.mark_closing(before);
         }
@@ -264,7 +286,7 @@ impl Host {
         let next = VisitBinding {
             focus_generation: generation, focus_revision: witness.focus_revision, ..previous
         };
-        let sent = self.lease.renew(&self.peer, progress, Some(previous.epoch), Some(|lease: screen_fix_protocol::ipc::elevated::runtime::Lease| {
+        let sent = self.lease.renew(&self.peer, progress, Some(previous.epoch), Some(|lease: Lease| {
             Control::RefreshFocus { previous, next, lease: lease.sequence }
         }))?;
         if sent {
@@ -305,13 +327,13 @@ impl Host {
             }
             Status::Stopped => return Ok(Change::Stopped),
             Status::Failed(failure) => return Err(Failure::NativeProducer(failure)),
-            Status::TransitionRejected { visit, transition: screen_fix_protocol::ipc::elevated::runtime::Transition::Revoke,
-                reason: ReadUnavailable::Stale } if self.last_closed == Some(visit) => return Ok(Change::None),
+            Status::TransitionRejected { visit, transition: Transition::Revoke, reason: ReadUnavailable::Stale }
+                if self.last_closed == Some(visit) => return Ok(Change::None),
             _ => {}
         }
         let grant = self.grant.as_mut().ok_or(Failure::Protocol)?;
         let binding = grant.binding;
-        if matches!(grant.phase, Phase::Closing) {
+        if let Phase::Closing { before: before_qpc } = grant.phase {
             let replacement = match &status {
                 Status::ResyncRequired { previous, visit, .. } if *previous == binding
                     && (VisitBinding { resync_revision: visit.resync_revision, ..binding }) == *visit
@@ -323,7 +345,6 @@ impl Host {
                 _ => None,
             };
             if let Some(visit) = replacement {
-                let before_qpc = grant.closing_before.ok_or(Failure::Protocol)?;
                 self.last_closed = Some(binding);
                 grant.binding = visit;
                 self.peer.send(Control::Revoke { visit, before_qpc })?;
@@ -348,7 +369,7 @@ impl Host {
                 grant.lower = arm_qpc;
                 grant.focus = Some(focus);
                 grant.registration = Some(registration);
-                grant.phase = Phase::Armed(registration);
+                grant.phase = Phase::Armed;
                 return Ok(Change::Registered { binding, at: arm_qpc, registration, held });
             }
             Status::Activated { visit, activation_qpc }
@@ -367,23 +388,21 @@ impl Host {
                 {
                     return Err(Failure::Protocol);
                 }
-                let focus = grant.focus.ok_or(Failure::Protocol)?;
+                let (focus, registration) = grant.focus.zip(grant.registration).ok_or(Failure::Protocol)?;
                 if !grant.current(self.witness)? || !focus_current(binding, focus) {
                     return self.revoke(now).map(|()| Change::None);
                 }
                 grant.lower = input_coverage.before_qpc;
                 grant.phase = Phase::Open;
-                self.retry = None;
-                self.retry_after = snapshot.is_none().then(|| add_time(after_qpc, self.frequency, HELD_RETRY)).transpose()?;
-                let registration = grant.registration.ok_or(Failure::Protocol)?;
+                self.retry.read = None;
+                self.retry.after = snapshot.is_none().then(|| add_time(after_qpc, self.frequency, HELD_RETRY)).transpose()?;
                 return Ok(Change::InputOpened { binding, focus, completed, snapshot, coverage: input_coverage, registration });
             }
             Status::FocusSuspended { visit, before_qpc } if visit == binding && before_qpc <= now => {
                 grant.phase = Phase::FocusSuspended;
                 grant.deadline = Instant::now() + READINESS;
                 grant.focus = None;
-                self.retry = None;
-                self.retry_after = None;
+                self.retry.clear();
                 return Ok(Change::InputClosed { binding, before: before_qpc, loss: None });
             }
             Status::FocusRefreshed { visit, focus, resync_after_qpc }
@@ -404,17 +423,12 @@ impl Host {
                 grant.binding = visit;
                 grant.lower = resync_after_qpc;
                 grant.deadline = Instant::now() + READINESS;
-                self.retry = None;
-                self.retry_after = None;
+                self.retry.clear();
                 self.request_held(now)?;
                 return Ok(Change::InputClosed { binding, before: first_uncovered, loss: Some((cause, native_gap)) });
             }
             Status::Invalidated { visit, before_qpc, reason } if visit == binding && before_qpc <= now => {
-                keep_earlier(&mut grant.closing_before, before_qpc);
-                if !matches!(grant.phase, Phase::Closing) {
-                    grant.deadline = Instant::now() + CLEANUP;
-                }
-                grant.phase = Phase::Closing;
+                grant.close_before(before_qpc);
                 return Ok(Change::Invalidated { binding, before: before_qpc, reason });
             }
             Status::Closed { visit, before_qpc } if visit == binding && before_qpc <= now => {
@@ -427,7 +441,7 @@ impl Host {
                 if reason != ReadUnavailable::Stale { return Err(Failure::TargetAccess); }
                 return self.revoke(now).map(|()| Change::None);
             }
-            Status::ReadRejected { read, .. } if self.retry == Some(read) => self.retry = None,
+            Status::ReadRejected { read, .. } if self.retry.read == Some(read) => self.retry.read = None,
             Status::ReadRejected { read, .. } if matches!(grant.phase, Phase::Open)
                 && read.visit == binding && read.request.0 <= self.request => {},
             Status::TransitionRejected { visit, reason, transition } if visit == binding
@@ -452,7 +466,7 @@ impl Host {
         Ok(Change::None)
     }
 
-    pub(super) fn observation(&mut self, observation: &Observation, now: QpcTick) -> Result<Option<(VisitBinding, QpcTick, HeldSnapshot)>> {
+    pub(super) fn observation(&mut self, observation: &Observation, now: QpcTick) -> Result<Option<Recovered>> {
         let Observation::Item { evidence, position, .. } = observation else { return Ok(None); };
         if let Some(read) = evidence.read_binding() {
             self.optional_reads.retain(|pending| *pending != read);
@@ -461,15 +475,15 @@ impl Host {
         let Some(grant) = self.grant.as_mut() else { return Ok(None); };
         let expected = match grant.phase {
             Phase::HeldPending(expected) => expected,
-            Phase::Open if self.retry == Some(read.binding) => {
-                self.retry = None;
+            Phase::Open if self.retry.read == Some(read.binding) => {
+                self.retry.read = None;
                 if let (Some(started), Some(completed), ReadOutcome::Observed(snapshot)) =
                     (read.started_qpc, read.completed_qpc, &read.outcome)
                     && read.binding.requested_qpc <= started && started <= completed
                     && completed <= now && now < read.binding.deadline_qpc
                     && grant.current(self.witness)? && grant.focus.is_some_and(|focus| focus_current(grant.binding, focus))
                 {
-                    return Ok(Some((grant.binding, completed, *snapshot)));
+                    return Ok(Some(Recovered { binding: grant.binding, completed, snapshot: *snapshot }));
                 }
                 return Ok(None);
             }
@@ -500,27 +514,24 @@ impl Host {
 
     pub(super) fn retry_held(&mut self, now: QpcTick) -> Result<()> {
         let Some(grant) = self.grant.as_ref().filter(|grant| matches!(grant.phase, Phase::Open)) else { return Ok(()); };
-        if self.retry.is_some_and(|read| read.deadline_qpc > now)
-            || self.retry_after.is_none_or(|after| after > now) || now < grant.lower
+        if self.retry.read.is_some_and(|read| read.deadline_qpc > now)
+            || self.retry.after.is_none_or(|after| after > now) || now < grant.lower
         {
             return Ok(());
         }
-        let request = next(self.request)?;
-        let binding = ReadBinding { visit: grant.binding, request: RequestId(request.get()), target: grant.binding.foreground,
-            requested_qpc: now, deadline_qpc: add_time(now, self.frequency, HELD_BUDGET)? };
-        if let Some(previous) = self.retry {
+        let binding = held_read(self.request, self.frequency, grant.binding, now)?;
+        if let Some(previous) = self.retry.read {
             self.peer.query(ContextCommand::Cancel { visit: previous.visit, request: previous.request })?;
         }
         self.peer.query(ContextCommand::Read { query: Query::Held(binding), secondary: None })?;
-        self.request = request.get();
-        self.retry = Some(binding);
-        self.retry_after = Some(add_time(now, self.frequency, HELD_RETRY)?);
+        self.request = binding.request.0;
+        self.retry.read = Some(binding);
+        self.retry.after = Some(add_time(now, self.frequency, HELD_RETRY)?);
         Ok(())
     }
 
     pub(super) fn optional_read(
-        &mut self, mut binding: ReadBinding, build: impl FnOnce(ReadBinding) -> Query,
-        secondary: Option<screen_fix_protocol::ipc::elevated::runtime::IdentityClaim>,
+        &mut self, mut binding: ReadBinding, build: impl FnOnce(ReadBinding) -> Query, secondary: Option<IdentityClaim>,
     ) -> Result<Option<ReadBinding>> {
         let recent = self.frequency.ticks(REJECT_RETENTION);
         self.optional_reads.retain(|read| {
@@ -528,35 +539,42 @@ impl Host {
             age <= 0 || recent.is_none_or(|recent| age <= recent)
         });
         if self.optional_reads.len() == OPTIONAL_READ_CAPACITY { return Ok(None); }
-        let request = next(self.request)?;
-        binding.request = RequestId(request.get());
+        binding.request = next_request(self.request)?;
         if !self.peer.try_query(ContextCommand::Read { query: build(binding), secondary })? {
             return Ok(None);
         }
-        self.request = request.get();
+        self.request = binding.request.0;
         self.optional_reads.push_back(binding);
         Ok(Some(binding))
     }
 
-    pub(super) fn recovered(&mut self) { self.retry_after = None; }
+    pub(super) fn recovered(&mut self) { self.retry.after = None; }
 
     fn request_held(&mut self, now: QpcTick) -> Result<()> {
         let grant = self.grant.as_mut().ok_or(Failure::Protocol)?;
         if now < grant.lower { return Err(Failure::Protocol); }
         if !grant.current(self.witness)? { return self.revoke(now); }
-        let request = next(self.request)?;
-        let binding = ReadBinding {
-            visit: grant.binding, request: RequestId(request.get()), target: grant.binding.foreground,
-            requested_qpc: now, deadline_qpc: add_time(now, self.frequency, HELD_BUDGET)?,
-        };
+        let binding = held_read(self.request, self.frequency, grant.binding, now)?;
         self.peer.query(ContextCommand::Read { query: Query::Held(binding), secondary: None })?;
-        self.request = request.get();
+        self.request = binding.request.0;
         grant.phase = Phase::HeldPending(binding);
         Ok(())
     }
 }
 
 impl Grant {
+    /// Close the grant with the coverage cutoff `before`, or lower the cutoff
+    /// of a closing grant. Closing starts the cleanup deadline.
+    fn close_before(&mut self, before: QpcTick) {
+        match &mut self.phase {
+            Phase::Closing { before: cutoff } => *cutoff = (*cutoff).min(before),
+            phase => {
+                *phase = Phase::Closing { before };
+                self.deadline = Instant::now() + CLEANUP;
+            }
+        }
+    }
+
     fn current(&self, witness: Option<Witness>) -> Result<bool> {
         if !self.witness_current(witness) { return Ok(false); }
         matches_target(&self.claim)
@@ -576,17 +594,30 @@ pub(super) fn matches_target(claim: &IdentityClaim) -> Result<bool> {
 }
 
 fn foreground_is(claim: &IdentityClaim) -> bool {
-    WindowProcess::foreground().map(screen_fix_protocol::ipc::elevated::WindowInstance::from) == Some(claim.target)
+    WindowProcess::foreground().map(WindowInstance::from) == Some(claim.target)
 }
 
 fn focus_current(binding: VisitBinding, focus: FocusAtReceipt) -> bool {
-    use screen_fix_protocol::ipc::elevated::WindowInstance;
     WindowProcess::foreground().filter(|window| WindowInstance::from(*window) == binding.foreground)
         .is_some_and(|window| elevated_focus_matches(window, focus))
 }
 
 fn next(previous: u64) -> Result<NonZeroU64> {
     previous.checked_add(1).and_then(NonZeroU64::new).ok_or(Failure::Protocol)
+}
+
+/// The request ID after `previous`.
+fn next_request(previous: u64) -> Result<RequestId> {
+    next(previous).map(|request| RequestId(request.get()))
+}
+
+/// A held read of the `visit` foreground requested at `now`, with the request
+/// ID after `previous`. The caller records the ID once the read was sent.
+fn held_read(previous: u64, frequency: QpcFrequency, visit: VisitBinding, now: QpcTick) -> Result<ReadBinding> {
+    Ok(ReadBinding {
+        visit, request: next_request(previous)?, target: visit.foreground,
+        requested_qpc: now, deadline_qpc: add_time(now, frequency, HELD_BUDGET)?,
+    })
 }
 
 /// `at` plus `duration`, at least one tick later.

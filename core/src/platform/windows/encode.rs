@@ -31,11 +31,32 @@ pub(super) enum Input {
     Memory(Arc<[u8]>),
 }
 
+/// One picture for the encoder: its input, timing in 100 ns and whether it
+/// must be an IDR.
+pub(super) struct Picture {
+    pub input: Input,
+    pub pts: i64,
+    pub duration: i64,
+    pub force_idr: bool,
+}
+
 pub(super) enum Next {
-    Frame { input: Input, pts: i64, duration: i64, force_idr: bool },
+    Frame(Picture),
     Wait,
     DrainPrefix,
     End,
+}
+
+/// The owner of one encoder stream: it supplies pictures and takes the
+/// encoded output, on the encoder's thread.
+pub(super) trait EncodeOwner {
+    /// Returns true after a system suspend: time asleep is not encoder time.
+    fn observe_admission(&mut self) -> Result<bool, ProbeError>;
+    fn next_frame(&mut self) -> Result<Next, ProbeError>;
+    /// The encoder completed the drain that `Next::DrainPrefix` requested.
+    fn prefix_drained(&mut self) -> Result<(), ProbeError>;
+    /// Take one encoded picture. Returns the submitted inputs it retires.
+    fn output(&mut self, transform: &IMFTransform, sample: &IMFSample) -> Result<usize, ProbeError>;
 }
 
 pub(super) fn codec_value(codec: &ICodecAPI, key: &GUID, value: u32, operation: &'static str) -> Result<(), ProbeError> {
@@ -68,15 +89,62 @@ pub(super) fn set_properties(encoder: &IMFTransform, fps: u32, cap: u32) -> Resu
     Ok(())
 }
 
-pub(super) fn record<S>(
+/// The progress of one encoder stream between its owner and the encoder.
+struct Stream {
+    /// The last encoder progress, for the progress timeout.
+    activity: Instant,
+    submitted: usize,
+    draining: bool,
+    /// The drain ends an approval prefix; the stream restarts after it.
+    prefix_drain: bool,
+    /// Input requests of an asynchronous encoder not yet served.
+    requested: u32,
+    /// Inputs submitted and not yet returned.
+    outstanding: usize,
+    /// The next picture, and since when it waits for the encoder.
+    pending: Option<(Picture, Instant)>,
+}
+
+impl Stream {
+    /// Restart the progress timeout, also for the waiting picture.
+    fn resume(&mut self) {
+        self.activity = Instant::now();
+        if let Some((_, since)) = &mut self.pending { *since = self.activity; }
+    }
+
+    /// Hand an encoded picture to the owner. Time in the owner's output step
+    /// (rotation, a wait for a verifier slot) is not encoder time.
+    fn retire(&mut self, owner: &mut impl EncodeOwner, encoder: &IMFTransform, sample: &IMFSample) -> Result<(), ProbeError> {
+        let retired = owner.output(encoder, sample)?;
+        self.outstanding = self.outstanding.checked_sub(retired)
+            .ok_or_else(|| unavailable("The H.264 encoder returned an unsolicited picture"))?;
+        self.resume();
+        Ok(())
+    }
+
+    /// The approval prefix drained: restart the stream for the next prefix.
+    fn restart_after_prefix(&mut self, owner: &mut impl EncodeOwner, encoder: &IMFTransform) -> Result<(), ProbeError> {
+        owner.prefix_drained()?;
+        message(encoder, MFT_MESSAGE_NOTIFY_START_OF_STREAM)?;
+        self.requested = 0;
+        self.outstanding = 0;
+        self.draining = false;
+        self.prefix_drain = false;
+        self.activity = Instant::now();
+        Ok(())
+    }
+
+    fn drain(&mut self, encoder: &IMFTransform) -> Result<(), ProbeError> {
+        self.draining = true;
+        self.activity = Instant::now();
+        message(encoder, MFT_MESSAGE_COMMAND_DRAIN)
+    }
+}
+
+pub(super) fn record(
     encoder: &IMFTransform,
     device: Option<&ID3D11Device>,
-    state: &mut S,
-    // Returns true after a system suspend: time asleep is not encoder time.
-    mut observe_admission: impl FnMut(&mut S) -> Result<bool, ProbeError>,
-    mut next_frame: impl FnMut(&mut S) -> Result<Next, ProbeError>,
-    mut prefix_drained: impl FnMut(&mut S) -> Result<(), ProbeError>,
-    mut output: impl FnMut(&mut S, &IMFTransform, &IMFSample) -> Result<usize, ProbeError>,
+    owner: &mut impl EncodeOwner,
 ) -> Result<usize, ProbeError> {
     let asynchronous = unsafe { encoder.GetAttributes() }.ok()
         .and_then(|attributes| unsafe { attributes.GetUINT32(&MF_TRANSFORM_ASYNC) }.ok())
@@ -99,22 +167,18 @@ pub(super) fn record<S>(
     message(encoder, MFT_MESSAGE_NOTIFY_START_OF_STREAM)?;
 
     let result = (|| {
-        let mut activity = Instant::now();
-        let mut submitted = 0;
-        let mut draining = false;
-        let mut prefix_drain = false;
-        let mut requested = 0_u32;
-        let mut outstanding = 0_usize;
+        let mut stream = Stream {
+            activity: Instant::now(), submitted: 0, draining: false, prefix_drain: false, requested: 0, outstanding: 0,
+            pending: None,
+        };
         let mut imports = Vec::new();
         let active = Arc::new(AtomicUsize::new(0));
-        let mut pending: Option<(Input, i64, i64, bool, Instant)> = None;
         loop {
-            if observe_admission(state)? {
-                activity = Instant::now();
-                if let Some(pending) = &mut pending { pending.4 = activity; }
+            if owner.observe_admission()? {
+                stream.resume();
             }
-            if ((draining || outstanding != 0) && activity.elapsed() >= PROGRESS_TIMEOUT)
-                || pending.as_ref().is_some_and(|pending| pending.4.elapsed() >= PROGRESS_TIMEOUT)
+            if ((stream.draining || stream.outstanding != 0) && stream.activity.elapsed() >= PROGRESS_TIMEOUT)
+                || stream.pending.as_ref().is_some_and(|(_, since)| since.elapsed() >= PROGRESS_TIMEOUT)
             {
                 return Err(unavailable(PROGRESS_TIMEOUT_MESSAGE));
             }
@@ -126,33 +190,21 @@ pub(super) fn record<S>(
                         let status = stage(unsafe { event.GetStatus() }, "Read the encoder event status")?;
                         stage(status.ok(), "H.264 encoder processing failed")?;
                         let kind = stage(unsafe { event.GetType() }, "Read the encoder event type")?;
-                        if kind == METransformNeedInput.0 as u32 && !draining {
-                            requested = requested.checked_add(1)
+                        if kind == METransformNeedInput.0 as u32 && !stream.draining {
+                            stream.requested = stream.requested.checked_add(1)
                                 .filter(|value| *value <= MAX_INPUT_REQUESTS)
                                 .ok_or_else(|| unavailable("The encoder issued too many outstanding input requests"))?;
                         } else if kind == METransformHaveOutput.0 as u32 {
                             if let Output::Sample(sample) = read_output(encoder, &mut output_buffer)? {
-                                let retired = output(state, encoder, &sample)?;
-                                outstanding = outstanding.checked_sub(retired)
-                                    .ok_or_else(|| unavailable("The H.264 encoder returned an unsolicited picture"))?;
-                                activity = Instant::now();
-                                // Time in the owner's output step (rotation, a
-                                // wait for a verifier slot) is not encoder time.
-                                if let Some(pending) = &mut pending { pending.4 = activity; }
+                                stream.retire(owner, encoder, &sample)?;
                             }
                             // Work in output order before taking another input request.
                             continue;
-                        } else if kind == METransformDrainComplete.0 as u32 && draining {
-                            if !prefix_drain {
+                        } else if kind == METransformDrainComplete.0 as u32 && stream.draining {
+                            if !stream.prefix_drain {
                                 break;
                             }
-                            prefix_drained(state)?;
-                            message(encoder, MFT_MESSAGE_NOTIFY_START_OF_STREAM)?;
-                            requested = 0;
-                            outstanding = 0;
-                            draining = false;
-                            prefix_drain = false;
-                            activity = Instant::now();
+                            stream.restart_after_prefix(owner, encoder)?;
                             continue;
                         }
                     }
@@ -160,26 +212,18 @@ pub(super) fn record<S>(
             } else {
                 match read_output(encoder, &mut output_buffer)? {
                     Output::Sample(sample) => {
-                        let retired = output(state, encoder, &sample)?;
-                        outstanding = outstanding.checked_sub(retired)
-                            .ok_or_else(|| unavailable("The H.264 encoder returned an unsolicited picture"))?;
-                        activity = Instant::now();
-                        if let Some(pending) = &mut pending { pending.4 = activity; }
+                        stream.retire(owner, encoder, &sample)?;
                         continue;
                     }
-                    Output::NeedInput if draining => {
-                        if !prefix_drain {
+                    Output::NeedInput if stream.draining => {
+                        if !stream.prefix_drain {
                             break;
                         }
-                        prefix_drained(state)?;
-                        message(encoder, MFT_MESSAGE_NOTIFY_START_OF_STREAM)?;
-                        outstanding = 0;
-                        draining = false;
-                        prefix_drain = false;
-                        activity = Instant::now();
+                        // A synchronous encoder issues no input requests.
+                        stream.restart_after_prefix(owner, encoder)?;
                         continue;
                     }
-                    Output::Empty if outstanding != 0 => {
+                    Output::Empty if stream.outstanding != 0 => {
                         // The encoder holds pictures but has none ready: wait
                         // for it instead of polling it in a tight loop.
                         thread::sleep(POLL);
@@ -188,49 +232,43 @@ pub(super) fn record<S>(
                     Output::Empty | Output::NeedInput => {}
                 }
             }
-            if !draining && pending.is_none() {
-                match next_frame(state)? {
-                    Next::Frame { input, pts, duration, force_idr } => {
-                        pending = Some((input, pts, duration, force_idr, Instant::now()));
-                    }
+            if !stream.draining && stream.pending.is_none() {
+                match owner.next_frame()? {
+                    Next::Frame(picture) => stream.pending = Some((picture, Instant::now())),
                     Next::Wait => {}
                     Next::DrainPrefix => {
-                        prefix_drain = true;
-                        draining = true;
-                        activity = Instant::now();
-                        message(encoder, MFT_MESSAGE_COMMAND_DRAIN)?;
+                        stream.prefix_drain = true;
+                        stream.drain(encoder)?;
                         continue;
                     }
                     Next::End => {
                         message(encoder, MFT_MESSAGE_NOTIFY_END_OF_STREAM)?;
-                        if submitted == 0 {
+                        if stream.submitted == 0 {
                             break;
                         }
-                        draining = true;
-                        activity = Instant::now();
-                        message(encoder, MFT_MESSAGE_COMMAND_DRAIN)?;
+                        stream.drain(encoder)?;
                         continue;
                     }
                 }
             }
-            if !draining && (events.is_none() || requested > 0) && outstanding < MAX_INPUTS
+            if !stream.draining && (events.is_none() || stream.requested > 0) && stream.outstanding < MAX_INPUTS
                 && active.load(Ordering::Acquire) < MAX_INPUTS
-                && let Some((input, pts, duration, force_idr, _)) = pending.take()
+                && let Some((Picture { input, pts, duration, force_idr }, _)) = stream.pending.take()
             {
                 let sample = input_sample(input, pts, duration, device, &mut imports, &active)?;
                 if force_idr {
                     codec_value(&codec, &CODECAPI_AVEncVideoForceKeyFrame, 1, "Request a boundary IDR")?;
                 }
                 stage(unsafe { encoder.ProcessInput(0, &sample, 0) }, "Submit an NV12 frame to the encoder")?;
-                submitted += 1;
-                outstanding += 1;
-                requested = requested.saturating_sub(1);
-                activity = Instant::now();
+                stream.submitted += 1;
+                stream.outstanding += 1;
+                stream.requested = stream.requested.saturating_sub(1);
+                stream.activity = Instant::now();
                 continue;
             }
             thread::sleep(POLL);
         }
-        Ok(submitted)
+        Ok(stream.submitted)
     })();
     if result.is_err() {
         let _ = message(encoder, MFT_MESSAGE_COMMAND_FLUSH);

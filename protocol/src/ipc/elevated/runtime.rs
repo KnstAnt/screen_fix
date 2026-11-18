@@ -238,12 +238,21 @@ pub enum Observation {
     Progress { visit: VisitBinding, before_qpc: QpcTick, witness_qpc: QpcTick },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A received record with its scope.
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Scoped<T> {
     attempt: AttemptId,
     session: SessionId,
     record: T,
+}
+
+/// A record to send with its scope, borrowed. It serializes like `Scoped`.
+#[derive(Serialize)]
+struct ScopedRef<'a, T> {
+    attempt: &'a AttemptId,
+    session: &'a SessionId,
+    record: &'a T,
 }
 
 mod sealed {
@@ -495,7 +504,7 @@ pub fn encode<T: Record>(
     if !record.valid() { return Err(PacketError::InvalidPayload); }
     let end = output.len().min(capacity::<T>());
     let mut payload = output.get_mut(HEADER_BYTES..end).ok_or(PacketError::OutputTooSmall)?;
-    let scoped = Scoped { attempt: scope.attempt.clone(), session: scope.session.clone(), record };
+    let scoped = ScopedRef { attempt: &scope.attempt, session: &scope.session, record };
     // These are bounded IPC schemas, separate from the Recorder's journal format.
     serde_json::to_writer(&mut payload, &scoped).map_err(|error| {
         if error.io_error_kind() == Some(std::io::ErrorKind::WriteZero) {

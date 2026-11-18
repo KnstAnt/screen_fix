@@ -74,6 +74,13 @@ impl Ingress {
         notify(self.visit, before);
     }
 
+    /// The staging loss, started or lowered to a record from `first`.
+    fn pressure_at(&mut self, first: QpcTick) -> &mut InputStagingLoss {
+        let loss = self.pressure.get_or_insert(InputStagingLoss { visit: self.visit, before: first, gaps: [None; PRODUCERS], malformed: 0 });
+        loss.before = loss.before.min(first);
+        loss
+    }
+
     pub(super) fn input(
         &mut self, mut item: GrantedInput, now: QpcTick, restrict: impl Fn(VisitBinding, QpcTick),
     ) -> Result<()> {
@@ -126,8 +133,7 @@ impl Ingress {
         }
         if self.pending.len() == CAPACITY || self.pressure.is_some() {
             self.restrict(first, &restrict);
-            let loss = self.pressure.get_or_insert(InputStagingLoss { visit: self.visit, before: first, gaps: [None; PRODUCERS], malformed: 0 });
-            loss.before = loss.before.min(first);
+            let loss = self.pressure_at(first);
             if let Some(gap) = range {
                 merge_gap(&mut loss.gaps[gap.producer.index()], gap);
             }
@@ -145,8 +151,7 @@ impl Ingress {
         let least = self.sources.iter().map(|bound| bound.unwrap_or(self.sample)).min().unwrap_or(self.sample);
         let first = least.max(self.delivered_before);
         self.restrict(first, &restrict);
-        let loss = self.pressure.get_or_insert(InputStagingLoss { visit: self.visit, before: first, gaps: [None; PRODUCERS], malformed: 0 });
-        loss.before = loss.before.min(first);
+        let loss = self.pressure_at(first);
         loss.malformed = loss.malformed.saturating_add(1);
     }
 

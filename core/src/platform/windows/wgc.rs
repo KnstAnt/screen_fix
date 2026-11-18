@@ -46,10 +46,19 @@ pub(super) fn start_monitor(
     item: GraphicsCaptureItem, device: &ID3D11Device, size: SizeInt32,
     hdr: bool, white_known: bool, borderless: bool,
 ) -> Result<(Capture, CaptureColor, Option<i32>), ProbeError> {
+    with_color_fallback(hdr, white_known, |format| Capture::start(item.clone(), device, size, format, borderless))
+}
+
+/// The VID-8 color rule: FP16 for an HDR monitor with a known SDR white
+/// level, else BGRA8. A rejected FP16 format falls back to BGRA8 and
+/// returns the rejection code with the result and its color.
+fn with_color_fallback<T>(
+    hdr: bool, white_known: bool, mut attempt: impl FnMut(DirectXPixelFormat) -> Result<T, ProbeError>,
+) -> Result<(T, CaptureColor, Option<i32>), ProbeError> {
     let mut fallback = None;
     if hdr && white_known {
-        match Capture::start(item.clone(), device, size, DirectXPixelFormat::R16G16B16A16Float, borderless) {
-            Ok(capture) => return Ok((capture, CaptureColor::HdrToneMappedToSdr, None)),
+        match attempt(DirectXPixelFormat::R16G16B16A16Float) {
+            Ok(value) => return Ok((value, CaptureColor::HdrToneMappedToSdr, None)),
             Err(error) => {
                 if let Some(code) = format_rejection(&error) {
                     fallback = Some(code);
@@ -59,9 +68,9 @@ pub(super) fn start_monitor(
             }
         }
     }
-    let capture = Capture::start(item, device, size, DirectXPixelFormat::B8G8R8A8UIntNormalized, borderless)?;
+    let value = attempt(DirectXPixelFormat::B8G8R8A8UIntNormalized)?;
     let color = if hdr { CaptureColor::HdrSystemBgra8 } else { CaptureColor::Sdr };
-    Ok((capture, color, fallback))
+    Ok((value, color, fallback))
 }
 
 /// A pool or session setup call, whose rejection may be format evidence.
@@ -155,21 +164,7 @@ impl Capture {
     }
 
     pub fn reconfigure(&mut self, size: SizeInt32, hdr: bool, white_known: bool) -> Result<(CaptureColor, Option<i32>), ProbeError> {
-        let mut fallback = None;
-        if hdr && white_known {
-            match self.recreate(size, DirectXPixelFormat::R16G16B16A16Float) {
-                Ok(()) => return Ok((CaptureColor::HdrToneMappedToSdr, None)),
-                Err(error) => {
-                    if let Some(code) = format_rejection(&error) {
-                        fallback = Some(code);
-                    } else {
-                        return Err(error);
-                    }
-                }
-            }
-        }
-        self.recreate(size, DirectXPixelFormat::B8G8R8A8UIntNormalized)?;
-        let color = if hdr { CaptureColor::HdrSystemBgra8 } else { CaptureColor::Sdr };
+        let ((), color, fallback) = with_color_fallback(hdr, white_known, |format| self.recreate(size, format))?;
         Ok((color, fallback))
     }
 

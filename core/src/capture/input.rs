@@ -29,9 +29,11 @@ pub(crate) use held::{
     HeldBoundary, HeldIdentity, HeldInput, Holding, HeldSynchronization, PhysicalHeld, PublishedHeld, SyntheticHeldEdge,
     button_bit, buttons_in, modifier_bit, modifiers_in,
 };
-pub(crate) use matching::{injected_hook, promoted as has_promotion};
+pub(crate) use matching::injected_hook;
 pub(crate) use matching::{CorrelatedInput, Correlation, Discarded, PenPromotion, InputGap, InputMatcher, InputStep, ProvisionalInputChange};
-pub(crate) use normalize::{Action, Button, Key, Modifier, Motion, ScanCode, ScanPrefix, VK_PACKET, WheelAxis, startup_modifier};
+pub(crate) use normalize::{
+    Action, Button, Key, Modifier, Motion, ScanCode, ScanPrefix, VK_PACKET, WheelAxis, promoted as has_promotion, startup_modifier,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingInput {

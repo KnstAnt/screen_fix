@@ -51,14 +51,17 @@ pub(super) struct Encoder {
 /// owner converts it on its device, so the selecting video thread never uses
 /// that device's immediate context (VID-12).
 pub(super) struct Probe {
-    pub format: gpu::VideoFormat,
-    pub software: bool,
+    pub encoding: gpu::Encoding,
     pub reply: SyncSender<Result<encode::Input, ProbeError>>,
 }
 
 impl Encoder {
     pub(super) fn software(&self) -> bool {
         self.activation.is_none()
+    }
+
+    pub(super) fn encoding(&self) -> gpu::Encoding {
+        gpu::Encoding { format: self.format, software: self.software() }
     }
 
     pub(super) fn finish(mut self) -> Result<(), ProbeError> {
@@ -97,7 +100,7 @@ pub(super) fn min_effective_fps(requested_fps: u32) -> u32 {
 /// self-check ends the selection at once.
 pub(super) fn select(
     adapter: &IDXGIAdapter1, luid: LUID, source: [u32; 2], requested_fps: u32,
-    probe: &mut dyn FnMut(gpu::VideoFormat, bool) -> Result<encode::Input, ProbeError>,
+    probe: &mut dyn FnMut(gpu::Encoding) -> Result<encode::Input, ProbeError>,
 ) -> Result<Encoder, SelectError> {
     let filter = discovery_filter(luid).map_err(|last| SelectError { last, rejected: Vec::new() })?;
     let mut rejected = Vec::new();
@@ -165,7 +168,7 @@ fn friendly_name(candidate: &IMFActivate) -> Option<String> {
 
 fn qualify(
     source: [u32; 2], fps: u32, hardware: Option<(&IMFActivate, &ID3D11Device)>,
-    probe: &mut dyn FnMut(gpu::VideoFormat, bool) -> Result<encode::Input, ProbeError>,
+    probe: &mut dyn FnMut(gpu::Encoding) -> Result<encode::Input, ProbeError>,
 ) -> Result<Encoder, ProbeError> {
     let native_limit = (source[0].max(source[1]).min(4096) + 1) & !1;
     let mut low = 2;
@@ -177,7 +180,7 @@ fn qualify(
         let format = gpu::VideoFormat::fit(source, candidate, fps)?;
         match configure(hardware, format) {
             Ok(encoder) => {
-                let check = probe(format, encoder.software()).and_then(|input| self_check(&encoder, input));
+                let check = probe(encoder.encoding()).and_then(|input| self_check(&encoder, input));
                 match check {
                     Ok(()) if candidate == native_limit => return Ok(encoder),
                     Ok(()) => {
@@ -204,7 +207,7 @@ fn qualify(
     }
     let format = best.ok_or(last_error)?;
     let encoder = configure(hardware, format)?;
-    self_check(&encoder, probe(format, encoder.software())?)?;
+    self_check(&encoder, probe(encoder.encoding())?)?;
     Ok(encoder)
 }
 
@@ -248,9 +251,9 @@ fn configure(
 
 /// Convert one self-check picture of `format` on the capture device. Only the
 /// owner of that device's immediate context calls this.
-pub(super) fn probe_input(device: &ID3D11Device, format: gpu::VideoFormat, software: bool) -> Result<encode::Input, ProbeError> {
-    let [width, height] = format.source;
-    let mut converter = gpu::Converter::new(device, format, software)?;
+pub(super) fn probe_input(device: &ID3D11Device, encoding: gpu::Encoding) -> Result<encode::Input, ProbeError> {
+    let [width, height] = encoding.format.source;
+    let mut converter = gpu::Converter::new(device, encoding)?;
     let source = pixels::texture(device, width, height, DXGI_FORMAT_B8G8R8A8_UNORM,
         D3D11_BIND_RENDER_TARGET.0 as u32, false)?;
     let mut target: Option<ID3D11RenderTargetView> = None;
@@ -273,35 +276,53 @@ pub(super) fn probe_input(device: &ID3D11Device, format: gpu::VideoFormat, softw
     Ok(input)
 }
 
-fn self_check(encoder: &Encoder, input: encode::Input) -> Result<(), ProbeError> {
-    let format = encoder.format;
+/// The startup self-check: `SELF_CHECK_PICTURES` copies of one picture,
+/// paced at the format's rate, with an IDR forced halfway.
+struct Check {
+    format: gpu::VideoFormat,
+    input: encode::Input,
+    pace_origin: Instant,
+    sent: u32,
+    received: u32,
+    headers: h264::Headers,
+}
 
-    struct Check {
-        sent: u32,
-        received: u32,
-        headers: h264::Headers,
+impl Check {
+    fn ticks(&self, index: u32) -> i64 {
+        i64::from(index) * 10_000_000 / i64::from(self.format.fps)
     }
-    let mut probe = Check { sent: 0, received: 0, headers: h264::Headers::default() };
-    let ticks = |index: u32| i64::from(index) * 10_000_000 / i64::from(format.fps);
-    let pace_origin = Instant::now();
-    let submitted = encode::record(&encoder.transform, encoder.device.as_ref(), &mut probe, |_| Ok(false), |probe| {
-        if probe.sent == SELF_CHECK_PICTURES {
+}
+
+impl encode::EncodeOwner for Check {
+    fn observe_admission(&mut self) -> Result<bool, ProbeError> {
+        Ok(false)
+    }
+
+    fn next_frame(&mut self) -> Result<encode::Next, ProbeError> {
+        if self.sent == SELF_CHECK_PICTURES {
             return Ok(encode::Next::End);
         }
-        let index = probe.sent;
-        let pts = ticks(index);
-        if pace_origin.elapsed() < Duration::from_nanos(pts as u64 * 100) {
+        let index = self.sent;
+        let pts = self.ticks(index);
+        if self.pace_origin.elapsed() < Duration::from_nanos(pts as u64 * 100) {
             return Ok(encode::Next::Wait);
         }
-        probe.sent += 1;
-        Ok(encode::Next::Frame { input: input.clone(), pts,
-            duration: ticks(index + 1) - pts, force_idr: index == SELF_CHECK_PICTURES / 2 })
-    }, |_| Ok(()), |probe, transform, sample| {
-        let index = probe.received;
-        if index >= SELF_CHECK_PICTURES || stage(unsafe { sample.GetSampleTime() }, "Read the startup H.264 PTS")? != ticks(index) {
+        self.sent += 1;
+        Ok(encode::Next::Frame(encode::Picture { input: self.input.clone(), pts,
+            duration: self.ticks(index + 1) - pts, force_idr: index == SELF_CHECK_PICTURES / 2 }))
+    }
+
+    fn prefix_drained(&mut self) -> Result<(), ProbeError> {
+        Ok(())
+    }
+
+    fn output(&mut self, transform: &IMFTransform, sample: &IMFSample) -> Result<usize, ProbeError> {
+        let index = self.received;
+        if index >= SELF_CHECK_PICTURES || stage(unsafe { sample.GetSampleTime() }, "Read the startup H.264 PTS")? != self.ticks(index) {
             return Err(unavailable("The startup encoder probe did not preserve the submitted picture order"));
         }
         if index == 0 {
+            let format = self.format;
             let media_type = stage(unsafe { transform.GetOutputCurrentType(0) }, "Read the startup H.264 media type")?;
             let video_size = stage(unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE) }, "Read the qualified H.264 dimensions")?;
             let rate = stage(unsafe { media_type.GetUINT64(&MF_MT_FRAME_RATE) }, "Read the qualified H.264 frame rate")?;
@@ -309,18 +330,25 @@ fn self_check(encoder: &Encoder, input: encode::Input) -> Result<(), ProbeError>
             {
                 return Err(unavailable("The H.264 probe returned a different size or frame rate"));
             }
-            probe.headers.read_media_type(&media_type)?;
+            self.headers.read_media_type(&media_type)?;
         }
-        let picture = probe.headers.inspect(sample)?;
+        let picture = self.headers.inspect(sample)?;
         if picture.b_slice {
             return Err(unavailable(B_FRAME_FOUND).with_kind(ProbeKind::BFrameFound));
         }
         if index == 0 || index == SELF_CHECK_PICTURES / 2 {
-            probe.headers.segment_header(&picture)?;
+            self.headers.segment_header(&picture)?;
         }
-        probe.received += 1;
+        self.received += 1;
         Ok(1)
-    })?;
+    }
+}
+
+fn self_check(encoder: &Encoder, input: encode::Input) -> Result<(), ProbeError> {
+    let mut probe = Check {
+        format: encoder.format, input, pace_origin: Instant::now(), sent: 0, received: 0, headers: h264::Headers::default(),
+    };
+    let submitted = encode::record(&encoder.transform, encoder.device.as_ref(), &mut probe)?;
     if submitted != SELF_CHECK_PICTURES as usize || probe.received != SELF_CHECK_PICTURES {
         return Err(unavailable("The startup encoder probe did not encode all 30 submitted pictures"));
     }

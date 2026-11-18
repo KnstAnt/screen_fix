@@ -171,7 +171,18 @@ impl Pipe {
         Ok(())
     }
 
-    pub(crate) fn is_server(&self) -> bool { self.server }
+    /// Read one frame into `buffer` and return its length. The server reads
+    /// one message; the client reads `header` bytes, then the payload whose
+    /// length `payload` derives from that header.
+    pub(crate) fn read_frame(
+        &self, buffer: &mut [u8], header: usize, payload: impl FnOnce(&[u8]) -> Result<usize>, deadline: Deadline<'_>,
+    ) -> Result<usize> {
+        if self.server { return self.read_message(buffer, deadline); }
+        self.read_exact(&mut buffer[..header], deadline)?;
+        let end = header + payload(&buffer[..header])?;
+        self.read_exact(&mut buffer[header..end], deadline)?;
+        Ok(end)
+    }
 
     /// Run one operation of `size` bytes: a write sends `data`, a read
     /// copies what it received into `received` when that fits.
@@ -247,7 +258,7 @@ impl Pipe {
         // Scoped runtime writes advance the lane on a successful transfer,
         // including when that visit closed between submission and completion.
         // The evidence owner separately decides whether it can certify it.
-        if kind != Operation::Write || deadline.grant.is_none() {
+        if kind != Operation::Write || !deadline.has_scope() {
             deadline.check()?;
         }
         Ok(Outcome { transferred, closed: false })

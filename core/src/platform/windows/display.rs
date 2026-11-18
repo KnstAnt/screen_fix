@@ -26,6 +26,25 @@ use crate::{
 
 use super::{ProbeError, stage, unavailable};
 
+/// A display adapter, by its LUID.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct AdapterId {
+    low: u32,
+    high: i32,
+}
+
+impl From<LUID> for AdapterId {
+    fn from(luid: LUID) -> Self {
+        Self { low: luid.LowPart, high: luid.HighPart }
+    }
+}
+
+impl From<AdapterId> for LUID {
+    fn from(id: AdapterId) -> Self {
+        Self { LowPart: id.low, HighPart: id.high }
+    }
+}
+
 pub(super) struct Monitor {
     pub key: DisplayKey,
     pub name: String,
@@ -139,6 +158,13 @@ pub(super) fn resolve(key: &DisplayKey) -> Result<Monitor, ProbeError> {
     }
     survey.monitors.into_iter().find(|monitor| &monitor.key == key)
         .ok_or_else(|| unavailable("The selected physical display is no longer available"))
+}
+
+/// The selected monitor, if it still has the properties of `expected`. A
+/// failed read proves nothing about the monitor and yields none.
+pub(super) fn resolve_matching(key: &DisplayKey, expected: &topology::Output) -> Option<Monitor> {
+    resolve(key).ok()
+        .filter(|actual| topology::Output::from_native(actual).is_ok_and(|actual| actual == *expected))
 }
 
 /// Every active monitor. Any unreadable output fails the whole list, which

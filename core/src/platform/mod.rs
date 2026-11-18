@@ -63,11 +63,9 @@ pub fn start_recording_with_hotkeys(
     hotkeys: &RecorderHotkeys,
     trigger: Option<crate::session::hotkey::HotkeyActivation>,
 ) -> Result<SessionHandle, CaptureError> {
-    use crate::{config::EffectiveCapabilities, platform::windows::controller};
+    use crate::platform::windows::controller;
 
-    if !config.calibrations().is_empty()
-        || config.capabilities() != EffectiveCapabilities::awaiting_probe()
-    {
+    if !config.calibrations().is_empty() {
         return Err(CaptureError::unsupported_configuration(
             "The selected capture configuration requires the M1 recording backend."
         ));
