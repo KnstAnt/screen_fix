@@ -22,7 +22,7 @@ use crate::{
     package::{diagnostics::{Failure, FailureComponent}, metadata::{CaptureCounters, MonitorCapture}, outcome::HealthKind},
     protocol::{AdmissionEpoch, CaptureEpoch, FrameId, FrameSequence, GeometryEpoch, GeometryId, MonitorId, QpcTick, SessionTimeUs},
     config::SelectedMonitor,
-    platform::windows::controller::{Admission, PauseProducer, Receipt, SuspendWatch, WorkerSession},
+    platform::windows::controller::{Admission, Budget, PauseProducer, Receipt, SuspendWatch, WorkerSession},
     session::{AdmissionBoundary, fault::FaultReport},
     util::widen,
 };
@@ -149,6 +149,10 @@ enum Reject {
 struct AdmissionLog {
     detailed: u32,
     counts: [u64; 6],
+    /// Frames refused by approval: the first of each run in full, then the
+    /// per-second count.
+    approval_run: bool,
+    approval: u64,
     window_start: Option<Instant>,
     accepted: bool,
 }
@@ -166,12 +170,33 @@ impl AdmissionLog {
             self.detailed += 1;
             devlog!("monitor", "frame rejected #{} {reason:?}: {}", self.detailed, detail());
         }
+        self.tick();
+    }
+
+    /// Emit the summary once per `WINDOW`.
+    fn tick(&mut self) {
         let now = Instant::now();
         let start = *self.window_start.get_or_insert(now);
         if now.duration_since(start) >= Self::WINDOW {
             self.summarize();
             self.window_start = Some(now);
         }
+    }
+
+    fn reject_approval(&mut self, detail: impl FnOnce() -> String) {
+        if !crate::devlog::ENABLED {
+            return;
+        }
+        self.approval += 1;
+        if !std::mem::replace(&mut self.approval_run, true) {
+            devlog!("monitor", "frames rejected by approval from: {}", detail());
+        }
+        self.tick();
+    }
+
+    /// An approved frame ends a run of approval rejections.
+    fn approved(&mut self) {
+        self.approval_run = false;
     }
 
     fn accept(&mut self, detail: impl FnOnce() -> String) {
@@ -181,6 +206,10 @@ impl AdmissionLog {
     }
 
     fn summarize(&mut self) {
+        let approval = std::mem::take(&mut self.approval);
+        if approval != 0 {
+            devlog!("monitor", "frames rejected by approval since last summary: {approval}");
+        }
         if self.counts.iter().any(|&count| count != 0) {
             let [closed, boundary, negative, geometry, monotonic, after] = std::mem::take(&mut self.counts);
             devlog!("monitor", "frames rejected since last summary: AdmissionClosed={closed} BeforeBoundary={boundary} \
@@ -456,12 +485,13 @@ impl CaptureOwner<'_> {
                 borrowed.close()?;
                 continue;
             };
-            let Some(approval) = self.await_approval(&frame)? else {
+            let Some(approval) = self.await_approval(&frame, &mut intake.log)? else {
                 self.counters.rejected_approval = self.counters.rejected_approval.saturating_add(1);
                 borrowed.close()?;
                 intake.scheduled = now + intake.interval;
                 continue;
             };
+            intake.log.approved();
             self.take_frame(borrowed, frame, approval, timeline, size, now, &mut intake)?;
         }
     }
@@ -789,7 +819,7 @@ impl CaptureOwner<'_> {
     }
 
     /// The approval of an admitted frame's content, or none.
-    fn await_approval(&self, frame: &Admitted) -> Result<Option<FrameApproval>, ProbeError> {
+    fn await_approval(&self, frame: &Admitted, log: &mut AdmissionLog) -> Result<Option<FrameApproval>, ProbeError> {
         let clock = frame.receipt.clock;
         // The content was composed no later than the dequeue or the present
         // time, so the approval must cover that point. It usually leads the
@@ -811,8 +841,7 @@ impl CaptureOwner<'_> {
             approval_at = clock.time(super::clock::qpc()?)?;
         };
         if approval.is_none() {
-            devlog!("monitor", "frame rejected by approval: content_time_us={} approval_at_us={}",
-                content_time.0, approval_at.0);
+            log.reject_approval(|| format!("content_time_us={} approval_at_us={}", content_time.0, approval_at.0));
         }
         Ok(approval)
     }
@@ -889,10 +918,10 @@ fn finish_stills(
 ) -> Result<(), ProbeError> {
     observations.finish_boundary(prefix, cutoff, images, mode, stopping, capture_available);
     let deadline = Instant::now() + STILL_DRAIN_WAIT;
+    let budget = if stopping { Budget::Stop } else { Budget::Segment };
     loop {
         let now = Instant::now();
-        let budget = if stopping { worker.stop_deadline() } else { worker.segment_deadline() };
-        let expired = now >= budget.map_or(deadline, |global| global.min(deadline));
+        let expired = now >= worker.bounded(deadline, budget);
         let certified = worker.input_prefix_closed(prefix);
         observations.finish_private_prefix(prefix, images, worker.config(), certified || expired);
         if certified && observations.drained() { break; }
@@ -903,7 +932,13 @@ fn finish_stills(
         }
         readbacks.poll(images, now)?;
         observations.work(device, images, readbacks, png, cutoff.time, now)?;
-        thread::park_timeout(BUSY_POLL);
+        // Readbacks and encodes are polled every BUSY_POLL; the certificate
+        // also ends the wait as soon as the input prefix closes.
+        if certified {
+            thread::park_timeout(BUSY_POLL);
+        } else {
+            worker.wait_input_prefix(prefix, deadline, budget, BUSY_POLL);
+        }
     }
     if !stopping && worker.pause_pending(cutoff) {
         observations.advance_boundary(cutoff.time);

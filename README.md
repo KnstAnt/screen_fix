@@ -20,7 +20,15 @@ Build the two ordinary Windows executables together:
 cargo build --release -p screen-fix -p screen-fix-input-helper
 ```
 
-Keep `screen-fix-input-helper.exe` beside `screen-fix.exe` and run the desktop normally. The Recorder and standard helper run asInvoker with UIAccess disabled. They use the launch token, which can already be high when the built-in Windows Administrator starts the Recorder normally. The workspace sets the desktop as its default member. Development and portable builds support ordinary recording. A foreground eligible for the standard source under that token can be recorded directly. An approved foreground that requires the separate collector returns deployment-required status. The source ZIP carries the Rust code and release authoring. Windows executables, signatures and an MSI are absent. `Cargo.lock` is tracked, so builds use the locked dependency resolution. The recording backend is Windows-only.
+Keep `screen-fix-input-helper.exe` beside `screen-fix.exe` and run the desktop normally. The Recorder and standard helper run asInvoker with UIAccess disabled. They use the launch token, which can already be high when the built-in Windows Administrator starts the Recorder normally. The workspace sets the desktop as its default member. Development and portable builds support ordinary recording. A foreground eligible for the standard source under that token can be recorded directly. An approved foreground that requires the separate collector returns deployment-required status. The source ZIP carries the Rust code and release authoring. Windows executables, signatures and an MSI are absent. `Cargo.lock` is tracked, so builds use the locked dependency resolution. The workspace is Windows-only: every crate except the platform-independent `screen-fix-protocol` stops a build for another target with `compile_error!`.
+
+The desktop crate enables the `dev-log` feature by default for manual testing. It writes a development `dev.log` (timing, counters, reasons, error messages and window class names; no titles, text, keys or paths) into each attempt directory. Build without it for anything you distribute:
+
+```powershell
+cargo build --release --no-default-features -p screen-fix -p screen-fix-input-helper
+```
+
+Official release builds use `--no-default-features --features elevated-release` for each signed image; `elevated-release` together with `dev-log` is a compile error, as described in the [Windows deployment instructions](deploy/windows/README.md).
 
 ### Official protected installation
 
@@ -41,7 +49,7 @@ A click-through, non-activating native indicator shows recording status on the f
 
 For developer verification of save-linked stills (M1-08), build the desktop with `cargo build -p screen-fix --features fixture-save`. While recording, the main window then shows **Confirm fixture save** and **Confirm final fixture save**. Each calls the trusted in-process `SessionHandle::confirm_fixture_save` seam for the approved executable, routed by the approved window geometry, and shows the returned save ID or error. The feature is off by default, and builds without it contain no save producer.
 
-Core tests use `cargo test -p screen-fix-core`. The package flag is required because the workspace default member is the desktop crate. The current source tree contains no test modules or fixture packages yet.
+Core tests use `cargo test -p screen-fix-core`. The package flag is required because the workspace default member is the desktop crate. The tests are a minimal set: golden byte tests of journal rows, `validate_gates` on a synthetic attempt and `FramePolicy` unit tests. There are no fixture packages.
 
 To exit during startup or recording, close the main window to request Stop. Complete or cancelled attempts can close automatically. Review an incomplete result, then choose **Acknowledge and exit** if closing or **Acknowledge incomplete recording** to allow a new attempt. An indicator failure stops recording and reports the UI failure without discarding the backend result. Diagnostic reports use the selected output directory.
 

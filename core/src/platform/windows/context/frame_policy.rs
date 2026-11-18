@@ -76,28 +76,39 @@ impl FramePolicy {
         self.write().approval = None;
     }
 
+    /// Publish the foreground approval. An ordinary approval is per process
+    /// instance: another top-level window of the approved process continues
+    /// it under the same generation and `since`. `interrupted` reports a
+    /// foreground change that may have left that process: a foreground notice
+    /// for another process, a desktop switch or a lost notice. Returns the
+    /// transition, if any, for the development log.
     pub fn publish(
         &self, window: Option<WindowProcess>, observed: SessionTimeUs, boundary: AdmissionBoundary, interrupted: bool,
-    ) {
+    ) -> Option<Transition> {
         let mut state = self.write();
+        let previous = state.approval.as_ref().map(|(previous, _)| *previous);
         if let Some(window) = window {
             if let Some((previous, approval)) = &mut state.approval
-                && *previous == window && approval.epoch == boundary.epoch && !interrupted
+                && previous.process == window.process && approval.epoch == boundary.epoch && !interrupted
                 && approval.coverage.is_none() && approval.fresh(observed)
             {
+                let changed = previous.window != window.window;
+                *previous = window;
                 approval.observed = observed;
-                return;
+                return changed.then_some(Transition::Continued);
             }
-            devlog!("approval", "new approval: since_us={} interrupted={} same_window={}", observed.0, interrupted,
-                state.approval.as_ref().is_some_and(|(previous, _)| *previous == window));
+            devlog!("approval", "new approval: since_us={} interrupted={} same_process={}", observed.0, interrupted,
+                previous.is_some_and(|previous| previous.process == window.process));
             state.approve(window, |generation| FrameApproval {
                 generation, epoch: boundary.epoch, since: observed.max(boundary.time), observed, certified_before: None, coverage: None,
             });
+            Some(Transition::Replaced(previous))
         } else {
-            if state.approval.is_some() {
+            if previous.is_some() {
                 devlog!("approval", "approval cleared: foreground not approved at_us={}", observed.0);
             }
             state.approval = None;
+            previous.map(|previous| Transition::Replaced(Some(previous)))
         }
     }
 
@@ -146,11 +157,14 @@ impl FramePolicy {
             devlog!("approval", "receipt approval none: no current approval at_us={} now_us={}", at.0, now.0);
             return Ok(None);
         };
-        if window.window != proof.window || window.process != proof.process || approval.epoch != epoch
+        // An ordinary approval spans every window of its process; an elevated
+        // one stays bound to its visit's window.
+        let same_window = window.window == proof.window || approval.coverage.is_none();
+        if !same_window || window.process != proof.process || approval.epoch != epoch
             || approval.elevated_visit() != visit || at < approval.since || now < at
         {
             devlog!("approval", "receipt approval none: same_window={} same_process={} same_epoch={} same_visit={} at_us={} since_us={} observed_us={} now_us={} generation={}",
-                window.window == proof.window, window.process == proof.process, approval.epoch == epoch,
+                same_window, window.process == proof.process, approval.epoch == epoch,
                 approval.elevated_visit() == visit, at.0, approval.since.0, approval.observed.0, now.0, approval.generation.0);
             return Ok(None);
         }
@@ -186,6 +200,16 @@ impl FramePolicy {
         }
         Ok(approval.fresh(now).then(|| approval.clone()))
     }
+}
+
+/// An approval change published by `FramePolicy::publish`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::platform::windows) enum Transition {
+    /// Another window of the approved process instance is foreground; the
+    /// generation and `since` are kept.
+    Continued,
+    /// A new generation or a clear; the previously approved window, if any.
+    Replaced(Option<WindowProcess>),
 }
 
 #[derive(Debug)]
@@ -238,5 +262,151 @@ impl FrameApproval {
     pub fn awaits_slot(&self, start: SessionTimeUs, end: SessionTimeUs) -> bool {
         self.since <= start && self.certified_before.is_some_and(|before| before < end)
             && self.coverage.as_ref().and_then(|coverage| coverage.before()).is_none_or(|before| end <= before)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::{NonZeroU32, NonZeroU64};
+
+    use crate::protocol::{FocusGeneration, QpcFrequency, WindowId, ipc::ProcessInstance};
+
+    use super::*;
+
+    const BOUNDARY: AdmissionBoundary = AdmissionBoundary { epoch: AdmissionEpoch(1), qpc: QpcTick(0), time: SessionTimeUs(0) };
+
+    fn window(window: u64, pid: u32) -> WindowProcess {
+        let pid = NonZeroU32::new(pid).expect("a nonzero pid");
+        WindowProcess { window: WindowId(window), process: ProcessInstance { pid, creation_filetime: 5 }, thread: NonZeroU32::MIN }
+    }
+
+    fn visit(foreground: WindowProcess) -> VisitBinding {
+        VisitBinding {
+            epoch: BOUNDARY.epoch, source_generation: NonZeroU64::MIN, grant: NonZeroU64::MIN, witness_revision: 0,
+            foreground: foreground.into(), focus_generation: FocusGeneration(1), focus_revision: 0,
+            resync_revision: NonZeroU64::MIN,
+        }
+    }
+
+    /// An elevated approval of `visit` observed at 200 since 100.
+    fn publish_elevated(policy: &FramePolicy, visit: VisitBinding) {
+        let clock = ClockOrigin { origin_qpc: QpcTick(0), qpc_frequency: QpcFrequency(NonZeroU64::MIN) };
+        policy.publish_elevated(visit, SessionTimeUs(100), SessionTimeUs(200), SessionTimeUs(200), BOUNDARY, clock);
+    }
+
+    fn receipt(policy: &FramePolicy, proof: WindowProcess, visit: Option<VisitBinding>, at: i64, now: i64) -> Option<ApprovalGeneration> {
+        let proof = ForegroundAtReceipt { window: proof.window, process: proof.process, focus: None };
+        policy.for_receipt(proof, BOUNDARY.epoch, visit, SessionTimeUs(at), SessionTimeUs(now))
+            .expect("a readable approval").map(|approval| approval.generation)
+    }
+
+    fn current(policy: &FramePolicy, now: i64) -> Option<(ApprovalGeneration, SessionTimeUs)> {
+        policy.current(BOUNDARY.epoch, SessionTimeUs(now)).map(|approval| (approval.generation, approval.since))
+    }
+
+    #[test]
+    fn another_window_of_the_process_continues_the_approval() {
+        let policy = FramePolicy::default();
+        assert!(policy.publish(Some(window(10, 7)), SessionTimeUs(100), BOUNDARY, false) == Some(Transition::Replaced(None)));
+        let first = current(&policy, 100);
+        assert!(policy.publish(Some(window(11, 7)), SessionTimeUs(120), BOUNDARY, false) == Some(Transition::Continued));
+        assert!(policy.publish(Some(window(10, 7)), SessionTimeUs(140), BOUNDARY, false) == Some(Transition::Continued));
+        assert!(policy.publish(Some(window(10, 7)), SessionTimeUs(160), BOUNDARY, false).is_none());
+        assert_eq!(current(&policy, 160), first);
+        assert_eq!(first, Some((ApprovalGeneration(1), SessionTimeUs(100))));
+    }
+
+    #[test]
+    fn another_process_starts_a_new_generation() {
+        let policy = FramePolicy::default();
+        policy.publish(Some(window(10, 7)), SessionTimeUs(100), BOUNDARY, false);
+        let other = window(10, 8);
+        assert!(policy.publish(Some(other), SessionTimeUs(120), BOUNDARY, false)
+            == Some(Transition::Replaced(Some(window(10, 7)))));
+        assert_eq!(current(&policy, 120), Some((ApprovalGeneration(2), SessionTimeUs(120))));
+    }
+
+    #[test]
+    fn an_interruption_starts_a_new_generation() {
+        let policy = FramePolicy::default();
+        policy.publish(Some(window(10, 7)), SessionTimeUs(100), BOUNDARY, false);
+        policy.publish(Some(window(11, 7)), SessionTimeUs(120), BOUNDARY, true);
+        assert_eq!(current(&policy, 120), Some((ApprovalGeneration(2), SessionTimeUs(120))));
+    }
+
+    #[test]
+    fn an_unapproved_foreground_clears_the_approval() {
+        let policy = FramePolicy::default();
+        policy.publish(Some(window(10, 7)), SessionTimeUs(100), BOUNDARY, false);
+        assert!(policy.publish(None, SessionTimeUs(120), BOUNDARY, false) == Some(Transition::Replaced(Some(window(10, 7)))));
+        assert_eq!(current(&policy, 120), None);
+        policy.publish(Some(window(10, 7)), SessionTimeUs(140), BOUNDARY, false);
+        assert_eq!(current(&policy, 140), Some((ApprovalGeneration(2), SessionTimeUs(140))));
+    }
+
+    #[test]
+    fn another_epoch_starts_a_new_generation() {
+        let policy = FramePolicy::default();
+        policy.publish(Some(window(10, 7)), SessionTimeUs(100), BOUNDARY, false);
+        let boundary = AdmissionBoundary { epoch: AdmissionEpoch(2), ..BOUNDARY };
+        assert!(policy.publish(Some(window(11, 7)), SessionTimeUs(120), boundary, false)
+            == Some(Transition::Replaced(Some(window(10, 7)))));
+        let approval = policy.current(boundary.epoch, SessionTimeUs(120)).map(|approval| (approval.generation, approval.since));
+        assert_eq!(approval, Some((ApprovalGeneration(2), SessionTimeUs(120))));
+    }
+
+    #[test]
+    fn a_stale_approval_starts_a_new_generation() {
+        let policy = FramePolicy::default();
+        policy.publish(Some(window(10, 7)), SessionTimeUs(100), BOUNDARY, false);
+        let late = 100 + MAX_AGE_US + 1;
+        assert!(policy.publish(Some(window(11, 7)), SessionTimeUs(late), BOUNDARY, false)
+            == Some(Transition::Replaced(Some(window(10, 7)))));
+        assert_eq!(current(&policy, late), Some((ApprovalGeneration(2), SessionTimeUs(late))));
+    }
+
+    #[test]
+    fn an_elevated_approval_is_not_continued() {
+        let policy = FramePolicy::default();
+        publish_elevated(&policy, visit(window(10, 7)));
+        assert_eq!(current(&policy, 200), Some((ApprovalGeneration(1), SessionTimeUs(100))));
+        assert!(policy.publish(Some(window(11, 7)), SessionTimeUs(210), BOUNDARY, false)
+            == Some(Transition::Replaced(Some(window(10, 7)))));
+        assert_eq!(current(&policy, 210), Some((ApprovalGeneration(2), SessionTimeUs(210))));
+    }
+
+    #[test]
+    fn a_reused_pid_starts_a_new_generation() {
+        let policy = FramePolicy::default();
+        policy.publish(Some(window(10, 7)), SessionTimeUs(100), BOUNDARY, false);
+        let reused = window(11, 7);
+        let reused = WindowProcess { process: ProcessInstance { creation_filetime: 6, ..reused.process }, ..reused };
+        assert!(policy.publish(Some(reused), SessionTimeUs(120), BOUNDARY, false)
+            == Some(Transition::Replaced(Some(window(10, 7)))));
+        assert_eq!(current(&policy, 120), Some((ApprovalGeneration(2), SessionTimeUs(120))));
+    }
+
+    #[test]
+    fn an_ordinary_receipt_accepts_another_window_of_the_process() {
+        let policy = FramePolicy::default();
+        policy.publish(Some(window(10, 7)), SessionTimeUs(100), BOUNDARY, false);
+        assert_eq!(receipt(&policy, window(11, 7), None, 110, 120), Some(ApprovalGeneration(1)));
+    }
+
+    #[test]
+    fn a_receipt_of_another_process_is_refused() {
+        let policy = FramePolicy::default();
+        policy.publish(Some(window(10, 7)), SessionTimeUs(100), BOUNDARY, false);
+        assert_eq!(receipt(&policy, window(10, 8), None, 110, 120), None);
+        assert_eq!(receipt(&policy, window(11, 8), None, 110, 120), None);
+    }
+
+    #[test]
+    fn an_elevated_receipt_of_another_window_is_refused() {
+        let policy = FramePolicy::default();
+        let visit = visit(window(10, 7));
+        publish_elevated(&policy, visit);
+        assert_eq!(receipt(&policy, window(10, 7), Some(visit), 150, 200), Some(ApprovalGeneration(1)));
+        assert_eq!(receipt(&policy, window(11, 7), Some(visit), 150, 200), None);
     }
 }

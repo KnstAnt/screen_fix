@@ -38,7 +38,7 @@ use crate::{
 
 use super::{
     MAX_INPUT_FAILURES, SuspendMarks, disk, failure,
-    facts::{CompletePublication, ControlPrefix},
+    facts::{CompletePublication, ControlPrefix, Facts},
     lifecycle::{FramesOpening, Lifecycle, request_stop},
 };
 
@@ -102,6 +102,22 @@ impl PausedVideo {
         let us = next.0.checked_sub(closed.0)?;
         let slots = (i128::from(us) * i128::from(self.fps) + 999_999).div_euclid(1_000_000);
         self.first_paused_slot.checked_add(u64::try_from(slots).ok()?)
+    }
+}
+
+/// The session deadline that bounds a worker wait.
+#[derive(Clone, Copy)]
+pub(in crate::platform::windows) enum Budget {
+    Stop,
+    Segment,
+}
+
+impl Budget {
+    fn deadline(self, facts: &Facts) -> Option<Instant> {
+        match self {
+            Self::Stop => facts.stop_deadline,
+            Self::Segment => facts.segment_deadline,
+        }
     }
 }
 
@@ -171,6 +187,50 @@ impl WorkerSession {
         self.lifecycle.lock().segment_deadline
     }
 
+    /// `local`, or the `budget` deadline when that is earlier.
+    pub(in crate::platform::windows) fn bounded(&self, local: Instant, budget: Budget) -> Instant {
+        budget.deadline(&self.lifecycle.lock()).map_or(local, |global| global.min(local))
+    }
+
+    /// Wait for the next change of the facts while `pending` holds, for at
+    /// most `step` and never past `until`. Returns at once when `pending` is
+    /// false. The check and the wait share one lock, and every writer a
+    /// caller depends on notifies `changed`, so no change is lost; `step`
+    /// bounds the wait if one is, and paces callers that also poll sources
+    /// outside the facts. The caller re-reads its state after every return.
+    fn wait_changed(&self, step: Duration, until: impl FnOnce(&Facts) -> Option<Instant>, pending: impl FnOnce(&Facts) -> bool) {
+        let facts = self.lifecycle.lock();
+        if !pending(&facts) {
+            return;
+        }
+        let timeout = until(&facts).map_or(step, |until| until.saturating_duration_since(Instant::now()).min(step));
+        if !timeout.is_zero() {
+            let _ = self.lifecycle.changed.wait_timeout(facts, timeout);
+        }
+    }
+
+    /// Wait at most `step` for a change while the input prefix through
+    /// `cutoff` is open, and never past `local` or the `budget` deadline.
+    pub(in crate::platform::windows) fn wait_input_prefix(
+        &self, cutoff: AdmissionBoundary, local: Instant, budget: Budget, step: Duration,
+    ) {
+        self.wait_changed(step, |facts| Some(budget.deadline(facts).map_or(local, |global| global.min(local))),
+            |facts| facts.pause.prefix.input != Some(cutoff));
+    }
+
+    /// Wait at most `step` for a change while the pause at `cutoff` holds and
+    /// some monitor's paused video range is missing.
+    pub(in crate::platform::windows) fn wait_paused_video(&self, cutoff: AdmissionBoundary, step: Duration) {
+        let monitors = self.config.monitors().len();
+        self.wait_changed(step, |_| None,
+            |facts| paused_at(facts, cutoff) && facts.pause.prefix.video.len() != monitors);
+    }
+
+    /// Wait at most `step` for a change while the pause at `cutoff` holds.
+    pub(in crate::platform::windows) fn wait_pause_end(&self, cutoff: AdmissionBoundary, step: Duration) {
+        self.wait_changed(step, |_| None, |facts| paused_at(facts, cutoff));
+    }
+
     /// The bound on the elevated collector's environment cleanup: the Stop or
     /// session-end deadline, or the suspend budget.
     pub(in crate::platform::windows) fn cleanup_deadline(&self) -> Option<Instant> {
@@ -198,6 +258,7 @@ impl WorkerSession {
         let mut facts = self.lifecycle.lock();
         if facts.bounds.closed == Some(cutoff) {
             facts.pause.prefix.input = Some(cutoff);
+            self.lifecycle.changed.notify_all();
         }
     }
 
@@ -211,8 +272,7 @@ impl WorkerSession {
     }
 
     pub(in crate::platform::windows) fn pause_pending(&self, cutoff: AdmissionBoundary) -> bool {
-        let facts = self.lifecycle.lock();
-        facts.status.phase == SessionPhase::Paused && facts.bounds.closed == Some(cutoff)
+        paused_at(&self.lifecycle.lock(), cutoff)
     }
 
     pub(in crate::platform::windows) fn paused_video(&self) -> Vec<PausedVideo> {
@@ -226,6 +286,7 @@ impl WorkerSession {
             if facts.status.phase == SessionPhase::Paused {
                 facts.pause.prefix.finished.insert(PauseProducer::Video(video.monitor));
             }
+            self.lifecycle.changed.notify_all();
             self.wake();
         }
     }
@@ -239,16 +300,21 @@ impl WorkerSession {
     }
 
     pub(in crate::platform::windows) fn wait_for_reopen(&self, cutoff: AdmissionBoundary) -> Result<Option<RecordingStart>, ProbeError> {
-        let facts = self.lifecycle.changed.wait_while(self.lifecycle.lock(), |facts| {
-            facts.status.phase == SessionPhase::Paused && facts.bounds.closed == Some(cutoff)
-        }).unwrap_or_else(PoisonError::into_inner);
-        facts.check_clock()?;
-        match (facts.status.phase, facts.bounds.origin, facts.bounds.opened) {
-            (SessionPhase::Recording | SessionPhase::Paused | SessionPhase::Stopping | SessionPhase::Failed,
-                Some(clock), Some(boundary))
-                if boundary.epoch != cutoff.epoch => Ok(Some(RecordingStart { clock, boundary })),
-            _ => Ok(None),
+        let facts = self.lifecycle.changed.wait_while(self.lifecycle.lock(), |facts| paused_at(facts, cutoff))
+            .unwrap_or_else(PoisonError::into_inner);
+        reopened(&facts, cutoff)
+    }
+
+    /// `wait_for_reopen` bounded by `timeout`: `None` while still paused at `cutoff`.
+    pub(in crate::platform::windows) fn wait_for_reopen_timeout(
+        &self, cutoff: AdmissionBoundary, timeout: Duration,
+    ) -> Result<Option<Option<RecordingStart>>, ProbeError> {
+        let (facts, _) = self.lifecycle.changed.wait_timeout_while(self.lifecycle.lock(), timeout, |facts| paused_at(facts, cutoff))
+            .unwrap_or_else(PoisonError::into_inner);
+        if paused_at(&facts, cutoff) {
+            return Ok(None);
         }
+        reopened(&facts, cutoff).map(Some)
     }
 
     pub(in crate::platform::windows) fn stop_boundary(&self) -> Option<AdmissionBoundary> {
@@ -548,6 +614,22 @@ impl WorkerSession {
             stop: facts.bounds.stop,
             last_admitted_boundary: facts.bounds.closed,
         })
+    }
+}
+
+/// The session is paused at `cutoff`.
+fn paused_at(facts: &Facts, cutoff: AdmissionBoundary) -> bool {
+    facts.status.phase == SessionPhase::Paused && facts.bounds.closed == Some(cutoff)
+}
+
+/// The opening that ended the pause at `cutoff`, if the session reopened.
+fn reopened(facts: &Facts, cutoff: AdmissionBoundary) -> Result<Option<RecordingStart>, ProbeError> {
+    facts.check_clock()?;
+    match (facts.status.phase, facts.bounds.origin, facts.bounds.opened) {
+        (SessionPhase::Recording | SessionPhase::Paused | SessionPhase::Stopping | SessionPhase::Failed,
+            Some(clock), Some(boundary))
+            if boundary.epoch != cutoff.epoch => Ok(Some(RecordingStart { clock, boundary })),
+        _ => Ok(None),
     }
 }
 

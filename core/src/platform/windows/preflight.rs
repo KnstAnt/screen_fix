@@ -91,7 +91,7 @@ fn process_candidates(approved: &[ExecutableIdentity]) -> Result<BTreeSet<u32>, 
     // The snapshot narrows candidate PIDs only. Authorization requires the
     // subsequently queried full path of a live process.
     let names: BTreeSet<_> = approved.iter().filter_map(|entry| image_name(entry.executable())).collect();
-    let inventory = os::process_image_names().map_err(|failure| error(match failure {
+    let inventory = os::process_image_names(None).map_err(|failure| error(match failure {
         InventoryFailure::Snapshot => "Windows could not enumerate processes to verify approval.",
         InventoryFailure::FirstProcess => "Windows could not read the process inventory.",
     }))?;

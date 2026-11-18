@@ -12,7 +12,7 @@ use crate::{
         outcome::{HealthKind, LossEvidence, SuppressionClass},
         row::RowEnvelope,
     },
-    platform::windows::controller::{Receipt, WorkerSession},
+    platform::windows::controller::{Budget, Receipt, WorkerSession},
     protocol::{AdmissionEpoch, CoarseTime, EventRef, MessageTickMs, QpcTick, RecordTime, SessionTimeUs},
 };
 
@@ -358,7 +358,7 @@ fn flush_boundary(
         } else if let FlushRequest::Queued(result) = journal.try_flush(Flush::Os, at)? {
             waiting = Some(result);
         }
-        if Instant::now() >= session.stop_deadline().map_or(deadline, |stop| stop.min(deadline)) {
+        if Instant::now() >= session.bounded(deadline, Budget::Stop) {
             return Err(unavailable("The lifecycle journal flush exceeded its deadline"));
         }
         drain()?;

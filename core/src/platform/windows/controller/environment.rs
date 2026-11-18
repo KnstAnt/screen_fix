@@ -46,6 +46,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongW, SetWindowLongW
 #[cfg(target_pointer_width = "64")]
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLongPtrW};
 
+use screen_fix_native_observation::wake::WakeEvent;
+
 use crate::{
     CaptureError,
     protocol::{QpcFrequency, QpcTick, ipc::EnvironmentChange},
@@ -56,6 +58,8 @@ use crate::platform::windows::{clock, on_input_desktop};
 
 const CLASS_NAME: *const u16 = w!("ScreenFixControllerNotifications");
 const DESKTOP_POLL: Duration = Duration::from_millis(100);
+/// The poll period of the session-end hold and of the owner loop after a
+/// failed wait.
 const PUMP_INTERVAL: Duration = Duration::from_millis(10);
 pub(super) const SESSION_END_BUDGET: Duration = Duration::from_millis(3800);
 pub(super) const SUSPEND_BUDGET: Duration = Duration::from_secs(2);
@@ -261,7 +265,6 @@ pub(super) struct ReasonState {
 
 pub(super) struct Notifications {
     signals: Arc<Signals>,
-    stop: SyncSender<()>,
     owner: thread::JoinHandle<()>,
 }
 
@@ -270,6 +273,8 @@ struct Signals {
     shared: Arc<EnvironmentSignals>,
     complete: AtomicBool,
     wake: SyncSender<()>,
+    /// Manual-reset; set once `complete` is, so the owner's wait ends.
+    stop: WakeEvent,
 }
 
 impl Signals {
@@ -292,8 +297,9 @@ impl Notifications {
     pub(super) fn spawn(
         shared: Arc<EnvironmentSignals>, wake: SyncSender<()>,
     ) -> Result<(Self, Receiver<Result<(), CaptureError>>), CaptureError> {
-        let signals = Arc::new(Signals { reasons: AtomicU32::new(0), shared, complete: AtomicBool::new(false), wake });
-        let (stop, stopped) = mpsc::sync_channel(1);
+        let stop = WakeEvent::new(true)
+            .map_err(|error| window_error("Create the Windows notification stop event", error.raw_os_error()))?;
+        let signals = Arc::new(Signals { reasons: AtomicU32::new(0), shared, complete: AtomicBool::new(false), wake, stop });
         let (ready, initialized) = mpsc::sync_channel(1);
         let owned = Arc::clone(&signals);
         let owner = thread::Builder::new().name("recording-windows-notifications".into()).spawn(move || {
@@ -312,10 +318,19 @@ impl Notifications {
                     owned.reason(SECURE_DESKTOP, !on_input_desktop());
                     next_poll = now + DESKTOP_POLL;
                 }
-                if !matches!(stopped.recv_timeout(PUMP_INTERVAL), Err(mpsc::RecvTimeoutError::Timeout)) { break; }
+                // Wake on a message, on stop, or at the next desktop poll
+                // (at most DESKTOP_POLL away). The event is manual-reset, so
+                // a stop set before this wait ends it at once.
+                let timeout = next_poll.saturating_duration_since(Instant::now()).min(DESKTOP_POLL);
+                // Round up, so that less than a millisecond left does not spin.
+                let timeout_ms = u32::try_from(timeout.as_micros().div_ceil(1000)).unwrap_or(u32::MAX);
+                if owned.stop.wait_messages(timeout_ms).is_err() {
+                    thread::park_timeout(PUMP_INTERVAL);
+                }
+                if owned.complete.load(Acquire) { break; }
             }
         }).map_err(|error| window_error("Start the Windows notification owner", error.raw_os_error()))?;
-        Ok((Self { signals, stop, owner }, initialized))
+        Ok((Self { signals, owner }, initialized))
     }
 
     /// Take the assertion edges and read each environment reason: sleep, lock
@@ -332,7 +347,8 @@ impl Notifications {
 
     pub(super) fn finished(&self) {
         if !self.signals.complete.swap(true, AcqRel) {
-            let _ = self.stop.try_send(());
+            // A failed set leaves the owner to see `complete` within DESKTOP_POLL.
+            let _ = self.signals.stop.set();
             self.owner.thread().unpark();
         }
     }

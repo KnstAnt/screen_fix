@@ -79,7 +79,7 @@ fn layouts() -> Option<Vec<u64>> {
 
 fn controllers() -> Option<Vec<ControllerHint>> {
     // A partial inventory still names the controllers it saw.
-    let inventory = crate::platform::windows::os::process_image_names().ok()?;
+    let inventory = crate::platform::windows::os::process_image_names(Some(MAX_PROCESSES)).ok()?;
     if inventory.images.len() > MAX_PROCESSES {
         return None;
     }

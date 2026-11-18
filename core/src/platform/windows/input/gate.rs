@@ -1,11 +1,12 @@
 //! Ordered input publication. Windows approval and focus are evaluated
 //! against the private receipt proof before any per-input payload is built.
 
-use std::{collections::{BTreeSet, VecDeque}, ops::ControlFlow, sync::mpsc};
+use std::{collections::{BTreeMap, BTreeSet, VecDeque}, ops::ControlFlow, sync::mpsc};
 
 use serde_json::{Value, json};
 
 use crate::{
+    devlog::devlog,
     capture::{
         context::{ControllerHint, TextTarget},
         observation::ProvisionalInputKind,
@@ -78,6 +79,7 @@ pub(super) struct Gate {
     /// Controller processes running at start (CTX-12), the injector hints of
     /// every injected row (INP-7).
     injector_hints: Vec<ControllerHint>,
+    suppression_log: SuppressionLog,
 }
 
 /// Pending runtime health conditions; each kind is rare.
@@ -135,8 +137,9 @@ type Approval = Result<(ForegroundAtReceipt, ReceiptFocus), SuppressionClass>;
 enum Front {
     /// The slot waits for more approval, focus or IME evidence.
     Wait,
-    /// The slot is decided now; an input slot with this approval.
-    Publish { approval: Approval, ime: ImeState, into_redaction: bool },
+    /// The slot is decided now; an input slot with this approval. `cause`
+    /// explains an `ApprovalUnknown` in the development log only.
+    Publish { approval: Approval, ime: ImeState, into_redaction: bool, cause: Option<UnknownCause> },
 }
 
 struct RedactedVisit {
@@ -288,7 +291,7 @@ impl Gate {
             redactions: Redactions::new(),
             motion: None, overflow_at: None, overflow: false, active_key_visit: None,
             keyboard_text: KeyboardText::default(), last_text_key: None, last_pointer_move: None, confirmed_text: VecDeque::with_capacity(MAX_CONFIRMED_TEXT),
-            outcomes: Outcomes::default(), injector_hints,
+            outcomes: Outcomes::default(), injector_hints, suppression_log: SuppressionLog::default(),
         }
     }
 
@@ -555,11 +558,12 @@ impl Gate {
             }
             let Some(at) = self.first_slot().filter(|at| *at <= through) else { break };
             self.flush_motion(at, false, receipt, output)?;
-            let Front::Publish { approval, ime, into_redaction } = self.decide_front(context, receipt, observed, at, final_boundary)
+            let Front::Publish { approval, ime, into_redaction, cause } = self.decide_front(context, receipt, observed, at, final_boundary)
             else { break };
             match self.slots.pop_front().expect("gate has a front slot") {
                 Slot::Boundary { at, kind, selection } => {
                     if is_closing(kind) {
+                        self.suppression_log.end(at);
                         self.finish_redaction(Some(at));
                         self.flush_redactions(at, receipt, output)?;
                     }
@@ -569,8 +573,14 @@ impl Gate {
                     self.publish_synchronization(at, visit, held_modifiers, released_modifiers, edges, context, output, receipt)?;
                 }
                 Slot::Input(classified) => match approval {
-                    Ok((proof, focus)) => self.publish(classified.input, proof, focus, ime, context, output, requests, receipt)?,
-                    Err(class) => self.suppress_input(classified.input, class, into_redaction, at, context, requests),
+                    Ok((proof, focus)) => {
+                        self.suppression_log.end(at);
+                        self.publish(classified.input, proof, focus, ime, context, output, requests, receipt)?;
+                    }
+                    Err(class) => {
+                        self.suppression_log.suppress(class, cause, at);
+                        self.suppress_input(classified.input, class, into_redaction, at, context, requests);
+                    }
                 }
             }
         }
@@ -671,9 +681,11 @@ impl Gate {
         // A hook-only key with an uncertain focus joins an adjacent open redacted visit.
         let mut into_redaction = false;
         let Some(Slot::Input(classified)) = self.slots.front() else {
-            return Front::Publish { approval: Err(SuppressionClass::ApprovalUnknown), ime, into_redaction };
+            return Front::Publish { approval: Err(SuppressionClass::ApprovalUnknown), ime, into_redaction, cause: None };
         };
         let correlated = &classified.input.normalized.correlated;
+        // The development log's cause of a hook-only `ApprovalUnknown`.
+        let mut cause = None;
         let mut approval = match classified.disposition {
             ControlDisposition::Recorder => Err(SuppressionClass::RecorderControl),
             ControlDisposition::Uncertain => Err(SuppressionClass::ControlUncertain),
@@ -683,16 +695,28 @@ impl Gate {
                 let key = matches!(correlated.first.action, Action::Key(_));
                 match context.hook_receipt(qpc, receipt.clock) {
                     HookReceipt::Pending if !final_boundary && observed.0.saturating_sub(at.0) < MAX_WAIT_US => return Front::Wait,
-                    HookReceipt::Covered(visit) => hook_approval(visit, qpc, context),
+                    HookReceipt::Covered(visit) => {
+                        cause = Some(UnknownCause::HookApprovalFailed);
+                        hook_approval(visit, qpc, context)
+                    }
                     HookReceipt::FocusUncertain { before, after } if key => {
                         into_redaction = self.redactions.is_open() && self.active_key_visit
                             .and_then(|visit| visit.generation).is_some_and(|open| open == before || open == after.generation);
                         Err(SuppressionClass::FocusUncertain)
                     }
                     // A pointer record needs only a stable approved foreground.
-                    HookReceipt::FocusUncertain { after, .. } =>
-                        hook_approval(after, qpc, context).map(|(proof, _)| (proof, ReceiptFocus::Unknown)),
-                    HookReceipt::Pending | HookReceipt::Unknown => Err(SuppressionClass::ApprovalUnknown),
+                    HookReceipt::FocusUncertain { after, .. } => {
+                        cause = Some(UnknownCause::HookApprovalFailed);
+                        hook_approval(after, qpc, context).map(|(proof, _)| (proof, ReceiptFocus::Unknown))
+                    }
+                    HookReceipt::Pending => {
+                        cause = Some(UnknownCause::HookPending);
+                        Err(SuppressionClass::ApprovalUnknown)
+                    }
+                    HookReceipt::Unknown => {
+                        cause = Some(UnknownCause::HookUnknown);
+                        Err(SuppressionClass::ApprovalUnknown)
+                    }
                 }
             }
             ControlDisposition::Application => approved_receipt(&classified.input, context),
@@ -718,7 +742,11 @@ impl Gate {
                 }
             }
         }
-        Front::Publish { approval, ime, into_redaction }
+        let cause = match approval {
+            Err(SuppressionClass::ApprovalUnknown) if crate::devlog::ENABLED => cause.or_else(|| Some(raw_unknown_cause(&classified.input))),
+            _ => None,
+        };
+        Front::Publish { approval, ime, into_redaction, cause }
     }
 
     /// A held-state synchronization slot: its synthetic edges are published
@@ -1417,11 +1445,37 @@ fn approved_receipt(input: &HeldInput, context: &mut Context<'_>) -> Approval {
     let first = times().min().ok_or(unknown)?;
     let last = times().max().ok_or(unknown)?;
     let focus = context.approve_receipt(proof, last, first).ok_or(SuppressionClass::NotApproved)?;
+    // A pointer or other non-key record needs only the approved process in
+    // the foreground at its receipt, as in the hook-only branch. A key keeps
+    // requiring a known focus when a hook record is part of it. A historical
+    // focus is an ended visit of the receipt's own proof that covered the
+    // whole record; a pointer row writes only `proof.window`, and its element
+    // query requires the current visit.
     let uses_hook = slots().any(|slot| slot.packet.sample.producer() != producer);
-    if uses_hook && matches!(focus, ReceiptFocus::Unknown | ReceiptFocus::Historical(_)) {
+    let key = matches!(input.first.action, Action::Key(_) | Action::AltGrCompanion)
+        || slots().any(|slot| is_key(&slot.packet.sample));
+    if key && uses_hook && matches!(focus, ReceiptFocus::Unknown | ReceiptFocus::Historical(_)) {
         return Err(unknown);
     }
     Ok((proof, focus))
+}
+
+/// Why `approved_receipt` returned `ApprovalUnknown`, for the development
+/// log. It repeats that function's checks without consulting the context;
+/// past them only the hook focus check of a key returns that class.
+fn raw_unknown_cause(input: &HeldInput) -> UnknownCause {
+    let input = &input.normalized.correlated;
+    let producer = Producer::RawInput;
+    let first_raw = input.slots().find(|slot| slot.packet.sample.producer() == producer);
+    let promotion_pen = input.promotion.as_ref().map(|link| link.pen.as_ref());
+    let Some(proof) = first_raw.map(|slot| slot.packet.as_ref()).or(promotion_pen).and_then(|packet| packet.foreground_at_receipt)
+    else { return UnknownCause::NoForegroundProof };
+    if !input.slots().filter(|slot| slot.packet.sample.producer() == producer)
+        .all(|slot| slot.packet.foreground_at_receipt == Some(proof))
+    {
+        return UnknownCause::MixedForeground;
+    }
+    UnknownCause::HookWithUncertainFocus
 }
 
 fn promotion_focus(link: &PenPromotion, proof: ForegroundAtReceipt, context: &mut Context<'_>) -> bool {
@@ -1490,4 +1544,78 @@ fn held_row(edge: SyntheticHeldEdge, receipt: Receipt) -> Value {
         }
     }
     row
+}
+
+/// A log-only sub-reason of `SuppressionClass::ApprovalUnknown`; the
+/// serialized class is unchanged.
+#[derive(Clone, Copy, Debug)]
+enum UnknownCause {
+    NoForegroundProof,
+    MixedForeground,
+    HookPending,
+    HookUnknown,
+    HookApprovalFailed,
+    HookWithUncertainFocus,
+}
+
+impl UnknownCause {
+    const ALL: [Self; 6] = [
+        Self::NoForegroundProof, Self::MixedForeground, Self::HookPending, Self::HookUnknown,
+        Self::HookApprovalFailed, Self::HookWithUncertainFocus,
+    ];
+}
+
+type CauseCounts = [u64; UnknownCause::ALL.len()];
+
+fn format_causes(counts: &CauseCounts) -> String {
+    UnknownCause::ALL.iter().zip(counts).filter(|(_, count)| **count != 0)
+        .map(|(cause, count)| format!("{cause:?}={count}")).collect::<Vec<_>>().join(" ")
+}
+
+/// A run of suppressed input slots, ended by a published input or a closing boundary.
+struct SuppressedRun {
+    start: SessionTimeUs,
+    classes: BTreeMap<SuppressionClass, u64>,
+    causes: CauseCounts,
+}
+
+/// Development log of input suppression: per-cause `ApprovalUnknown`
+/// counts in at most one summary line per second, and a line at the start
+/// and the end of each suppressed run. It never changes a decision.
+#[derive(Default)]
+struct SuppressionLog {
+    /// Counts since the last summary line.
+    pending: CauseCounts,
+    summarized: Option<SessionTimeUs>,
+    run: Option<SuppressedRun>,
+}
+
+impl SuppressionLog {
+    const SUMMARY_US: i64 = 1_000_000;
+
+    fn suppress(&mut self, class: SuppressionClass, cause: Option<UnknownCause>, at: SessionTimeUs) {
+        if !crate::devlog::ENABLED {
+            return;
+        }
+        let run = self.run.get_or_insert_with(|| {
+            devlog!("gate", "suppressed interval started at_us={} class={class:?} cause={cause:?}", at.0);
+            SuppressedRun { start: at, classes: BTreeMap::new(), causes: CauseCounts::default() }
+        });
+        *run.classes.entry(class).or_default() += 1;
+        let Some(cause) = cause else { return };
+        run.causes[cause as usize] += 1;
+        self.pending[cause as usize] += 1;
+        if self.summarized.is_none_or(|last| at.0.saturating_sub(last.0) >= Self::SUMMARY_US) {
+            devlog!("gate", "approval unknown at_us={} {}", at.0, format_causes(&self.pending));
+            self.pending = CauseCounts::default();
+            self.summarized = Some(at);
+        }
+    }
+
+    fn end(&mut self, at: SessionTimeUs) {
+        if let Some(run) = self.run.take() {
+            devlog!("gate", "suppressed interval ended at_us={} duration_us={} classes={:?} approval_unknown=[{}]",
+                at.0, at.0.saturating_sub(run.start.0), run.classes, format_causes(&run.causes));
+        }
+    }
 }

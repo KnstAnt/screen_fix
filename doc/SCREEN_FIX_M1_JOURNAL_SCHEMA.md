@@ -5,7 +5,7 @@ Project: screen_fix / Intercall Recorder
 
 ## 1. Version and conventions
 
-Package format v6 (`MANIFEST_VERSION = 6` in `core/src/package/metadata.rs`) versions `manifest.json` and every journal schema below. Rows carry no version of their own; a row's `version` field is only the foreground product version. Under D-1 A-v6only, `PackageReader::open` reads `version` first and opens v6 only; any other value is `UnsupportedVersion`. Packages recorded before v6 no longer open.
+Package format v6 (`MANIFEST_VERSION = 6` in `core/src/package/manifest.rs`) versions `manifest.json` and every journal schema below. Rows carry no version of their own; a row's `version` field is only the foreground product version. Under D-1 A-v6only, `PackageReader::open` reads `version` first and opens v6 only; any other value is `UnsupportedVersion`. Packages recorded before v6 no longer open.
 
 Marks:
 - **PDF**: the kind or field is named literally by the Intercall Recorder technical spec v1 (Windows).
@@ -106,7 +106,7 @@ The input stream holds at most 32 pending health conditions. Beyond that, a cond
 | --- | --- | --- |
 | `version` | ext | `6`. |
 | `attempt_id`, `state` | PDF | `state` is `complete` or `incomplete`. |
-| `capture` | ext | `pending`, `recorded`, `stopped_before_first_frame`, `approval_suppressed`, `video_unavailable`, `input_unavailable` or `failed`. |
+| `capture` | ext | `pending`, `recorded`, `stopped_before_first_frame`, `approval_suppressed`, `video_unavailable`, `input_unavailable` or `failed`. `approval_suppressed`: every slot of every monitor with slots was approval-suppressed. Approval is per approved process instance, so moving among windows of that process suppresses no slot. |
 | `selected_displays` | ext | Selected monitor ids. |
 | `clock` | PDF | `origin`, `utc_anchors[]` (`admission_epoch`, `sample`), `stop`, `last_admitted_boundary`. |
 | `os` | PDF | Windows evidence. |
@@ -305,7 +305,7 @@ One row per trigger. `recv_t_us` is the trigger receipt. A pre-motion or pre-act
 | `seen_file` | PDF | Only when the seen image differs from `file`. |
 | `role` | ext | `before`, `image` or `final_save_settled`. |
 | `trigger_t_us`, `reason`, `geometry`, `admission_epoch`, `scroll_device`, `settled_confirmed_t_us`, `adjustment`, `element` | ext | `reason` explains a `still_dropped` row. |
-| `frame` | ext | `{id, source_t_us, recv_t_us, approval_generation, width, height, color, source_uncertainty_us}`. |
+| `frame` | ext | `{id, source_t_us, recv_t_us, approval_generation, width, height, color, source_uncertainty_us}`. `approval_generation` identifies the frame approval in force. An ordinary approval is per approved process instance: the generation changes when the approved process or the admission epoch changes, when an interruption occurs (lost notice, desktop switch, a foreground notice for another process, an unreadable window or a Ghost window), on a stale observation, or after the approval was cleared. Another window of the same process keeps it. An elevated approval has its own generation per visit (ALG §13.14). |
 | `outcome` | ext | `{kind: saved, image, deduplicated}`, `{kind: dropped, reason}`, `{kind: failed, operation, native_code}` or `{kind: unavailable, reason}`. |
 | `save` | ext | `{id, kind, routing_basis}` for save-linked stills. |
 | `seen_frame`, `seen_outcome` | ext | Pre rows only. |
@@ -335,7 +335,7 @@ One row per decided, non-paused slot per selected monitor, without `kind`. The s
 | `frame_id`, `capture_recv_t_us`, `geometry` | ext | Frame identity, its capture receipt (max of the dequeue and the present time) and monitor geometry; absent without a frame. |
 | `late` | ext | Repeat rows with a frame: whether a changed frame of this slot arrived after the decision. |
 
-`reason` values (`MissingVideoSlot`): `before_first_frame`, `approval_suppressed`, `capture_unavailable`, `monitor_missing`, `conversion_pressure`, `queue_pressure`, `encoder_unavailable`, `segment_unpublished`, `encoder_skipped`, `timeline_pending`, `segment_unverified`.
+`reason` values (`MissingVideoSlot`): `before_first_frame`, `approval_suppressed`, `capture_unavailable`, `monitor_missing`, `conversion_pressure`, `queue_pressure`, `encoder_unavailable`, `segment_unpublished`, `encoder_skipped`, `timeline_pending`, `segment_unverified`. An `approval_suppressed` slot has no approval covering it; a change of approval generation also ends the open segment. Because the generation changes only with the approved process, the epoch or an interruption, switching among windows of the approved process neither suppresses slots nor cuts the video.
 
 **`recv_t_us` of frames rows (plan §6.5, amended).** Let e_k be the end of slot k, limited by the epoch cutoff.
 - `recv_t_us` is the true capture receipt only on a row that newly selects a frame (`repeated: false`). It then equals `capture_recv_t_us`.

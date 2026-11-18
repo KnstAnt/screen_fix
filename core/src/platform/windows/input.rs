@@ -43,6 +43,8 @@ const PAUSE_CERTIFICATION_WAIT: Duration = Duration::from_millis(250);
 const STOP_FINALIZATION_RESERVE: Duration = Duration::from_secs(2);
 /// The step of a bounded wait at a pause or stop boundary.
 const BOUNDARY_WAIT_STEP: Duration = Duration::from_millis(2);
+/// The service period of the helper and the context while paused.
+const PAUSED_SERVICE_STEP: Duration = Duration::from_millis(5);
 
 pub(super) fn with_journal<T>(
     layout: &AttemptLayout,
@@ -740,7 +742,8 @@ impl Pump<'_> {
             let ranges = session.paused_video();
             if ranges.len() == session.config().monitors().len() || !session.pause_pending(closed) { break ranges; }
             self.tick_paused(drain)?;
-            thread::park_timeout(BOUNDARY_WAIT_STEP);
+            // The helper is still polled every step; a video prefix ends the wait at once.
+            session.wait_paused_video(closed, BOUNDARY_WAIT_STEP);
         };
         let reasons = session.pause_interval_reasons(closed);
         let all_monitors = ranges.len() == session.config().monitors().len();
@@ -783,7 +786,9 @@ impl Pump<'_> {
             publish_controls(controls, receipt, at, &mut self.context, |_, _| None)?;
             let through = receipt.clock.time(at)?;
             self.context.flush(through, wrote_control)?;
-            thread::park_timeout(Duration::from_millis(5));
+            // The helper and the context are still served every step; a
+            // resume or Stop ends the wait at once.
+            session.wait_pause_end(closed, PAUSED_SERVICE_STEP);
         }
         let Some(opened) = session.wait_for_reopen(closed)? else {
             // Health counted during this pause was handed to the context ingress.

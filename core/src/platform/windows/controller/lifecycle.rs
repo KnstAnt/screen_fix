@@ -79,8 +79,13 @@ impl Lifecycle {
 
     pub(super) fn apply_session_end_deadlines(&self, facts: &mut Facts) {
         if let Some(&started) = self.environment.session_end.get() {
+            let before = (facts.stop_deadline, facts.segment_deadline);
             keep_earlier(&mut facts.stop_deadline, started + SESSION_END_CONTROLLER_BUDGET);
             keep_earlier(&mut facts.segment_deadline, started + SUSPEND_BUDGET);
+            // Workers waiting on `changed` re-read their deadline bound.
+            if (facts.stop_deadline, facts.segment_deadline) != before {
+                self.changed.notify_all();
+            }
         }
     }
 }

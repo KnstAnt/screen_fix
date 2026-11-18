@@ -145,8 +145,11 @@ impl VisitTimeline {
         }
         match (before, after) {
             // The replacement was established in the same sweep, so no other
-            // foreground came between the two visits.
-            (Some((before, Some(ended))), Some(after)) if ended == after.started_at && before.foreground == after.foreground =>
+            // foreground came between the two ordinary visits of one approved
+            // process instance.
+            (Some((before, Some(ended))), Some(after)) if ended == after.started_at
+                && before.foreground.process == after.foreground.process
+                && !before.is_elevated() && !after.is_elevated() =>
                 HookReceipt::FocusUncertain { before: before.generation, after },
             _ => HookReceipt::Unknown,
         }
@@ -158,5 +161,55 @@ impl VisitTimeline {
     pub fn prune(&mut self, published: SessionTimeUs, clock: ClockOrigin, keep: Option<FocusGeneration>) {
         self.previous.retain(|ended| Some(ended.visit.generation) == keep
             || clock.time(ended.ended).is_ok_and(|end| end.0.saturating_add(HOOK_UNCERTAINTY_US) >= published.0));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::{NonZeroU32, NonZeroU64};
+
+    use crate::protocol::{QpcFrequency, WindowId, ipc::ProcessInstance};
+
+    use super::super::identity::WindowProcess;
+    use super::*;
+
+    /// One tick per microsecond: the hook uncertainty is 16 000 ticks.
+    const CLOCK: ClockOrigin = ClockOrigin { origin_qpc: QpcTick(0), qpc_frequency: QpcFrequency(NonZeroU64::MIN.saturating_add(999_999)) };
+
+    fn visit(generation: u64, window: u64, pid: u32, started_at: i64) -> Visit {
+        let pid = NonZeroU32::new(pid).expect("a nonzero pid");
+        Visit {
+            generation: FocusGeneration(generation), started_at: QpcTick(started_at),
+            foreground: WindowProcess { window: WindowId(window), process: ProcessInstance { pid, creation_filetime: 5 }, thread: NonZeroU32::MIN },
+            native: None, uia_blocked: None, elevated: None,
+        }
+    }
+
+    /// Visit `before` ends at 100 000 and `after` replaces it in the same sweep;
+    /// a hook-only receipt at 105 000 falls inside the seam.
+    fn seam(before: Visit, after: Visit) -> HookReceipt {
+        let mut timeline = VisitTimeline::new();
+        timeline.replace(Some(before), before.started_at);
+        timeline.mark_swept(QpcTick(50_000));
+        timeline.replace(Some(after), QpcTick(100_000));
+        timeline.mark_swept(QpcTick(200_000));
+        timeline.hook_receipt(QpcTick(105_000), CLOCK)
+    }
+
+    #[test]
+    fn same_process_seam_is_focus_uncertain() {
+        let receipt = seam(visit(1, 10, 7, 0), visit(2, 11, 7, 100_000));
+        assert!(matches!(receipt, HookReceipt::FocusUncertain { before: FocusGeneration(1), after }
+            if after.generation == FocusGeneration(2)));
+    }
+
+    #[test]
+    fn other_process_seam_is_unknown() {
+        assert!(matches!(seam(visit(1, 10, 7, 0), visit(2, 11, 8, 100_000)), HookReceipt::Unknown));
+    }
+
+    #[test]
+    fn seam_with_gap_is_unknown() {
+        assert!(matches!(seam(visit(1, 10, 7, 0), visit(2, 11, 7, 100_500)), HookReceipt::Unknown));
     }
 }

@@ -24,7 +24,7 @@ use crate::{
         outcome::HealthKind,
     },
     protocol::{AdmissionEpoch, ClockOrigin, MonitorId, SegmentId, SessionTimeUs},
-    platform::windows::controller::{Admission, AwakeElapsed, PausedVideo, SuspendWatch, WorkerSession},
+    platform::windows::controller::{Admission, AwakeElapsed, Budget, PausedVideo, SuspendWatch, WorkerSession},
     session::{AdmissionBoundary, fault::FaultReport},
 };
 
@@ -395,6 +395,17 @@ struct SlotDecision {
     cutoff: Option<SessionTimeUs>,
 }
 
+/// Why an open segment is finished, for the development log.
+#[derive(Clone, Copy)]
+enum SegmentEnd {
+    /// An IDR started the next segment.
+    Rotation,
+    /// An approval-suppressed slot gap broke the segment.
+    ApprovalGap,
+    /// The encoder loop ended: see `Video::end_reason`.
+    EncoderEnd,
+}
+
 /// The admission of the worker's current epoch.
 enum EpochAdmission {
     /// The epoch records; the session time now.
@@ -429,7 +440,9 @@ const ROTATION_PART_UNPUBLISHED: &str = "Publish the segment interrupted during 
 const ADMISSION_UNCLOSED: &str = "Video admission changed without closing its slot prefix";
 /// The wait of an elevated segment for its input prefix closer, sleep excluded.
 const INPUT_PREFIX_WAIT: Duration = Duration::from_secs(3);
-const INPUT_PREFIX_POLL: Duration = Duration::from_millis(2);
+/// The longest wait for a facts change while that prefix is open: the former
+/// poll period, which also bounds how late a suspend-mark change is seen.
+const INPUT_PREFIX_WAKE: Duration = Duration::from_millis(2);
 
 /// The epoch opened at `opening` still records.
 fn still_open(worker: &WorkerSession, opening: AdmissionBoundary) -> Result<bool, ProbeError> {
@@ -551,7 +564,22 @@ fn record(
         }
         // A pause reports its decided prefix; verification can finish after it.
         worker.finish_video_pause(closed, boundary);
-        let reopened = if worker.pause_pending(closed) { worker.wait_for_reopen(closed)? } else { None };
+        // While rows await verification, verdicts arriving during the pause
+        // are published at once rather than at resume or Stop.
+        let reopened = if worker.pause_pending(closed) {
+            let mut pending = !state.publication.staged.is_empty();
+            loop {
+                if !pending {
+                    break worker.wait_for_reopen(closed)?;
+                }
+                if let Some(reopened) = worker.wait_for_reopen_timeout(closed, VERIFIER_POLL)? {
+                    break reopened;
+                }
+                pending = state.publish_paused()?;
+            }
+        } else {
+            None
+        };
         let Some(opened) = reopened else {
             state.settle_verification()?;
             state.drain_lane()?;
@@ -568,6 +596,10 @@ fn record(
         };
         state.freeze_late();
         drop(state);
+        // A verdict applied during the pause can have lost this monitor's video.
+        if summary.unavailable && let Some(active) = encoder.take() {
+            loss.release(active, summary);
+        }
         progress.next = boundary.end_exclusive(closed.time, opened.boundary.time)
             .ok_or_else(|| unavailable("The paused video slot range overflowed"))?;
         publication.paused_slots.push_back((boundary.first_paused_slot, progress.next));
@@ -819,7 +851,7 @@ impl encode::EncodeOwner for Video<'_> {
                 // sets while the prior muxer finishes synchronously on this worker.
                 // Capture keeps only its bounded queue until we resume consumption.
                 self.preserve_rotation_part = false;
-                self.finish_current()?;
+                self.finish_current(SegmentEnd::Rotation)?;
                 self.progress.segment_number = self.progress.segment_number.checked_add(1)
                     .ok_or_else(|| unavailable("The MP4 segment index overflowed"))?;
                 let id = SegmentId(self.progress.segment_number);
@@ -886,7 +918,7 @@ impl Video<'_> {
                     self.progress.required_finalization_failure.get_or_insert(ROTATION_PART_UNPUBLISHED);
                 }
             }
-        } else if let Err(error) = self.finish_current() {
+        } else if let Err(error) = self.finish_current(SegmentEnd::EncoderEnd) {
             if fails_attempt(&error) {
                 return Err(error);
             }
@@ -992,14 +1024,36 @@ impl Video<'_> {
     fn finish_approval_prefix(&mut self) -> Result<(), ProbeError> {
         // The MFT either had no pending input or completed its drain.
         self.skip_outstanding(slots::Missing::EncoderSkipped)?;
-        self.finish_current()?;
+        self.finish_current(SegmentEnd::ApprovalGap)?;
         self.approval_break = false;
         self.force_pending = false;
         self.preserve_rotation_part = false;
         Ok(())
     }
 
-    fn finish_current(&mut self) -> Result<(), ProbeError> {
+    fn close_reason(&self, end: SegmentEnd) -> &'static str {
+        match end {
+            SegmentEnd::Rotation => "rotation",
+            SegmentEnd::ApprovalGap => "approval_gap",
+            SegmentEnd::EncoderEnd => self.end_reason(),
+        }
+    }
+
+    /// Why the encoder loop ended, for the development log: a lost video, a
+    /// format change, Stop, or a pause.
+    fn end_reason(&self) -> &'static str {
+        if self.summary.unavailable {
+            "loss"
+        } else if self.change_ready {
+            "format_change"
+        } else if self.cutoff.is_some_and(|cutoff| self.worker.stop_boundary() == Some(cutoff)) {
+            "stop"
+        } else {
+            "pause"
+        }
+    }
+
+    fn finish_current(&mut self, end: SegmentEnd) -> Result<(), ProbeError> {
         if self.elevated && self.current.is_some()
             && let Admission::Closed(Some(closed)) = self.worker.admit()?
             && closed.epoch == self.opening.epoch
@@ -1014,13 +1068,13 @@ impl Video<'_> {
                 if seen.slept(self.worker.suspend_marks()) {
                     deadline = Instant::now() + INPUT_PREFIX_WAIT;
                 }
-                if Instant::now() >= self.worker.segment_deadline().map_or(deadline, |limit| limit.min(deadline)) {
+                if Instant::now() >= self.worker.bounded(deadline, Budget::Segment) {
                     if let Some(segment) = self.current.take() { segment.discard()?; }
                     let stage = "The elevated video prefix did not close before publication";
                     self.progress.required_finalization_failure.get_or_insert(stage);
                     return Err(unavailable(stage));
                 }
-                thread::park_timeout(INPUT_PREFIX_POLL);
+                self.worker.wait_input_prefix(closed, deadline, Budget::Segment, INPUT_PREFIX_WAKE);
             }
         }
         if let Some(segment) = self.current.take() {
@@ -1041,14 +1095,16 @@ impl Video<'_> {
             };
             match closed {
                 Closed::Resolved(rows) => {
-                    devlog!("video", "segment closed m{} s{segment_id} resolved rows={}", self.id.0, rows.len());
+                    devlog!("video", "segment closed m{} s{segment_id} reason={} resolved rows={}", self.id.0, self.close_reason(end),
+                        rows.len());
                     let last = self.last_row(&rows);
                     self.resolve_all(rows)?;
                     self.frames.request_flush(last);
                     self.worker.request_journal_flush();
                 }
                 Closed::Part { pending, part, suppressed } => {
-                    devlog!("video", "segment closed m{} s{segment_id} part handed to verifier", self.id.0);
+                    devlog!("video", "segment closed m{} s{segment_id} reason={} part handed to verifier", self.id.0,
+                        self.close_reason(end));
                     self.resolve_all(suppressed)?;
                     self.hand_off(pending, part)?;
                 }
@@ -1116,6 +1172,13 @@ impl Video<'_> {
         if self.publication.verifying.is_empty() {
             return Ok(None);
         }
+        let lost = self.receive_verdicts(wait)?;
+        Ok(lost.or(self.abandon_overdue()?))
+    }
+
+    /// Apply arrived verdicts, waiting up to `wait` for the first. A verifier
+    /// that exited leaves every part in flight unverified.
+    fn receive_verdicts(&mut self, wait: Duration) -> Result<Option<ProbeError>, ProbeError> {
         let mut lost = None;
         let mut received = if wait.is_zero() {
             self.verdicts.try_recv().map_err(|error| error == mpsc::TryRecvError::Disconnected)
@@ -1136,6 +1199,12 @@ impl Video<'_> {
             }
             received = self.verdicts.try_recv().map_err(|error| error == mpsc::TryRecvError::Disconnected);
         }
+        Ok(lost)
+    }
+
+    /// Resolve segments whose verification is overdue as unverified (§6.2 row 19).
+    fn abandon_overdue(&mut self) -> Result<Option<ProbeError>, ProbeError> {
+        let mut lost = None;
         let now = clock::qpc()?;
         let marks = self.worker.suspend_marks();
         for index in 0..self.publication.verifying.len() {
@@ -1149,6 +1218,25 @@ impl Video<'_> {
             lost = lost.or_else(|| Some(unavailable("The segment verification result is overdue")));
         }
         Ok(lost)
+    }
+
+    /// One step of a pause: apply arrived verdicts and move the resolved
+    /// prefix into the lane, closing the mark once nothing is staged, as at
+    /// the pause. Overdue parts are judged at resume or Stop, as before, so a
+    /// pause does not change which parts are abandoned (§6.2 row 19).
+    /// Returns whether rows remain staged.
+    fn publish_paused(&mut self) -> Result<bool, ProbeError> {
+        if self.publication.verifying.iter().any(|entry| !entry.abandoned())
+            && let Some(lost) = self.receive_verdicts(Duration::ZERO)?
+        {
+            self.loss.lose(self.summary, &lost);
+        }
+        self.publish_resolved()?;
+        if self.publication.staged.is_empty() {
+            self.lane.mark.close(self.opening.epoch);
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     fn apply_verdict(&mut self, verdict: mp4::Verdict) -> Result<Option<ProbeError>, ProbeError> {

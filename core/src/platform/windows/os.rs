@@ -37,7 +37,9 @@ pub(super) struct ProcessImages {
 }
 
 /// The PID and image file name of each process in a new Toolhelp snapshot.
-pub(super) fn process_image_names() -> Result<ProcessImages, InventoryFailure> {
+/// With `limit`, the walk stops after `limit + 1` entries, so a caller sees
+/// that the snapshot holds more than `limit`; `complete` is then false.
+pub(super) fn process_image_names(limit: Option<usize>) -> Result<ProcessImages, InventoryFailure> {
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return Err(InventoryFailure::Snapshot);
@@ -52,6 +54,9 @@ pub(super) fn process_image_names() -> Result<ProcessImages, InventoryFailure> {
     loop {
         let end = entry.szExeFile.iter().position(|unit| *unit == 0).unwrap_or(entry.szExeFile.len());
         images.push((entry.th32ProcessID, String::from_utf16_lossy(&entry.szExeFile[..end])));
+        if limit.is_some_and(|limit| images.len() > limit) {
+            return Ok(ProcessImages { images, complete: false });
+        }
         if unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) } == 0 {
             let complete = unsafe { GetLastError() } == ERROR_NO_MORE_FILES;
             return Ok(ProcessImages { images, complete });

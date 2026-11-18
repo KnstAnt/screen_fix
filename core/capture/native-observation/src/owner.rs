@@ -12,7 +12,11 @@
 
 use std::{
     io,
-    sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel},
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+        mpsc::{RecvTimeoutError, SyncSender, sync_channel},
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -36,19 +40,34 @@ pub enum StartupError<E> {
     Timeout,
 }
 
+/// Who settled the startup race: nobody yet, the thread (ready), or the
+/// starter (gave up waiting).
+const PENDING: u8 = 0;
+const CLAIMED: u8 = 1;
+const ABANDONED: u8 = 2;
+
 /// The owner thread's side of the startup report.
-pub struct Startup<T, E>(SyncSender<Result<(u32, T), E>>);
+pub struct Startup<T, E> {
+    report: SyncSender<Result<(u32, T), E>>,
+    state: Arc<AtomicU8>,
+}
 
 impl<T, E> Startup<T, E> {
     /// Report that the thread is ready, with its thread ID and `value`. False
     /// when the starter no longer waits; the thread then ends without serving.
     pub fn ready(&self, value: T) -> bool {
-        self.0.try_send(Ok((unsafe { GetCurrentThreadId() }, value))).is_ok()
+        let thread_id = unsafe { GetCurrentThreadId() };
+        // Claim before sending: once claimed, the starter waits for the report
+        // instead of giving up, so both sides agree that the thread started.
+        if self.state.compare_exchange(PENDING, CLAIMED, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return false;
+        }
+        self.report.try_send(Ok((thread_id, value))).is_ok()
     }
 
     /// Report why the thread could not start.
     pub fn fail(&self, error: E) {
-        let _ = self.0.try_send(Err(error));
+        let _ = self.report.try_send(Err(error));
     }
 }
 
@@ -74,11 +93,20 @@ where
     R: Send + 'static,
     E: Send + 'static,
 {
-    let (ready, initialized) = sync_channel(1);
-    let handle = thread::Builder::new().name(name.into()).spawn(move || body(Startup(ready)))
+    let (report, initialized) = sync_channel(1);
+    let state = Arc::new(AtomicU8::new(PENDING));
+    let startup = Startup { report, state: Arc::clone(&state) };
+    let handle = thread::Builder::new().name(name.into()).spawn(move || body(startup))
         .map_err(StartupError::Spawn)?;
-    let result = initialized.recv_timeout(STARTUP_WAIT);
-    // A thread that reports after this point finds no receiver.
+    let mut result = initialized.recv_timeout(STARTUP_WAIT);
+    // On timeout, give up unless the thread already claimed the start; a
+    // claimed report is already in flight, so take it. A thread that claims
+    // after this point gets false from `ready` and ends without serving.
+    if matches!(result, Err(RecvTimeoutError::Timeout))
+        && state.compare_exchange(PENDING, ABANDONED, Ordering::AcqRel, Ordering::Acquire).is_err()
+    {
+        result = initialized.recv().map_err(|_| RecvTimeoutError::Disconnected);
+    }
     drop(initialized);
     match result {
         Ok(Ok((thread_id, value))) => Ok((OwnerThread { thread_id, handle, join_on_failure }, value)),

@@ -4,7 +4,7 @@ mod cursor;
 mod events;
 mod elevated;
 mod frame_policy;
-pub(super) use frame_policy::{ApprovalReadError, ELEVATED_FRAME_WAIT_US, FrameApproval, FramePolicy};
+pub(super) use frame_policy::{ApprovalReadError, ELEVATED_FRAME_WAIT_US, FrameApproval, FramePolicy, Transition};
 mod hung;
 mod ime;
 pub(super) use ime::State as ImeState;
@@ -30,10 +30,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_DESTROY, EVENT_OBJECT_FOCUS, EVENT_OBJECT_HIDE, EVENT_OBJECT_IME_CHANGE,
     EVENT_OBJECT_IME_HIDE, EVENT_OBJECT_IME_SHOW, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE,
     EVENT_OBJECT_SHOW, EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
-    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_SWITCHEND, EVENT_SYSTEM_SWITCHSTART, GetForegroundWindow, OBJID_CARET, OBJID_CURSOR, OBJID_WINDOW,
+    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_SWITCHEND, EVENT_SYSTEM_SWITCHSTART, GetClassNameW, GetForegroundWindow, OBJID_CARET, OBJID_CURSOR, OBJID_WINDOW,
 };
 
 use crate::{
+    devlog::devlog,
     capture::{context::{BusyLevel, InputSettings, TextTarget}, save::SaveWindowContext},
     config::ResolvedCaptureConfig,
     package::metadata::AttemptLayout,
@@ -152,8 +153,9 @@ impl ReceiptFocus {
 pub(super) enum HookReceipt {
     /// One visit was verified throughout the receipt's uncertainty interval.
     Covered(Visit),
-    /// The focus changed inside the interval while the foreground stayed the
-    /// same approved window; `before` is the focus generation that ended.
+    /// The focus changed inside the interval while the foreground stayed in
+    /// the same approved process instance, with no other foreground between
+    /// the two visits; `before` is the focus generation that ended.
     FocusUncertain { before: FocusGeneration, after: Visit },
     /// No sweep has verified the timeline through the receipt yet.
     Pending,
@@ -269,6 +271,8 @@ struct ForegroundRead {
     replaced: Option<WindowProcess>,
     /// The approved, ordinary foreground, if any.
     approved: Option<WindowProcess>,
+    /// The condition that refused approval, for the development log.
+    refusal: Option<&'static str>,
 }
 
 /// What one context poll found before its window sweep.
@@ -490,11 +494,25 @@ impl<'a> Context<'a> {
         }
         let (notices, lost) = self.take_notices(receipt.boundary.qpc, at);
         let mut output = Vec::new();
-        let interrupted = lost != 0 || notices.iter().any(|notice| matches!(notice.event,
-            EVENT_SYSTEM_FOREGROUND | EVENT_SYSTEM_DESKTOPSWITCH));
         let foreground = self.read_foreground();
+        // A foreground notice keeps the approval only when it names a window
+        // of the approved process instance: a brief visit to another process
+        // between two polls must still end it. The notice window is read now,
+        // not at notice time: a window that is gone or reused reads as another
+        // process or not at all, and so interrupts, the safe direction.
+        let interrupted = lost != 0 || notices.iter().any(|notice| match notice.event {
+            EVENT_SYSTEM_DESKTOPSWITCH => true,
+            EVENT_SYSTEM_FOREGROUND => foreground.approved.is_none_or(|approved| read_window(notice.window)
+                .is_none_or(|proof| proof.process != approved.process
+                    || notice.thread != 0 && proof.thread.get() != notice.thread)),
+            _ => false,
+        });
         let observed_at = origin.time(clock::qpc()?)?;
-        frame_policy.publish(foreground.approved, observed_at, receipt.boundary, interrupted);
+        if let Some(transition) = frame_policy.publish(foreground.approved, observed_at, receipt.boundary, interrupted)
+            && crate::devlog::ENABLED
+        {
+            Self::log_approval(&foreground, transition, observed_at);
+        }
         let now = Instant::now();
         let scan = self.scan_notices(&notices);
         let invalidated = lost != 0 || self.queries.changed() || scan.invalidated;
@@ -572,14 +590,46 @@ impl<'a> Context<'a> {
     fn read_foreground(&mut self) -> ForegroundRead {
         let foreground = unsafe { GetForegroundWindow() };
         let window = WindowId(foreground as usize as u64);
-        let observed = WindowProcess::foreground().filter(|proof| proof.window == window);
+        let read = WindowProcess::foreground();
+        let observed = read.filter(|proof| proof.window == window);
         // IMG-8: a Ghost that verifiably replaced a hung window counts as that
-        // window; an unresolved Ghost stays unapproved (C4).
-        let replaced = observed.filter(|proof| hung::is_ghost(proof.hwnd().0))
-            .and_then(|ghost| self.hung.ghost_original(ghost.window));
-        let approved = replaced.or(observed).filter(|proof| !hung::is_ghost(proof.hwnd().0)
-            && self.approvals.get(proof.process).is_some() && self.ordinary_process(proof.process));
-        ForegroundRead { window, observed, replaced, approved }
+        // window; an unresolved Ghost stays unapproved (C4). The Ghost is
+        // recognized by its own window: its owner (DWM) is not readable.
+        let replaced = hung::is_ghost(foreground).then(|| self.hung.ghost_original(window)).flatten();
+        let candidate = replaced.or(observed);
+        let refusal = match candidate {
+            None if read.is_none() => Some("foreground_unreadable"),
+            None => Some("window_mismatch"),
+            Some(proof) if hung::is_ghost(proof.hwnd().0) => Some("hung_ghost"),
+            Some(proof) if self.approvals.get(proof.process).is_none() => Some("process_not_approved"),
+            Some(proof) if !self.ordinary_process(proof.process) => Some("not_ordinary_process"),
+            Some(_) => None,
+        };
+        let approved = candidate.filter(|_| refusal.is_none());
+        ForegroundRead { window, observed, replaced, approved, refusal }
+    }
+
+    /// Development log of an approval transition: the failed condition, if
+    /// any, whether the process is the previously approved one and, only for
+    /// a window of the approved process, its class. Never titles, text or
+    /// paths, and nothing about a window of another process.
+    fn log_approval(foreground: &ForegroundRead, transition: Transition, at: SessionTimeUs) {
+        let class = |window: Option<WindowProcess>| window.map_or_else(String::new, |window| {
+            let mut class = [0_u16; 64];
+            let length = unsafe { GetClassNameW(window.window.0 as usize as _, class.as_mut_ptr(), class.len() as i32) };
+            format!(" class={:?}", String::from_utf16_lossy(&class[..usize::try_from(length).unwrap_or(0).min(class.len())]))
+        });
+        match transition {
+            Transition::Continued => devlog!("approval", "foreground continued same_process window_changed{} at_us={}",
+                class(foreground.approved), at.0),
+            Transition::Replaced(previous) => {
+                let candidate = foreground.replaced.or(foreground.observed);
+                let same_process = previous.zip(candidate).map(|(previous, candidate)| previous.process == candidate.process);
+                let approved = foreground.approved.or(candidate.filter(|_| same_process == Some(true)));
+                devlog!("approval", "foreground {} same_process={same_process:?} previous={}{} at_us={}",
+                    foreground.refusal.unwrap_or("approved"), previous.is_some(), class(approved), at.0);
+            }
+        }
     }
 
     fn scan_notices(&self, notices: &[Notice]) -> NoticeScan {

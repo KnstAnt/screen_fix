@@ -25,7 +25,7 @@ pub(super) use facts::ControlPrefix;
 pub(crate) use lifecycle::Control;
 pub(super) use source::{ActiveSourceProof, SourceDispatch, SourcePreparation};
 pub(super) use worker::{
-    Admission, FixtureNotice, InputFailure, PauseProducer, PausedVideo, Receipt, VideoFailure, WorkerSession,
+    Admission, Budget, FixtureNotice, InputFailure, PauseProducer, PausedVideo, Receipt, VideoFailure, WorkerSession,
 };
 
 use std::{
