@@ -2,7 +2,6 @@ use std::{
     ffi::OsStr,
     mem::size_of,
     os::windows::io::{FromRawHandle, OwnedHandle},
-    ptr::null_mut,
     sync::{
         Arc, Mutex, MutexGuard, mpsc,
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -12,13 +11,14 @@ use std::{
 };
 
 use screen_fix_elevated::{Authenticated, Cancellation, Failure, LaunchRequest, RecorderBootstrap, Result};
+use screen_fix_native_observation::{StaticLease, com::ComApartment};
 use screen_fix_protocol::{AttemptId, SessionId};
-use crate::session::windows::SourceDispatch;
+use crate::platform::windows::controller::SourceDispatch;
 use super::{super::wide, visit::matches_target};
 
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows_sys::Win32::{
     Foundation::{ERROR_CANCELLED, GetLastError, INVALID_HANDLE_VALUE},
-    System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize},
     UI::{
         Shell::{SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW},
         WindowsAndMessaging::SW_SHOWNORMAL,
@@ -30,20 +30,6 @@ const READINESS: Duration = screen_fix_elevated::READINESS;
 const POLL: Duration = Duration::from_millis(25);
 
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-
-struct Flight;
-
-impl Flight {
-    fn acquire() -> Result<Arc<Self>> {
-        IN_FLIGHT.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| Failure::Busy)?;
-        Ok(Arc::new(Self))
-    }
-}
-
-impl Drop for Flight {
-    fn drop(&mut self) { IN_FLIGHT.store(false, Ordering::Release); }
-}
 
 #[derive(Clone, Copy)]
 enum Phase {
@@ -139,7 +125,7 @@ pub(super) struct Ticket {
 impl Ticket {
     /// A controller must close capture admission before asking Windows for consent.
     pub(super) fn start(attempt: AttemptId, session: SessionId, source: SourceDispatch) -> Result<Self> {
-        let flight = Flight::acquire()?;
+        let flight = Arc::new(StaticLease::claim(&IN_FLIGHT).ok_or(Failure::Busy)?);
         let consent_until = Instant::now() + CONSENT;
         let shared = Arc::new(Shared {
             permit: Arc::new(Permit {
@@ -213,7 +199,7 @@ impl Drop for Ticket {
     fn drop(&mut self) { self.cancel(); }
 }
 
-fn attach(shared: &Shared, flight: &Arc<Flight>, attempt: AttemptId, session: SessionId, source: SourceDispatch) -> Result<Authenticated> {
+fn attach(shared: &Shared, flight: &Arc<StaticLease>, attempt: AttemptId, session: SessionId, source: SourceDispatch) -> Result<Authenticated> {
     let permit = &shared.permit;
     source.with_closed_phase(|| permit.cancellation.check())?;
     let (bootstrap, request) = RecorderBootstrap::prepare(attempt, session, &permit.cancellation, permit.consent_until)?;
@@ -227,15 +213,15 @@ fn attach(shared: &Shared, flight: &Arc<Flight>, attempt: AttemptId, session: Se
     let shell_source = Arc::new(source);
     let source = Arc::clone(&shell_source);
     thread::Builder::new().name("elevated-consent".into()).spawn(move || {
-        match Apartment::start() {
+        match ComApartment::initialize(COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) {
             Ok(apartment) => {
                 let outcome = shell(request, &shell_permit, &shell_source);
                 let _ = sender.send(outcome);
                 drop(shell_flight);
                 drop(apartment);
             }
-            Err(failure) => {
-                let _ = sender.send(Err(failure));
+            Err(_) => {
+                let _ = sender.send(Err(Failure::ConsentLaunch));
             }
         }
     }).map_err(|_| Failure::Supervisor)?;
@@ -256,20 +242,6 @@ fn attach(shared: &Shared, flight: &Arc<Flight>, attempt: AttemptId, session: Se
     };
     shared.enter_binding(returned)?;
     bootstrap.authenticate(child, returned, &permit.cancellation)
-}
-
-struct Apartment;
-
-impl Apartment {
-    fn start() -> Result<Self> {
-        let mode = (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32;
-        if unsafe { CoInitializeEx(null_mut(), mode) } < 0 { return Err(Failure::ConsentLaunch) }
-        Ok(Self)
-    }
-}
-
-impl Drop for Apartment {
-    fn drop(&mut self) { unsafe { CoUninitialize() }; }
 }
 
 fn shell(request: LaunchRequest, permit: &Permit, source: &SourceDispatch) -> Result<(OwnedHandle, Instant)> {

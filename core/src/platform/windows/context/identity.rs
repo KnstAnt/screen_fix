@@ -7,6 +7,7 @@ use std::{
 pub(in crate::platform::windows) use screen_fix_native_observation::identity::{
     MetadataScrubber, ProcessHandle, WindowProcess,
 };
+use screen_fix_native_observation::StaticLease;
 
 use crate::{
     config::{ExecutableIdentity, ResolvedProfile},
@@ -16,12 +17,6 @@ use crate::{
 const PROCESS_CACHE: usize = 64;
 const RESOLUTION_WAIT: Duration = Duration::from_secs(2);
 static RESOLVER_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-struct ResolutionLease;
-
-impl Drop for ResolutionLease {
-    fn drop(&mut self) { RESOLVER_ACTIVE.store(false, Ordering::Release); }
-}
 
 enum ApprovalMatch {
     Resolved(Option<usize>),
@@ -94,9 +89,8 @@ pub(in crate::platform::windows) struct ApprovedProcesses<'a> {
 
 impl<'a> ApprovedProcesses<'a> {
     pub fn new(profile: &'a ResolvedProfile) -> Result<Self, super::ProbeError> {
-        RESOLVER_ACTIVE.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| super::unavailable("A previous executable path resolution owner is still active"))?;
-        let lease = ResolutionLease;
+        let lease = StaticLease::claim(&RESOLVER_ACTIVE)
+            .ok_or_else(|| super::unavailable("A previous executable path resolution owner is still active"))?;
         let (requests, incoming) = mpsc::sync_channel::<ProcessInstance>(PROCESS_CACHE);
         let (completed, results) = mpsc::sync_channel(PROCESS_CACHE);
         let stop = Arc::new(AtomicBool::new(false));
@@ -106,8 +100,7 @@ impl<'a> ApprovedProcesses<'a> {
             let _lease = lease;
             while let Ok(proof) = incoming.recv() {
                 if stopping.load(Ordering::Acquire) { break; }
-                let index = ProcessHandle::open(proof.pid)
-                    .filter(|process| process.instance(proof.pid) == Some(proof))
+                let index = ProcessHandle::open_instance(proof)
                     .ok_or(ResolutionError::ProcessIdentityUnavailable)
                     .and_then(|process| approved_index(&process, &approved)
                         .map_err(|()| ResolutionError::ExecutablePathUnavailable));
@@ -179,10 +172,7 @@ impl<'a> ApprovedProcesses<'a> {
         if let Some(cached) = self.cache.iter().find(|cached| cached.process == proof) {
             return cached.index.map(|index| &self.profile.approved_identities()[index]);
         }
-        let process = ProcessHandle::open(proof.pid)?;
-        if process.instance(proof.pid)? != proof {
-            return None;
-        }
+        let process = ProcessHandle::open_instance(proof)?;
         let index = match approval_match(&process.image_path()?, self.profile.approved_identities()).ok()? {
             ApprovalMatch::Resolved(index) => index,
             ApprovalMatch::Canonicalize(_) => {

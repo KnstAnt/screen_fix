@@ -52,6 +52,12 @@ impl NativeError {
     pub fn without_code(stage: HelperFailureStage) -> Self {
         Self { stage, code: None, raw_input_registration: None }
     }
+
+    /// An I/O failure at `stage`, with its operating-system code if any.
+    pub(crate) fn io(stage: HelperFailureStage, error: &io::Error) -> Self {
+        Self { code: error.raw_os_error(), ..Self::without_code(stage) }
+    }
+
     pub fn into_helper_failure(self) -> HelperFailure {
         HelperFailure {
             stage: self.stage,
@@ -62,7 +68,7 @@ impl NativeError {
 }
 
 pub fn last_error(stage: HelperFailureStage) -> NativeError {
-    NativeError { stage, code: io::Error::last_os_error().raw_os_error(), raw_input_registration: None }
+    NativeError::io(stage, &io::Error::last_os_error())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -145,9 +151,7 @@ pub fn run_scoped(
     if data_wake.is_null() { return Err(last_error(HelperFailureStage::Startup)); }
     // CreateEventW returned a new unnamed auto-reset event.
     let data_wake = unsafe { OwnedHandle::from_raw_handle(data_wake) };
-    let raw_wake = data_wake.try_clone().map_err(|error| NativeError {
-        stage: HelperFailureStage::Startup, code: error.raw_os_error(), raw_input_registration: None,
-    })?;
+    let raw_wake = data_wake.try_clone().map_err(|error| NativeError::io(HelperFailureStage::Startup, &error))?;
     let mut hooks = Hooks::start(scope.clone())?;
     let mut raw = match RawOwner::start(raw_wake, frequency, settings.pen_hid, scope) {
         Ok(raw) => raw,

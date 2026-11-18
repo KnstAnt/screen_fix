@@ -10,7 +10,7 @@ use crate::{
     config::DisplayKey,
     package::metadata::MonitorCapture,
     protocol::{GeometryId, MonitorId, PhysicalRect, QpcTick},
-    session::windows::WorkerSession,
+    platform::windows::controller::WorkerSession,
 };
 
 use super::{Monitor, Survey, survey};

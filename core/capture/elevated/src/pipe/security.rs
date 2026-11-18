@@ -1,15 +1,11 @@
 use std::{mem::size_of, ptr::null_mut};
 
 use windows_sys::Win32::{
-    Foundation::LocalFree,
     Security::{
         DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, GetSecurityDescriptorSacl,
         LABEL_SECURITY_INFORMATION,
         OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SE_DACL_PROTECTED,
-        Authorization::{
-            ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-            GetSecurityInfo, SE_FILE_OBJECT,
-        },
+        Authorization::{ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW},
     },
     Storage::FileSystem::FILE_ALL_ACCESS,
     System::SystemServices::SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
@@ -19,7 +15,10 @@ use crate::{
     process::Sid,
     win::{
         Failure, Handle, Result, wide,
-        acl::{ACCESS_ALLOWED, ADMINISTRATORS, LocalAllocation, MANDATORY_LABEL, MEDIUM_INTEGRITY, SYSTEM, acl_entries, parse_sid},
+        acl::{
+            ACCESS_ALLOWED, ADMINISTRATORS, LocalAllocation, MANDATORY_LABEL, MEDIUM_INTEGRITY, SYSTEM, acl_entries, parse_sid,
+            security_info,
+        },
     },
 };
 
@@ -59,18 +58,9 @@ impl Owner<'_> {
         let system = parse_sid(SYSTEM, Failure::PipeSecurity)?;
         let administrators = parse_sid(ADMINISTRATORS, Failure::PipeSecurity)?;
         let medium = parse_sid(MEDIUM_INTEGRITY, Failure::PipeSecurity)?;
-        let mut owner = null_mut();
-        let mut dacl = null_mut();
-        let mut descriptor = null_mut();
-        let status = unsafe {
-            GetSecurityInfo(handle.raw(), SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
-                &mut owner, null_mut(), &mut dacl, null_mut(), &mut descriptor)
-        };
-        let _descriptor = LocalAllocation(descriptor);
-        if status != 0 || descriptor.is_null() {
-            return Err(Failure::PipeSecurity);
-        }
+        let info = security_info(handle,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION, Failure::PipeSecurity)?;
+        let (owner, dacl, descriptor) = (info.owner, info.dacl, info.descriptor.0);
         let mut control = 0;
         let mut revision = 0;
         if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
@@ -134,10 +124,8 @@ fn sid_string(sid: &Sid) -> Result<String> {
     if unsafe { ConvertSidToStringSidW(sid.raw(), &mut output) } == 0 || output.is_null() {
         return Err(Failure::PipeSecurity);
     }
+    let _allocation = LocalAllocation(output.cast());
     let length = (0..256).find(|&i| unsafe { *output.add(i) == 0 });
-    let value = length.and_then(|length| {
-        String::from_utf16(unsafe { std::slice::from_raw_parts(output, length) }).ok()
-    });
-    unsafe { LocalFree(output.cast()) };
-    value.ok_or(Failure::PipeSecurity)
+    length.and_then(|length| String::from_utf16(unsafe { std::slice::from_raw_parts(output, length) }).ok())
+        .ok_or(Failure::PipeSecurity)
 }

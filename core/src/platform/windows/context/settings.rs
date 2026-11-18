@@ -1,17 +1,14 @@
 use std::{mem::size_of, ptr::null_mut};
 
-use windows_sys::Win32::{
-    Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
-    System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
-    },
-    UI::{
-        Input::KeyboardAndMouse::{GetDoubleClickTime, GetKeyboardLayoutList},
-        WindowsAndMessaging::*,
-    },
+use windows_sys::Win32::UI::{
+    Input::KeyboardAndMouse::{GetDoubleClickTime, GetKeyboardLayoutList},
+    WindowsAndMessaging::*,
 };
 
 use crate::capture::context::{ControllerHint, InputSettings, TouchpadParameters};
+
+/// A process inventory longer than this names no controllers.
+const MAX_PROCESSES: usize = 16_384;
 
 pub(super) fn read() -> InputSettings {
     let pointer: Option<[i32; 3]> = parameter(SPI_GETMOUSE);
@@ -81,26 +78,14 @@ fn layouts() -> Option<Vec<u64>> {
 }
 
 fn controllers() -> Option<Vec<ControllerHint>> {
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
+    // A partial inventory still names the controllers it saw.
+    let inventory = crate::platform::windows::os::process_image_names().ok()?;
+    if inventory.images.len() > MAX_PROCESSES {
         return None;
     }
-    struct Snapshot(windows_sys::Win32::Foundation::HANDLE);
-    impl Drop for Snapshot {
-        fn drop(&mut self) {
-            unsafe { CloseHandle(self.0) };
-        }
-    }
-    let snapshot = Snapshot(snapshot);
-    let mut entry = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
     let mut result = Vec::new();
-    if unsafe { Process32FirstW(snapshot.0, &mut entry) } == 0 {
-        return None;
-    }
-    for _ in 0..16_384 {
-        let end = entry.szExeFile.iter().position(|unit| *unit == 0).unwrap_or(entry.szExeFile.len());
-        let name = String::from_utf16_lossy(&entry.szExeFile[..end]).to_ascii_lowercase();
-        let hint = match name.as_str() {
+    for (_, name) in inventory.images {
+        let hint = match name.to_ascii_lowercase().as_str() {
             "wacom_tablet.exe" | "wacom_tabletuser.exe" | "pentablet.exe" | "huiontablet.exe" => Some(ControllerHint::TabletDriver),
             "3dxservice.exe" => Some(ControllerHint::ThreeDxWare),
             "streamdeck.exe" => Some(ControllerHint::StreamDeck),
@@ -113,9 +98,6 @@ fn controllers() -> Option<Vec<ControllerHint>> {
         if let Some(hint) = hint && !result.contains(&hint) {
             result.push(hint);
         }
-        if unsafe { Process32NextW(snapshot.0, &mut entry) } == 0 {
-            return Some(result);
-        }
     }
-    None
+    Some(result)
 }

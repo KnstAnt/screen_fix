@@ -336,34 +336,6 @@ impl HidReport {
     pub fn is_touchpad(&self) -> bool {
         self.collection() == Some(OptionalCollection::Touchpad)
     }
-
-    pub fn pen_continuity_uncertain(&self) -> bool {
-        if self.usage_page.is_some() && !self.is_pen() {
-            return false;
-        }
-        match &self.result {
-            HidReportResult::InvalidExtent | HidReportResult::PreparsedUnavailable
-            | HidReportResult::UnsupportedReport => true,
-            HidReportResult::Report(report) => report.fields.as_slice().iter().any(|field| {
-                field.usage == HidUsage::Tip && !matches!(field.value, HidValue::Switch(_))
-            }),
-            _ => false,
-        }
-    }
-
-    /// Distinguish a single attested tip switch from missing or
-    /// multi-transducer evidence without guessing which transducer moved.
-    pub fn pen_tip(&self) -> Option<(u16, bool)> {
-        if !self.is_pen() {
-            return None;
-        }
-        let HidReportResult::Report(report) = &self.result else { return None };
-        let mut tips = report.fields.as_slice().iter().filter(|field| field.usage == HidUsage::Tip);
-        match (tips.next(), tips.next()) {
-            (Some(HidField { link, value: HidValue::Switch(down), .. }), None) => Some((*link, *down)),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -749,8 +721,5 @@ fn decode<T: DeserializeOwned>(packet: &[u8], direction: u8) -> Result<T, Packet
     }
     serde_json::from_slice(&packet[HEADER_BYTES..]).map_err(|_| PacketError::InvalidPayload)
 }
-
-#[cfg(target_os = "windows")]
-pub mod shared;
 
 pub mod elevated;

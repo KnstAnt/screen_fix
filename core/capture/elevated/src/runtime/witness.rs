@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use screen_fix_protocol::{QpcTick, WindowId, ipc::elevated::WindowInstance};
+use screen_fix_protocol::{MESSAGE_TICK_UNCERTAINTY_MS, MessageTickMs, QpcTick, WindowId, ipc::elevated::WindowInstance};
 use windows_sys::{
     Win32::{
         Foundation::{HANDLE, HWND, LPARAM, LRESULT, WAIT_FAILED, WPARAM},
@@ -37,6 +37,8 @@ use super::lifetime::qpc;
 
 /// The longest interval between two witness samples.
 const SAMPLE: Duration = Duration::from_millis(10);
+/// A coarse tick older than this is not bounded from its anchor.
+const MAX_TICK_AGE_MS: u64 = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Foreground {
@@ -374,13 +376,12 @@ fn observe(
 /// A WinEvent or input message tick can wrap and is coarser than QPC.
 pub(super) fn coarse_lower(tick: u32, lifetime: &super::lifetime::Lifetime) -> Option<QpcTick> {
     let start = qpc().ok()?;
-    let anchor = unsafe { GetTickCount64() } as u32;
+    let anchor = unsafe { GetTickCount64() };
     let end = qpc().ok()?;
     if end < start { return None; }
-    let elapsed = anchor.wrapping_sub(tick);
-    if elapsed > 1_000 { return None; }
-    let uncertainty_ms = 16;
-    let range = Duration::from_millis(u64::from(elapsed) + uncertainty_ms);
+    let delta = MessageTickMs(tick).delta_from(anchor)?;
+    let elapsed = u64::try_from(-i64::from(delta)).ok().filter(|elapsed| *elapsed <= MAX_TICK_AGE_MS)?;
+    let range = Duration::from_millis(elapsed + MESSAGE_TICK_UNCERTAINTY_MS);
     Some(QpcTick(start.0.checked_sub(lifetime.ticks(range).ok()?)?))
 }
 

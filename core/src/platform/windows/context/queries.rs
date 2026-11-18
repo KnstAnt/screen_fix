@@ -39,7 +39,7 @@ pub(super) enum Classification {
     Resolved(TextTarget, Option<QpcTick>),
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 pub(in crate::platform::windows) struct PointerLink {
     /// None when no read can serve the action (`reason`).
     request_id: Option<RequestId>,
@@ -49,7 +49,7 @@ pub(in crate::platform::windows) struct PointerLink {
     reason: Option<&'static str>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum PointerBasis {
     PreAction,

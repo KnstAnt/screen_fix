@@ -265,3 +265,99 @@ Release пересобран. Нужен повторный ручной тес�
   - тест с elevated-окном (`matches()` при выдаче конвертации сверяет `source_t_us` = время показа);
   - выключить `dev-log` перед продакшеном;
   - коммит делает пользователь.
+
+## Аудит архитектуры и технического долга, раунд 2 (2026-11-18)
+Основа — `74ed5af`, смержено в master пользователем.
+
+Бриф: `review/code_review2/audit_brief.md`. Акцент — архитектура (SOLID, слои), дублирование, KISS, идиоматичность, техдолг.
+
+Ревьюеры: 8 по областям A–H (владение файлами как в фазе 2) и X — сквозная архитектура (граф крейтов, слои, межобластное дублирование, потоки, фичи). Находки каждого пишутся в `review/code_review2/findings_<A..H,X>.md`.
+
+Режим: только чтение. Код не меняется, пока пользователь не примет решения по находкам.
+Аудит завершён. Сводка — в `review/code_review2/AUDIT_SUMMARY.md`: 6 high, 45 medium, 102 low; почти всё — рефакторинг без изменения поведения.
+
+Ждём решений пользователя:
+- D1: защита от `dev-log` в release;
+- D2: минимальные golden-тесты;
+- D3: только Windows;
+- D4: мелкие изменения поведения;
+- D5: объём фаз.
+
+Примечание: субагенты не могут писать файлы, поэтому их находки сохраняет координатор.
+
+### Решения по аудиту (2026-11-18)
+- **D1.** `compile_error!` при `elevated-release` вместе с `dev-log` — сделано (ui/src/main.rs, deploy README).
+- **D2.** Минимальные тесты разрешены: golden-тесты строк журналов и интеграционный тест `validate_gates`. Запускает их пользователь.
+- **D3.** Workspace только под Windows (X14).
+- **D4.** G6 — только вариант без изменения поведения; H12 и C15 не трогаем.
+- **D5.** Делаем фазы 1–3, план в `review/code_review2/execution_brief.md`.
+
+Фаза 1 разбита на 3 последовательные части:
+- 1a — время, потери, мелкие обобщения;
+- 1b — ошибки, отказы, конвертеры protocol;
+- 1c — нативные хелперы.
+- **Фаза 1a — готово.**
+  - Добавлены методы QPC↔время в protocol и `Lifetime`, `LossSpan`, `core/src/util.rs` (`keep_earlier`, `raise`, `push_bounded`, `has_duplicate`), `MessageTickEstimate::not_before`, общий `tick_delta`, комбинаторы `Evidence`, `MODIFIER_VKS`, `CorrelatedInput::slots`, `From<GapCause>`.
+  - Оставлены как были, с обоснованием: насыщение в elevated `input.rs:176`, `context.rs:1220`, потолок слотов X10.
+  - `HOOK_UNCERTAINTY_MS` оставлен отдельно от `MESSAGE_TICK_UNCERTAINTY_MS`: это разные величины.
+  - Остатки (D6 `notice_interval`, слияния спанов X9, H11 `VecDeque` и `receipt`, D2 merge `ContextGap`) переданы в фазу 1b.
+  - `cargo check`: 0 ошибок, 0 предупреждений.
+- **Фаза 1b — готово.**
+  - `From` для `ClockRangeError`/`JournalError` убрал около 95 `map_err`. Добавлены `ProbeError::new`, `CaptureCause`, `HelperError`-аксессоры.
+  - `SourceFailureReason` перенесён в protocol, рядом с ним `Failure::reason()`. Неиспользуемые `Display`/`Error` у `elevated::Failure` удалены.
+  - Добавлены конвертеры `InputEvidence`, `From<WindowInstance>` (5 мест), `FrameHeader` (байты прежние), `NativeError::io`, `controller_error`, wake/qpc/anchor-хелперы, `notice_interval`, `util::widen`, `VecDeque`+`receipt` в `loss.rs`, `merge_context_gap`.
+  - Не делали: `still_rows` (счётчик там `NonZero`), G8 в `grant`/`notices` (там нет чистой конверсии).
+  - Решения координатора: `unavailable` остаётся сокращением; неиспользуемый `CaptureErrorKind` убрать в 1c.
+- **Фаза 1c — готово.** `cargo check` без ошибок и предупреждений.
+  - Новое в native-observation: `owner` (handshake старта потока), `wake::WakeEvent`, `com::ComApartment`, `StaticLease`.
+  - Общие проверки: `ProcessHandle::open_instance`, `FocusAt::receipt`, `WindowOwner` — строгость сохранена.
+  - FFI-хелперы elevated, `mf::pack`, `os::process_image_names`, константы раскладки пакета.
+  - Типы-обёртки ID; добавлен `ApprovalGeneration`, сериализуется прозрачно.
+  - Удалён `CaptureErrorKind`.
+  - После слияния две проверки доверия стали строже (принято координатором как fail-closed):
+    - null-дескриптор в `permissions.rs`;
+    - пустой путь образа в `process.rs`.
+  - Помощник публикации PNG не делался: потоки cursor и stills различаются по семантике.
+  - Не тронуто: `data_wake` и ещё 3 места с `GetWindowThreadProcessId`.
+- **Фаза 1 завершена.** Ревью критиком по снимку diff запущено параллельно с фазой 2.
+- **Критик по фазе 1: одобрено с замечаниями (P3).** Объединённые проверки не ослаблены, арифметика времени и байты на проводе не изменились.
+  - Новые файлы (`util.rs`, `owner.rs`, `wake.rs`, `com.rs`) не попали в снимок, т.к. `git diff` не включает неотслеживаемые файлы; координатор проверил их вручную — в порядке. Урок: снимок делать через `git add -N` или с явным перечислением новых файлов.
+  - Отложено в фазу 5:
+    - гонка в `owner::spawn` — `ready()` после таймаута до `drop`, сохранилась из исходного кода; актуальна для clipboard;
+    - `process_image_names` без предела памяти.
+- **Фаза 2a — готово.** `cargo check` без ошибок и предупреждений.
+  - `package/row.rs`: `RowKind`, `RowCounts`, общие для writer и reader; `BlindRow`; `RowEnvelope`, `MessageTick`, `stamp_receipt`.
+  - Golden-тесты байтов для envelope, blind, stills, `native_status`, фиксированных строк ввода; `package/tests.rs` — байты журналов на реальном writer и `validate_gates` на синтетической попытке.
+  - Убрана избыточная запись `recv_t_us` в `apply_context_envelope`: encode всё равно её перезаписывает; принято координатором.
+  - **Ожидаемые байты в тестах выведены вручную и ни разу не запускались.** До фазы 2b их должен прогнать пользователь (`cargo test -p screen-fix-core`), чтобы зафиксировать исходное состояние.
+- Пользователь прогнал `cargo test -p screen-fix-core`: 20 тестов, все зелёные. Базовое состояние зафиксировано, начинаем фазу 2b.
+- **Фаза 2b — готово.** `cargo check` без ошибок и предупреждений.
+  - Скриншоты: `StillRow` (`fallback`, `withdraw_uncertified`, `join_seen`, `deadline`), `SaveRef`, полный `DropReason` (Drain удалён).
+  - Контекст: `WindowRowKind`, `NativeStatus`.
+  - Фиксированные строки ввода: `PauseRow`, `ResumeRow`, `DiscontinuityRow`, `InputSourceLossRow`, `CheckpointContextRow`, `CheckpointUnavailable`.
+  - Ожидания golden-тестов не менялись, кроме трёх тестов `still_rows`. Они работали на частичных `Value`, а типизированная строка так не умеет, поэтому перенесены на полные строки. Координатор это принял.
+  - Нужен повторный прогон тестов пользователем.
+- Пользователь прогнал тесты после 2b — всё зелёное. **Фаза 2 завершена.** Фаза 3 разбита на 3a (только Windows, цикл package⇄session, мелкие переносы) и 3b (перенос контроллера и доменных модулей, финализация).
+- **Фаза 3a — готово.**
+  - Workspace только для Windows: `compile_error!` для других платформ, удалены заглушки и все 58 `cfg` в UI, удалены Linux-зависимости (минус около 379 строк в `Cargo.lock`). Защита в build-скриптах оставлена.
+  - `package/source.rs` разорвал цикл package⇄session (проверено grep); добавлены `source_failure_guidance` и `ControlNotice`.
+  - `AttemptStage` в core.
+  - Перо перенесено в `capture/input/pen.rs`; `ipc/shared.rs` перенесён в `native_observation::channel`, protocol теперь без `cfg`.
+  - Ссылка в плане исправлена.
+- **Фаза 3b — готово.** `cargo check` без ошибок и предупреждений.
+  - Контроллер перенесён в `platform/windows/controller{,/disk,/environment}.rs`. В `session/` остались только `fault`, `hotkey` и новый `labels`. Единственная точка входа — `SessionHandle` → `Control`.
+  - В `capture/input/` перенесены `hid` (+touchpad), `hook_health`, `blind`, `devices`; добавлены новые `publication.rs` и `loss.rs`.
+  - `package/finalize.rs` (`FinalRows`); в `record_with_disk` и `record` выделены шаги.
+  - `slots.rs` и `still_time.rs` остались на месте: зависят от платформенных типов. `frame_policy` — только хелперы. Группировка плоских модулей не делалась: не чистый перенос.
+  - Пути обновлены в документах о текущем состоянии (README, ARCH addendum, handoff). План и прогресс исторические, их пути оставлены.
+  - Нужны: прогон тестов пользователем и критик по фазам 2–3 (снимок теперь включает новые файлы).
+- **Критик по фазам 2–3: одобрено с замечаниями (только P3).**
+  - Подтверждено:
+    - байты `StillRow`, `NativeStatus`, `RowEnvelope`, фиксированных строк;
+    - подсчёт `RowCounts`;
+    - порядок `FinalRows`;
+    - перенос потерь.
+  - Добавлен `debug_assert` в `withdraw_uncertified`.
+  - Критик только просмотрел, но не проверял детально: удаление `cfg`, перенос контроллера и доменных модулей, `source.rs`. Это механические переносы; гарантией служат компиляция и прогон тестов.
+- **Фазы 1–3 раунда 2 завершены.** Ждём прогона тестов пользователем и ручной записи. Фазы 4 (god-объекты) и 5 (события вместо опроса) отложены.
+- Пользователь прогнал тесты после фазы 3 — все зелёные.

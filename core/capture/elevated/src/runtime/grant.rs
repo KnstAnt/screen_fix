@@ -92,7 +92,7 @@ impl Grant {
         let now = qpc()?;
         if request.lease != lease.sequence || lease.epoch.is_some()
             || request.expires_qpc <= now
-            || request.expires_qpc.0 > now.0.checked_add(lifetime.ticks(LEASE)?).ok_or(Failure::Supervisor)?
+            || request.expires_qpc > lifetime.after(now, LEASE)?
             || request.visit.foreground != request.foreground.target
             || request.visit.epoch.0 == 0 || request.visit.focus_generation.0 == 0
             || request.visit.resync_revision != NonZeroU64::MIN
@@ -376,10 +376,9 @@ impl Grant {
             self.check(true)?;
         }
         self.verify_token()?;
-        let bound = lease.controller_qpc.min(lease.pump_qpc).0
-            .checked_add(self.lifetime.ticks(LEASE)?).ok_or(Failure::Supervisor)?;
-        if bound <= now.0 { return Err(Failure::LeaseExpired); }
-        self.expires_qpc.store(bound, Release);
+        let bound = self.lifetime.after(lease.controller_qpc.min(lease.pump_qpc), LEASE)?;
+        if bound <= now { return Err(Failure::LeaseExpired); }
+        self.expires_qpc.store(bound.0, Release);
         Ok(())
     }
 

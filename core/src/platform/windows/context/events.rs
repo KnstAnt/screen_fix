@@ -21,7 +21,7 @@ impl Notifications {
     pub fn drain(&self) -> impl Iterator<Item = Notice> + '_ { self.0.drain() }
 
     /// Lost notices since the last drain: count and first and last receipt.
-    pub fn take_loss(&self) -> Option<(u64, crate::protocol::QpcTick, crate::protocol::QpcTick)> { self.0.take_loss() }
+    pub fn take_loss(&self) -> Option<screen_fix_native_observation::LossSpan> { self.0.take_loss() }
 
     pub fn running(&self) -> bool { self.0.running() }
 }

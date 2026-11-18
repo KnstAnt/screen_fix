@@ -1,8 +1,6 @@
 //! Native UI Automation reads and subscriptions on one owning MTA thread.
 
 use std::{
-    marker::PhantomData,
-    rc::Rc,
     sync::{Arc, atomic::{AtomicU64, Ordering::Release}},
     time::{Duration, Instant},
 };
@@ -11,7 +9,7 @@ use windows::{
     Win32::{
         Foundation::{HWND, POINT},
         System::{
-            Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize},
+            Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance},
             Variant::{VT_BOOL, VT_UNKNOWN, VariantToBoolean},
         },
         UI::{Accessibility::*, WindowsAndMessaging::{IsHungAppWindow, WindowFromPhysicalPoint}},
@@ -34,6 +32,7 @@ const MAX_CONNECT: Duration = Duration::from_millis(250);
 const MIN_CALL: Duration = Duration::from_millis(10);
 
 use crate::{
+    com::ComApartment,
     hung::is_ghost,
     identity::{MetadataScrubber, WindowProcess},
     uia_commits::{CommitScope, Handler, Queue as CommitQueue},
@@ -110,21 +109,6 @@ fn qpc() -> Option<QpcTick> {
         .then_some(QpcTick(value))
 }
 
-struct Apartment(PhantomData<Rc<()>>);
-
-impl Apartment {
-    fn initialize() -> windows::core::Result<Self> {
-        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok()?;
-        Ok(Self(PhantomData))
-    }
-}
-
-impl Drop for Apartment {
-    fn drop(&mut self) {
-        unsafe { CoUninitialize() };
-    }
-}
-
 #[implement(IUIAutomationFocusChangedEventHandler)]
 struct FocusNotification(Arc<AtomicU64>);
 
@@ -154,7 +138,7 @@ pub struct Client {
     text_edit: Option<IUIAutomation3>,
     subscription: Option<TextEditSubscription>,
     pending_subscription: Option<(Request, IUIAutomationElement)>,
-    _apartment: Apartment,
+    _apartment: ComApartment,
 }
 
 impl Client {
@@ -168,7 +152,7 @@ impl Client {
 
     fn open_inner(revision: Arc<AtomicU64>, scoped: bool) -> windows::core::Result<Self> {
         // The apartment guard is the last field to drop.
-        let _apartment = Apartment::initialize()?;
+        let _apartment = ComApartment::initialize(COINIT_MULTITHREADED)?;
         let automation: IUIAutomation2 = unsafe { CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) }?;
         unsafe {
             automation.SetConnectionTimeout(MAX_CONNECT.as_millis() as u32)?;

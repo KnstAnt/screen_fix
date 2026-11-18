@@ -120,9 +120,9 @@ The observation selector is app-neutral. It does not normalize full training act
 No subsystem receives a universal CoreContext containing all queues, tasks and resources. Route only the commands and facts it consumes. Do not introduce a broadcast bus for every record or a shared mutable session object queried by every worker.
 
 **Permitted process-wide state (explicit exceptions to "no global mutable state").** Each item is an atomic latch or counter, a once-initialized immutable value or callback context for a native callback without a user-data pointer, with one documented purpose. In the core crate:
-- `RECORDING_OWNED` (`session/windows.rs`): the process-wide one-recording latch.
+- `RECORDING_OWNED` (`platform/windows/controller.rs`): the process-wide one-recording latch.
 - `REPORT_SERIAL` (`package/diagnostics.rs`): a counter that makes diagnostic report names unique.
-- `DESKTOP_SIGNALS` (`session/windows/environment.rs`, thread-local): the context of the out-of-context desktop WinEvent callback, which has no user-data pointer. The message loop clears it before removing the hook.
+- `DESKTOP_SIGNALS` (`platform/windows/controller/environment.rs`, thread-local): the context of the out-of-context desktop WinEvent callback, which has no user-data pointer. The message loop clears it before removing the hook.
 - `IN_FLIGHT` (`platform/windows/elevated/launcher.rs`): the one-flight latch of the elevated launch. It stays set until the shell call returns, so consent prompts cannot stack across attempts.
 - `RESOLVER_ACTIVE` (`platform/windows/context/identity.rs`) and `CLASSIFIER_ACTIVE` (`platform/windows/elevated/selector.rs`): single-owner latches. No replacement resolver or classifier starts while an earlier one may still be blocked in a native call.
 - `FUNCTIONS` (`platform/windows/mf.rs`): the Media Foundation function table, loaded once and immutable afterwards.
@@ -139,7 +139,7 @@ In the shared native crates `screen-fix-native-observation` and `screen-fix-elev
 - lifecycle and boundaries: `request_stop`, `mark_input_prefix`, `finish_video_pause`, `finish_pause`, `complete_prefix`, `authorize_complete_publication`, `verify_startup`, `startup_step`, `video_ready`, `input_ready`, `window_coverage`, `windows_evidence`;
 - drained notices and environment: `take_fixture_saves`, `take_hotkeys`, `request_journal_flush`, `take_input_environment`, `take_elevated_environment`.
 
-The lifecycle state machine is one phase value with several latch flags, not one enum. Its states, transitions and latches are documented on `Facts` in `core/src/session/windows.rs`. Suspend data is read only through `WorkerSession::suspend_marks`. The power, desktop and window-message callbacks run inside `catch_unwind` and take no lock.
+The lifecycle state machine is one phase value with several latch flags, not one enum. Its states, transitions and latches are documented on `Facts` in `core/src/platform/windows/controller.rs`. Suspend data is read only through `WorkerSession::suspend_marks`. The power, desktop and window-message callbacks run inside `catch_unwind` and take no lock.
 
 ## 5. Threads, blocking and queues
 

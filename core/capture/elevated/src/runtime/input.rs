@@ -146,14 +146,8 @@ impl Collector for Output {
             Ok(()) => return self.flush_status().map(|_| ()),
             Err(record) => record,
         };
-        let value = match &record {
-            HelperToCore::Input(input) => InputEvidence::Input(input.clone()),
-            HelperToCore::DeviceArrived { receipt, descriptor } => InputEvidence::DeviceArrived { receipt: *receipt, descriptor: descriptor.clone() },
-            HelperToCore::DeviceRemoved { receipt, id } => InputEvidence::DeviceRemoved { receipt: *receipt, id: *id },
-            HelperToCore::Progress(progress) => InputEvidence::Progress(*progress),
-            HelperToCore::Gap(gap) => InputEvidence::Gap(*gap),
-            _ => return Err(transport()),
-        };
+        // Status records were deferred above.
+        let value = InputEvidence::try_from(record.clone()).map_err(|_| transport())?;
         if !self.enqueue(value)? { self.losses.drop_record(&record); }
         Ok(())
     }
@@ -216,12 +210,8 @@ impl Output {
     fn flush_status(&mut self) -> std::result::Result<bool, NativeError> {
         // The pending records leave `self` while `enqueue` borrows it.
         let mut status = std::mem::take(&mut self.status);
-        let flushed = status.flush(|record| match record {
-            HelperToCore::Environment(state) => self.enqueue(InputEvidence::Environment(state)),
-            HelperToCore::OptionalUnavailable { collection, observed_qpc } =>
-                self.enqueue(InputEvidence::OptionalUnavailable { collection, observed_qpc }),
-            _ => Err(transport()),
-        });
+        // Only status records are pending.
+        let flushed = status.flush(|record| self.enqueue(InputEvidence::try_from(record).map_err(|_| transport())?));
         self.status = status;
         flushed
     }

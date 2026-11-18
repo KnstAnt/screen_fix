@@ -23,7 +23,7 @@ use windows::{
     core::{BSTR, Ref, implement},
 };
 
-use crate::LossCounter;
+use crate::{LossCounter, LossSpan};
 use screen_fix_protocol::{
     FocusGeneration, QpcTick,
     ipc::elevated::{MAX_COMMIT_PARTS as MAX_PARTS, MAX_COMMIT_UTF16 as MAX_UTF16},
@@ -98,9 +98,7 @@ const LOSS_REASONS: [CommitLossReason; 5] = [
 #[derive(Debug, Clone, Copy)]
 pub struct CommitLoss {
     pub reason: CommitLossReason,
-    pub count: u64,
-    pub first: QpcTick,
-    pub last: QpcTick,
+    pub span: LossSpan,
 }
 
 struct WriteReservation<'a> {
@@ -144,12 +142,12 @@ impl Queue {
     /// Drain on the single context owner, per reason.
     pub fn take_loss(&self) -> Vec<CommitLoss> {
         LOSS_REASONS.into_iter().zip(&self.lost).filter_map(|(reason, lost)| {
-            lost.take().map(|(count, first, last)| CommitLoss { reason, count, first, last })
+            lost.take().map(|span| CommitLoss { reason, span })
         }).collect()
     }
 
     fn lose(&self, reason: CommitLossReason, receipt: i64) {
-        self.lost[reason as usize].note(1, receipt, receipt);
+        self.lost[reason as usize].note(LossSpan::at(QpcTick(receipt)));
     }
 
     /// Drain on the single context owner. Callback threads only write slots.

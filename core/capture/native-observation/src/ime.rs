@@ -4,12 +4,12 @@ use std::time::Instant;
 
 use windows_sys::Win32::UI::{
     Input::{Ime::{IME_CMODE_FULLSHAPE, IME_CMODE_NATIVE, ImmGetDefaultIMEWnd, ImmIsIME}, KeyboardAndMouse::HKL},
-    WindowsAndMessaging::{GetWindowThreadProcessId, SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_IME_CONTROL},
+    WindowsAndMessaging::{SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_IME_CONTROL},
 };
 
 pub use screen_fix_protocol::ipc::elevated::ImeState as State;
 
-use crate::{identity::WindowProcess, windows::FocusSnapshot};
+use crate::{focus::window_owner, identity::WindowProcess, windows::FocusSnapshot};
 
 /// `WM_IME_CONTROL` commands (imm.h), not exported by windows-sys.
 const IMC_GETOPENSTATUS: usize = 0x0005;
@@ -55,9 +55,8 @@ fn read_inner(
     let valid = || {
         if !guard() || !active(foreground, Some(focus)) { return false; }
         if !scoped { return true; }
-        let mut pid = 0;
-        unsafe { GetWindowThreadProcessId(window, &mut pid) == focus.focus.thread.get() 
-            && pid == foreground.process.pid.get() && ImmGetDefaultIMEWnd(hwnd) == window }
+        window_owner(window).is_some_and(|owner| owner.thread == focus.focus.thread && owner.pid == foreground.process.pid)
+            && unsafe { ImmGetDefaultIMEWnd(hwnd) } == window
     };
     if !valid() { return State::Unknown; }
     let open = send(window, IMC_GETOPENSTATUS, expires);

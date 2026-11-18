@@ -10,11 +10,8 @@ use std::{
     ptr::{null, null_mut},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering::{AcqRel, Acquire, Relaxed, Release}},
-        mpsc,
+        atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Relaxed, Release}},
     },
-    thread,
-    time::Duration,
 };
 
 use screen_fix_protocol::{
@@ -27,14 +24,15 @@ use windows_sys::Win32::{
     System::{
         LibraryLoader::GetModuleHandleW,
         Performance::QueryPerformanceCounter,
-        Threading::GetCurrentThreadId,
     },
     UI::WindowsAndMessaging::{
-        CallNextHookEx, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE,
+        CallNextHookEx, GetForegroundWindow, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE,
         PeekMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
-        WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_QUIT,
+        WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP,
     },
 };
+
+use crate::{StaticLease, focus::window_owner, owner::{self, OwnerThread, Startup, StartupError}};
 
 use super::{CaptureScope, HookForeground, NativeError, last_error};
 
@@ -51,55 +49,25 @@ static POINTER: HookRing = HookRing::new();
 /// and a single reader.
 static RINGS_CLAIMED: AtomicBool = AtomicBool::new(false);
 
-/// The exclusive claim on the static rings, released on drop.
-struct RingClaim;
-
-impl RingClaim {
-    fn acquire() -> Result<Self, NativeError> {
-        if RINGS_CLAIMED.swap(true, AcqRel) {
-            return Err(NativeError::without_code(HelperFailureStage::Startup));
-        }
-        Ok(Self)
-    }
-}
-
-impl Drop for RingClaim {
-    fn drop(&mut self) {
-        RINGS_CLAIMED.store(false, Release);
-    }
-}
-
 pub(super) struct Hooks {
-    thread_id: u32,
-    owner: thread::JoinHandle<Result<(), NativeError>>,
-    governed: bool,
-    claim: RingClaim,
+    owner: OwnerThread<Result<(), NativeError>>,
+    /// The exclusive claim on the static rings.
+    claim: StaticLease,
 }
 
 impl Hooks {
     pub(super) fn start(scope: Option<Arc<CaptureScope>>) -> Result<Self, NativeError> {
-        let claim = RingClaim::acquire()?;
+        let claim = StaticLease::claim(&RINGS_CLAIMED)
+            .ok_or_else(|| NativeError::without_code(HelperFailureStage::Startup))?;
         KEYBOARD.reset();
         POINTER.reset();
         PROGRESS_PENDING.store(false, Release);
         let governed = scope.is_some();
-        let (ready, initialized) = mpsc::sync_channel(1);
-        let owner = thread::Builder::new().name("input-hooks".into()).spawn(move || hook_loop(ready, scope))
-            .map_err(|error| NativeError {
-                stage: HelperFailureStage::Startup,
-                code: error.raw_os_error(),
-                raw_input_registration: None,
-            })?;
-        match initialized.recv_timeout(Duration::from_secs(2)) {
-            Ok(Ok(thread_id)) => Ok(Self { thread_id, owner, governed, claim }),
-            result => {
-                drop(initialized);
-                if governed { let _ = owner.join(); }
-                match result {
-                    Ok(Err(error)) => Err(error),
-                    _ => Err(NativeError::without_code(HelperFailureStage::MessageLoop)),
-                }
-            }
+        match owner::spawn("input-hooks", governed, || {}, move |ready| hook_loop(ready, scope)) {
+            Ok((owner, ())) => Ok(Self { owner, claim }),
+            Err(StartupError::Spawn(error)) => Err(NativeError::io(HelperFailureStage::Startup, &error)),
+            Err(StartupError::Failed(error)) => Err(error),
+            Err(StartupError::Timeout) => Err(NativeError::without_code(HelperFailureStage::MessageLoop)),
         }
     }
 
@@ -119,7 +87,7 @@ impl Hooks {
         if PROGRESS_PENDING.swap(true, Relaxed) {
             return Ok(());
         }
-        if unsafe { PostThreadMessageW(self.thread_id, PROBE_PROGRESS, 0, 0) } == 0 {
+        if unsafe { PostThreadMessageW(self.owner.thread_id, PROBE_PROGRESS, 0, 0) } == 0 {
             return Err(last_error(HelperFailureStage::MessageLoop));
         }
         Ok(())
@@ -134,22 +102,16 @@ impl Hooks {
     }
 
     pub(super) fn stop(self) -> Result<ClosedHooks, NativeError> {
-        // GetMessage already has a thread queue when the owner reports ready.
-        if !self.owner.is_finished()
-            && unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) } == 0
-        {
-            let error = last_error(HelperFailureStage::MessageLoop);
-            if self.governed { let _ = self.owner.join(); }
-            return Err(error);
-        }
-        self.owner.join().map_err(|_| NativeError::without_code(HelperFailureStage::MessageLoop))??;
+        self.owner.post_quit_and_join()
+            .map_err(|error| NativeError::io(HelperFailureStage::MessageLoop, &error))?
+            .map_err(|_| NativeError::without_code(HelperFailureStage::MessageLoop))??;
         Ok(ClosedHooks { _claim: self.claim })
     }
 }
 
 /// The rings of joined hooks, still claimed until they are drained.
 pub(super) struct ClosedHooks {
-    _claim: RingClaim,
+    _claim: StaticLease,
 }
 
 impl ClosedHooks {
@@ -171,9 +133,7 @@ thread_local! {
     static SCOPE: OnceCell<Option<Arc<CaptureScope>>> = const { OnceCell::new() };
 }
 
-fn hook_loop(
-    ready: mpsc::SyncSender<Result<u32, NativeError>>, scope: Option<Arc<CaptureScope>>,
-) -> Result<(), NativeError> {
+fn hook_loop(ready: Startup<(), NativeError>, scope: Option<Arc<CaptureScope>>) -> Result<(), NativeError> {
     // Each hook thread is new, so its cell is still empty here.
     SCOPE.with(|state| { let _ = state.set(scope); });
     let mut message = MSG::default();
@@ -182,13 +142,12 @@ fn hook_loop(
     let (keyboard, pointer) = match install_hooks() {
         Ok(pair) => pair,
         Err(error) => {
-            let _ = ready.try_send(Err(error));
+            ready.fail(error);
             return Err(error);
         }
     };
     let _registration = (keyboard, pointer);
-    let thread_id = unsafe { GetCurrentThreadId() };
-    if ready.try_send(Ok(thread_id)).is_err() {
+    if !ready.ready(()) {
         return Ok(());
     }
     loop {
@@ -282,16 +241,14 @@ fn hook_foreground() -> Option<Option<HookForeground>> {
         let Some(scope) = scope.get().and_then(Option::as_ref) else { return Some(None) };
         let serial = (scope.hook_open)()?;
         let hwnd = unsafe { GetForegroundWindow() };
-        if hwnd.is_null() { return None; }
-        let mut pid = 0;
-        let thread = unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        let owner = window_owner(hwnd)?;
         let window = WindowId(hwnd as usize as u64);
-        if window != scope.foreground.window || pid != scope.foreground.process.pid.get()
-            || thread != scope.foreground.thread.get()
+        if window != scope.foreground.window || owner.pid != scope.foreground.process.pid
+            || owner.thread != scope.foreground.thread
         {
             return None;
         }
-        Some(Some(HookForeground { window, pid, thread, serial }))
+        Some(Some(HookForeground { window, pid: owner.pid.get(), thread: owner.thread.get(), serial }))
     })
 }
 

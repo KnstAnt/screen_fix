@@ -1,10 +1,10 @@
 //! The context owner publishes only a bounded foreground admission interval.
 //! Capture and video take nonblocking copies without querying a window.
 
-use std::sync::{Arc, RwLock, TryLockError, Weak};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError, Weak};
 
 use crate::{
-    capture::frame::{FrameCoverage, FrameMetadata},
+    capture::frame::{ApprovalGeneration, FrameCoverage, FrameMetadata},
     protocol::{AdmissionEpoch, ClockOrigin, QpcTick, SessionTimeUs, ipc::{ForegroundAtReceipt, elevated::VisitBinding}},
 };
 use crate::session::AdmissionBoundary;
@@ -20,15 +20,24 @@ pub(in crate::platform::windows) struct FramePolicy(RwLock<State>);
 
 #[derive(Default)]
 struct State {
-    generation: u64,
+    generation: ApprovalGeneration,
     approval: Option<(WindowProcess, FrameApproval)>,
     // Only media already owned by a bounded pipeline keeps a token alive.
     coverage: Vec<Weak<FrameCoverage>>,
 }
 
+impl State {
+    /// Replace the approval with a new one under the next generation. When
+    /// the generations are exhausted, nothing is approved.
+    fn approve(&mut self, window: WindowProcess, approval: impl FnOnce(ApprovalGeneration) -> FrameApproval) {
+        self.approval = self.generation.0.checked_add(1).map(|generation| (window, approval(ApprovalGeneration(generation))));
+        if let Some((_, approval)) = &self.approval { self.generation = approval.generation; }
+    }
+}
+
 #[derive(Clone)]
 pub(in crate::platform::windows) struct FrameApproval {
-    pub generation: u64,
+    pub generation: ApprovalGeneration,
     epoch: AdmissionEpoch,
     since: SessionTimeUs,
     observed: SessionTimeUs,
@@ -37,8 +46,22 @@ pub(in crate::platform::windows) struct FrameApproval {
 }
 
 impl FramePolicy {
+    /// A writer recovers a poisoned lock: every update leaves a valid state.
+    fn write(&self) -> RwLockWriteGuard<'_, State> {
+        self.0.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A nonblocking read: `None` when a writer panicked.
+    fn read(&self) -> Result<Option<RwLockReadGuard<'_, State>>, ApprovalReadError> {
+        match self.0.try_read() {
+            Ok(state) => Ok(Some(state)),
+            Err(TryLockError::WouldBlock) => Err(ApprovalReadError::Contended),
+            Err(TryLockError::Poisoned(_)) => Ok(None),
+        }
+    }
+
     pub fn restrict_elevated(&self, visit: VisitBinding, before: QpcTick) {
-        let mut state = self.0.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.write();
         state.coverage.retain(|coverage| {
             let Some(coverage) = coverage.upgrade() else { return false; };
             if coverage.visit == visit { coverage.restrict(before); }
@@ -50,30 +73,26 @@ impl FramePolicy {
     }
 
     pub fn clear(&self) {
-        self.0.write().unwrap_or_else(std::sync::PoisonError::into_inner).approval = None;
+        self.write().approval = None;
     }
 
     pub fn publish(
         &self, window: Option<WindowProcess>, observed: SessionTimeUs, boundary: AdmissionBoundary, interrupted: bool,
     ) {
-        let mut state = self.0.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.write();
         if let Some(window) = window {
             if let Some((previous, approval)) = &mut state.approval
                 && *previous == window && approval.epoch == boundary.epoch && !interrupted
-                && approval.coverage.is_none()
-                && (0..=MAX_AGE_US).contains(&observed.0.saturating_sub(approval.observed.0))
+                && approval.coverage.is_none() && approval.fresh(observed)
             {
                 approval.observed = observed;
                 return;
             }
             devlog!("approval", "new approval: since_us={} interrupted={} same_window={}", observed.0, interrupted,
                 state.approval.as_ref().is_some_and(|(previous, _)| *previous == window));
-            state.approval = state.generation.checked_add(1).map(|generation| (window, FrameApproval {
+            state.approve(window, |generation| FrameApproval {
                 generation, epoch: boundary.epoch, since: observed.max(boundary.time), observed, certified_before: None, coverage: None,
-            }));
-            if let Some((_, approval)) = &state.approval {
-                state.generation = approval.generation;
-            }
+            });
         } else {
             if state.approval.is_some() {
                 devlog!("approval", "approval cleared: foreground not approved at_us={}", observed.0);
@@ -92,11 +111,10 @@ impl FramePolicy {
             return;
         }
         let certified_before = certified_before.max(since);
-        let mut state = self.0.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let window = WindowProcess { window: visit.foreground.window, process: visit.foreground.process,
-            thread: visit.foreground.thread };
+        let mut state = self.write();
+        let window = WindowProcess::from(visit.foreground);
         if let Some((_, approval)) = &mut state.approval && approval.elevated_visit() == Some(visit)
-            && approval.observed <= observed && observed.0.saturating_sub(approval.observed.0) <= MAX_AGE_US
+            && approval.fresh(observed)
         {
             approval.observed = observed;
             approval.certified_before = Some(certified_before);
@@ -113,22 +131,17 @@ impl FramePolicy {
             state.approval = None;
             return;
         }
-        state.approval = state.generation.checked_add(1).map(|generation| (window, FrameApproval {
+        state.approve(window, |generation| FrameApproval {
             generation, epoch: boundary.epoch, since, observed,
             certified_before: Some(certified_before), coverage: Some(coverage),
-        }));
-        if let Some((_, approval)) = &state.approval { state.generation = approval.generation; }
+        });
     }
 
     pub fn for_receipt(
         &self, proof: ForegroundAtReceipt, epoch: AdmissionEpoch, visit: Option<VisitBinding>,
         at: SessionTimeUs, now: SessionTimeUs,
     ) -> Result<Option<FrameApproval>, ApprovalReadError> {
-        let state = match self.0.try_read() {
-            Ok(state) => state,
-            Err(TryLockError::WouldBlock) => return Err(ApprovalReadError::Contended),
-            Err(TryLockError::Poisoned(_)) => return Ok(None),
-        };
+        let Some(state) = self.read()? else { return Ok(None) };
         let Some((window, approval)) = &state.approval else {
             devlog!("approval", "receipt approval none: no current approval at_us={} now_us={}", at.0, now.0);
             return Ok(None);
@@ -136,15 +149,15 @@ impl FramePolicy {
         if window.window != proof.window || window.process != proof.process || approval.epoch != epoch
             || approval.elevated_visit() != visit || at < approval.since || now < at
         {
-            devlog!("approval", "receipt approval none: same_window={} same_process={} same_epoch={} same_visit={}                 at_us={} since_us={} observed_us={} now_us={} generation={}",
+            devlog!("approval", "receipt approval none: same_window={} same_process={} same_epoch={} same_visit={} at_us={} since_us={} observed_us={} now_us={} generation={}",
                 window.window == proof.window, window.process == proof.process, approval.epoch == epoch,
-                approval.elevated_visit() == visit, at.0, approval.since.0, approval.observed.0, now.0, approval.generation);
+                approval.elevated_visit() == visit, at.0, approval.since.0, approval.observed.0, now.0, approval.generation.0);
             return Ok(None);
         }
         if now < approval.observed {
             return Err(ApprovalReadError::NewerThanReceipt);
         }
-        if now.0.saturating_sub(approval.observed.0) > MAX_AGE_US {
+        if !approval.fresh(now) {
             devlog!("approval", "receipt approval none: stale observation at_us={} observed_us={} now_us={}",
                 at.0, approval.observed.0, now.0);
             return Ok(None);
@@ -164,18 +177,14 @@ impl FramePolicy {
     }
 
     pub fn try_current(&self, epoch: AdmissionEpoch, now: SessionTimeUs) -> Result<Option<FrameApproval>, ApprovalReadError> {
-        let state = match self.0.try_read() {
-            Ok(state) => state,
-            Err(TryLockError::WouldBlock) => return Err(ApprovalReadError::Contended),
-            Err(TryLockError::Poisoned(_)) => return Ok(None),
-        };
+        let Some(state) = self.read()? else { return Ok(None) };
         let Some((_, approval)) = state.approval.as_ref().filter(|(_, approval)| approval.epoch == epoch) else {
             return Ok(None);
         };
         if approval.observed > now {
             return Err(ApprovalReadError::NewerThanReceipt);
         }
-        Ok((now.0.saturating_sub(approval.observed.0) <= MAX_AGE_US).then(|| approval.clone()))
+        Ok(approval.fresh(now).then(|| approval.clone()))
     }
 }
 
@@ -187,6 +196,12 @@ pub(in crate::platform::windows) enum ApprovalReadError {
 }
 
 impl FrameApproval {
+    /// Whether the last foreground observation is at most `MAX_AGE_US`
+    /// before `now`, and not after it.
+    fn fresh(&self, now: SessionTimeUs) -> bool {
+        (0..=MAX_AGE_US).contains(&now.0.saturating_sub(self.observed.0))
+    }
+
     pub fn elevated_visit(&self) -> Option<VisitBinding> { self.coverage.as_ref().map(|coverage| coverage.visit) }
 
     pub fn matches(&self, frame: &FrameMetadata) -> bool {

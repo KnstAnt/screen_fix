@@ -118,6 +118,56 @@ impl Scope {
     }
 }
 
+/// The little-endian frame header shared by the attachment and runtime
+/// lanes. Bytes 9..12 are reserved and written as zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameHeader {
+    pub(crate) magic: [u8; 4],
+    pub(crate) version: u16,
+    pub(crate) role: u8,
+    pub(crate) kind: u8,
+    pub(crate) direction: u8,
+    pub(crate) length: u32,
+    pub(crate) sequence: u64,
+    pub(crate) connection: [u8; 16],
+}
+
+impl FrameHeader {
+    const RESERVED: std::ops::Range<usize> = 9..12;
+
+    pub(crate) fn write(&self) -> [u8; HEADER_BYTES] {
+        let mut bytes = [0; HEADER_BYTES];
+        bytes[..4].copy_from_slice(&self.magic);
+        bytes[4..6].copy_from_slice(&self.version.to_le_bytes());
+        bytes[6] = self.role;
+        bytes[7] = self.kind;
+        bytes[8] = self.direction;
+        bytes[12..16].copy_from_slice(&self.length.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.sequence.to_le_bytes());
+        bytes[24..].copy_from_slice(&self.connection);
+        bytes
+    }
+
+    /// The header fields. The reserved bytes are checked by `reserved_clear`.
+    pub(crate) fn parse(bytes: &[u8; HEADER_BYTES]) -> Self {
+        Self {
+            magic: [bytes[0], bytes[1], bytes[2], bytes[3]],
+            version: u16::from_le_bytes([bytes[4], bytes[5]]),
+            role: bytes[6],
+            kind: bytes[7],
+            direction: bytes[8],
+            length: u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+            sequence: u64::from_le_bytes(std::array::from_fn(|index| bytes[16 + index])),
+            connection: std::array::from_fn(|index| bytes[24 + index]),
+        }
+    }
+
+    /// Whether the reserved bytes are zero.
+    pub(crate) fn reserved_clear(bytes: &[u8; HEADER_BYTES]) -> bool {
+        bytes[Self::RESERVED].iter().all(|&byte| byte == 0)
+    }
+}
+
 fn encode_id(field: &mut [u8], id: &str) {
     field[0] = id.len() as u8;
     field[1..=id.len()].copy_from_slice(id.as_bytes());
@@ -142,16 +192,10 @@ pub fn header(
     if payload > cap || !transition.valid_for(role) {
         return Err(InvalidAttachment);
     }
-    let mut bytes = [0; HEADER_BYTES];
-    bytes[..4].copy_from_slice(&MAGIC);
-    bytes[4..6].copy_from_slice(&VERSION.to_le_bytes());
-    bytes[6] = role as u8;
-    bytes[7] = transition as u8;
-    bytes[8] = transition.direction();
-    bytes[12..16].copy_from_slice(&(payload as u32).to_le_bytes());
-    bytes[16..24].copy_from_slice(&transition.sequence().to_le_bytes());
-    bytes[24..].copy_from_slice(&connection.as_bytes());
-    Ok(bytes)
+    Ok(FrameHeader {
+        magic: MAGIC, version: VERSION, role: role as u8, kind: transition as u8, direction: transition.direction(),
+        length: payload as u32, sequence: transition.sequence(), connection: connection.as_bytes(),
+    }.write())
 }
 
 pub fn check_header(

@@ -5,7 +5,7 @@ use crate::protocol::{DeviceId, ipc::{DeviceDescriptor, HelperToCore, InputSampl
 const ELEVATED_DEVICE: u64 = 1 << 63;
 
 #[derive(Default)]
-pub(super) struct Devices {
+pub(crate) struct Devices {
     ordinary: Inventory,
     elevated: Inventory,
     next: u64,
@@ -18,21 +18,21 @@ struct Inventory {
 }
 
 impl Devices {
-    pub(super) fn new_elevated_owner(&mut self) {
+    pub(crate) fn new_elevated_owner(&mut self) {
         self.elevated = Inventory::default();
     }
 
-    pub(super) fn current(&self, elevated: bool) -> impl Iterator<Item = &DeviceDescriptor> {
+    pub(crate) fn current(&self, elevated: bool) -> impl Iterator<Item = &DeviceDescriptor> {
         let inventory = if elevated { &self.elevated } else { &self.ordinary };
         inventory.active.values()
     }
 
-    pub(super) fn incomplete(&self, elevated: bool) -> bool {
+    pub(crate) fn incomplete(&self, elevated: bool) -> bool {
         let inventory = if elevated { &self.elevated } else { &self.ordinary };
         inventory.incomplete
     }
 
-    pub(super) fn translate(&mut self, elevated: bool, mut record: HelperToCore) -> Option<HelperToCore> {
+    pub(crate) fn translate(&mut self, elevated: bool, mut record: HelperToCore) -> Option<HelperToCore> {
         let inventory = if elevated { &mut self.elevated } else { &mut self.ordinary };
         match &mut record {
             HelperToCore::DeviceArrived { descriptor, .. } => {

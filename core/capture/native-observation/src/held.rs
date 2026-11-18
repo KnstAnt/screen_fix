@@ -1,4 +1,4 @@
-use std::{mem::{size_of, size_of_val}, os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle}, ptr::null_mut};
+use std::{mem::{size_of, size_of_val}, num::NonZeroU32, os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle}, ptr::null_mut};
 
 use windows_sys::Win32::{
     Foundation::{HANDLE, HWND},
@@ -13,11 +13,13 @@ use windows_sys::Win32::{
         Input::KeyboardAndMouse::{GetAsyncKeyState, GetKeyState, VK_CAPITAL, VK_LSHIFT, VK_RSHIFT, VK_LCONTROL,
             VK_RCONTROL, VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN, VK_LBUTTON, VK_RBUTTON,
             VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2},
-        WindowsAndMessaging::{GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId, SM_SWAPBUTTON},
+        WindowsAndMessaging::{GetForegroundWindow, GetSystemMetrics, SM_SWAPBUTTON},
     },
 };
 
 pub use screen_fix_protocol::ipc::elevated::HeldSnapshot;
+
+use crate::focus::window_owner;
 
 struct Desktop(HDESK);
 
@@ -30,7 +32,7 @@ impl Drop for Desktop {
 pub fn read() -> Option<HeldSnapshot> {
     let foreground = unsafe { GetForegroundWindow() };
     let pid = process_id(foreground)?;
-    if !on_input_desktop() || !foreground_integrity_allowed(pid) {
+    if !on_input_desktop() || !foreground_integrity_allowed(pid.get()) {
         return None;
     }
     let modifiers = [VK_LSHIFT, VK_RSHIFT, VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU,
@@ -55,13 +57,8 @@ fn pressed(vk: u16) -> bool {
     (unsafe { GetAsyncKeyState(i32::from(vk)) }) < 0
 }
 
-fn process_id(window: HWND) -> Option<u32> {
-    if window.is_null() {
-        return None;
-    }
-    let mut pid = 0;
-    let thread = unsafe { GetWindowThreadProcessId(window, &mut pid) };
-    (thread != 0 && pid != 0).then_some(pid)
+fn process_id(window: HWND) -> Option<NonZeroU32> {
+    window_owner(window).map(|owner| owner.pid)
 }
 
 pub fn on_input_desktop() -> bool {

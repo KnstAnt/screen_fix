@@ -4,11 +4,14 @@ use std::ptr::null_mut;
 
 use windows_sys::Win32::{
     Foundation::LocalFree,
-    Security::{ACE_HEADER, ACL, Authorization::ConvertStringSidToSidW, GetAce, IsValidAcl, IsValidSid, PSID},
+    Security::{
+        ACE_HEADER, ACL, GetAce, IsValidAcl, IsValidSid, OBJECT_SECURITY_INFORMATION, PSID,
+        Authorization::{ConvertStringSidToSidW, GetSecurityInfo, SE_FILE_OBJECT},
+    },
     System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, SYSTEM_MANDATORY_LABEL_ACE_TYPE},
 };
 
-use crate::{process::Sid, win::{Failure, Result, wide}};
+use crate::{process::Sid, win::{Failure, Handle, Result, wide}};
 
 pub(crate) const SYSTEM: &str = "S-1-5-18";
 pub(crate) const ADMINISTRATORS: &str = "S-1-5-32-544";
@@ -32,6 +35,31 @@ impl Drop for LocalAllocation {
             unsafe { LocalFree(self.0) };
         }
     }
+}
+
+/// The parts of a file object's security descriptor that `GetSecurityInfo`
+/// returned. `owner` and `dacl` point into `descriptor` and are null unless
+/// requested.
+pub(crate) struct SecurityInfo {
+    pub(crate) owner: PSID,
+    pub(crate) dacl: *mut ACL,
+    pub(crate) descriptor: LocalAllocation,
+}
+
+/// Query the security `information` of the file object `handle`; `failure`
+/// reports a failed query.
+pub(crate) fn security_info(handle: &Handle, information: OBJECT_SECURITY_INFORMATION, failure: Failure) -> Result<SecurityInfo> {
+    let mut owner = null_mut();
+    let mut dacl = null_mut();
+    let mut descriptor = null_mut();
+    let status = unsafe {
+        GetSecurityInfo(handle.raw(), SE_FILE_OBJECT, information, &mut owner, null_mut(), &mut dacl, null_mut(), &mut descriptor)
+    };
+    let descriptor = LocalAllocation(descriptor);
+    if status != 0 || descriptor.0.is_null() {
+        return Err(failure);
+    }
+    Ok(SecurityInfo { owner, dacl, descriptor })
 }
 
 /// Parse a SID string; `failure` reports an invalid one.

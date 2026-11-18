@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use screen_fix_native_observation::hung::{self, CandidateEvidence};
+use screen_fix_native_observation::{focus::window_owner, hung::{self, CandidateEvidence}};
 use serde_json::{Value, json};
 use windows_sys::Win32::Foundation::HWND;
 
@@ -12,6 +12,7 @@ pub(super) use hung::is_ghost;
 use crate::{
     capture::context::BusyReasons,
     protocol::{WindowId, ipc::ProcessInstance},
+    util::push_bounded,
 };
 
 use super::identity::{ApprovedProcesses, WindowProcess};
@@ -109,9 +110,9 @@ impl Hung {
                 continue;
             }
             let hwnd = window.hwnd();
-            let owner = hung::native_owner(hwnd.0);
+            let owner = window_owner(hwnd.0);
             let proof = WindowProcess::read(hwnd);
-            let gone = owner != Some((window.process.pid.get(), window.thread.get()))
+            let gone = owner != Some(window.owner())
                 || proof.is_some_and(|proof| proof != window);
             if !gone && (!complete || proof.is_none() || hung::is_hung(hwnd.0)) {
                 // Prefer an existing interval over an untracked new one if
@@ -121,7 +122,7 @@ impl Hung {
                     let replace = next.iter().rposition(|new| !self.active.iter().any(|entry| entry.window == new.window));
                     if let Some(index) = replace { next.swap_remove(index); }
                 }
-                if next.len() < ACTIVE_LIMIT { next.push(*old); }
+                push_bounded(&mut next, *old, ACTIVE_LIMIT);
             } else {
                 let reason = if gone { "window_gone" }
                     else if ghost_unknown { "ghost_association_unknown" }

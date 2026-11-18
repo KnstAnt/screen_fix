@@ -5,7 +5,7 @@ use windows::{
             OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
             QueryFullProcessImageNameW,
         },
-        UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId},
+        UI::WindowsAndMessaging::GetForegroundWindow,
     },
     core::PWSTR,
 };
@@ -13,6 +13,8 @@ use windows::{
 use std::num::NonZeroU32;
 
 use screen_fix_protocol::{WindowId, ipc::{ProcessInstance, elevated::WindowInstance}};
+
+use crate::focus::{WindowOwner, window_owner};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct WindowProcess {
@@ -23,18 +25,12 @@ pub struct WindowProcess {
 
 impl WindowProcess {
     pub fn read(window: HWND) -> Option<Self> {
-        if window.0.is_null() {
-            return None;
-        }
-        let mut pid = 0;
-        let thread = NonZeroU32::new(unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) })?;
-        let pid = NonZeroU32::new(pid)?;
-        let handle = ProcessHandle::open(pid)?;
-        let process = handle.instance(pid)?;
-        let mut verified_pid = 0;
-        let verified_thread = unsafe { GetWindowThreadProcessId(window, Some(&mut verified_pid)) };
-        (verified_thread == thread.get() && verified_pid == pid.get()).then_some(Self {
-            window: WindowId(window.0 as usize as u64), process, thread,
+        let owner = window_owner(window.0)?;
+        // The open handle keeps the PID from reuse until the owner is read again.
+        let handle = ProcessHandle::open(owner.pid)?;
+        let process = handle.instance(owner.pid)?;
+        (window_owner(window.0) == Some(owner)).then_some(Self {
+            window: WindowId(window.0 as usize as u64), process, thread: owner.thread,
         })
     }
 
@@ -47,11 +43,21 @@ impl WindowProcess {
     pub fn hwnd(self) -> HWND {
         HWND(self.window.0 as usize as *mut _)
     }
+
+    pub fn owner(self) -> WindowOwner {
+        WindowOwner { thread: self.thread, pid: self.process.pid }
+    }
 }
 
 impl From<WindowProcess> for WindowInstance {
     fn from(observed: WindowProcess) -> Self {
         Self { window: observed.window, process: observed.process, thread: observed.thread }
+    }
+}
+
+impl From<WindowInstance> for WindowProcess {
+    fn from(instance: WindowInstance) -> Self {
+        Self { window: instance.window, process: instance.process, thread: instance.thread }
     }
 }
 
@@ -62,6 +68,12 @@ impl ProcessHandle {
 
     pub fn open(pid: NonZeroU32) -> Option<Self> {
         unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid.get()) }.ok().map(Self)
+    }
+
+    /// Open process `instance.pid` only while it is still that instance: a
+    /// process that reuses the PID never passes.
+    pub fn open_instance(instance: ProcessInstance) -> Option<Self> {
+        Self::open(instance.pid).filter(|process| process.instance(instance.pid) == Some(instance))
     }
 
     pub fn instance(&self, pid: NonZeroU32) -> Option<ProcessInstance> {

@@ -1,11 +1,10 @@
-use std::{collections::BTreeSet, mem::{size_of, size_of_val}, num::NonZeroU32, os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle}, path::Path};
+use std::{collections::BTreeSet, mem::{size_of, size_of_val}, num::NonZeroU32, path::Path};
 
 use screen_fix_elevated::{ForegroundAccess, foreground_access};
 use screen_fix_protocol::ipc::elevated::{ImagePath, runtime::{ApprovalKey, IdentityClaim}};
 use windows::Win32::{Foundation::HWND as NativeWindow, Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute}};
 use windows_sys::Win32::{
-    Foundation::{ERROR_NO_MORE_FILES, GetLastError, HWND, INVALID_HANDLE_VALUE, LPARAM, RECT},
-    System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS},
+    Foundation::{HWND, LPARAM, RECT},
     UI::WindowsAndMessaging::{EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible},
 };
 
@@ -16,10 +15,10 @@ use crate::{
     protocol::PhysicalRect,
 };
 
-use super::{context::identity::{ProcessHandle, WindowProcess, approved_image_index, approved_index, canonical_executable, image_name}, display};
+use super::{context::identity::{ProcessHandle, WindowProcess, approved_image_index, approved_index, canonical_executable, image_name}, display, os::{self, InventoryFailure}};
 
 pub(crate) fn approved_windows(approved: &ExecutableIdentity) -> Result<ApprovedWindows, CaptureError> {
-    let displays = display::enumerate().map_err(|error| error.into_error(crate::package::diagnostics::FailureComponent::Capture))?;
+    let displays = display::enumerate().map_err(|error| error.to_error(crate::package::diagnostics::FailureComponent::Capture))?;
     let approved = std::slice::from_ref(approved);
     let mut scan = WindowScan { approved, candidates: process_candidates(approved)?, bounds: Vec::new(), incomplete: false };
     // EnumWindows calls back synchronously on this thread and does not retain the pointer.
@@ -56,8 +55,7 @@ unsafe extern "system" fn read_window(window: HWND, data: LPARAM) -> i32 {
         scan.incomplete = true;
         return 1;
     };
-    let identity = ProcessHandle::open(proof.process.pid)
-        .filter(|process| process.instance(proof.process.pid) == Some(proof.process))
+    let identity = ProcessHandle::open_instance(proof.process)
         .ok_or(()).and_then(|process| approved_index(&process, scan.approved));
     match identity {
         Ok(Some(_)) => {}
@@ -93,31 +91,17 @@ fn process_candidates(approved: &[ExecutableIdentity]) -> Result<BTreeSet<u32>, 
     // The snapshot narrows candidate PIDs only. Authorization requires the
     // subsequently queried full path of a live process.
     let names: BTreeSet<_> = approved.iter().filter_map(|entry| image_name(entry.executable())).collect();
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(error("Windows could not enumerate processes to verify approval."));
+    let inventory = os::process_image_names().map_err(|failure| error(match failure {
+        InventoryFailure::Snapshot => "Windows could not enumerate processes to verify approval.",
+        InventoryFailure::FirstProcess => "Windows could not read the process inventory.",
+    }))?;
+    if !inventory.complete {
+        return Err(error("Windows could not finish the process inventory."));
     }
-    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
-    let mut entry = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
-    if unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) } == 0 {
-        return Err(error("Windows could not read the process inventory."));
-    }
-    let mut candidates = BTreeSet::new();
-    loop {
-        let len = entry.szExeFile.iter().position(|unit| *unit == 0).unwrap_or(entry.szExeFile.len());
-        if entry.th32ProcessID != std::process::id()
-            && names.contains(&String::from_utf16_lossy(&entry.szExeFile[..len]).to_lowercase())
-        {
-            candidates.insert(entry.th32ProcessID);
-        }
-        if unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) } == 0 {
-            if unsafe { GetLastError() } != ERROR_NO_MORE_FILES {
-                return Err(error("Windows could not finish the process inventory."));
-            }
-            break;
-        }
-    }
-    Ok(candidates)
+    Ok(inventory.images.into_iter()
+        .filter(|(pid, name)| *pid != std::process::id() && names.contains(&name.to_lowercase()))
+        .map(|(pid, _)| pid)
+        .collect())
 }
 
 pub(super) fn validate_processes(config: &ResolvedCaptureConfig) -> Result<(), CaptureError> {
@@ -197,8 +181,7 @@ fn foreground(config: &ResolvedCaptureConfig, expected: Option<WindowProcess>) -
     if expected.is_some_and(|expected| expected != proof) || proof.process.pid.get() == std::process::id() {
         return Ok(None);
     }
-    let process = ProcessHandle::open(proof.process.pid)
-        .filter(|process| process.instance(proof.process.pid) == Some(proof.process))
+    let process = ProcessHandle::open_instance(proof.process)
         .ok_or_else(|| error("The foreground process identity could not be verified."))?;
     let image = process.image_path()
         .ok_or_else(|| error("The full path of the foreground application could not be verified."))?;

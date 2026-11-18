@@ -4,7 +4,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use eframe::egui;
 
 use screen_fix_core::{
-    Remedy,
+    AttemptStage, Remedy,
     config::{
         CapturePace, ClipboardMode, EffectiveCapabilities, MAX_SELECTED_MONITORS, ResolvedCaptureConfig,
         ResolvedProfile, SelectedMonitor,
@@ -15,35 +15,24 @@ use screen_fix_core::{
     session::{PauseReason, SessionCommand, SessionHandle, SessionOutcome, SessionPhase, SessionResult, SessionStatus, SourceStatus, StartupStep},
 };
 
-#[cfg(target_os = "windows")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-#[cfg(target_os = "windows")]
 use screen_fix_core::session::hotkey::{ControlOutcome, DEBUGGER_FUNCTION, HotkeyActivation, HotkeyBindings, RecorderAction};
 
 pub(crate) struct ScreenFix {
     state: RecordingState,
     last_status: Option<SessionStatus>,
-    #[cfg(target_os = "windows")]
     native_window: Option<platform::RecorderWindow>,
-    #[cfg(target_os = "windows")]
     native_window_error: Option<String>,
-    #[cfg(target_os = "windows")]
     indicator_error: Option<String>,
-    #[cfg(target_os = "windows")]
     indicator_diagnostic: Option<DiagnosticSnapshot>,
     close_after_recording: bool,
     incomplete_pending: bool,
     record_clipboard: bool,
     record_pen: bool,
-    #[cfg(target_os = "windows")]
     approved_executable: Option<screen_fix_core::config::ExecutableIdentity>,
-    #[cfg(target_os = "windows")]
     approved_windows: Option<Result<platform::ApprovedWindows, String>>,
-    #[cfg(target_os = "windows")]
     setup_probe: Option<Receiver<SetupInventory>>,
-    #[cfg(target_os = "windows")]
     display_error: Option<String>,
-    #[cfg(target_os = "windows")]
     manual_monitors: bool,
     displays: Vec<platform::Display>,
     display_ids: BTreeMap<String, MonitorId>,
@@ -51,18 +40,14 @@ pub(crate) struct ScreenFix {
     pace: CapturePace,
     command_error: Option<screen_fix_core::session::CommandError>,
     folder: PathBuf,
-    #[cfg(target_os = "windows")]
     hotkey_bindings: HotkeyBindings,
-    #[cfg(target_os = "windows")]
     hotkeys: Option<platform::RecorderHotkeys>,
-    #[cfg(target_os = "windows")]
     hotkey_error: Option<String>,
-    #[cfg(target_os = "windows")]
     hotkey_probe: Option<Receiver<Result<platform::RecorderHotkeys, String>>>,
     /// The pending reply and the last result of the fixture Save producer.
-    #[cfg(all(feature = "fixture-save", target_os = "windows"))]
+    #[cfg(feature = "fixture-save")]
     fixture_reply: Option<Receiver<screen_fix_core::capture::save::FixtureSaveResult>>,
-    #[cfg(all(feature = "fixture-save", target_os = "windows"))]
+    #[cfg(feature = "fixture-save")]
     fixture_message: Option<String>,
 }
 
@@ -71,27 +56,18 @@ impl Default for ScreenFix {
         Self {
             state: RecordingState::Idle,
             last_status: None,
-            #[cfg(target_os = "windows")]
             native_window: None,
-            #[cfg(target_os = "windows")]
             native_window_error: None,
-            #[cfg(target_os = "windows")]
             indicator_error: None,
-            #[cfg(target_os = "windows")]
             indicator_diagnostic: None,
             close_after_recording: false,
             incomplete_pending: false,
             record_clipboard: false,
             record_pen: false,
-            #[cfg(target_os = "windows")]
             approved_executable: None,
-            #[cfg(target_os = "windows")]
             approved_windows: None,
-            #[cfg(target_os = "windows")]
             setup_probe: None,
-            #[cfg(target_os = "windows")]
             display_error: None,
-            #[cfg(target_os = "windows")]
             manual_monitors: false,
             displays: Vec::new(),
             display_ids: BTreeMap::new(),
@@ -99,23 +75,18 @@ impl Default for ScreenFix {
             pace: CapturePace::Fps30,
             command_error: None,
             folder: PathBuf::new(),
-            #[cfg(target_os = "windows")]
             hotkey_bindings: HotkeyBindings::default(),
-            #[cfg(target_os = "windows")]
             hotkeys: None,
-            #[cfg(target_os = "windows")]
             hotkey_error: None,
-            #[cfg(target_os = "windows")]
             hotkey_probe: None,
-            #[cfg(all(feature = "fixture-save", target_os = "windows"))]
+            #[cfg(feature = "fixture-save")]
             fixture_reply: None,
-            #[cfg(all(feature = "fixture-save", target_os = "windows"))]
+            #[cfg(feature = "fixture-save")]
             fixture_message: None,
         }
     }
 }
 
-#[cfg(target_os = "windows")]
 struct SetupInventory {
     displays: Result<Vec<platform::Display>, String>,
     approved_windows: Option<Result<platform::ApprovedWindows, String>>,
@@ -138,28 +109,25 @@ struct Failed {
 }
 
 impl eframe::App for ScreenFix {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        #[cfg(target_os = "windows")]
-        {
-            if let Some(error) = self.native_window.as_mut().and_then(|window| window.take_indicator_error()) {
-                self.indicator_error = Some(error.to_string());
-                self.indicator_diagnostic = Some(error.into_diagnostic().with_output_root(self.folder.clone()));
-                if let RecordingState::Running { session, .. } = &self.state {
-                    let _ = session.submit(SessionCommand::Stop);
-                }
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Some(error) = self.native_window.as_mut().and_then(|window| window.take_indicator_error()) {
+            self.indicator_error = Some(error.to_string());
+            self.indicator_diagnostic = Some(error.into_diagnostic().with_output_root(self.folder.clone()));
+            if let RecordingState::Running { session, .. } = &self.state {
+                let _ = session.submit(SessionCommand::Stop);
             }
-            self.attach_window(_frame);
-            if self.native_window.is_none() && self.indicator_error.is_none() {
-                if let RecordingState::Running { session, .. } = &self.state {
-                    self.indicator_error = Some("The recording indicator window is unavailable.".into());
-                    self.indicator_diagnostic = Some(diagnostic(FailureComponent::Interface,
-                        "Maintain the recording indicator").with_output_root(self.folder.clone()));
-                    let _ = session.submit(SessionCommand::Stop);
-                }
-            }
-            self.poll_inventory(ctx);
-            self.poll_hotkeys(ctx);
         }
+        self.attach_window(frame);
+        if self.native_window.is_none() && self.indicator_error.is_none() {
+            if let RecordingState::Running { session, .. } = &self.state {
+                self.indicator_error = Some("The recording indicator window is unavailable.".into());
+                self.indicator_diagnostic = Some(diagnostic(FailureComponent::Interface,
+                    "Maintain the recording indicator").with_output_root(self.folder.clone()));
+                let _ = session.submit(SessionCommand::Stop);
+            }
+        }
+        self.poll_inventory(ctx);
+        self.poll_hotkeys(ctx);
         match &mut self.state {
             RecordingState::Running { session, status, .. } => {
                 if let Some(latest) = session.status() {
@@ -169,19 +137,17 @@ impl eframe::App for ScreenFix {
                     Ok(Ok(message)) => {
                         self.incomplete_pending = message.outcome == SessionOutcome::Incomplete;
                         self.last_status = Some(session.status().unwrap_or_else(|| status.clone()));
-                        #[cfg(target_os = "windows")]
                         let report = self.indicator_diagnostic.take().map(|snapshot| {
                             let issue = self.indicator_error.as_deref().unwrap_or("The recording indicator failed.");
                             recording_error(format!("{issue}\n{}", message.message), snapshot, None, Some(ctx))
                         });
                         self.state = RecordingState::Complete(Ok(message));
-                        #[cfg(target_os = "windows")]
                         if let Some(report) = report { self.state = report; }
                     }
                     Ok(Err(error)) => {
                         self.last_status = Some(session.status().unwrap_or_else(|| status.clone()));
-                        let mut message = match error.source_failure() {
-                            _ if error.retained_recording().is_some() || error.source_failure().is_some_and(|failure| failure.admitted) => {
+                        let mut message = match error.attempt_stage() {
+                            AttemptStage::Admitted => {
                                 // An admitted attempt, standard or elevated (M1-01).
                                 self.incomplete_pending = true;
                                 match error.retained_recording() {
@@ -191,16 +157,11 @@ impl eframe::App for ScreenFix {
                                     _ => format!("Recording failed after capture started. The failed recording manifest could not be confirmed.\n{error}"),
                                 }
                             }
-                            Some(failure) if failure.reason == screen_fix_core::session::SourceFailureReason::TokenIdentity
-                                && failure.stage == screen_fix_core::session::SourceStage::Foreground =>
-                            {
-                                format!("Recording did not start.\n{error}")
-                            }
-                            Some(_) => format!("Elevated capture unavailable. Recording did not start.\n{error}"),
-                            None => error.to_string(),
+                            AttemptStage::TargetRejected => format!("Recording did not start.\n{error}"),
+                            AttemptStage::ElevatedUnavailable => format!("Elevated capture unavailable. Recording did not start.\n{error}"),
+                            AttemptStage::BeforeAdmission => error.to_string(),
                         };
                         // The indicator failure is reported with the attempt's own failure.
-                        #[cfg(target_os = "windows")]
                         if self.indicator_diagnostic.take().is_some() {
                             let issue = self.indicator_error.as_deref().unwrap_or("The recording indicator failed.");
                             message.push_str(&format!("\n{issue}"));
@@ -235,7 +196,6 @@ impl eframe::App for ScreenFix {
         }
         self.close_after_recording &= self.incomplete_pending || matches!(self.state, RecordingState::Running { .. });
 
-        #[cfg(target_os = "windows")]
         if matches!(self.state, RecordingState::Idle | RecordingState::Complete(_)) {
             if let Some(hotkeys) = self.hotkeys.as_ref() {
                 // The hotkey pump requests a repaint for a Start activation; it
@@ -250,29 +210,24 @@ impl eframe::App for ScreenFix {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("screen_fix");
-            egui::ScrollArea::vertical().show(ui, |ui| self.recording_panel(ui, ctx, _frame));
+            egui::ScrollArea::vertical().show(ui, |ui| self.recording_panel(ui, ctx, frame));
         });
     }
 
-    #[cfg(target_os = "windows")]
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.native_window = None;
     }
 }
 
 impl ScreenFix {
-    pub(crate) fn new(_creation: &eframe::CreationContext<'_>) -> Self {
+    pub(crate) fn new(creation: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self::default();
-        #[cfg(target_os = "windows")]
-        {
-            app.attach_window(_creation);
-            app.refresh_inventory(&_creation.egui_ctx);
-            app.register_hotkeys(&_creation.egui_ctx);
-        }
+        app.attach_window(creation);
+        app.refresh_inventory(&creation.egui_ctx);
+        app.register_hotkeys(&creation.egui_ctx);
         app
     }
 
-    #[cfg(target_os = "windows")]
     fn attach_window(&mut self, owner: &impl HasWindowHandle) {
         let Ok(handle) = owner.window_handle() else {
             self.native_window = None;
@@ -306,13 +261,12 @@ impl ScreenFix {
         }
     }
 
-    fn recording_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn recording_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let running = self.incomplete_pending || matches!(self.state, RecordingState::Running { .. } | RecordingState::Reporting { .. });
-        #[cfg(target_os = "windows")]
         if let Some(error) = self.indicator_error.as_ref().or(self.native_window_error.as_ref()) {
             ui.label(error);
         }
-        if platform::VIDEO_RECORDING_AVAILABLE && !running {
+        if !running {
             ui.label("Capture stays on the selected displays. Recordings are stored locally.");
             ui.label("Displays");
             for item in &self.displays {
@@ -320,8 +274,7 @@ impl ScreenFix {
                 if ui.add_enabled(selected || self.selected.len() < MAX_SELECTED_MONITORS,
                     egui::Checkbox::new(&mut selected, &item.label)).changed()
                 {
-                    #[cfg(target_os = "windows")]
-                    { self.manual_monitors = true; }
+                    self.manual_monitors = true;
                     if selected {
                         self.selected.push(SelectedMonitor {
                             id: self.display_ids[item.key.as_str()],
@@ -338,8 +291,7 @@ impl ScreenFix {
             if self.selected.iter().any(|entry| !self.displays.iter().any(|item| item.key == entry.key))
                 && ui.button("Remove disconnected selections").clicked()
             {
-                #[cfg(target_os = "windows")]
-                { self.manual_monitors = true; }
+                self.manual_monitors = true;
                 self.selected.retain(|entry| self.displays.iter().any(|item| item.key == entry.key));
             }
             egui::ComboBox::from_label("Capture rate")
@@ -348,17 +300,14 @@ impl ScreenFix {
                     ui.selectable_value(&mut self.pace, CapturePace::Fps30, "30 FPS");
                     ui.selectable_value(&mut self.pace, CapturePace::Fps60, "60 FPS pilot");
                 });
-            #[cfg(target_os = "windows")]
-            {
-                if let Some(error) = &self.display_error {
-                    ui.label(error);
-                }
-                if ui.add_enabled(self.setup_probe.is_none(), egui::Button::new("Refresh displays and windows")).clicked() {
-                    self.refresh_inventory(ctx);
-                }
-                if self.setup_probe.is_some() {
-                    ui.label("Checking displays and approved windows…");
-                }
+            if let Some(error) = &self.display_error {
+                ui.label(error);
+            }
+            if ui.add_enabled(self.setup_probe.is_none(), egui::Button::new("Refresh displays and windows")).clicked() {
+                self.refresh_inventory(ctx);
+            }
+            if self.setup_probe.is_some() {
+                ui.label("Checking displays and approved windows…");
             }
             ui.label("Output directory");
             ui.horizontal(|ui| {
@@ -368,11 +317,10 @@ impl ScreenFix {
                 if ui.add_sized([(ui.available_width() - 82.0).max(40.0), 22.0], field).changed() {
                     self.folder = PathBuf::from(path.trim());
                 }
-                #[cfg(target_os = "windows")]
                 if ui.button("Browse…").clicked() {
                     let mut dialog = rfd::FileDialog::new()
                         .set_title("Choose an output folder")
-                        .set_parent(_frame);
+                        .set_parent(frame);
                     if !self.folder.as_os_str().is_empty() {
                         dialog = dialog.set_directory(&self.folder);
                     }
@@ -384,76 +332,70 @@ impl ScreenFix {
             ui.checkbox(&mut self.record_clipboard, "Log clipboard changes");
             ui.checkbox(&mut self.record_pen, "Record pen input");
         }
-        #[cfg(target_os = "windows")]
-        {
-            if !running {
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(self.setup_probe.is_none(), egui::Button::new("Approve an executable…")).clicked() {
-                        let chosen = rfd::FileDialog::new()
-                            .set_title("Choose the application whose input may be recorded")
-                            .set_parent(_frame)
-                            .add_filter("Executables", &["exe"])
-                            .pick_file();
-                        if let Some(chosen) = chosen {
-                            self.start_inventory(ctx, Some(chosen));
-                        }
+        if !running {
+            ui.horizontal(|ui| {
+                if ui.add_enabled(self.setup_probe.is_none(), egui::Button::new("Approve an executable…")).clicked() {
+                    let chosen = rfd::FileDialog::new()
+                        .set_title("Choose the application whose input may be recorded")
+                        .set_parent(frame)
+                        .add_filter("Executables", &["exe"])
+                        .pick_file();
+                    if let Some(chosen) = chosen {
+                        self.start_inventory(ctx, Some(chosen));
                     }
-                    if self.approved_executable.is_some() && ui.add_enabled(self.setup_probe.is_none(), egui::Button::new("Clear approval")).clicked() {
-                        self.approved_executable = None;
-                        self.approved_windows = None;
-                        if !self.manual_monitors {
-                            self.selected.clear();
-                        }
-                    }
-                });
-                ui.label(self.approved_executable.as_ref().map_or(
-                    "Video and input recording require an approved executable in the foreground.", |entry| entry.executable(),
-                ));
-                match &self.approved_windows {
-                    Some(Ok(windows)) => {
-                        let unselected = windows.monitors.iter().filter(|key| !self.selected.iter().any(|entry| &entry.key == *key)).count();
-                        if unselected != 0 {
-                            ui.label(format!("The approved application has a window on {unselected} unselected monitor(s)."));
-                        }
-                        if windows.evidence_incomplete {
-                            ui.label("Some approved window locations could not be verified.");
-                        }
-                        if windows.monitors.is_empty() {
-                            ui.label("No visible approved window was found on a connected monitor.");
-                        }
-                    }
-                    Some(Err(error)) => { ui.label(format!("Approved window locations unknown. {error}")); }
-                    None => {}
                 }
-                if self.approved_executable.is_some() && self.manual_monitors
-                    && ui.add_enabled(self.setup_probe.is_none(), egui::Button::new("Use displays with approved windows")).clicked()
-                {
-                    self.manual_monitors = false;
-                    self.refresh_inventory(ctx);
+                if self.approved_executable.is_some() && ui.add_enabled(self.setup_probe.is_none(), egui::Button::new("Clear approval")).clicked() {
+                    self.approved_executable = None;
+                    self.approved_windows = None;
+                    if !self.manual_monitors {
+                        self.selected.clear();
+                    }
                 }
-                self.hotkey_settings(ui, ctx);
-                ui.collapsing("M1 recording scope", |ui| {
-                    ui.label("App-pack version, adapter and shortcut checks, task duration, start file, goal and task consent are not part of M1.");
-                    ui.label("The 60 FPS profile is a sculpt and paint pilot. Recording rates depend on the per-monitor encoder check.");
-                });
+            });
+            ui.label(self.approved_executable.as_ref().map_or(
+                "Video and input recording require an approved executable in the foreground.", |entry| entry.executable(),
+            ));
+            match &self.approved_windows {
+                Some(Ok(windows)) => {
+                    let unselected = windows.monitors.iter().filter(|key| !self.selected.iter().any(|entry| &entry.key == *key)).count();
+                    if unselected != 0 {
+                        ui.label(format!("The approved application has a window on {unselected} unselected monitor(s)."));
+                    }
+                    if windows.evidence_incomplete {
+                        ui.label("Some approved window locations could not be verified.");
+                    }
+                    if windows.monitors.is_empty() {
+                        ui.label("No visible approved window was found on a connected monitor.");
+                    }
+                }
+                Some(Err(error)) => { ui.label(format!("Approved window locations unknown. {error}")); }
+                None => {}
             }
-            if !running {
-                let issue = self.start_issue();
-                if let Some(issue) = issue {
-                    ui.label(issue);
-                }
-                let pause_key = self.hotkey_bindings.function(RecorderAction::TogglePause);
-                ui.label(format!("Before typing private information in the approved application, pause recording with Ctrl+Alt+F{pause_key}. Resume only when the private information is no longer visible."));
-                ui.label("M1 does not hide the recorder or other windows from captured displays. The recording indicator can appear in video and stills.");
-                if ui.add_enabled(issue.is_none(), egui::Button::new("Start recording")).clicked() {
-                    self.start_recording(ctx, None);
-                }
+            if self.approved_executable.is_some() && self.manual_monitors
+                && ui.add_enabled(self.setup_probe.is_none(), egui::Button::new("Use displays with approved windows")).clicked()
+            {
+                self.manual_monitors = false;
+                self.refresh_inventory(ctx);
+            }
+            self.hotkey_settings(ui, ctx);
+            ui.collapsing("M1 recording scope", |ui| {
+                ui.label("App-pack version, adapter and shortcut checks, task duration, start file, goal and task consent are not part of M1.");
+                ui.label("The 60 FPS profile is a sculpt and paint pilot. Recording rates depend on the per-monitor encoder check.");
+            });
+        }
+        if !running {
+            let issue = self.start_issue();
+            if let Some(issue) = issue {
+                ui.label(issue);
+            }
+            let pause_key = self.hotkey_bindings.function(RecorderAction::TogglePause);
+            ui.label(format!("Before typing private information in the approved application, pause recording with Ctrl+Alt+F{pause_key}. Resume only when the private information is no longer visible."));
+            ui.label("M1 does not hide the recorder or other windows from captured displays. The recording indicator can appear in video and stills.");
+            if ui.add_enabled(issue.is_none(), egui::Button::new("Start recording")).clicked() {
+                self.start_recording(ctx, None);
             }
         }
 
-        if !platform::VIDEO_RECORDING_AVAILABLE {
-            ui.label("Recording is unavailable on this platform.");
-        }
         if !matches!(self.state, RecordingState::Running { .. }) {
             if let Some(status) = &self.last_status {
                 Self::show_windows_status(ui, status);
@@ -577,17 +519,14 @@ impl ScreenFix {
                         ui.label("Preparing input diagnostic report…");
                     }
                 }
-                #[cfg(target_os = "windows")]
-                {
-                    if status.hotkeys_unavailable {
-                        ui.label("Recorder hotkeys are unavailable. Use the Stop button.");
-                    }
-                    match status.last_hotkey {
-                        Some(ControlOutcome::CheckpointRequested) => { ui.label("Checkpoint requested. Saving requires independent file confirmation."); }
-                        Some(ControlOutcome::CheckpointUnavailable) => { ui.label("Checkpoint requests require active recording."); }
-                        Some(ControlOutcome::PauseUnavailable) => { ui.label("Pause becomes available when recording starts."); }
-                        _ => {}
-                    }
+                if status.hotkeys_unavailable {
+                    ui.label("Recorder hotkeys are unavailable. Use the Stop button.");
+                }
+                match status.last_hotkey {
+                    Some(ControlOutcome::CheckpointRequested) => { ui.label("Checkpoint requested. Saving requires independent file confirmation."); }
+                    Some(ControlOutcome::CheckpointUnavailable) => { ui.label("Checkpoint requests require active recording."); }
+                    Some(ControlOutcome::PauseUnavailable) => { ui.label("Pause becomes available when recording starts."); }
+                    _ => {}
                 }
                 for report in &status.video_reports {
                     ui.label(format!("Monitor {} · {}", report.monitor.0, report.outcome));
@@ -598,7 +537,7 @@ impl ScreenFix {
                 // Developer-only trusted fixture Save producer (M1-08). It is compiled into the
                 // Recorder and calls only the public confirm_fixture_save seam with the
                 // approved executable; the monitors follow the approved window geometry.
-                #[cfg(all(feature = "fixture-save", target_os = "windows"))]
+                #[cfg(feature = "fixture-save")]
                 {
                     use screen_fix_core::capture::save::{FixtureSave, SaveKind};
                     if let Some(reply) = &self.fixture_reply && let Ok(result) = reply.try_recv() {
@@ -686,7 +625,6 @@ impl ScreenFix {
             if matches!(self.state, RecordingState::Complete(_) | RecordingState::Reporting { .. })
                 && ui.button(acknowledge).clicked()
             {
-                #[cfg(target_os = "windows")]
                 if let Some(window) = &mut self.native_window { window.clear_indicator(); }
                 self.incomplete_pending = false;
                 if matches!(self.state, RecordingState::Complete(_)) {
@@ -718,7 +656,6 @@ impl ScreenFix {
         }
     }
 
-    #[cfg(target_os = "windows")]
     fn start_issue(&self) -> Option<&'static str> {
         if self.native_window.is_none() || self.native_window_error.is_some() || self.indicator_error.is_some() {
             return Some("The recording indicator is unavailable. Restart Screen Fix before recording.");
@@ -750,12 +687,10 @@ impl ScreenFix {
         None
     }
 
-    #[cfg(target_os = "windows")]
     fn refresh_inventory(&mut self, ctx: &egui::Context) {
         self.start_inventory(ctx, None);
     }
 
-    #[cfg(target_os = "windows")]
     fn start_inventory(&mut self, ctx: &egui::Context, chosen: Option<PathBuf>) {
         if self.setup_probe.is_some() {
             return;
@@ -778,7 +713,6 @@ impl ScreenFix {
         }
     }
 
-    #[cfg(target_os = "windows")]
     fn poll_inventory(&mut self, ctx: &egui::Context) {
         let Some(receive) = &self.setup_probe else { return; };
         let inventory = match receive.try_recv() {
@@ -829,7 +763,6 @@ impl ScreenFix {
         self.setup_probe = None;
     }
 
-    #[cfg(target_os = "windows")]
     fn register_hotkeys(&mut self, ctx: &egui::Context) {
         if self.hotkey_probe.is_some() {
             return;
@@ -851,7 +784,6 @@ impl ScreenFix {
         }
     }
 
-    #[cfg(target_os = "windows")]
     fn poll_hotkeys(&mut self, ctx: &egui::Context) {
         let Some(receive) = &self.hotkey_probe else { return; };
         let result = match receive.try_recv() {
@@ -872,7 +804,6 @@ impl ScreenFix {
         }
     }
 
-    #[cfg(target_os = "windows")]
     fn hotkey_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let previous = self.hotkey_bindings;
         ui.collapsing("Recorder hotkeys", |ui| {
@@ -906,7 +837,6 @@ impl ScreenFix {
         }
     }
 
-    #[cfg(target_os = "windows")]
     fn start_recording(&mut self, ctx: &egui::Context, activation: Option<HotkeyActivation>) {
         if !matches!(self.state, RecordingState::Idle | RecordingState::Complete(_))
             || self.start_issue().is_some()

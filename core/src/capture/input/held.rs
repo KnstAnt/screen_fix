@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use crate::protocol::{DeviceId, Evidence, SessionTimeUs, UnavailableReason, ipc::InputSample};
 
 use super::{
-    Action, Button, Correlation, InputOrigin, Key, Modifier, NormalizedInput, ScanCode,
+    Action, Button, Correlation, InputOrigin, Key, Modifier, NormalizedInput, PendingInput, ScanCode,
     normalize::{LLKHF_UP, VK_CAPITAL},
 };
 
@@ -91,6 +91,18 @@ pub(crate) struct HeldInput {
     pub motion_thinned: bool,
 }
 
+impl HeldInput {
+    /// The row's first record.
+    pub fn first(&self) -> &PendingInput {
+        &self.normalized.correlated.first
+    }
+
+    /// The receipt time of the row's first record.
+    pub fn receipt(&self) -> SessionTimeUs {
+        self.first().time.recv_t_us
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct PhysicalHeld {
     held: BTreeSet<HeldIdentity>,
@@ -109,7 +121,7 @@ pub(crate) struct PhysicalHeld {
 impl PhysicalHeld {
     pub fn observe(&mut self, normalized: NormalizedInput) -> HeldInput {
         let action = normalized.correlated.first.action;
-        let device = observed_device(normalized.origin.device);
+        let device = normalized.origin.device.observed();
         let at = normalized.correlated.first.time.recv_t_us;
         if let Action::AltGrCompanion = action
             && let crate::protocol::ipc::InputSample::HookKey(key) = normalized.correlated.first.packet.sample
@@ -143,14 +155,12 @@ impl PhysicalHeld {
                 }
             }
             Action::Hid => match &normalized.correlated.first.packet.sample {
-                InputSample::Hid(report) => report.pen_tip().map(|(link, down)| (Holding::PenTip { link }, down)),
+                InputSample::Hid(report) => super::pen::tip(report).map(|(link, down)| (Holding::PenTip { link }, down)),
                 _ => None,
             },
             Action::Button { logical, physical, down } => {
-                let physical = normalized.pointer.as_ref().and_then(|pointer| match pointer.physical_button {
-                    Evidence::Observed(button) => Some(button),
-                    _ => physical,
-                });
+                let physical = normalized.pointer.as_ref()
+                    .and_then(|pointer| pointer.physical_button.observed().or(physical));
                 Some((Holding::Button { logical, physical }, down))
             }
             _ => None,
@@ -178,15 +188,7 @@ impl PhysicalHeld {
     }
 
     pub fn snapshot(&self) -> HeldSnapshot {
-        let mut modifiers = 0;
-        let mut buttons = 0;
-        for identity in &self.held {
-            match identity.holding {
-                Holding::Key { modifier: Some(modifier), .. } => modifiers |= modifier_bit(modifier),
-                Holding::Button { logical, .. } | Holding::PromotedPenPointer { logical, .. } => buttons |= button_bit(logical),
-                _ => {}
-            }
-        }
+        let (modifiers, buttons) = masks(&self.held);
         HeldSnapshot {
             modifiers, modifiers_known: self.modifiers_known | modifiers,
             buttons, buttons_known: self.buttons_known | buttons,
@@ -239,16 +241,14 @@ impl PhysicalHeld {
         self.modifiers_known = MODIFIER_MASK;
         self.buttons_known = BUTTON_MASK;
         let mut edges = Vec::new();
-        for modifier in [Modifier::LeftShift, Modifier::RightShift, Modifier::LeftCtrl, Modifier::RightCtrl,
-            Modifier::LeftAlt, Modifier::RightAlt, Modifier::LeftWin, Modifier::RightWin]
-        {
+        for modifier in Modifier::ALL {
             let bit = modifier_bit(modifier);
             let identity = HeldIdentity { device: None, holding: Holding::Key {
-                vk: modifier_vk(modifier), scan: None, modifier: Some(modifier),
+                vk: modifier.vk(), scan: None, modifier: Some(modifier),
             } };
             self.synchronize_one(identity, modifiers & bit != 0, prior.modifiers & bit != 0, t_us, &mut edges);
         }
-        for physical in [Button::Left, Button::Right, Button::Middle, Button::X1, Button::X2] {
+        for physical in Button::ALL {
             let logical = physical.mapped(swapped);
             let identity = HeldIdentity { device: None, holding: Holding::Button { logical, physical: Some(physical) } };
             self.synchronize_one(
@@ -341,16 +341,7 @@ pub(crate) struct PublishedHeld {
 impl PublishedHeld {
     /// The modifier and button masks of the published holdings.
     pub fn modifiers_and_buttons(&self) -> (u8, u8) {
-        let mut modifiers = 0;
-        let mut buttons = 0;
-        for entry in &self.held {
-            match entry.holding {
-                Holding::Key { modifier: Some(modifier), .. } => modifiers |= modifier_bit(modifier),
-                Holding::Button { logical, .. } | Holding::PromotedPenPointer { logical, .. } => buttons |= button_bit(logical),
-                _ => {}
-            }
-        }
-        (modifiers, buttons)
+        masks(&self.held)
     }
 
     pub fn buttons_down(&self) -> bool {
@@ -392,11 +383,18 @@ impl PublishedHeld {
     }
 }
 
-fn observed_device(evidence: Evidence<DeviceId>) -> Option<DeviceId> {
-    match evidence {
-        Evidence::Observed(device) => Some(device),
-        _ => None,
+/// The modifier and logical button masks of `held`.
+fn masks<'a>(held: impl IntoIterator<Item = &'a HeldIdentity>) -> (u8, u8) {
+    let mut modifiers = 0;
+    let mut buttons = 0;
+    for identity in held {
+        match identity.holding {
+            Holding::Key { modifier: Some(modifier), .. } => modifiers |= modifier_bit(modifier),
+            Holding::Button { logical, .. } | Holding::PromotedPenPointer { logical, .. } => buttons |= button_bit(logical),
+            _ => {}
+        }
     }
+    (modifiers, buttons)
 }
 
 pub(super) fn compatible(left: HeldIdentity, right: HeldIdentity) -> bool {
@@ -414,19 +412,6 @@ pub(super) fn compatible(left: HeldIdentity, right: HeldIdentity) -> bool {
             match (x, y) { (Some(x), Some(y)) => x == y, _ => a == b }
         }
         _ => false,
-    }
-}
-
-pub(crate) fn modifier_vk(modifier: Modifier) -> u16 {
-    match modifier {
-        Modifier::LeftShift => 0xa0,
-        Modifier::RightShift => 0xa1,
-        Modifier::LeftCtrl => 0xa2,
-        Modifier::RightCtrl => 0xa3,
-        Modifier::LeftAlt => 0xa4,
-        Modifier::RightAlt => 0xa5,
-        Modifier::LeftWin => 0x5b,
-        Modifier::RightWin => 0x5c,
     }
 }
 

@@ -11,7 +11,7 @@ name = "screen-fix-elevated-capture"
 path = "src/main.rs"
 required-features = ["elevated-release"]
 
-[target.'cfg(target_os = "windows")'.dependencies]
+[dependencies]
 screen-fix-protocol = { path = "../../../protocol" }
 screen-fix-native-observation = { path = "../native-observation", features = ["context"] }
 windows-sys = { version = "0.61", features = [

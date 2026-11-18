@@ -1082,7 +1082,7 @@ Stages that are not blocked can run in parallel within these dependencies. A sug
 - **`InputHelper::drop`.** The wait is bounded by the ordinary 750 ms cleanup bound, after the job close.
 - **`pen_pressure`.** Map the opt-in-disabled state to the PDF enum (`unavailable_unknown`) with a separate `pen_hid_collection_enabled:false` extension field.
 
-**Affected modules.** `native-observation/src/input/{device.rs,raw.rs,hooks.rs,hid.rs}`, `native-observation/src/input.rs`, `protocol/src/ipc/shared.rs`, `core/src/platform/windows/input_helper.rs`, `core/src/platform/windows/input/hid.rs`, `core/src/capture/input/evidence.rs`, `metadata.rs`.
+**Affected modules.** `native-observation/src/input/{device.rs,raw.rs,hooks.rs,hid.rs}`, `native-observation/src/input.rs`, `core/capture/native-observation/src/channel.rs`, `core/src/platform/windows/input_helper.rs`, `core/src/platform/windows/input/hid.rs`, `core/src/capture/input/evidence.rs`, `metadata.rs`.
 
 **Completion criteria (static).**
 - No `CreateFileW`, `HidD_*` or `SetupDi*` call is reachable from the Raw Input message handler.

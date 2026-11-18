@@ -6,7 +6,7 @@ use crate::{
 const TRANSITIONS_WITHOUT_HOOK: u8 = 20;
 
 #[derive(Default)]
-pub(super) struct HookHealth {
+pub(crate) struct HookHealth {
     keyboard: Channel,
     pointer: Channel,
 }

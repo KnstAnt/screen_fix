@@ -11,7 +11,7 @@ use std::{
 };
 
 use screen_fix_native_observation::{
-    hung, identity::{MetadataScrubber, WindowProcess}, ime,
+    LossSpan, hung, identity::{MetadataScrubber, WindowProcess}, ime,
     uia::{self, Client}, uia_commits::{CommitLossReason, CommitScope, Queue as Commits},
     windows::{FocusSnapshot, WindowMetadata, window_dpi},
 };
@@ -354,8 +354,7 @@ impl Worker {
         })();
         uia.desired.store(0, Release);
         if let Some(client) = uia.client.take() {
-            let deadline = QpcTick(qpc()?.0.checked_add(self.grant.lifetime.ticks(CLEANUP)?).ok_or(Failure::Supervisor)?);
-            let _guard = self.grant.lifetime.provider(ProviderKind::Teardown, deadline).ok_or(Failure::Supervisor)?;
+            let _guard = self.grant.lifetime.teardown(qpc()?)?;
             drop(client);
         }
         result
@@ -622,8 +621,8 @@ impl Worker {
         let Some((read, focus, revision)) = uia.subscription else { return Ok(()) };
         let now = qpc()?;
         // Commit losses reach the Recorder per reason (E3).
-        let lose = |cause, count, first, last| match NonZeroU64::new(count) {
-            Some(count) => self.send.lost(&self.grant, read.visit, ContextProducer::TextEdit, cause, first, last, count),
+        let lose = |cause, span: LossSpan| match NonZeroU64::new(span.count) {
+            Some(count) => self.send.lost(&self.grant, read.visit, ContextProducer::TextEdit, cause, span.first, span.last, count),
             None => Ok(()),
         };
         for loss in uia.commits.take_loss() {
@@ -633,18 +632,17 @@ impl Worker {
                 CommitLossReason::Parts => ContextGapCause::CommitParts,
                 CommitLossReason::Rejected => ContextGapCause::CommitRejected,
                 CommitLossReason::Stale => ContextGapCause::Stale,
-            }, loss.count, loss.first, loss.last)?;
+            }, loss.span)?;
         }
         if !self.commit_current(read.visit, focus, &uia.revision, revision) {
             uia.desired.store(0, Release);
             uia.subscription = None;
             uia.editable = None;
             for commit in uia.commits.take() {
-                lose(ContextGapCause::Stale, 1, commit.receipt, commit.receipt)?;
+                lose(ContextGapCause::Stale, LossSpan::at(commit.receipt))?;
             }
             if let Some(client) = uia.client.as_mut() {
-                let deadline = QpcTick(now.0.checked_add(self.grant.lifetime.ticks(CLEANUP)?).ok_or(Failure::Supervisor)?);
-                let _call = self.grant.lifetime.provider(ProviderKind::Teardown, deadline).ok_or(Failure::Supervisor)?;
+                let _call = self.grant.lifetime.teardown(now)?;
                 client.clear_subscription();
             }
             return Ok(());
@@ -653,11 +651,11 @@ impl Worker {
             if commit.generation != read.visit.focus_generation || commit.revision != revision
                 || !self.commit_current(read.visit, focus, &uia.revision, revision)
             {
-                lose(ContextGapCause::Stale, 1, commit.receipt, commit.receipt)?;
+                lose(ContextGapCause::Stale, LossSpan::at(commit.receipt))?;
                 continue;
             }
             let Ok(text) = CommitText::new(&commit.text) else {
-                lose(ContextGapCause::CommitTooLong, 1, commit.receipt, commit.receipt)?;
+                lose(ContextGapCause::CommitTooLong, LossSpan::at(commit.receipt))?;
                 continue;
             };
             self.send.publish_checked(&self.grant, read.visit, ContextEvidence::Commit(CommitEvidence {
@@ -678,8 +676,7 @@ impl Worker {
         let sender_revision = Arc::clone(&revision);
         CommitScope {
             check_sender: Arc::new(move |sender, receipt| {
-                let Ok(budget) = sender_proof.grant.lifetime.ticks(NATIVE_BUDGET) else { return false };
-                let Some(deadline) = receipt.0.checked_add(budget).map(QpcTick) else { return false };
+                let Ok(deadline) = sender_proof.grant.lifetime.after(receipt, NATIVE_BUDGET) else { return false };
                 let Some(_call) = sender_proof.grant.lifetime.provider(ProviderKind::Callback, deadline) else { return false };
                 sender_proof.commit_current(visit, focus, &sender_revision, expected)
                     && uia::commit_sender(sender, foreground)
@@ -720,8 +717,7 @@ impl Worker {
     }
 
     fn foreground(&self) -> WindowProcess {
-        let window = self.grant.visit().foreground;
-        WindowProcess { window: window.window, process: window.process, thread: window.thread }
+        self.grant.visit().foreground.into()
     }
 
     /// Registers a provider call with the supervisor. Its slot deadline is
@@ -729,19 +725,17 @@ impl Worker {
     /// between is stale, one still running at the slot deadline defeats
     /// cancellation and the supervisor terminates the collector.
     fn call(&self, kind: ProviderKind, request: QpcTick) -> Option<super::lifetime::Provider<'_>> {
-        let slot = request.0.checked_add(self.grant.lifetime.ticks(CLEANUP).ok()?)?;
-        self.grant.lifetime.provider(kind, QpcTick(slot))
+        let slot = self.grant.lifetime.after(request, CLEANUP).ok()?;
+        self.grant.lifetime.provider(kind, slot)
     }
 
     /// The provider call deadline: the request deadline capped by `cap`, as
     /// a QPC tick and an instant; `None` when no time remains.
     fn deadline(&self, read: ReadBinding, cap: Duration) -> Result<Option<(QpcTick, Instant)>> {
         let start = qpc()?;
-        let capped = read.deadline_qpc.0.min(start.0.checked_add(self.grant.lifetime.ticks(cap)?).ok_or(Failure::Supervisor)?);
-        let Some(remaining) = capped.checked_sub(start.0).filter(|value| *value > 0) else { return Ok(None) };
-        let total = self.grant.lifetime.ticks(Duration::from_secs(1))?;
-        let nanos = u64::try_from(i128::from(remaining) * 1_000_000_000 / i128::from(total)).map_err(|_| Failure::Supervisor)?;
-        Ok(Some((QpcTick(capped), Instant::now() + Duration::from_nanos(nanos))))
+        let capped = read.deadline_qpc.min(self.grant.lifetime.after(start, cap)?);
+        let Some(remaining) = capped.0.checked_sub(start.0).filter(|value| *value > 0) else { return Ok(None) };
+        Ok(Some((capped, self.grant.lifetime.instant_of(remaining)?)))
     }
 
     fn publish(&self, job: &Job, result: ContextEvidence) -> Result<()> {

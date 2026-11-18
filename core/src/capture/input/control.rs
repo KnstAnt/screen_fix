@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, VecDeque};
 
 use crate::{
     protocol::{MessageTickMs, SessionTimeUs, ipc::InputSample},
-    session::hotkey::HotkeyActivation,
+    util::raise,
 };
 
 use super::{Action, HeldInput, HeldSynchronization, Modifier, held::{HeldIdentity, Holding, compatible, modifier_bit}};
@@ -41,8 +41,16 @@ struct Staged {
     boundary: Option<ControlBoundary>,
 }
 
+/// The key and message tick of a Recorder hotkey that the control owner
+/// confirmed; the receiver associates it with the matching raw key press.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ControlNotice {
+    pub virtual_key: u16,
+    pub message_tick: MessageTickMs,
+}
+
 struct Confirmation {
-    activation: HotkeyActivation,
+    notice: ControlNotice,
     at: SessionTimeUs,
 }
 
@@ -95,31 +103,31 @@ impl ControlChords {
         omit
     }
 
-    pub fn confirm(&mut self, activation: HotkeyActivation, at: SessionTimeUs) {
+    pub fn confirm(&mut self, notice: ControlNotice, at: SessionTimeUs) {
         if self.confirmations.len() == MAX_NOTICES {
             self.note_loss(at);
             return;
         }
-        self.confirmations.push_back(Confirmation { activation, at });
+        self.confirmations.push_back(Confirmation { notice, at });
     }
 
     pub fn note_loss(&mut self, through: SessionTimeUs) {
-        self.lost_through = Some(self.lost_through.map_or(through, |old| old.max(through)));
+        raise(&mut self.lost_through, through);
     }
 
     pub fn progress(&mut self, bound: SessionTimeUs) {
-        self.bound = Some(self.bound.map_or(bound, |old| old.max(bound)));
+        raise(&mut self.bound, bound);
     }
 
     pub fn local_before(&self) -> Option<SessionTimeUs> {
         let native = self.bound?;
-        [Some(native), self.pending.front().map(|slot| time(&slot.input)),
+        [Some(native), self.pending.front().map(|slot| slot.input.receipt()),
             self.confirmations.front().map(|notice| notice.at)].into_iter().flatten().min()
     }
 
     pub fn stage(&mut self, input: HeldInput) -> Result<(), HeldInput> {
         if self.pending.len() == MAX_PREFIX {
-            self.note_loss(time(&input));
+            self.note_loss(input.receipt());
             return Err(input);
         }
         self.pending.push_back(Staged { input, disposition: None, boundary: None });
@@ -127,7 +135,7 @@ impl ControlChords {
     }
 
     pub fn discard_from(&mut self, at: SessionTimeUs) -> impl Iterator<Item = HeldInput> + '_ {
-        let first = self.pending.iter().position(|slot| time(&slot.input) >= at).unwrap_or(self.pending.len());
+        let first = self.pending.iter().position(|slot| slot.input.receipt() >= at).unwrap_or(self.pending.len());
         self.pending.drain(first..).map(|slot| slot.input)
     }
 
@@ -169,14 +177,14 @@ impl ControlChords {
         if front.input.edge.is_some_and(|edge| self.consumed.iter().any(|held| compatible(*held, edge.identity))) {
             return Some(ControlDisposition::Recorder);
         }
-        let Action::Key(key) = front.input.normalized.correlated.first.action else {
+        let Action::Key(key) = front.input.first().action else {
             return Some(ControlDisposition::Application);
         };
         let modifier_prefix = key.modifier.is_some_and(is_chord_modifier);
         if !modifier_prefix && !self.keys.contains(&key.virtual_key) {
             return Some(ControlDisposition::Application);
         }
-        let at = time(&front.input);
+        let at = front.input.receipt();
         let wait = if modifier_prefix { PREFIX_WAIT_US } else { ASSOCIATION_US };
         let until = SessionTimeUs(at.0.saturating_add(wait));
         let timed_out = now.0.saturating_sub(at.0) >= MAX_CONTROL_WAIT_US;
@@ -264,7 +272,7 @@ impl ControlChords {
             return;
         }
         self.consumed.insert(HeldIdentity { device: None, holding: Holding::Key {
-            vk: super::modifier_vk(modifier), scan: None, modifier: Some(modifier),
+            vk: modifier.vk(), scan: None, modifier: Some(modifier),
         } });
     }
 
@@ -283,26 +291,22 @@ impl ControlChords {
     }
 }
 
-fn time(input: &HeldInput) -> SessionTimeUs {
-    input.normalized.correlated.first.time.recv_t_us
-}
-
 fn eligible(input: &HeldInput, confirmation: &Confirmation) -> bool {
     let correlated = &input.normalized.correlated;
     let Action::Key(key) = correlated.first.action else { return false };
-    if !key.down || key.virtual_key != confirmation.activation.virtual_key {
+    if !key.down || key.virtual_key != confirmation.notice.virtual_key {
         return false;
     }
-    let distance = time(input).0.abs_diff(confirmation.at.0);
+    let distance = input.receipt().0.abs_diff(confirmation.at.0);
     if distance > ASSOCIATION_US as u64 {
         return false;
     }
-    let hook_tick = std::iter::once(&correlated.first).chain(&correlated.partners).find_map(|slot| {
+    let hook_tick = correlated.slots().find_map(|slot| {
         matches!(slot.packet.sample, InputSample::HookKey(_)).then_some(slot.packet.receipt.message_tick_ms).flatten()
     });
     let tick = hook_tick.or(correlated.first.packet.receipt.message_tick_ms);
     tick.map_or(distance <= RAW_ONLY_ASSOCIATION_US, |tick| {
-        tick_distance(tick, confirmation.activation.message_tick) <= COARSE_DISTANCE_MS
+        tick_distance(tick, confirmation.notice.message_tick) <= COARSE_DISTANCE_MS
     })
 }
 
@@ -311,11 +315,11 @@ fn tick_distance(left: MessageTickMs, right: MessageTickMs) -> u32 {
 }
 
 fn recorder_key_down(input: &HeldInput, keys: &[u16; 4]) -> bool {
-    matches!(input.normalized.correlated.first.action, Action::Key(key) if key.down && keys.contains(&key.virtual_key))
+    matches!(input.first().action, Action::Key(key) if key.down && keys.contains(&key.virtual_key))
 }
 
 fn ordinary_use(input: &HeldInput, keys: &[u16; 4]) -> bool {
-    match input.normalized.correlated.first.action {
+    match input.first().action {
         Action::Key(key) => key.down && key.modifier.is_none() && !keys.contains(&key.virtual_key),
         Action::Button { down, .. } => down,
         Action::Wheel { .. } => true,

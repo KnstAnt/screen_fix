@@ -1,35 +1,32 @@
-mod blind;
 mod gate;
-mod devices;
-mod hid;
-mod hook_health;
 mod receiver;
 mod resync;
 pub(crate) use resync::on_input_desktop;
 mod text;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     ops::ControlFlow,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 
+use screen_fix_native_observation::LossSpan;
+
 use crate::{
     capture::input::HeldBoundary,
     capture::save::{ConfirmationSource, ConfirmedSave, FixtureSaveError, FixtureSaveResult, MonitorRoutingBasis,
-        SaveEvidence, SaveRouting},
-    package::{diagnostics::ReportOutcome, journal::{Flush, FlushRequest, JournalIngress, Submit}, metadata::{AttemptLayout, InputBlindReason, InputCapture, InputPublication, InputTailReason, PenCapture, SourceBlindReason, UncertifiedInputTail}, outcome::{LossEvidence, LossReason, SuppressionClass}},
-    protocol::{AdmissionEpoch, BoundedList, CoarseTime, MonitorId, MessageTickMs, QpcTick, RecordTime, RequestId, SessionId, SessionTimeUs,
-        ipc::{ConfigureInput, DeviceDescriptor, GapCause, InputRegistration, MAX_INPUT_DEVICES, ProducerGap, elevated::{VisitBinding, runtime::CoverageReason}}},
-    session::{
-        AdmissionBoundary, PauseReason, SourceFailureReason, hotkey::ControlOutcome,
-        windows::{Admission, ControlPrefix, FixtureNotice, PauseProducer, Receipt, WorkerSession, pause_blind_reason},
-    },
+        SaveEvidence, SaveRouting, SaveWindowContext},
+    package::{diagnostics::ReportOutcome, journal::{Flush, FlushRequest, JournalIngress, Submit}, metadata::{AttemptLayout, InputBlindReason, InputCapture, InputPublication, InputTailReason, SourceBlindReason, UncertifiedInputTail}, outcome::{HealthKind, LossEvidence, LossReason, SuppressionClass}, row::{BlindRow, RowEnvelope, RowKind}},
+    protocol::{AdmissionEpoch, CoarseTime, MonitorId, MessageTickMs, QpcTick, RecordTime, RequestId, SessionId, SessionTimeUs,
+        ipc::{ConfigureInput, InputRegistration, ProducerGap, elevated::{VisitBinding, runtime::CoverageReason}}},
+    platform::windows::controller::{Admission, ControlPrefix, FixtureNotice, MAX_FIXTURE_SAVES, PauseProducer, PausedVideo, Receipt, WorkerSession},
+    session::{AdmissionBoundary, PauseReason, hotkey::ControlOutcome, labels::{input_tail_reason, pause_blind_labels, pen_capture}},
 };
 
-use super::{ProbeError, RecordingReport, clock, clock_error, context::{Context, FramePolicy}, elevated::{InputCertificate, InputStagingLoss, Selector}, input_helper::{HelperError, InputHelper, READY_WAIT}, io_error, package_journal_error, still_rows, stills, unavailable, video_failure_health};
+use super::{ProbeError, RecordingReport, clock, context::{Context, FramePolicy}, elevated::{InputCertificate, InputStagingLoss, Selector}, input_helper::{HelperError, InputHelper, READY_WAIT}, io_error, still_rows, stills, unavailable};
+use crate::package::finalize::video_failure_health;
 
 /// The bounded wait for producer progress past a pause cutoff (§6.3).
 const PAUSE_CERTIFICATION_WAIT: Duration = Duration::from_millis(250);
@@ -151,7 +148,7 @@ impl ReceiptPrefix {
     /// Submit lifecycle rows at `at`; each is queued and advances the prefix.
     fn submit_boundary(&mut self, output: &mut JournalIngress, at: SessionTimeUs, rows: Vec<serde_json::Value>) -> Result<(), ProbeError> {
         let count = rows.len();
-        output.submit_boundary(at, rows).map_err(package_journal_error)?;
+        output.submit_boundary(at, rows)?;
         (0..count).try_for_each(|_| self.advance_time(at, Submit::Queued))
     }
 
@@ -240,7 +237,7 @@ fn pump(
 
 /// A pause that lasted until Stop: its cutoff, its reasons and the paused
 /// video slot ranges.
-type PausedAtStop = (AdmissionBoundary, Vec<PauseReason>, Vec<crate::session::windows::PausedVideo>);
+type PausedAtStop = (AdmissionBoundary, Vec<PauseReason>, Vec<PausedVideo>);
 
 /// The input pump's state across admission intervals. Fields drop in the
 /// order the pump's locals did.
@@ -341,7 +338,7 @@ impl<'a> Pump<'a> {
                                 receiver.collect_ordinary_inventory(record, !elevated);
                             }))
                     {
-                        let at = receipt.clock.time(receipt.qpc).map_err(clock_error)?;
+                        let at = receipt.clock.time(receipt.qpc)?;
                         note_inactive_helper_failure(session, error, at);
                         retire_helper(helper, retired_helper);
                     }
@@ -385,7 +382,7 @@ impl<'a> Pump<'a> {
                         keep_first_error(&mut accepted, || receiver.accept(record, receipt, None, native_context));
                     }));
                     accepted?;
-                    let at = receipt.clock.time(receipt.qpc).map_err(clock_error)?;
+                    let at = receipt.clock.time(receipt.qpc)?;
                     receiver.advance(at);
                     for producer in receiver.take_hook_reports().into_iter().flatten() {
                         note_helper_failure(session, reports, receiver, HelperError::SuspectedHookLoss(producer), at, true);
@@ -425,12 +422,12 @@ impl<'a> Pump<'a> {
                     elevated_saves.poll(certified, receipt, observed_at, session, layout, native_context,
                         still_endpoints, still_rows, context, context_prefix, next_context_index, false)?;
                     if let Some((_, before)) = certified {
-                        receiver.advance_stills(receipt.clock.time(before).map_err(clock_error)?, true);
+                        receiver.advance_stills(receipt.clock.time(before)?, true);
                     }
                 }
                 publish_runtime_health(session, context, receipt, observed_at,
                     video_health, video_health_seen, capture_health_seen)?;
-                let watermark = receipt.clock.time(observed_at).map_err(clock_error)?;
+                let watermark = receipt.clock.time(observed_at)?;
                 if ordinary_live {
                     let (texts, losses) = native_context.take_confirmed_text(receipt, observed_at);
                     for text in texts {
@@ -443,7 +440,7 @@ impl<'a> Pump<'a> {
                     if helper.is_some() && let Some(synchronized) = receiver.synchronization_qpc()
                         && let Some(before) = receiver.unresolved_before()
                     {
-                        let start = receipt.clock.time(synchronized.max(receipt.boundary.qpc)).map_err(clock_error)?;
+                        let start = receipt.clock.time(synchronized.max(receipt.boundary.qpc))?;
                         session.record_source_coverage(receipt.boundary.epoch, None, start, before.min(watermark));
                     }
                     receiver.poll_pointer_rest(native_context, receipt, observed_at)?;
@@ -455,7 +452,7 @@ impl<'a> Pump<'a> {
                     }
                 }
                 publish_context_health(native_context, context, &context_prefix, session, receipt, observed_at)?;
-                context.offer_gap(watermark).map_err(package_journal_error)?;
+                context.offer_gap(watermark)?;
                 let revision = session.journal_flush_revision();
                 let closed_segment = *journal_revision != revision;
                 *journal_revision = revision;
@@ -575,16 +572,9 @@ impl<'a> Pump<'a> {
             thread::park_timeout(Duration::from_millis(2));
         };
         let reasons = session.pause_interval_reasons(closed);
-        let mut pause = serde_json::json!({
-            // `reason` is the primary (first ordered) reason (CTX-6);
-            // `reasons` keeps the full ordered set as an extension.
-            "kind": "pause", "reason": reasons.first(), "reasons": reasons, "cutoff_t_us": closed.time,
-            "uncertified_input_tail": tail, "paused_slots": ranges,
-            "paused_slots_all_monitors": ranges.len() == session.config().monitors().len(),
-        });
-        if let Some(before) = receiver.elevated_hook_loss() {
-            pause["required_hook_first_uncovered_qpc"] = serde_json::json!(before);
-        }
+        let all_monitors = ranges.len() == session.config().monitors().len();
+        let pause = pause_row(&reasons, closed.time, tail, &ranges, all_monitors, receiver.elevated_hook_loss())
+            .map_err(|_| unavailable("Encode a pause row"))?;
         send_boundary_event(context, pause, timing, context_prefix, next_context_index)?;
         // Pending context gaps preceded the pause row; later ones follow the resume rows.
         context.pause();
@@ -613,12 +603,12 @@ impl<'a> Pump<'a> {
             for failed in session.video_failures_after(paused_video_counted) {
                 if let Some(at) = failed.at {
                     context.submit_health(video_failure_health(failed.failure, failed.monitor, at))
-                        .map_err(package_journal_error)?;
+                        ?;
                 }
                 paused_video_counted += 1;
             }
             for record in session.health_after(paused_health_counted) {
-                context.submit_health(record).map_err(package_journal_error)?;
+                context.submit_health(record)?;
                 paused_health_counted += 1;
             }
             if !session.pause_pending(closed) { break; }
@@ -627,7 +617,7 @@ impl<'a> Pump<'a> {
             resume_chord |= controls.notices().any(|notice| notice.outcome == ControlOutcome::ResumeRequested);
             publish_controls(controls, receipt, at, context, context_prefix,
                 next_context_index, |_, _| None)?;
-            let through = receipt.clock.time(at).map_err(clock_error)?;
+            let through = receipt.clock.time(at)?;
             context_flush.poll(context, through, wrote_control)?;
             thread::park_timeout(Duration::from_millis(5));
         }
@@ -641,22 +631,18 @@ impl<'a> Pump<'a> {
         let timing = input_timing(resumed, opened.boundary.qpc, None)?
             .ok_or_else(|| unavailable("The input resume boundary is invalid"))?;
         publish_blind_pause(input, input_prefix, closed.time, opened.boundary.time, opened.boundary.time, &reasons)?;
-        send_boundary_event(context, serde_json::json!({
-            "kind": "discontinuity", "start_t_us": closed.time, "end_t_us": opened.boundary.time,
-            "gap_us": opened.boundary.time.0.saturating_sub(closed.time.0),
-            "previous_admission_epoch": closed.epoch, "reasons": reasons,
-        }), timing, context_prefix, next_context_index)?;
+        let discontinuity = discontinuity_row(closed, opened.boundary.time, &reasons)
+            .map_err(|_| unavailable("Encode a discontinuity row"))?;
+        send_boundary_event(context, discontinuity, timing, context_prefix, next_context_index)?;
         let paused_slots = paused_slot_ranges(&ranges, closed.time, opened.boundary.time);
         let mut suppressed_health = context.take_paused_health();
         for (kind, count) in input.take_paused_health() {
             let total = suppressed_health.entry(kind).or_default();
             *total = total.saturating_add(count);
         }
-        send_boundary_event(context, serde_json::json!({
-            "kind": "resume", "reason": reasons.first(), "reasons": reasons, "paused_start_t_us": closed.time,
-            "paused_slots": paused_slots, "suppressed_context_notifications": discarded_context,
-            "suppressed_health": suppressed_health,
-        }), timing, context_prefix, next_context_index)?;
+        let resume = resume_row(&reasons, closed.time, &paused_slots, discarded_context, &suppressed_health)
+            .map_err(|_| unavailable("Encode a resume row"))?;
+        send_boundary_event(context, resume, timing, context_prefix, next_context_index)?;
         // Losses noticed during the pause now follow the resume row.
         context.resume();
         input.resume();
@@ -805,13 +791,13 @@ impl<'a> Pump<'a> {
             }
             publish_controls(final_controls, receipt, stopped.qpc, &mut context, &mut context_prefix,
                 &mut next_context_index, |_, _| None)?;
-            input.seal(cutoff.time).map_err(package_journal_error)?;
-            context.seal(stopped.time).map_err(package_journal_error)?;
+            input.seal(cutoff.time)?;
+            context.seal(stopped.time)?;
         } else if input_prefix.last_time.is_some() || context_prefix.last_receipt.is_some() {
             return Err(unavailable("The admitted input prefix has no closing boundary"));
         }
         let (devices, device_inventory_truncated) = receiver.finish_inventory()?;
-        let pen = pen_capture(&receiver, registration, remote, &devices, device_inventory_truncated);
+        let pen = pen_capture(receiver.pen_observation(), registration, remote, devices.as_slice(), device_inventory_truncated);
         let (keyboard_hook_loss_suspected, pointer_hook_loss_suspected) = receiver.hook_loss();
         Ok(InputPrefix {
             cutoff, input: input_prefix, context: context_prefix, video_health,
@@ -859,35 +845,6 @@ fn remote_session() -> bool {
     unsafe { GetSystemMetrics(SM_REMOTESESSION) != 0 }
 }
 
-/// The pen capture evidence of the manifest: why pressure is unavailable
-/// when no pressure was observed.
-fn pen_capture(
-    receiver: &receiver::Receiver, registration: InputRegistration, remote: bool,
-    devices: &BoundedList<DeviceDescriptor, MAX_INPUT_DEVICES>, inventory_truncated: bool,
-) -> PenCapture {
-    use crate::package::metadata::{PenPressure, TabletDriverMode, TabletInputPath};
-    use crate::protocol::{Evidence, UnavailableReason};
-    let (pen_observed, pressure_observed) = receiver.pen_observation();
-    let pressure = if pressure_observed {
-        PenPressure::Captured
-    } else if !registration.pen_hid {
-        PenPressure::UnavailableUnknown
-    } else if remote {
-        PenPressure::UnavailableVmOrRemote
-    } else if !inventory_truncated && !devices.as_slice().iter().any(|descriptor| descriptor.kind.is_pen()) {
-        PenPressure::UnavailableNoHidCollection
-    } else {
-        PenPressure::UnavailableUnknown
-    };
-    PenCapture {
-        pressure,
-        pen_hid_collection_enabled: registration.pen_hid,
-        observed_path: pen_observed.then_some(TabletInputPath::NativeDigitizerHid),
-        driver_mode: TabletDriverMode::Unknown,
-        app_tablet_settings: Evidence::Unavailable(UnavailableReason::Unsupported),
-    }
-}
-
 /// Write the runtime health found since the last poll: each new video
 /// failure, and each new capture health record.
 fn publish_runtime_health(
@@ -898,12 +855,12 @@ fn publish_runtime_health(
         let Some(timing) = input_timing(receipt, observed_at, None)? else { break };
         let detected = failed.at.unwrap_or(timing.time.recv_t_us);
         context.submit_health(video_failure_health(failed.failure, failed.monitor, detected))
-            .map_err(package_journal_error)?;
+            ?;
         *video_health_seen += 1;
         video_health.push(failed.monitor);
     }
     for record in session.health_after(*capture_health_seen) {
-        context.submit_health(record).map_err(package_journal_error)?;
+        context.submit_health(record)?;
         *capture_health_seen += 1;
     }
     Ok(())
@@ -956,17 +913,15 @@ fn poll_elevated(
         note_staging_loss(receiver, loss, receipt)?;
     }
     for gap in source.take_prior_gaps() {
-        let reason = if gap.cause == GapCause::Malformed { LossReason::MalformedPacket } else { LossReason::NativeQueueOverflow };
-        receiver.note_elevated_loss(reason, Some(gap), gap.first_qpc, receipt)?;
+        receiver.note_elevated_loss(gap.cause.into(), Some(gap), gap.first_qpc, receipt)?;
     }
     // Elevated context evidence the Recorder's staging could not hold is a
     // typed context loss (E3, D-1).
     if let Some(gap) = context_pressure {
-        let count = gap.last_position.get().saturating_sub(gap.first_position.get()).saturating_add(1);
-        native.note_loss(LossReason::StagingPressure, count, gap.first_qpc, gap.last_qpc);
+        native.note_loss(LossReason::StagingPressure, LossSpan { count: gap.count(), first: gap.first_qpc, last: gap.last_qpc });
     }
-    if let Some((first, last, count)) = source.take_optional_loss() {
-        native.note_loss(LossReason::StagingPressure, u64::from(count), first, last);
+    if let Some(span) = source.take_optional_loss() {
+        native.note_loss(LossReason::StagingPressure, span);
     }
     if let Some(loss) = staging_loss && let Some(timing) = input_timing(receipt, observed_at, None)? {
         publish_input_staging_loss(context, loss, timing, context_prefix, next_context_index)?;
@@ -976,17 +931,15 @@ fn poll_elevated(
             receiver.note_native_gap();
         }
         let reason = match (cause, gap) {
-            (_, Some(ProducerGap { cause: GapCause::Malformed, .. })) => LossReason::MalformedPacket,
-            (_, Some(_)) | (CoverageReason::NativeGap, None) => LossReason::NativeQueueOverflow,
+            (_, Some(gap)) => gap.cause.into(),
+            (CoverageReason::NativeGap, None) => LossReason::NativeQueueOverflow,
             (CoverageReason::UncertifiedSource, None) => LossReason::UncertifiedSource,
             (CoverageReason::Opening | CoverageReason::HeldUnknown, None) => LossReason::ResyncPending,
         };
         receiver.note_elevated_loss(reason, gap, before, receipt)?;
         if let Some(timing) = input_timing(receipt, observed_at, None)? {
-            send_boundary_event(context, serde_json::json!({
-                "kind": "input_source_loss", "source": "elevated", "visit": binding,
-                "first_uncovered_qpc": before, "cause": cause, "native_gap": gap,
-            }), timing, context_prefix, next_context_index)?;
+            let row = source_loss_row(binding, before, cause, gap).map_err(|_| unavailable("Encode an input source loss row"))?;
+            send_boundary_event(context, row, timing, context_prefix, next_context_index)?;
         }
     }
     if let Some(interrupted) = source.take_interruption() {
@@ -1007,16 +960,16 @@ fn poll_elevated(
                 .filter(|certificate| certificate.visit == previous)
                 && accept_elevated_certificate(source, certificate, receiver, native, receipt, None)?
             {
-                receiver.advance(receipt.clock.time(certificate.before).map_err(clock_error)?);
+                receiver.advance(receipt.clock.time(certificate.before)?);
                 let before = close_failed_hooks(source, receiver, native, session, receipt)?
                     .map_or(certificate.before, |hook| hook.min(certificate.before));
-                let through = receipt.clock.time(before).map_err(clock_error)?;
+                let through = receipt.clock.time(before)?;
                 record_elevated_coverage(session, receipt, receiver, certificate, through)?;
                 before
             } else {
                 receipt.boundary.qpc
             };
-            let cutoff = receipt.clock.time(certified.max(receipt.boundary.qpc)).map_err(clock_error)?;
+            let cutoff = receipt.clock.time(certified.max(receipt.boundary.qpc))?;
             let through = input_prefix.raised(cutoff);
             let boundary = if loss.is_some() || overflowed { HeldBoundary::InputGap } else { HeldBoundary::FocusChanged };
             receiver.interrupt_certified(cutoff, through, boundary);
@@ -1080,10 +1033,10 @@ fn poll_elevated(
             return Ok(());
         }
     };
-    let observed = receipt.clock.time(now).map_err(clock_error)?;
-    let since = receipt.clock.time(opened.coverage.before_qpc).map_err(clock_error)?;
+    let observed = receipt.clock.time(now)?;
+    let since = receipt.clock.time(opened.coverage.before_qpc)?;
     let certificate = source.input_certificate(None);
-    let certified = certificate.map(|certificate| receipt.clock.time(certificate.before)).transpose().map_err(clock_error)?;
+    let certified = certificate.map(|certificate| receipt.clock.time(certificate.before)).transpose()?;
     if observed.0.saturating_sub(certified.unwrap_or(since).0) >= MAX_ELEVATED_CERTIFICATION_LAG_US {
         frames.clear();
         session.fail_source(source.stage(), screen_fix_elevated::Failure::Witness);
@@ -1156,7 +1109,7 @@ fn poll_elevated(
     }
     // Pointer rest is decided only through a whole microsecond and one tick
     // before the certificate, so its session time is certified as well.
-    let ticks_per_us = i64::try_from(receipt.clock.qpc_frequency.0.get() / 1_000_000).unwrap_or(i64::MAX);
+    let ticks_per_us = receipt.clock.qpc_frequency.ticks(Duration::from_micros(1)).unwrap_or(i64::MAX);
     let last_certified = QpcTick(certificate.before.0.saturating_sub(ticks_per_us.saturating_add(1)));
     receiver.poll_pointer_rest(native, receipt, last_certified)?;
     Ok(())
@@ -1183,19 +1136,9 @@ fn describe_tail(
         if tail.first_t_us >= cutoff.time { return None; }
     }
     let failure = session.source_failure();
-    tail.reason = Some(if receiver.elevated_hook_loss().is_some()
-        || failure.is_some_and(|failure| failure.reason == SourceFailureReason::RequiredHook)
-    {
-        InputTailReason::RequiredHook
-    } else if failure.is_some() {
-        InputTailReason::SourceFailure
-    } else if certified.is_some() && receiver.synchronization_qpc().is_none() {
-        InputTailReason::ActivationPending
-    } else if certified.is_some() {
-        InputTailReason::ElevatedCoverage
-    } else {
-        InputTailReason::ProducerProgress
-    });
+    tail.reason = Some(input_tail_reason(
+        receiver.elevated_hook_loss().is_some(), failure, certified.is_some(), receiver.synchronization_qpc().is_some(),
+    ));
     session.record_uncertified_tail(cutoff.epoch, tail);
     Some(tail)
 }
@@ -1204,7 +1147,7 @@ fn record_elevated_coverage(
     session: &WorkerSession, receipt: Receipt, receiver: &receiver::Receiver,
     certificate: InputCertificate, through: SessionTimeUs,
 ) -> Result<bool, ProbeError> {
-    let opening = receipt.clock.time(certificate.opening.max(receipt.boundary.qpc)).map_err(clock_error)?;
+    let opening = receipt.clock.time(certificate.opening.max(receipt.boundary.qpc))?;
     let Some(start) = opening.0.checked_add(1).map(SessionTimeUs) else { return Ok(false); };
     let Some(before) = receiver.unresolved_before().map(|before| before.min(through)).filter(|before| *before > start)
         else { return Ok(false); };
@@ -1218,14 +1161,14 @@ fn drain_elevated_prefix(
 ) -> Result<SessionTimeUs, ProbeError> {
     let Some(certificate) = source.input_certificate(Some(closing.qpc))
         .filter(|_| !source.awaiting_close()) else { return Ok(receipt.boundary.time); };
-    let time = receipt.clock.time(certificate.before).map_err(clock_error)?;
+    let time = receipt.clock.time(certificate.before)?;
     let closing = AdmissionBoundary { qpc: certificate.before, time, ..closing };
     if !accept_elevated_certificate(source, certificate, receiver, native, receipt, Some(closing))? {
         return Ok(receipt.boundary.time);
     }
     receiver.advance(time);
     let certified = match close_failed_hooks(source, receiver, native, session, receipt)? {
-        Some(before) => receipt.clock.time(before.min(certificate.before)).map_err(clock_error)?,
+        Some(before) => receipt.clock.time(before.min(certificate.before))?,
         None => time,
     };
     if record_elevated_coverage(session, receipt, receiver, certificate, certified)? {
@@ -1338,13 +1281,13 @@ impl DeferredFlush {
         self.requested |= requested;
         if let Some(waiting) = &self.waiting {
             match waiting.try_recv() {
-                Ok(outcome) => { outcome.map_err(package_journal_error)?; self.waiting = None; }
+                Ok(outcome) => { outcome?; self.waiting = None; }
                 Err(mpsc::TryRecvError::Empty) => return Ok(()),
                 Err(mpsc::TryRecvError::Disconnected) => return Err(unavailable("A requested journal flush did not complete")),
             }
         }
         if self.requested && let FlushRequest::Queued(waiting) = journal.try_flush(Flush::Os, at)
-            .map_err(package_journal_error)?
+            ?
         {
             self.waiting = Some(waiting);
             self.requested = false;
@@ -1362,11 +1305,11 @@ fn flush_boundary(
     loop {
         if let Some(result) = &waiting {
             match result.try_recv() {
-                Ok(summary) => return summary.map(|_| ()).map_err(package_journal_error),
+                Ok(summary) => return summary.map(|_| ()).map_err(ProbeError::from),
                 Err(mpsc::TryRecvError::Disconnected) => return Err(unavailable("The journal pause flush did not complete")),
                 Err(mpsc::TryRecvError::Empty) => {}
             }
-        } else if let FlushRequest::Queued(result) = journal.try_flush(Flush::Os, at).map_err(package_journal_error)? {
+        } else if let FlushRequest::Queued(result) = journal.try_flush(Flush::Os, at)? {
             waiting = Some(result);
         }
         if Instant::now() >= session.stop_deadline().map_or(deadline, |stop| stop.min(deadline)) {
@@ -1377,13 +1320,20 @@ fn flush_boundary(
     }
 }
 
-fn paused_slot_ranges(
-    ranges: &[crate::session::windows::PausedVideo], closed: SessionTimeUs, through: SessionTimeUs,
-) -> Vec<serde_json::Value> {
-    ranges.iter().map(|range| serde_json::json!({
-        "monitor": range.monitor, "fps": range.fps, "first_paused_slot": range.first_paused_slot,
-        "end_slot_exclusive": range.end_exclusive(closed, through),
-    })).collect()
+fn paused_slot_ranges(ranges: &[PausedVideo], closed: SessionTimeUs, through: SessionTimeUs) -> Vec<PausedSlots> {
+    ranges.iter().map(|range| PausedSlots {
+        monitor: range.monitor, fps: range.fps, first_paused_slot: range.first_paused_slot,
+        end_slot_exclusive: range.end_exclusive(closed, through),
+    }).collect()
+}
+
+/// The video slots of one monitor that a pause interval covered.
+#[derive(serde::Serialize)]
+struct PausedSlots {
+    monitor: MonitorId,
+    fps: u32,
+    first_paused_slot: u64,
+    end_slot_exclusive: Option<u64>,
 }
 
 /// The input blind rows of a pause interval (INP-13), admitted to the input
@@ -1392,49 +1342,12 @@ fn publish_blind_pause(
     input: &mut JournalIngress, prefix: &mut ReceiptPrefix, start: SessionTimeUs, end: SessionTimeUs,
     at: SessionTimeUs, reasons: &[PauseReason],
 ) -> Result<(), ProbeError> {
-    let rows = pause_blind_labels(reasons).into_iter().map(|reason| serde_json::json!({
-        "kind": "blind", "reason": reason, "start_us": start, "end_us": end,
-    })).collect();
+    let rows = pause_blind_labels(reasons).into_iter().map(|reason| BlindRow::new(reason, start, end, &[]).value())
+        .collect::<serde_json::Result<_>>().map_err(|_| unavailable("Encode an input blind row"))?;
     prefix.submit_boundary(input, at, rows)
 }
 
 /// The reason of an input blind row of a pause interval (INP-13).
-#[derive(Clone, Copy, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-enum PauseBlindLabel {
-    SecureDesktop,
-    ElevationTransition,
-    User,
-    Sleep,
-    LowDisk,
-}
-
-/// The labels of a pause interval's input blind rows, in row order: a lock
-/// or secure desktop pause is `secure_desktop`. A source-transition pause is
-/// also labelled with its other actual reasons, or `elevation_transition`
-/// when the transition latch alone paused: the rule of the source blind
-/// interval ([`pause_blind_reason`], S2).
-fn pause_blind_labels(reasons: &[PauseReason]) -> Vec<PauseBlindLabel> {
-    let set: BTreeSet<_> = reasons.iter().copied().collect();
-    let mut labels = Vec::new();
-    if set.contains(&PauseReason::LockScreen) || set.contains(&PauseReason::SecureDesktop) {
-        labels.push(PauseBlindLabel::SecureDesktop);
-    }
-    if set.contains(&PauseReason::ElevationTransition) {
-        if pause_blind_reason(&set) == SourceBlindReason::ElevationTransition {
-            labels.push(PauseBlindLabel::ElevationTransition);
-        } else {
-            labels.extend(reasons.iter().filter_map(|reason| match reason {
-                PauseReason::User => Some(PauseBlindLabel::User),
-                PauseReason::Sleep => Some(PauseBlindLabel::Sleep),
-                PauseReason::LowDisk => Some(PauseBlindLabel::LowDisk),
-                PauseReason::LockScreen | PauseReason::SecureDesktop | PauseReason::ElevationTransition => None,
-            }));
-        }
-    }
-    labels
-}
-
 fn send_boundary_event(
     journal: &mut JournalIngress, event: serde_json::Value, timing: InputTiming,
     prefix: &mut ReceiptPrefix, next_context_index: &mut u64,
@@ -1446,11 +1359,185 @@ fn publish_input_staging_loss(
     journal: &mut JournalIngress, loss: InputStagingLoss, timing: InputTiming,
     prefix: &mut ReceiptPrefix, next_context_index: &mut u64,
 ) -> Result<(), ProbeError> {
-    send_boundary_event(journal, serde_json::json!({
-        "kind": "input_source_loss", "source": "elevated", "visit": loss.visit,
-        "first_uncovered_qpc": loss.before, "cause": "recorder_staging", "native_gaps": loss.gaps,
-        "malformed": loss.malformed,
-    }), timing, prefix, next_context_index)
+    let row = staging_loss_row(&loss).map_err(|_| unavailable("Encode an input source loss row"))?;
+    send_boundary_event(journal, row, timing, prefix, next_context_index)
+}
+
+/// The pause reasons of a `pause` or `resume` row: `reason` is the primary
+/// (first ordered) reason (CTX-6); `reasons` keeps the full ordered set as an extension.
+#[derive(serde::Serialize)]
+struct PauseReasons<'a> {
+    reason: Option<&'a PauseReason>,
+    reasons: &'a [PauseReason],
+}
+
+impl<'a> PauseReasons<'a> {
+    fn new(reasons: &'a [PauseReason]) -> Self {
+        Self { reason: reasons.first(), reasons }
+    }
+}
+
+/// The context `pause` row at the input cutoff.
+#[derive(serde::Serialize)]
+struct PauseRow<'a> {
+    kind: RowKind,
+    #[serde(flatten)]
+    reasons: PauseReasons<'a>,
+    cutoff_t_us: SessionTimeUs,
+    uncertified_input_tail: Option<UncertifiedInputTail>,
+    paused_slots: &'a [PausedVideo],
+    paused_slots_all_monitors: bool,
+    /// The first QPC a required hook did not cover, when one stopped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    required_hook_first_uncovered_qpc: Option<QpcTick>,
+}
+
+fn pause_row(
+    reasons: &[PauseReason], cutoff: SessionTimeUs, tail: Option<UncertifiedInputTail>, ranges: &[PausedVideo],
+    all_monitors: bool, hook_loss: Option<QpcTick>,
+) -> serde_json::Result<serde_json::Value> {
+    serde_json::to_value(PauseRow {
+        kind: RowKind::Pause, reasons: PauseReasons::new(reasons), cutoff_t_us: cutoff, uncertified_input_tail: tail,
+        paused_slots: ranges, paused_slots_all_monitors: all_monitors, required_hook_first_uncovered_qpc: hook_loss,
+    })
+}
+
+/// The context `discontinuity` row from the pause cutoff to the reopened boundary.
+#[derive(serde::Serialize)]
+struct DiscontinuityRow<'a> {
+    kind: RowKind,
+    start_t_us: SessionTimeUs,
+    end_t_us: SessionTimeUs,
+    gap_us: i64,
+    previous_admission_epoch: AdmissionEpoch,
+    reasons: &'a [PauseReason],
+}
+
+/// The `discontinuity` row from the pause cutoff `closed` to the reopened boundary at `opened`.
+fn discontinuity_row(closed: AdmissionBoundary, opened: SessionTimeUs, reasons: &[PauseReason])
+    -> serde_json::Result<serde_json::Value>
+{
+    serde_json::to_value(DiscontinuityRow {
+        kind: RowKind::Discontinuity, start_t_us: closed.time, end_t_us: opened,
+        gap_us: opened.0.saturating_sub(closed.time.0), previous_admission_epoch: closed.epoch, reasons,
+    })
+}
+
+/// The context `resume` row with the totals suppressed during the pause.
+#[derive(serde::Serialize)]
+struct ResumeRow<'a> {
+    kind: RowKind,
+    #[serde(flatten)]
+    reasons: PauseReasons<'a>,
+    paused_start_t_us: SessionTimeUs,
+    paused_slots: &'a [PausedSlots],
+    suppressed_context_notifications: u64,
+    suppressed_health: &'a BTreeMap<HealthKind, u64>,
+}
+
+fn resume_row(
+    reasons: &[PauseReason], paused_start: SessionTimeUs, paused_slots: &[PausedSlots],
+    suppressed_notifications: u64, suppressed_health: &BTreeMap<HealthKind, u64>,
+) -> serde_json::Result<serde_json::Value> {
+    serde_json::to_value(ResumeRow {
+        kind: RowKind::Resume, reasons: PauseReasons::new(reasons), paused_start_t_us: paused_start, paused_slots,
+        suppressed_context_notifications: suppressed_notifications, suppressed_health,
+    })
+}
+
+/// The input source an `input_source_loss` row reports.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LossSource {
+    Elevated,
+}
+
+/// A Recorder staging overflow of elevated input, as an `input_source_loss` cause (E3).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StagingCause {
+    RecorderStaging,
+}
+
+/// What an `input_source_loss` row reports beside its source and visit.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum SourceLoss<'a> {
+    /// The collector's coverage loss, with the native producer gap that caused it.
+    Coverage { cause: CoverageReason, native_gap: Option<ProducerGap> },
+    /// The overflowed producer ranges and the undecodable records.
+    Staging { cause: StagingCause, native_gaps: &'a [Option<ProducerGap>], malformed: u64 },
+}
+
+/// The context `input_source_loss` row of an elevated visit.
+#[derive(serde::Serialize)]
+struct InputSourceLossRow<'a> {
+    kind: RowKind,
+    source: LossSource,
+    visit: VisitBinding,
+    first_uncovered_qpc: QpcTick,
+    #[serde(flatten)]
+    loss: SourceLoss<'a>,
+}
+
+impl<'a> InputSourceLossRow<'a> {
+    fn value(visit: VisitBinding, first_uncovered_qpc: QpcTick, loss: SourceLoss<'a>) -> serde_json::Result<serde_json::Value> {
+        serde_json::to_value(Self { kind: RowKind::InputSourceLoss, source: LossSource::Elevated, visit, first_uncovered_qpc, loss })
+    }
+}
+
+/// The context row of an elevated visit's input coverage loss.
+fn source_loss_row(visit: VisitBinding, before: QpcTick, cause: CoverageReason, gap: Option<ProducerGap>)
+    -> serde_json::Result<serde_json::Value>
+{
+    InputSourceLossRow::value(visit, before, SourceLoss::Coverage { cause, native_gap: gap })
+}
+
+/// The context row of a Recorder staging overflow of elevated input (E3).
+fn staging_loss_row(loss: &InputStagingLoss) -> serde_json::Result<serde_json::Value> {
+    InputSourceLossRow::value(loss.visit, loss.before, SourceLoss::Staging {
+        cause: StagingCause::RecorderStaging, native_gaps: &loss.gaps, malformed: loss.malformed,
+    })
+}
+
+/// Why a checkpoint Save has no selected context.
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CheckpointUnavailable {
+    /// The checkpoint queue was full when it was requested.
+    QueueFull,
+    TimedOut,
+    AdmissionClosed,
+}
+
+/// Whether a checkpoint Save's context was observed.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ContextStatus {
+    Observed,
+    Unavailable,
+}
+
+/// The context row of a checkpoint Save's selected context, or of why it has none.
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename = "checkpoint_context")]
+struct CheckpointContextRow<S> {
+    request_id: RequestId,
+    control_receipt_t_us: Option<SessionTimeUs>,
+    save_context: Option<S>,
+    status: ContextStatus,
+    reason: Option<CheckpointUnavailable>,
+}
+
+fn checkpoint_context_row<S: serde::Serialize>(
+    id: RequestId, control_receipt: Option<SessionTimeUs>, selected: Result<S, CheckpointUnavailable>,
+) -> serde_json::Result<serde_json::Value> {
+    let status = if selected.is_ok() { ContextStatus::Observed } else { ContextStatus::Unavailable };
+    let (save_context, reason) = match selected {
+        Ok(selected) => (Some(selected), None),
+        Err(reason) => (None, Some(reason)),
+    };
+    serde_json::to_value(CheckpointContextRow { request_id: id, control_receipt_t_us: control_receipt, save_context, status, reason })
 }
 
 /// The input-stream markers of a Recorder staging overflow (E3): one per
@@ -1460,7 +1547,7 @@ fn note_staging_loss(receiver: &mut receiver::Receiver, loss: &InputStagingLoss,
         receiver.note_elevated_loss(LossReason::StagingPressure, Some(*gap), loss.before, receipt)?;
     }
     if let Some(count) = std::num::NonZeroU64::new(loss.malformed) && loss.before >= receipt.boundary.qpc {
-        let at = receipt.clock.time(loss.before).map_err(clock_error)?;
+        let at = receipt.clock.time(loss.before)?;
         receiver.note_loss(LossEvidence::ordinary(LossReason::MalformedPacket, None, count, at, at));
     } else if loss.gaps.iter().all(Option::is_none) {
         receiver.note_elevated_loss(LossReason::StagingPressure, None, loss.before, receipt)?;
@@ -1508,7 +1595,7 @@ struct ElevatedSaves {
 
 impl ElevatedSaves {
     fn fixture(&mut self, notice: FixtureNotice) {
-        if self.fixtures.len() < crate::session::windows::MAX_FIXTURE_SAVES {
+        if self.fixtures.len() < MAX_FIXTURE_SAVES {
             self.fixtures.push_back(notice);
         } else {
             let _ = notice.reply.try_send(Err(FixtureSaveError::Busy));
@@ -1516,7 +1603,7 @@ impl ElevatedSaves {
     }
 
     fn checkpoint(&mut self, id: RequestId, at: QpcTick) {
-        if self.checkpoints.len() < crate::session::windows::MAX_FIXTURE_SAVES {
+        if self.checkpoints.len() < MAX_FIXTURE_SAVES {
             self.checkpoints.push_back((id, at));
         } else {
             self.refused.push((id, at));
@@ -1532,7 +1619,7 @@ impl ElevatedSaves {
         still_rows: &still_rows::Rows, context: &mut JournalIngress, prefix: &mut ReceiptPrefix, next: &mut u64,
         closing: bool,
     ) -> Result<(), ProbeError> {
-        let now = receipt.clock.time(observed).map_err(clock_error)?;
+        let now = receipt.clock.time(observed)?;
         let expired = |at| receipt.clock.time(at).is_ok_and(|at| now.0.saturating_sub(at.0) >= DEFERRED_SAVE_TIMEOUT_US);
         for _ in 0..self.fixtures.len() {
             let Some(notice) = self.fixtures.pop_front() else { break; };
@@ -1552,12 +1639,13 @@ impl ElevatedSaves {
             let _ = notice.reply.try_send(result);
         }
         let Some(timing) = input_timing(receipt, observed, None)? else { return Ok(()) };
-        let mut row = |id: RequestId, at: QpcTick, selected: Option<serde_json::Value>, reason: Option<&str>| send_event(context, serde_json::json!({
-            "kind": "checkpoint_context", "request_id": id, "control_receipt_t_us": receipt.clock.time(at).ok(),
-            "save_context": selected, "status": if selected.is_some() { "observed" } else { "unavailable" }, "reason": reason,
-        }), timing, prefix, next);
+        let mut row = |id: RequestId, at: QpcTick, selected: Result<SaveWindowContext, CheckpointUnavailable>| {
+            let row = checkpoint_context_row(id, receipt.clock.time(at).ok(), selected)
+                .map_err(|_| unavailable("Encode a checkpoint context row"))?;
+            send_event(context, row, timing, prefix, next)
+        };
         for (id, at) in std::mem::take(&mut self.refused) {
-            row(id, at, None, Some("queue_full"))?;
+            row(id, at, Err(CheckpointUnavailable::QueueFull))?;
         }
         for _ in 0..self.checkpoints.len() {
             let Some((id, at)) = self.checkpoints.pop_front() else { break; };
@@ -1566,9 +1654,9 @@ impl ElevatedSaves {
                 self.checkpoints.push_back((id, at));
                 continue;
             }
-            let selected = available.and_then(|(binding, _)| native.checkpoint_context(at, Some(binding)));
-            let reason = selected.is_none().then(|| if expired(at) { "timed_out" } else { "admission_closed" });
-            row(id, at, selected.map(|selected| serde_json::json!(selected)), reason)?;
+            let selected = available.and_then(|(binding, _)| native.checkpoint_context(at, Some(binding)))
+                .ok_or_else(|| if expired(at) { CheckpointUnavailable::TimedOut } else { CheckpointUnavailable::AdmissionClosed });
+            row(id, at, selected)?;
         }
         Ok(())
     }
@@ -1616,10 +1704,8 @@ fn route_fixture(
         let Some(endpoint) = endpoints.get(&monitor) else { continue; };
         let Some(confirmation) = confirmation.for_monitor(monitor) else { continue; };
         let (trigger, role) = stills::save_slot(confirmation.kind());
-        let mut fallback = stills::fallback_row(trigger, role, time, crate::protocol::Evidence::Observed(geometry),
-            open.boundary.epoch, None, "save_handoff_unavailable");
-        fallback["save"] = serde_json::json!({ "id": confirmation.id(), "kind": confirmation.kind(),
-            "routing_basis": confirmation.routing_basis() });
+        let fallback = stills::fallback_row(trigger, role, time, crate::protocol::Evidence::Observed(geometry),
+            open.boundary.epoch, None, stills::DropReason::SaveHandoffUnavailable).with_save(&confirmation);
         let reservation = match rows.reserve(time, Some(fallback)) {
             Ok(reservation) => reservation,
             Err(reason) => {
@@ -1656,8 +1742,8 @@ fn publish_controls(
             "index": *next_context_index,
             "admitted_100ns": timing.admitted_100ns,
             "dropped": loss.count,
-            "first_control_receipt_t_us": receipt.clock.time(loss.first).map_err(clock_error)?,
-            "last_control_receipt_t_us": receipt.clock.time(loss.last).map_err(clock_error)?,
+            "first_control_receipt_t_us": receipt.clock.time(loss.first)?,
+            "last_control_receipt_t_us": receipt.clock.time(loss.last)?,
         });
         send_boundary_event(context, event, timing, prefix, next_context_index)?;
     }
@@ -1674,7 +1760,7 @@ fn publish_controls(
             "outcome": notice.outcome,
             "request_id": request,
             "save_context": save_context,
-            "control_receipt_t_us": receipt.clock.time(activation.at).map_err(clock_error)?,
+            "control_receipt_t_us": receipt.clock.time(activation.at)?,
         });
         send_boundary_event(context, event, timing, prefix, next_context_index)?;
     }
@@ -1697,7 +1783,7 @@ fn input_timing(
     if received < receipt.boundary.qpc {
         return Ok(None);
     }
-    let recv_t_us = receipt.clock.time(received).map_err(clock_error)?;
+    let recv_t_us = receipt.clock.time(received)?;
     let coarse = tick.map(CoarseTime::windows_message);
     // A queued message can survive the boundary. Exclude it only when
     // its entire coarse time interval predates admission.
@@ -1709,7 +1795,7 @@ fn input_timing(
     Ok(Some(InputTiming {
         time: RecordTime { recv_t_us, source_t_us: None, source_uncertainty_us: None, coarse },
         received,
-        admitted_100ns: receipt.clock.offset_100ns(received).map_err(clock_error)?,
+        admitted_100ns: receipt.clock.offset_100ns(received)?,
         epoch: receipt.boundary.epoch,
     }))
 }
@@ -1724,14 +1810,14 @@ fn publish_context_health(
     let Some(timing) = input_timing(receipt, observed, None)? else { return Ok(()) };
     let admitted = prefix.raised(timing.time.recv_t_us);
     for loss in native.take_losses(receipt, observed) {
-        context.record_loss(loss, admitted).map_err(package_journal_error)?;
+        context.record_loss(loss, admitted)?;
     }
     for health in native.take_health() {
-        let at = receipt.clock.time(health.at.max(receipt.boundary.qpc)).map_err(clock_error)?;
+        let at = receipt.clock.time(health.at.max(receipt.boundary.qpc))?;
         context.submit_health(HealthRecord {
             kind: health.kind, failure: health.failure, detected: at, first_affected: Some(at),
             ongoing: health.activity_lost, monitor: None, count: health.count,
-        }).map_err(package_journal_error)?;
+        })?;
         if health.activity_lost {
             session.report_fault(FaultReport::activity(LostActivity::Auxiliary, health.failure, None, Some(at)));
         }
@@ -1752,10 +1838,10 @@ fn send_event_with_priority(
 ) -> Result<(), ProbeError> {
     apply_context_envelope(&mut event, timing)?;
     let disposition = if lifecycle {
-        journal.submit_boundary(timing.time.recv_t_us, [event]).map_err(package_journal_error)?;
+        journal.submit_boundary(timing.time.recv_t_us, [event])?;
         Submit::Queued
     } else {
-        journal.try_submit(timing.time.recv_t_us, event).map_err(package_journal_error)?
+        journal.try_submit(timing.time.recv_t_us, event)?
     };
     prefix.advance(timing.received, timing.time.recv_t_us, disposition)?;
     // Control rows use this context index. The journal writer allocates its own sequence.
@@ -1773,7 +1859,7 @@ fn send_boundary_events(
     for event in &mut events {
         apply_context_envelope(event, timing)?;
     }
-    journal.submit_boundary(timing.time.recv_t_us, events).map_err(package_journal_error)?;
+    journal.submit_boundary(timing.time.recv_t_us, events)?;
     for _ in 0..count {
         prefix.advance(timing.received, timing.time.recv_t_us, Submit::Queued)?;
         *next_context_index = next_context_index.checked_add(1)
@@ -1782,16 +1868,93 @@ fn send_boundary_events(
     Ok(())
 }
 
+/// The envelope of a context row. The journal stamps its `recv_t_us`, the
+/// receipt it is submitted at. The package format version (manifest v6)
+/// versions every row; a row's own `version` is the foreground product version (D-1).
 fn apply_context_envelope(event: &mut serde_json::Value, timing: InputTiming) -> Result<(), ProbeError> {
-    // The package format version (manifest v6) versions every row; a row's
-    // own `version` is the foreground product version (D-1).
-    let record = event.as_object_mut().ok_or_else(|| unavailable("The input record is not an object"))?;
-    record.insert("recv_t_us".into(), serde_json::json!(timing.time.recv_t_us));
-    record.insert("source_t_us".into(), serde_json::json!(timing.time.source_t_us));
-    record.insert("source_uncertainty_us".into(), serde_json::json!(timing.time.source_uncertainty_us));
-    record.entry("tick_ms").or_insert_with(|| serde_json::json!(timing.time.coarse.map(|time| time.tick_ms)));
-    record.entry("tick_uncertainty_us").or_insert_with(|| serde_json::json!(timing.time.coarse.map(|time| time.uncertainty_us)));
-    record.entry("late").or_insert(serde_json::Value::Null);
-    record.insert("admission_epoch".into(), serde_json::json!(timing.epoch));
-    Ok(())
+    RowEnvelope::new(timing.time, None, timing.epoch).write_keeping_tick(event)
+        .map_err(|_| unavailable("The input record is not an object"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::{NonZeroU32, NonZeroU64};
+
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::protocol::{
+        FocusGeneration, SourceSequence, WindowId,
+        ipc::{GapCause, ProcessInstance, Producer, elevated::WindowInstance},
+    };
+
+    const VIDEO: PausedVideo = PausedVideo { monitor: MonitorId(1), first_paused_slot: 12, fps: 30 };
+    const VISIT: &str = r#"{"epoch":1,"focus_generation":0,"focus_revision":0,"foreground":{"process":{"creation_filetime":0,"pid":1},"thread":1,"window":1},"grant":1,"resync_revision":1,"source_generation":1,"witness_revision":0}"#;
+    const GAP: &str = r#"{"cause":"overflow","first_qpc":400,"first_sequence":3,"last_qpc":450,"last_sequence":5,"producer":"raw_input"}"#;
+
+    fn visit() -> VisitBinding {
+        VisitBinding {
+            epoch: AdmissionEpoch(1), source_generation: NonZeroU64::MIN, grant: NonZeroU64::MIN, witness_revision: 0,
+            foreground: WindowInstance {
+                window: WindowId(1), process: ProcessInstance { pid: NonZeroU32::MIN, creation_filetime: 0 }, thread: NonZeroU32::MIN,
+            },
+            focus_generation: FocusGeneration(0), focus_revision: 0, resync_revision: NonZeroU64::MIN,
+        }
+    }
+
+    fn gap() -> ProducerGap {
+        ProducerGap {
+            producer: Producer::RawInput, cause: GapCause::Overflow, first_sequence: SourceSequence(3),
+            last_sequence: SourceSequence(5), first_qpc: QpcTick(400), last_qpc: QpcTick(450),
+        }
+    }
+
+    #[test]
+    fn pause_bytes() -> serde_json::Result<()> {
+        let tail = UncertifiedInputTail { first_t_us: SessionTimeUs(150), cutoff_t_us: SessionTimeUs(200), reason: None };
+        let pause = pause_row(&[PauseReason::User, PauseReason::LowDisk], SessionTimeUs(200), Some(tail), &[VIDEO], true,
+            Some(QpcTick(777)))?;
+        assert_eq!(serde_json::to_string(&pause)?,
+            r#"{"cutoff_t_us":200,"kind":"pause","paused_slots":[{"first_paused_slot":12,"fps":30,"monitor":1}],"paused_slots_all_monitors":true,"reason":"user","reasons":["user","low_disk"],"required_hook_first_uncovered_qpc":777,"uncertified_input_tail":{"cutoff_t_us":200,"first_t_us":150}}"#);
+        assert_eq!(serde_json::to_string(&pause_row(&[], SessionTimeUs(200), None, &[], false, None)?)?,
+            r#"{"cutoff_t_us":200,"kind":"pause","paused_slots":[],"paused_slots_all_monitors":false,"reason":null,"reasons":[],"uncertified_input_tail":null}"#);
+        Ok(())
+    }
+
+    #[test]
+    fn resume_bytes() -> serde_json::Result<()> {
+        let closed = AdmissionBoundary { epoch: AdmissionEpoch(3), qpc: QpcTick(2_000), time: SessionTimeUs(200) };
+        assert_eq!(serde_json::to_string(&discontinuity_row(closed, SessionTimeUs(900), &[PauseReason::Sleep])?)?,
+            r#"{"end_t_us":900,"gap_us":700,"kind":"discontinuity","previous_admission_epoch":3,"reasons":["sleep"],"start_t_us":200}"#);
+        let slots = paused_slot_ranges(&[VIDEO], closed.time, SessionTimeUs(900));
+        let health = BTreeMap::from([(HealthKind::VideoFailure, 2)]);
+        assert_eq!(serde_json::to_string(&resume_row(&[PauseReason::Sleep], closed.time, &slots, 4, &health)?)?,
+            r#"{"kind":"resume","paused_slots":[{"end_slot_exclusive":13,"first_paused_slot":12,"fps":30,"monitor":1}],"paused_start_t_us":200,"reason":"sleep","reasons":["sleep"],"suppressed_context_notifications":4,"suppressed_health":{"video_failure":2}}"#);
+        Ok(())
+    }
+
+    #[test]
+    fn input_source_loss_bytes() -> serde_json::Result<()> {
+        let row = source_loss_row(visit(), QpcTick(500), CoverageReason::NativeGap, Some(gap()))?;
+        assert_eq!(serde_json::to_string(&row)?, format!(
+            r#"{{"cause":"native_gap","first_uncovered_qpc":500,"kind":"input_source_loss","native_gap":{GAP},"source":"elevated","visit":{VISIT}}}"#));
+        let row = source_loss_row(visit(), QpcTick(500), CoverageReason::Opening, None)?;
+        assert_eq!(serde_json::to_string(&row)?, format!(
+            r#"{{"cause":"opening","first_uncovered_qpc":500,"kind":"input_source_loss","native_gap":null,"source":"elevated","visit":{VISIT}}}"#));
+        let loss = InputStagingLoss { visit: visit(), before: QpcTick(500), gaps: [None, Some(gap()), None, None, None], malformed: 2 };
+        assert_eq!(serde_json::to_string(&staging_loss_row(&loss)?)?, format!(
+            r#"{{"cause":"recorder_staging","first_uncovered_qpc":500,"kind":"input_source_loss","malformed":2,"native_gaps":[null,{GAP},null,null,null],"source":"elevated","visit":{VISIT}}}"#));
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_context_bytes() -> serde_json::Result<()> {
+        let row = checkpoint_context_row(RequestId(5), Some(SessionTimeUs(300)), Err::<Value, _>(CheckpointUnavailable::QueueFull))?;
+        assert_eq!(serde_json::to_string(&row)?,
+            r#"{"control_receipt_t_us":300,"kind":"checkpoint_context","reason":"queue_full","request_id":5,"save_context":null,"status":"unavailable"}"#);
+        let row = checkpoint_context_row(RequestId(6), None, Ok(json!({ "id": 1 })))?;
+        assert_eq!(serde_json::to_string(&row)?,
+            r#"{"control_receipt_t_us":null,"kind":"checkpoint_context","reason":null,"request_id":6,"save_context":{"id":1},"status":"observed"}"#);
+        Ok(())
+    }
 }

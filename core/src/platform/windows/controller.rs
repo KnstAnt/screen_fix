@@ -3,9 +3,9 @@
 //! workers read them and report readiness, pause prefixes, source facts and
 //! faults through `WorkerSession`.
 
-pub(crate) mod disk;
+pub(super) mod disk;
 mod environment;
-pub(crate) use environment::{AwakeElapsed, SuspendMarks};
+pub(super) use environment::{AwakeElapsed, SuspendMarks};
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -20,6 +20,7 @@ use std::{
 };
 
 use crate::package::metadata::{AttemptClock, ClockAnchor};
+use crate::util::{keep_earlier, push_bounded};
 
 use crate::{
     CaptureError,
@@ -27,21 +28,24 @@ use crate::{
     capture::save::{FixtureSave, FixtureSaveError, FixtureSaveResult},
     config::ResolvedCaptureConfig,
     package::{diagnostics::{DiagnosticContext, Failure, FailureComponent, ReportOutcome}, journal::HealthRecord, outcome::HealthKind, metadata::{
-        ElevatedSourceEvidence, InputBlindReason, LostActivity, SelectedSourceInterval, SelectedSourceKind, SourceBlindInterval, SourceBlindReason,
+        ElevatedSourceEvidence, InputBlindReason, LostActivity, SelectedSourceInterval, SelectedSourceKind, SourceBlindInterval,
         SourceEvidence, SourceRegistration, SourceTail, StandardSourceEvidence, UncertifiedInputTail,
     }},
-    platform::windows::{ProbeError, clock, hotkeys::ActiveHotkeys, preflight::ForegroundApproval, unavailable},
-    protocol::{AdmissionEpoch, ClockOrigin, MessageTickAnchor, MonitorId, QpcFrequency, QpcTick, SaveId, SessionTimeUs},
+    protocol::{AdmissionEpoch, ClockOrigin, MessageTickAnchor, MonitorId, QpcFrequency, QpcTick, SaveId, SessionTimeUs, SourceFailureReason, UtcAnchor},
 };
+use screen_fix_native_observation::StaticLease;
 use screen_fix_protocol::ipc::{FocusAtReceipt, InputRegistration, elevated::{VisitBinding, runtime::IdentityClaim}};
 
-use super::{
+use crate::session::{
     fault::{FaultClass, FaultLog, FaultOutcome, FaultReport},
     AdmissionBoundary, CommandError, PauseReason, SessionCommand, SessionHandle, SessionPhase,
-    ReadyVideo, SessionResult, SessionStatus, SourceFailure, SourceFailureReason, SourceStage, SourceStatus,
+    ReadyVideo, SessionResult, SessionStatus, SourceFailure, SourceStage, SourceStatus,
     StartupStep, VideoReport, WindowCoverage,
     hotkey::{ControlLoss, ControlNotice, ControlOutcome, HotkeyActivation, RecorderAction},
+    labels::pause_blind_reason,
 };
+
+use super::{ProbeError, clock, hotkeys::ActiveHotkeys, preflight::ForegroundApproval, unavailable};
 
 const COUNTDOWN_SECONDS: u8 = 3;
 const UTC_INTERVAL_SECONDS: i64 = 60;
@@ -49,9 +53,9 @@ const STOP_BUDGET: Duration = Duration::from_secs(10);
 const SESSION_END_CONTROLLER_BUDGET: Duration = Duration::from_millis(3750);
 const CONTROL_WAIT: Duration = Duration::from_millis(25);
 const MAX_CONTROL_NOTICES: usize = 32;
-pub(crate) const MAX_FIXTURE_SAVES: usize = 8;
+pub(super) const MAX_FIXTURE_SAVES: usize = 8;
 const MAX_SOURCE_TRACE: usize = 4096;
-pub(crate) const MAX_INPUT_FAILURES: usize = 4;
+pub(super) const MAX_INPUT_FAILURES: usize = 4;
 const MAX_HEALTH_REPORTS: usize = 256;
 /// The hotkey progress gap that records a control loss (S1).
 const HOTKEY_PROGRESS_GAP: Duration = Duration::from_millis(250);
@@ -62,25 +66,12 @@ const FRAMES_OPENING_ACK: Duration = Duration::from_secs(1);
 /// The frames merge owner's opening endpoint (§6.5). The controller sends
 /// each opening boundary with an acknowledgement sender and publishes the
 /// boundary to the workers only after the acknowledgement.
-pub(crate) type FramesOpening = SyncSender<(AdmissionBoundary, SyncSender<()>)>;
+pub(super) type FramesOpening = SyncSender<(AdmissionBoundary, SyncSender<()>)>;
 
 // The recording worker and all nested owners retain this lease until their
 // actual exit, even when the controller has stopped waiting for a result.
 static RECORDING_OWNED: AtomicBool = AtomicBool::new(false);
 
-struct RecordingLease;
-
-impl RecordingLease {
-    fn claim() -> Result<Self, CaptureError> {
-        RECORDING_OWNED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| Self)
-            .map_err(|_| failure("Start recording", "The previous recording still owns capture or output resources."))
-    }
-}
-
-impl Drop for RecordingLease {
-    fn drop(&mut self) { RECORDING_OWNED.store(false, Ordering::Release); }
-}
 
 #[derive(Default)]
 enum AdmissionCheck {
@@ -92,27 +83,27 @@ enum AdmissionCheck {
 }
 
 #[derive(Clone)]
-pub(crate) struct SourcePreparation {
-    pub(crate) epoch: AdmissionEpoch,
-    pub(crate) startup: Option<ForegroundApproval>,
+pub(super) struct SourcePreparation {
+    pub(super) epoch: AdmissionEpoch,
+    pub(super) startup: Option<ForegroundApproval>,
 }
 
-pub(crate) struct SourceDispatch {
+pub(super) struct SourceDispatch {
     lifecycle: Weak<Lifecycle>,
     epoch: AdmissionEpoch,
     target: IdentityClaim,
 }
 
 impl SourceDispatch {
-    pub(crate) fn target(&self) -> &IdentityClaim { &self.target }
+    pub(super) fn target(&self) -> &IdentityClaim { &self.target }
 
-    pub(crate) fn epoch(&self) -> AdmissionEpoch { self.epoch }
+    pub(super) fn epoch(&self) -> AdmissionEpoch { self.epoch }
 
-    pub(crate) fn stopped(&self) -> bool {
+    pub(super) fn stopped(&self) -> bool {
         self.lifecycle.upgrade().is_none_or(|lifecycle| lifecycle.closing())
     }
 
-    pub(crate) fn with_closed_phase<T>(
+    pub(super) fn with_closed_phase<T>(
         &self, dispatch: impl FnOnce() -> screen_fix_elevated::Result<T>,
     ) -> screen_fix_elevated::Result<T> {
         let lifecycle = self.lifecycle.upgrade().ok_or(screen_fix_elevated::Failure::Cancelled)?;
@@ -127,13 +118,13 @@ impl SourceDispatch {
 }
 
 #[derive(Clone)]
-pub(crate) struct ActiveSourceProof {
+pub(super) struct ActiveSourceProof {
     lifecycle: Weak<Lifecycle>,
     epoch: AdmissionEpoch,
 }
 
 impl ActiveSourceProof {
-    pub(crate) fn current(&self) -> bool {
+    pub(super) fn current(&self) -> bool {
         let Some(lifecycle) = self.lifecycle.upgrade() else { return false; };
         if lifecycle.closing() { return false; }
         let Ok(facts) = lifecycle.facts.try_lock() else { return false; };
@@ -275,7 +266,7 @@ struct SelectedInterval {
     cutoff: Option<SessionTimeUs>,
 }
 
-pub(crate) struct FixtureNotice {
+pub(super) struct FixtureNotice {
     pub signal: FixtureSave,
     pub id: SaveId,
     pub receipt: Receipt,
@@ -300,7 +291,7 @@ struct Lifecycle {
 }
 
 #[derive(Default)]
-pub(crate) struct ControlPrefix {
+pub(super) struct ControlPrefix {
     notices: VecDeque<ControlNotice>,
     stop: Option<ControlNotice>,
     pub before: Option<QpcTick>,
@@ -356,8 +347,8 @@ impl Lifecycle {
 
     fn apply_session_end_deadlines(&self, facts: &mut Facts) {
         if let Some(&started) = self.session_end_started.get() {
-            shorten(&mut facts.stop_deadline, started + SESSION_END_CONTROLLER_BUDGET);
-            shorten(&mut facts.segment_deadline, started + environment::SUSPEND_BUDGET);
+            keep_earlier(&mut facts.stop_deadline, started + SESSION_END_CONTROLLER_BUDGET);
+            keep_earlier(&mut facts.segment_deadline, started + environment::SUSPEND_BUDGET);
         }
     }
 }
@@ -370,7 +361,7 @@ pub(crate) struct Control {
 }
 
 impl Control {
-    pub(crate) fn stop_for_indicator_failure(&self) {
+    pub(super) fn stop_for_indicator_failure(&self) {
         request_stop(&self.lifecycle, &self.wake, "indicator failure");
     }
 
@@ -384,7 +375,7 @@ impl Control {
         })
     }
 
-    pub(super) fn confirm_fixture_save(
+    pub(crate) fn confirm_fixture_save(
         &self, signal: FixtureSave,
     ) -> Result<Receiver<FixtureSaveResult>, FixtureSaveError> {
         let mut facts = self.lifecycle.facts.try_lock().map_err(|_| FixtureSaveError::Busy)?;
@@ -409,7 +400,7 @@ impl Control {
         Ok(result)
     }
 
-    pub(super) fn submit(&self, command: SessionCommand) -> Result<(), CommandError> {
+    pub(crate) fn submit(&self, command: SessionCommand) -> Result<(), CommandError> {
         if command == SessionCommand::Stop {
             request_stop(&self.lifecycle, &self.wake, "user stop command");
             return Ok(());
@@ -449,13 +440,13 @@ pub(crate) struct WorkerSession {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct RecordingStart {
+pub(super) struct RecordingStart {
     pub clock: ClockOrigin,
     pub boundary: AdmissionBoundary,
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct Receipt {
+pub(super) struct Receipt {
     pub qpc: QpcTick,
     pub clock: ClockOrigin,
     pub boundary: AdmissionBoundary,
@@ -481,7 +472,7 @@ pub(crate) struct InputFailure {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum PauseProducer {
+pub(super) enum PauseProducer {
     Input,
     Capture(MonitorId),
     Video(MonitorId),
@@ -489,87 +480,92 @@ pub(crate) enum PauseProducer {
 }
 
 #[derive(Clone, Copy, serde::Serialize)]
-pub(crate) struct PausedVideo {
+pub(super) struct PausedVideo {
     pub monitor: MonitorId,
     pub first_paused_slot: u64,
     pub fps: u32,
 }
 
 impl PausedVideo {
-    pub(crate) fn end_exclusive(self, closed: SessionTimeUs, next: SessionTimeUs) -> Option<u64> {
+    pub(super) fn end_exclusive(self, closed: SessionTimeUs, next: SessionTimeUs) -> Option<u64> {
         let us = next.0.checked_sub(closed.0)?;
         let slots = (i128::from(us) * i128::from(self.fps) + 999_999).div_euclid(1_000_000);
         self.first_paused_slot.checked_add(u64::try_from(slots).ok()?)
     }
 }
 
-pub(crate) enum Admission {
+pub(super) enum Admission {
     Starting,
     Open(Receipt),
     Closed(Option<AdmissionBoundary>),
 }
 
 impl WorkerSession {
-    pub(crate) fn active_source(&self, epoch: AdmissionEpoch) -> ActiveSourceProof {
+    /// Wake the controller. A full wake slot already guarantees that it wakes up.
+    fn wake(&self) {
+        let _ = self.wake.try_send(());
+    }
+
+    pub(super) fn active_source(&self, epoch: AdmissionEpoch) -> ActiveSourceProof {
         ActiveSourceProof { lifecycle: Arc::downgrade(&self.lifecycle), epoch }
     }
 
-    pub(crate) fn elevated_active(&self, epoch: AdmissionEpoch) -> bool {
+    pub(super) fn elevated_active(&self, epoch: AdmissionEpoch) -> bool {
         let facts = self.lifecycle.lock();
         !self.lifecycle.closing() && source_active(&facts, epoch)
     }
 
-    pub(crate) fn ordinary_source_active(&self, epoch: AdmissionEpoch) -> bool {
+    pub(super) fn ordinary_source_active(&self, epoch: AdmissionEpoch) -> bool {
         let facts = self.lifecycle.lock();
         !self.lifecycle.closing() && source_epoch_active(&facts, epoch) && facts.elevated_epoch.is_none()
     }
 
-    pub(crate) fn source_dispatch(&self, epoch: AdmissionEpoch, target: &IdentityClaim) -> SourceDispatch {
+    pub(super) fn source_dispatch(&self, epoch: AdmissionEpoch, target: &IdentityClaim) -> SourceDispatch {
         SourceDispatch { lifecycle: Arc::downgrade(&self.lifecycle), epoch, target: target.clone() }
     }
 
-    pub(crate) fn controller_qpc(&self) -> QpcTick {
+    pub(super) fn controller_qpc(&self) -> QpcTick {
         QpcTick(self.lifecycle.controller_qpc.load(Ordering::Acquire))
     }
 
-    pub(crate) fn elevated_epoch(&self, epoch: AdmissionEpoch) -> bool {
+    pub(super) fn elevated_epoch(&self, epoch: AdmissionEpoch) -> bool {
         self.lifecycle.lock().elevated_epoch == Some(epoch)
     }
 
-    pub(crate) fn require_source_change(&self, epoch: AdmissionEpoch) {
+    pub(super) fn require_source_change(&self, epoch: AdmissionEpoch) {
         let mut facts = self.lifecycle.lock();
         if facts.status.opened.is_some_and(|boundary| boundary.epoch == epoch)
             && matches!(facts.status.phase, SessionPhase::Recording | SessionPhase::Paused)
         {
             facts.source_change = true;
-            let _ = self.wake.try_send(());
+            self.wake();
         }
     }
 
-    pub(crate) fn source_preparation(&self) -> Option<SourcePreparation> {
+    pub(super) fn source_preparation(&self) -> Option<SourcePreparation> {
         let facts = self.lifecycle.lock();
         facts.source_preparation.as_ref().filter(|pending| !self.lifecycle.stop_requested()
             && source_preparation_current(&facts, pending.epoch)).cloned()
     }
 
-    pub(crate) fn source_authorized(&self, epoch: AdmissionEpoch) -> bool {
+    pub(super) fn source_authorized(&self, epoch: AdmissionEpoch) -> bool {
         let facts = self.lifecycle.lock();
         !self.lifecycle.closing()
             && (source_preparation_current(&facts, epoch)
                 || (facts.status.phase == SessionPhase::Recording && facts.elevated_epoch == Some(epoch)))
     }
 
-    pub(crate) fn abandon_source_preparation(&self, epoch: AdmissionEpoch) {
+    pub(super) fn abandon_source_preparation(&self, epoch: AdmissionEpoch) {
         let mut facts = self.lifecycle.lock();
         if facts.source_preparation.as_ref().is_some_and(|pending| pending.epoch == epoch) {
             facts.source_ready = None;
             facts.source_preparation = None;
             clear_source_status(&mut facts);
-            let _ = self.wake.try_send(());
+            self.wake();
         }
     }
 
-    pub(crate) fn source_ready(
+    pub(super) fn source_ready(
         &self, epoch: AdmissionEpoch, approval: ForegroundApproval, focus: Option<FocusAtReceipt>,
     ) {
         let mut facts = self.lifecycle.lock();
@@ -577,47 +573,45 @@ impl WorkerSession {
             && source_preparation_current(&facts, epoch)
         {
             facts.source_ready = Some(SelectedSource { epoch, approval, focus });
-            let _ = self.wake.try_send(());
+            self.wake();
         }
     }
 
-    pub(crate) fn source_pending(&self, epoch: AdmissionEpoch, status: SourceStatus) {
+    pub(super) fn source_pending(&self, epoch: AdmissionEpoch, status: SourceStatus) {
         let mut facts = self.lifecycle.lock();
         if !self.lifecycle.stop_requested() && source_preparation_current(&facts, epoch) {
             facts.status.source = status;
         }
     }
 
-    pub(crate) fn source_enhanced(&self, epoch: AdmissionEpoch) {
+    pub(super) fn source_enhanced(&self, epoch: AdmissionEpoch) {
         let mut facts = self.lifecycle.lock();
         if !self.lifecycle.stop_requested() && source_active(&facts, epoch) {
             facts.status.source = SourceStatus::Enhanced;
         }
     }
 
-    pub(crate) fn update_standard_evidence(&self, update: impl FnOnce(&mut StandardSourceEvidence)) {
+    pub(super) fn update_standard_evidence(&self, update: impl FnOnce(&mut StandardSourceEvidence)) {
         update(self.lifecycle.lock().source_evidence.standard.get_or_insert_with(StandardSourceEvidence::default));
     }
 
-    pub(crate) fn update_elevated_evidence(&self, update: impl FnOnce(&mut ElevatedSourceEvidence)) {
+    pub(super) fn update_elevated_evidence(&self, update: impl FnOnce(&mut ElevatedSourceEvidence)) {
         update(self.lifecycle.lock().source_evidence.elevated.get_or_insert_with(ElevatedSourceEvidence::default));
     }
 
-    pub(crate) fn elevated_registration(
+    pub(super) fn elevated_registration(
         &self, epoch: AdmissionEpoch, observed_qpc: QpcTick, registration: InputRegistration,
         held: screen_fix_protocol::ipc::elevated::runtime::HeldReadiness,
     ) {
         let mut facts = self.lifecycle.lock();
         let registration = SourceRegistration { epoch, observed_qpc, registration, held: Some(held) };
         let evidence = facts.source_evidence.elevated.get_or_insert_with(ElevatedSourceEvidence::default);
-        if evidence.registrations.len() < MAX_SOURCE_TRACE {
-            evidence.registrations.push(registration);
-        } else {
+        if !push_bounded(&mut evidence.registrations, registration, MAX_SOURCE_TRACE) {
             facts.source_evidence.truncated = true;
         }
     }
 
-    pub(crate) fn record_source_coverage(
+    pub(super) fn record_source_coverage(
         &self, epoch: AdmissionEpoch, visit: Option<VisitBinding>, start: SessionTimeUs, before: SessionTimeUs,
     ) {
         let mut facts = self.lifecycle.lock();
@@ -629,21 +623,19 @@ impl WorkerSession {
         {
             let before = interval.cutoff.map_or(before, |cutoff| before.min(cutoff));
             interval.evidence.before_t_us = interval.evidence.before_t_us.max(before);
-        } else if facts.selected_intervals.len() < MAX_SOURCE_TRACE {
-            facts.selected_intervals.push(SelectedInterval {
-                visit, cutoff: None,
-                evidence: SelectedSourceInterval {
-                    source: if visit.is_some() { SelectedSourceKind::Elevated } else { SelectedSourceKind::Ordinary },
-                    epoch, source_generation: visit.map(|binding| binding.source_generation), start_t_us: start,
-                    before_t_us: before,
-                },
-            });
-        } else {
+        } else if !push_bounded(&mut facts.selected_intervals, SelectedInterval {
+            visit, cutoff: None,
+            evidence: SelectedSourceInterval {
+                source: if visit.is_some() { SelectedSourceKind::Elevated } else { SelectedSourceKind::Ordinary },
+                epoch, source_generation: visit.map(|binding| binding.source_generation), start_t_us: start,
+                before_t_us: before,
+            },
+        }, MAX_SOURCE_TRACE) {
             facts.source_evidence.truncated = true;
         }
     }
 
-    pub(crate) fn restrict_source_coverage(&self, visit: VisitBinding, before: QpcTick) {
+    pub(super) fn restrict_source_coverage(&self, visit: VisitBinding, before: QpcTick) {
         let mut facts = self.lifecycle.lock();
         let Some(before) = facts.status.clock.and_then(|clock| clock.time(before).ok()) else { return; };
         if let Some(interval) = facts.selected_intervals.iter_mut().rev().find(|item| item.visit == Some(visit)) {
@@ -651,14 +643,14 @@ impl WorkerSession {
         }
     }
 
-    pub(crate) fn last_elevated_coverage(&self, epoch: AdmissionEpoch) -> Option<SessionTimeUs> {
+    pub(super) fn last_elevated_coverage(&self, epoch: AdmissionEpoch) -> Option<SessionTimeUs> {
         self.lifecycle.lock().selected_intervals.iter().rev()
             .find(|item| item.evidence.epoch == epoch && item.visit.is_some()
                 && item.evidence.start_t_us < item.evidence.before_t_us)
             .map(|item| item.evidence.before_t_us)
     }
 
-    pub(crate) fn record_uncertified_tail(&self, epoch: AdmissionEpoch, tail: UncertifiedInputTail) {
+    pub(super) fn record_uncertified_tail(&self, epoch: AdmissionEpoch, tail: UncertifiedInputTail) {
         let mut facts = self.lifecycle.lock();
         if let Some(interval) = facts.selected_intervals.last_mut()
             .filter(|item| item.evidence.epoch == epoch && item.visit.is_none())
@@ -666,34 +658,32 @@ impl WorkerSession {
             restrict_interval(interval, tail.first_t_us);
         }
         let evidence = &mut facts.source_evidence;
-        if evidence.uncertified_tails.len() < MAX_SOURCE_TRACE {
-            evidence.uncertified_tails.push(SourceTail { epoch, tail });
-        } else {
+        if !push_bounded(&mut evidence.uncertified_tails, SourceTail { epoch, tail }, MAX_SOURCE_TRACE) {
             evidence.truncated = true;
         }
     }
 
-    pub(crate) fn record_source_blind(&self, interval: SourceBlindInterval) {
+    pub(super) fn record_source_blind(&self, interval: SourceBlindInterval) {
         push_source_blind(&mut self.lifecycle.lock(), interval);
     }
 
-    pub(crate) fn source_resynchronizing(&self, epoch: AdmissionEpoch) {
+    pub(super) fn source_resynchronizing(&self, epoch: AdmissionEpoch) {
         let mut facts = self.lifecycle.lock();
         if !self.lifecycle.stop_requested() && source_active(&facts, epoch) {
             facts.status.source = SourceStatus::Activating;
         }
     }
 
-    pub(crate) fn source_evidence(&self) -> Option<SourceEvidence> {
+    pub(super) fn source_evidence(&self) -> Option<SourceEvidence> {
         source_evidence(&self.lifecycle.lock())
     }
 
-    pub(crate) fn fail_classified_source(&self, failure: SourceFailure) -> bool {
+    pub(super) fn fail_classified_source(&self, failure: SourceFailure) -> bool {
         let mut facts = self.lifecycle.lock();
         self.stop_for_source_failure(&mut facts, failure)
     }
 
-    pub(crate) fn fail_source(&self, stage: SourceStage, failure: screen_fix_elevated::Failure) {
+    pub(super) fn fail_source(&self, stage: SourceStage, failure: screen_fix_elevated::Failure) {
         let mut facts = self.lifecycle.lock();
         let admitted = facts.status.clock.is_some();
         self.stop_for_source_failure(&mut facts, SourceFailure::elevated(stage, failure, admitted));
@@ -708,22 +698,22 @@ impl WorkerSession {
             && !matches!(failure.reason, SourceFailureReason::Cancelled | SourceFailureReason::ScopeClosed))
         {
             set_source_failure(facts, failure);
-            let _ = self.wake.try_send(());
+            self.wake();
         }
         first
     }
 
-    pub(crate) fn required_elevated_hook_failed(&self, closing: bool) {
+    pub(super) fn required_elevated_hook_failed(&self, closing: bool) {
         let mut facts = self.lifecycle.lock();
         if closing || self.lifecycle.latch_stop("required elevated hook failed") {
             set_source_failure(&mut facts, SourceFailure {
                 stage: SourceStage::Capture, reason: SourceFailureReason::RequiredHook, admitted: true, native: None, token_identity: None,
             });
-            let _ = self.wake.try_send(());
+            self.wake();
         }
     }
 
-    pub(crate) fn source_finalization_failed(&self, failure: screen_fix_elevated::Failure) {
+    pub(super) fn source_finalization_failed(&self, failure: screen_fix_elevated::Failure) {
         let mut facts = self.lifecycle.lock();
         if facts.status.clock.is_some() {
             let failure = SourceFailure::elevated(SourceStage::Cleanup, failure, true);
@@ -734,25 +724,25 @@ impl WorkerSession {
         }
     }
 
-    pub(crate) fn source_failure(&self) -> Option<SourceFailure> {
+    pub(super) fn source_failure(&self) -> Option<SourceFailure> {
         self.lifecycle.lock().status.source.failure()
     }
 
     fn disk_sample(&self, sample: disk::Sample) {
         self.lifecycle.lock().disk = Some(sample);
-        let _ = self.wake.try_send(());
+        self.wake();
     }
 
-    pub(crate) fn stop_requested(&self) -> bool {
+    pub(super) fn stop_requested(&self) -> bool {
         self.lifecycle.stop_requested()
     }
 
-    pub(crate) fn started(&self) -> bool {
+    pub(super) fn started(&self) -> bool {
         self.lifecycle.lock().status.clock.is_some()
     }
 
     /// Report an attempt failure or an activity loss. An attempt failure runs the Stop path.
-    pub(crate) fn report_fault(&self, report: FaultReport) {
+    pub(super) fn report_fault(&self, report: FaultReport) {
         let attempt = report.class() == FaultClass::Attempt;
         record_fault(&mut self.lifecycle.lock(), report);
         if attempt {
@@ -760,35 +750,35 @@ impl WorkerSession {
         }
     }
 
-    pub(crate) fn attempt_failed(&self) -> bool {
+    pub(super) fn attempt_failed(&self) -> bool {
         self.lifecycle.lock().faults.attempt_failure().is_some()
     }
 
-    pub(crate) fn fault_outcome(&self) -> FaultOutcome {
+    pub(super) fn fault_outcome(&self) -> FaultOutcome {
         self.lifecycle.lock().faults.outcome()
     }
 
-    pub(crate) fn stop_deadline(&self) -> Option<Instant> {
+    pub(super) fn stop_deadline(&self) -> Option<Instant> {
         self.lifecycle.lock().stop_deadline
     }
 
     /// The latest suspend and resume QPC marks, for excluding sleep from QPC intervals.
-    pub(crate) fn suspend_marks(&self) -> environment::SuspendMarks {
+    pub(super) fn suspend_marks(&self) -> environment::SuspendMarks {
         self.lifecycle.power.snapshot()
     }
 
-    pub(crate) fn segment_deadline(&self) -> Option<Instant> {
+    pub(super) fn segment_deadline(&self) -> Option<Instant> {
         self.lifecycle.lock().segment_deadline
     }
 
     /// The bound on the elevated collector's environment cleanup: the Stop or
     /// session-end deadline, or the suspend budget.
-    pub(crate) fn cleanup_deadline(&self) -> Option<Instant> {
+    pub(super) fn cleanup_deadline(&self) -> Option<Instant> {
         let facts = self.lifecycle.lock();
         facts.segment_deadline.into_iter().chain(facts.suspend_cleanup).min()
     }
 
-    pub(crate) fn pause_interval_reasons(&self, cutoff: AdmissionBoundary) -> Vec<PauseReason> {
+    pub(super) fn pause_interval_reasons(&self, cutoff: AdmissionBoundary) -> Vec<PauseReason> {
         let facts = self.lifecycle.lock();
         if let Some((closed, reasons)) = &facts.last_pause && *closed == cutoff {
             return reasons.clone();
@@ -796,7 +786,7 @@ impl WorkerSession {
         facts.pause_interval_reasons.iter().copied().collect()
     }
 
-    pub(crate) fn wait_for_stop(&self) -> Result<Option<AdmissionBoundary>, ProbeError> {
+    pub(super) fn wait_for_stop(&self) -> Result<Option<AdmissionBoundary>, ProbeError> {
         let facts = self.lifecycle.changed.wait_while(self.lifecycle.lock(), |facts| {
             matches!(facts.status.phase, SessionPhase::Starting | SessionPhase::Recording | SessionPhase::Paused)
         }).unwrap_or_else(PoisonError::into_inner);
@@ -804,51 +794,51 @@ impl WorkerSession {
         Ok(facts.status.closed)
     }
 
-    pub(crate) fn mark_input_prefix(&self, cutoff: AdmissionBoundary) {
+    pub(super) fn mark_input_prefix(&self, cutoff: AdmissionBoundary) {
         let mut facts = self.lifecycle.lock();
         if facts.status.closed == Some(cutoff) {
             facts.input_prefix = Some(cutoff);
         }
     }
 
-    pub(crate) fn input_prefix_closed(&self, cutoff: AdmissionBoundary) -> bool {
+    pub(super) fn input_prefix_closed(&self, cutoff: AdmissionBoundary) -> bool {
         self.lifecycle.lock().input_prefix == Some(cutoff)
     }
 
-    pub(crate) fn paused_cutoff(&self) -> Option<AdmissionBoundary> {
+    pub(super) fn paused_cutoff(&self) -> Option<AdmissionBoundary> {
         let facts = self.lifecycle.lock();
         (facts.status.phase == SessionPhase::Paused).then_some(facts.status.closed).flatten()
     }
 
-    pub(crate) fn pause_pending(&self, cutoff: AdmissionBoundary) -> bool {
+    pub(super) fn pause_pending(&self, cutoff: AdmissionBoundary) -> bool {
         let facts = self.lifecycle.lock();
         facts.status.phase == SessionPhase::Paused && facts.status.closed == Some(cutoff)
     }
 
-    pub(crate) fn paused_video(&self) -> Vec<PausedVideo> {
+    pub(super) fn paused_video(&self) -> Vec<PausedVideo> {
         self.lifecycle.lock().paused_video.values().copied().collect()
     }
 
-    pub(crate) fn finish_video_pause(&self, cutoff: AdmissionBoundary, video: PausedVideo) {
+    pub(super) fn finish_video_pause(&self, cutoff: AdmissionBoundary, video: PausedVideo) {
         let mut facts = self.lifecycle.lock();
         if facts.status.closed == Some(cutoff) {
             facts.paused_video.insert(video.monitor, video);
             if facts.status.phase == SessionPhase::Paused {
                 facts.pause_prefix.insert(PauseProducer::Video(video.monitor));
             }
-            let _ = self.wake.try_send(());
+            self.wake();
         }
     }
 
-    pub(crate) fn finish_pause(&self, cutoff: AdmissionBoundary, producer: PauseProducer) {
+    pub(super) fn finish_pause(&self, cutoff: AdmissionBoundary, producer: PauseProducer) {
         let mut facts = self.lifecycle.lock();
         if facts.status.phase == SessionPhase::Paused && facts.status.closed == Some(cutoff) {
             facts.pause_prefix.insert(producer);
-            let _ = self.wake.try_send(());
+            self.wake();
         }
     }
 
-    pub(crate) fn wait_for_reopen(&self, cutoff: AdmissionBoundary) -> Result<Option<RecordingStart>, ProbeError> {
+    pub(super) fn wait_for_reopen(&self, cutoff: AdmissionBoundary) -> Result<Option<RecordingStart>, ProbeError> {
         let facts = self.lifecycle.changed.wait_while(self.lifecycle.lock(), |facts| {
             facts.status.phase == SessionPhase::Paused && facts.status.closed == Some(cutoff)
         }).unwrap_or_else(PoisonError::into_inner);
@@ -862,19 +852,19 @@ impl WorkerSession {
         }
     }
 
-    pub(crate) fn stop_boundary(&self) -> Option<AdmissionBoundary> {
+    pub(super) fn stop_boundary(&self) -> Option<AdmissionBoundary> {
         self.lifecycle.lock().status.stop
     }
 
-    pub(crate) fn take_fixture_saves(&self) -> VecDeque<FixtureNotice> {
+    pub(super) fn take_fixture_saves(&self) -> VecDeque<FixtureNotice> {
         std::mem::take(&mut self.lifecycle.lock().fixture_saves)
     }
 
-    pub(crate) fn window_coverage(&self, coverage: WindowCoverage) {
+    pub(super) fn window_coverage(&self, coverage: WindowCoverage) {
         self.lifecycle.lock().status.window_coverage = Some(coverage);
     }
 
-    pub(crate) fn verify_startup(&self, check: impl FnOnce() -> Result<ForegroundApproval, CaptureError>) {
+    pub(super) fn verify_startup(&self, check: impl FnOnce() -> Result<ForegroundApproval, CaptureError>) {
         let mut facts = self.lifecycle.lock();
         while matches!(facts.admission_check, AdmissionCheck::Idle)
             && facts.status.phase == SessionPhase::Starting
@@ -892,14 +882,14 @@ impl WorkerSession {
         drop(facts);
         let result = check();
         self.lifecycle.lock().admission_check = AdmissionCheck::Finished(result);
-        let _ = self.wake.try_send(());
+        self.wake();
     }
 
-    pub(crate) fn startup_step(&self, step: StartupStep) {
+    pub(super) fn startup_step(&self, step: StartupStep) {
         self.lifecycle.lock().status.startup = step;
     }
 
-    pub(crate) fn video_ready(&self, video: ReadyVideo) {
+    pub(super) fn video_ready(&self, video: ReadyVideo) {
         let mut facts = self.lifecycle.lock();
         let ready = &mut facts.status.ready_video;
         if let Some(previous) = ready.iter_mut().find(|item| item.monitor == video.monitor) {
@@ -910,34 +900,34 @@ impl WorkerSession {
         }
     }
 
-    pub(crate) fn input_ready(&self, registration: InputRegistration, required_ready: bool) {
+    pub(super) fn input_ready(&self, registration: InputRegistration, required_ready: bool) {
         let mut facts = self.lifecycle.lock();
         facts.status.input_ready = Some(registration);
         facts.status.input_helper_ready = required_ready;
     }
 
-    pub(crate) fn input_registration(&self) -> Option<crate::protocol::ipc::InputRegistration> {
+    pub(super) fn input_registration(&self) -> Option<crate::protocol::ipc::InputRegistration> {
         self.lifecycle.lock().status.input_ready
     }
 
-    pub(crate) fn windows_evidence(&self, evidence: crate::platform::WindowsEvidence) {
+    pub(super) fn windows_evidence(&self, evidence: crate::platform::WindowsEvidence) {
         self.lifecycle.lock().status.windows = Some(evidence);
     }
 
-    pub(crate) fn config(&self) -> &ResolvedCaptureConfig {
+    pub(super) fn config(&self) -> &ResolvedCaptureConfig {
         &self.config
     }
 
-    pub(crate) fn ready(&self) -> Result<(), ProbeError> {
+    pub(super) fn ready(&self) -> Result<(), ProbeError> {
         self.ready.try_send(())
             .map_err(|_| unavailable("The session controller did not accept readiness"))?;
-        let _ = self.wake.try_send(());
+        self.wake();
         Ok(())
     }
 
     /// The worker reports this after its local producers and journals have
     /// finished the admitted prefix. The publication decision reads the same fact.
-    pub(crate) fn complete_prefix(&self, cutoff: AdmissionBoundary) -> Result<(), ProbeError> {
+    pub(super) fn complete_prefix(&self, cutoff: AdmissionBoundary) -> Result<(), ProbeError> {
         let mut facts = self.lifecycle.lock();
         if facts.status.phase != SessionPhase::Stopping || facts.status.closed != Some(cutoff) {
             return Err(unavailable("The session controller did not accept the closed producer prefix"));
@@ -946,7 +936,7 @@ impl WorkerSession {
         Ok(())
     }
 
-    pub(crate) fn authorize_complete_publication(&self) -> io::Result<()> {
+    pub(super) fn authorize_complete_publication(&self) -> io::Result<()> {
         let mut facts = self.lifecycle.lock();
         match facts.complete_publication {
             CompletePublication::Awaiting => {}
@@ -982,11 +972,11 @@ impl WorkerSession {
         Ok(())
     }
 
-    pub(crate) fn request_stop(&self) {
+    pub(super) fn request_stop(&self) {
         request_stop(&self.lifecycle, &self.wake, "worker request or attempt failure");
     }
 
-    pub(crate) fn wait_for_start(&self) -> Result<Option<RecordingStart>, ProbeError> {
+    pub(super) fn wait_for_start(&self) -> Result<Option<RecordingStart>, ProbeError> {
         let facts = self.lifecycle.changed.wait_while(self.lifecycle.lock(), |facts| {
             facts.status.phase == SessionPhase::Starting
         }).unwrap_or_else(PoisonError::into_inner);
@@ -998,7 +988,7 @@ impl WorkerSession {
     }
 
     /// Receipt and boundary publication share the same short critical section.
-    pub(crate) fn admit(&self) -> Result<Admission, ProbeError> {
+    pub(super) fn admit(&self) -> Result<Admission, ProbeError> {
         let facts = self.lifecycle.lock();
         check_clock(&facts)?;
         let status = &facts.status;
@@ -1020,7 +1010,7 @@ impl WorkerSession {
 
     /// The input pump uses the closed epoch to convert delayed WinEvent
     /// receipts without reopening normal admission.
-    pub(crate) fn foreground_closing_receipt(&self, cutoff: AdmissionBoundary) -> Result<Receipt, ProbeError> {
+    pub(super) fn foreground_closing_receipt(&self, cutoff: AdmissionBoundary) -> Result<Receipt, ProbeError> {
         let facts = self.lifecycle.lock();
         check_clock(&facts)?;
         let status = &facts.status;
@@ -1034,7 +1024,7 @@ impl WorkerSession {
     }
 
     /// A bounded wait between video pacing or input polling iterations.
-    pub(crate) fn wait_for_close(&self, timeout: Duration) -> Result<Option<AdmissionBoundary>, ProbeError> {
+    pub(super) fn wait_for_close(&self, timeout: Duration) -> Result<Option<AdmissionBoundary>, ProbeError> {
         let (facts, _) = self.lifecycle.changed.wait_timeout_while(self.lifecycle.lock(), timeout, |facts| {
             matches!(facts.status.phase, SessionPhase::Starting | SessionPhase::Recording)
         }).unwrap_or_else(PoisonError::into_inner);
@@ -1045,11 +1035,11 @@ impl WorkerSession {
         Ok(facts.status.closed)
     }
 
-    pub(crate) fn session_time(&self) -> Option<SessionTimeUs> {
+    pub(super) fn session_time(&self) -> Option<SessionTimeUs> {
         self.lifecycle.lock().now()
     }
 
-    pub(crate) fn video_failed(&self, monitor: MonitorId, failure: Failure) -> Option<VideoFailure> {
+    pub(super) fn video_failed(&self, monitor: MonitorId, failure: Failure) -> Option<VideoFailure> {
         let mut facts = self.lifecycle.lock();
         if facts.status.video_unavailable.contains(&monitor) {
             return None;
@@ -1062,7 +1052,7 @@ impl WorkerSession {
         Some(entry)
     }
 
-    pub(crate) fn set_video_report(&self, monitor: MonitorId, outcome: ReportOutcome) {
+    pub(super) fn set_video_report(&self, monitor: MonitorId, outcome: ReportOutcome) {
         let mut facts = self.lifecycle.lock();
         if facts.status.video_unavailable.contains(&monitor)
             && !facts.status.video_reports.iter().any(|report| report.monitor == monitor)
@@ -1071,32 +1061,32 @@ impl WorkerSession {
         }
     }
 
-    pub(crate) fn video_reports(&self) -> Vec<VideoReport> {
+    pub(super) fn video_reports(&self) -> Vec<VideoReport> {
         self.lifecycle.lock().status.video_reports.clone()
     }
 
     /// A capture or video health condition written to the context stream when
     /// it occurs (CTX-7). Before the session clock exists it stays only in the
     /// manifest. Conditions beyond the bound are counted as `omitted_health`.
-    pub(crate) fn report_health(
+    pub(super) fn report_health(
         &self, kind: HealthKind, failure: Failure, monitor: Option<MonitorId>, ongoing: bool,
     ) {
         push_health(&mut self.lifecycle.lock(), kind, failure, monitor, ongoing);
     }
 
-    pub(crate) fn omitted_health(&self) -> u64 {
+    pub(super) fn omitted_health(&self) -> u64 {
         self.lifecycle.lock().omitted_health
     }
 
-    pub(crate) fn health_after(&self, prefix: usize) -> Vec<HealthRecord> {
+    pub(super) fn health_after(&self, prefix: usize) -> Vec<HealthRecord> {
         self.lifecycle.lock().health.get(prefix..).unwrap_or_default().to_vec()
     }
 
-    pub(crate) fn video_failures_after(&self, prefix: usize) -> Vec<VideoFailure> {
+    pub(super) fn video_failures_after(&self, prefix: usize) -> Vec<VideoFailure> {
         self.lifecycle.lock().video_failures.get(prefix..).unwrap_or_default().to_vec()
     }
 
-    pub(crate) fn input_failed(&self, failure: InputFailure) -> bool {
+    pub(super) fn input_failed(&self, failure: InputFailure) -> bool {
         let mut facts = self.lifecycle.lock();
         if facts.input_failures.len() >= MAX_INPUT_FAILURES
             || facts.input_failures.iter().any(|old| old.operation == failure.operation)
@@ -1110,32 +1100,32 @@ impl WorkerSession {
         true
     }
 
-    pub(crate) fn input_failure(&self) -> Option<InputFailure> {
+    pub(super) fn input_failure(&self) -> Option<InputFailure> {
         self.lifecycle.lock().input_failures.first().copied()
     }
 
-    pub(crate) fn input_failures(&self) -> Vec<InputFailure> {
+    pub(super) fn input_failures(&self) -> Vec<InputFailure> {
         self.lifecycle.lock().input_failures.clone()
     }
 
-    pub(crate) fn set_input_report_for(&self, failure: InputFailure, report: ReportOutcome) {
+    pub(super) fn set_input_report_for(&self, failure: InputFailure, report: ReportOutcome) {
         let mut facts = self.lifecycle.lock();
         if facts.input_failures.last().is_some_and(|latest| latest.operation == failure.operation && latest.at == failure.at) {
             facts.status.input_report = Some(report);
         }
     }
 
-    pub(crate) fn set_input_report(&self, report: ReportOutcome) {
+    pub(super) fn set_input_report(&self, report: ReportOutcome) {
         self.lifecycle.lock().status.input_report = Some(report);
     }
 
-    pub(crate) fn input_report(&self) -> Option<ReportOutcome> {
+    pub(super) fn input_report(&self) -> Option<ReportOutcome> {
         self.lifecycle.lock().status.input_report.clone()
     }
 
-    pub(crate) fn hotkey_keys(&self) -> [u16; 4] { self.lifecycle.hotkey_keys }
+    pub(super) fn hotkey_keys(&self) -> [u16; 4] { self.lifecycle.hotkey_keys }
 
-    pub(crate) fn take_hotkeys(&self) -> ControlPrefix {
+    pub(super) fn take_hotkeys(&self) -> ControlPrefix {
         let mut facts = self.lifecycle.lock();
         let pending = &mut facts.hotkeys;
         ControlPrefix {
@@ -1145,38 +1135,38 @@ impl WorkerSession {
     }
 
     /// Register the frames merge owner before the controller can start.
-    pub(crate) fn register_frames(&self, opening: FramesOpening) -> Result<(), ProbeError> {
+    pub(super) fn register_frames(&self, opening: FramesOpening) -> Result<(), ProbeError> {
         self.lifecycle.frames_opening.set(opening)
             .map_err(|_| unavailable("The frames merge owner was already registered"))
     }
 
-    pub(crate) fn request_journal_flush(&self) {
+    pub(super) fn request_journal_flush(&self) {
         self.lifecycle.journal_flush_revision.fetch_add(1, Ordering::Release);
     }
 
-    pub(crate) fn journal_flush_revision(&self) -> u64 {
+    pub(super) fn journal_flush_revision(&self) -> u64 {
         self.lifecycle.journal_flush_revision.load(Ordering::Acquire)
     }
 
-    pub(crate) fn display_revision(&self) -> u32 {
+    pub(super) fn display_revision(&self) -> u32 {
         self.lifecycle.display_revision.load(Ordering::Acquire)
     }
 
     /// Ask the standard helper for a fresh registration check; its next
     /// environment record attests the result (E4).
-    pub(crate) fn request_input_check(&self) {
+    pub(super) fn request_input_check(&self) {
         self.lifecycle.input_environment.fetch_or(crate::protocol::ipc::EnvironmentChange::Settings.bit(), Ordering::AcqRel);
     }
 
-    pub(crate) fn take_input_environment(&self) -> u32 {
+    pub(super) fn take_input_environment(&self) -> u32 {
         self.lifecycle.input_environment.swap(0, Ordering::AcqRel)
     }
 
-    pub(crate) fn take_elevated_environment(&self) -> u32 {
+    pub(super) fn take_elevated_environment(&self) -> u32 {
         self.lifecycle.elevated_environment.swap(0, Ordering::AcqRel)
     }
 
-    pub(crate) fn attempt_clock(&self) -> Option<AttemptClock> {
+    pub(super) fn attempt_clock(&self) -> Option<AttemptClock> {
         let facts = self.lifecycle.lock();
         Some(AttemptClock {
             origin: facts.status.clock?,
@@ -1201,7 +1191,8 @@ pub(crate) fn spawn(
     trigger: Option<HotkeyActivation>,
     record: fn(&WorkerSession) -> Result<SessionResult, CaptureError>,
 ) -> Result<SessionHandle, CaptureError> {
-    let lease = RecordingLease::claim()?;
+    let lease = StaticLease::claim(&RECORDING_OWNED)
+        .ok_or_else(|| failure("Start recording", "The previous recording still owns capture or output resources."))?;
     let lifecycle = Arc::new(Lifecycle { hotkey_keys: hotkeys.virtual_keys(), ..Lifecycle::default() });
     if let Some(activation) = trigger {
         lifecycle.lock().hotkeys.push(ControlNotice { activation, outcome: ControlOutcome::StartRequested });
@@ -1241,7 +1232,7 @@ pub(crate) fn spawn(
         controller_lifecycle.changed.notify_all();
         let _ = complete.try_send(result);
     }).map_err(|error| CaptureError::owned(FailureComponent::Controller, "Start the session controller", None, error.to_string()))?;
-    Ok(SessionHandle { result, control: Control { lifecycle, commands, wake } })
+    Ok(SessionHandle::new(result, Control { lifecycle, commands, wake }))
 }
 
 fn run(
@@ -1252,7 +1243,7 @@ fn run(
     endpoint: WorkerSession,
     hotkeys: ActiveHotkeys,
     record: fn(&WorkerSession) -> Result<SessionResult, CaptureError>,
-    lease: RecordingLease,
+    lease: StaticLease,
 ) -> Result<SessionResult, CaptureError> {
     let frequency = clock::frequency().map_err(controller_error)?;
     let (environment, notifications_ready) = environment::Notifications::spawn(
@@ -1367,7 +1358,7 @@ impl Drop for WorkerExit {
 
 impl RecordingWorker {
     fn spawn(
-        endpoint: WorkerSession, record: fn(&WorkerSession) -> Result<SessionResult, CaptureError>, lease: RecordingLease,
+        endpoint: WorkerSession, record: fn(&WorkerSession) -> Result<SessionResult, CaptureError>, lease: StaticLease,
     ) -> Result<Self, CaptureError> {
         let (sender, outcome) = mpsc::sync_channel(1);
         let thread = thread::Builder::new().name("video-recording".into())
@@ -1445,7 +1436,7 @@ fn coordinate(
             }
             return Ok(pause_finished);
         }
-        lifecycle.controller_qpc.store(clock::qpc().map_err(controller_error)?.0, Ordering::Release);
+        lifecycle.controller_qpc.store(controller_qpc()?.0, Ordering::Release);
         subscribed = watch_notifications(environment, &notifications_ready, subscribed)?;
         track_environment(lifecycle, session, environment, &mut reasons)?;
         let startup_hotkeys_lost = {
@@ -1457,7 +1448,7 @@ fn coordinate(
         }
         if subscribed && countdown.is_none() && ready.try_recv().is_ok() {
             lifecycle.lock().status.startup = StartupStep::Ready;
-            countdown = Some(clock::qpc().map_err(controller_error)?);
+            countdown = Some(controller_qpc()?);
         }
         // Bound processing per wake and revisit the independent Stop latch first.
         for command in commands.try_iter().take(8) {
@@ -1532,7 +1523,7 @@ fn track_environment(
                     // Video finalization may continue after wake; a miss is
                     // a health row, never a fault (D-5 A).
                     facts.suspend_wait = Some(session.suspend_marks().sequence);
-                    shorten(&mut facts.suspend_cleanup, Instant::now() + environment::SUSPEND_BUDGET);
+                    keep_earlier(&mut facts.suspend_cleanup, Instant::now() + environment::SUSPEND_BUDGET);
                 }
             }
             pause_command(lifecycle, reasons, SessionCommand::Pause(reason))?;
@@ -1586,7 +1577,7 @@ fn track_pause_prefix(lifecycle: &Lifecycle, session: &WorkerSession, pause_fini
 /// The pause prefix has stayed open for the Stop budget, sleep excluded.
 fn pause_overdue(lifecycle: &Lifecycle, session: &WorkerSession, frequency: QpcFrequency) -> Result<bool, CaptureError> {
     let facts = lifecycle.lock();
-    let now = clock::qpc().map_err(controller_error)?;
+    let now = controller_qpc()?;
     Ok(facts.pause_started.is_some_and(|(started, since)| matches!(
         session.suspend_marks().awake_elapsed(started, now, since, frequency),
         AwakeElapsed::Known(elapsed) if elapsed >= STOP_BUDGET)))
@@ -1641,22 +1632,18 @@ fn advance_countdown(
     if reasons.iter().any(|reason| matches!(reason,
         PauseReason::LockScreen | PauseReason::SecureDesktop | PauseReason::Sleep))
     {
-        *countdown = Some(clock::qpc().map_err(controller_error)?);
+        *countdown = Some(controller_qpc()?);
         lifecycle.lock().status.countdown_seconds = None;
         return Ok(Some(CONTROL_WAIT));
     }
-    let ticks_per_second = i128::from(frequency.0.get());
-    let elapsed = i128::from(clock::qpc().map_err(controller_error)?.0) - i128::from(begin.0);
-    if elapsed < 0 {
-        return Err(failure("Count down to recording", "QPC moved backward during the countdown."));
-    }
-    let remaining = (i128::from(COUNTDOWN_SECONDS) * ticks_per_second - elapsed).max(0);
-    if remaining != 0 {
-        let seconds = ((remaining + ticks_per_second - 1) / ticks_per_second) as u8;
-        lifecycle.lock().status.countdown_seconds = Some(seconds);
+    let elapsed = u64::try_from(controller_qpc()?.ticks_since(begin))
+        .map_err(|_| failure("Count down to recording", "QPC moved backward during the countdown."))?;
+    let remaining = Duration::from_secs(u64::from(COUNTDOWN_SECONDS)).saturating_sub(frequency.duration(elapsed));
+    if !remaining.is_zero() {
+        let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0);
+        lifecycle.lock().status.countdown_seconds = Some(u8::try_from(seconds).unwrap_or(COUNTDOWN_SECONDS));
         // Use a bounded wait and let the next QPC read decide when Start occurs.
-        let nanos = (remaining * 1_000_000_000 + ticks_per_second - 1) / ticks_per_second;
-        return Ok(Some(CONTROL_WAIT.min(Duration::from_nanos(nanos as u64))));
+        return Ok(Some(CONTROL_WAIT.min(remaining)));
     }
     if reasons.contains(&PauseReason::LowDisk) {
         return Err(startup_disk_error());
@@ -1860,7 +1847,7 @@ fn route_hotkeys(
     let batch = hotkeys.drain();
     let before = batch.before;
     let loss = batch.loss;
-    let detected_at = clock::qpc().map_err(controller_error)?;
+    let detected_at = controller_qpc()?;
     // A progress gap over 250 ms, sleep excluded, is a recorded control loss;
     // later activations are processed normally. The suspend sequence was read
     // at the previous drain, before the progress mark, so a missed suspend
@@ -1923,24 +1910,14 @@ fn route_hotkeys(
 }
 
 fn restrict_interval(interval: &mut SelectedInterval, before: SessionTimeUs) {
-    interval.cutoff = Some(interval.cutoff.map_or(before, |cutoff| cutoff.min(before)));
+    keep_earlier(&mut interval.cutoff, before);
     interval.evidence.before_t_us = interval.evidence.before_t_us.min(before);
-}
-
-/// The label of a source-transition pause: its actual pause reason, and
-/// `elevation_transition` only when the transition latch alone paused (S2).
-/// The input blind rows of the pause follow the same rule.
-pub(crate) fn pause_blind_reason(reasons: &BTreeSet<PauseReason>) -> SourceBlindReason {
-    reasons.iter().copied().find(|reason| *reason != PauseReason::ElevationTransition)
-        .map_or(SourceBlindReason::ElevationTransition, SourceBlindReason::Pause)
 }
 
 fn push_source_blind(facts: &mut Facts, interval: SourceBlindInterval) {
     if interval.start_t_us >= interval.before_t_us { return; }
     let evidence = &mut facts.source_evidence;
-    if evidence.blind.len() < MAX_SOURCE_TRACE {
-        evidence.blind.push(interval);
-    } else {
+    if !push_bounded(&mut evidence.blind, interval, MAX_SOURCE_TRACE) {
         evidence.truncated = true;
     }
 }
@@ -1953,6 +1930,21 @@ fn source_evidence(facts: &Facts) -> Option<SourceEvidence> {
     evidence.blind.sort_by_key(|interval| (interval.start_t_us, interval.before_t_us));
     (evidence.standard.is_some() || evidence.elevated.is_some() || evidence.failure.is_some() || !evidence.intervals.is_empty()
         || !evidence.uncertified_tails.is_empty() || !evidence.blind.is_empty() || evidence.truncated).then_some(evidence)
+}
+
+impl SourceFailure {
+    pub(super) fn elevated(stage: SourceStage, failure: screen_fix_elevated::Failure, admitted: bool) -> Self {
+        use screen_fix_elevated::Failure;
+        let native = match failure {
+            Failure::NativeProducer(failure) => Some(failure),
+            _ => None,
+        };
+        let token_identity = match failure {
+            Failure::TokenIdentity(detail) => Some(detail),
+            _ => None,
+        };
+        Self { stage, reason: failure.reason(), admitted, native, token_identity }
+    }
 }
 
 fn clear_source_status(facts: &mut Facts) {
@@ -2011,7 +2003,7 @@ fn start(lifecycle: &Lifecycle, frequency: QpcFrequency, selected: Option<Select
     if lifecycle.stop_requested() {
         return Ok(());
     }
-    let anchor = clock::utc_anchor().map_err(controller_error)?;
+    let anchor = controller_utc_anchor()?;
     let origin = ClockOrigin { origin_qpc: anchor.qpc, qpc_frequency: frequency };
     let epoch = selected.as_ref().map_or(AdmissionEpoch(1), |source| source.epoch);
     let boundary = boundary(origin, anchor.qpc, epoch)?;
@@ -2049,17 +2041,10 @@ fn push_health(
     facts: &mut Facts, kind: HealthKind, failure: Failure, monitor: Option<MonitorId>, ongoing: bool,
 ) {
     let Some(at) = facts.now() else { return };
-    if facts.health.len() < MAX_HEALTH_REPORTS {
-        facts.health.push(HealthRecord {
-            kind, failure, detected: at, first_affected: Some(at), ongoing, monitor, count: None,
-        });
-    } else {
+    let health = HealthRecord { kind, failure, detected: at, first_affected: Some(at), ongoing, monitor, count: None };
+    if !push_bounded(&mut facts.health, health, MAX_HEALTH_REPORTS) {
         facts.omitted_health = facts.omitted_health.saturating_add(1);
     }
-}
-
-fn shorten(deadline: &mut Option<Instant>, candidate: Instant) {
-    *deadline = Some(deadline.map_or(candidate, |old| old.min(candidate)));
 }
 
 fn stop(lifecycle: &Lifecycle) -> Result<(), CaptureError> {
@@ -2070,8 +2055,8 @@ fn stop(lifecycle: &Lifecycle) -> Result<(), CaptureError> {
     }
     let was_recording = facts.status.phase == SessionPhase::Recording;
     let now = Instant::now();
-    shorten(&mut facts.stop_deadline, now + STOP_BUDGET);
-    shorten(&mut facts.segment_deadline, now + STOP_BUDGET);
+    keep_earlier(&mut facts.stop_deadline, now + STOP_BUDGET);
+    keep_earlier(&mut facts.segment_deadline, now + STOP_BUDGET);
     facts.status.phase = SessionPhase::Stopping;
     if facts.status.clock.is_none() { clear_source_status(&mut facts); }
     facts.source_preparation = None;
@@ -2079,7 +2064,7 @@ fn stop(lifecycle: &Lifecycle) -> Result<(), CaptureError> {
     facts.status.countdown_seconds = None;
     let sampled = (|| {
         if let (Some(origin), Some(opened)) = (facts.status.clock, facts.status.opened) {
-            let stopped = boundary(origin, clock::qpc().map_err(controller_error)?, opened.epoch)?;
+            let stopped = boundary(origin, controller_qpc()?, opened.epoch)?;
             facts.status.stop = Some(stopped);
             if was_recording {
                 facts.status.closed = Some(stopped);
@@ -2092,7 +2077,7 @@ fn stop(lifecycle: &Lifecycle) -> Result<(), CaptureError> {
                     epoch: closed.epoch, start_t_us: closed.time, before_t_us: stopped.time, reason,
                 });
             }
-            facts.utc_anchors.push(ClockAnchor { admission_epoch: stopped.epoch, sample: clock::utc_anchor().map_err(controller_error)? });
+            facts.utc_anchors.push(ClockAnchor { admission_epoch: stopped.epoch, sample: controller_utc_anchor()? });
         }
         Ok::<(), CaptureError>(())
     })();
@@ -2131,8 +2116,8 @@ fn pause_command(
     } else if facts.status.phase == SessionPhase::Recording && !reasons.is_empty()
         && let (Some(origin), Some(opened)) = (facts.status.clock, facts.status.opened)
     {
-        let closed = boundary(origin, clock::qpc().map_err(controller_error)?, opened.epoch)?;
-        let anchor = clock::utc_anchor().map_err(controller_error)?;
+        let closed = boundary(origin, controller_qpc()?, opened.epoch)?;
+        let anchor = controller_utc_anchor()?;
         facts.status.closed = Some(closed);
         facts.utc_anchors.push(ClockAnchor { admission_epoch: closed.epoch, sample: anchor });
         facts.status.phase = SessionPhase::Paused;
@@ -2141,7 +2126,7 @@ fn pause_command(
         facts.paused_video.clear();
         facts.input_prefix = None;
         facts.pause_interval_reasons.clone_from(reasons);
-        let started = clock::qpc().map_err(controller_error)?;
+        let started = controller_qpc()?;
         facts.pause_started = Some((started, lifecycle.power.snapshot().sequence));
         devlog!("session", "phase Recording -> Paused closed={closed:?} reasons={reasons:?}");
         lifecycle.changed.notify_all();
@@ -2161,7 +2146,7 @@ fn resume(lifecycle: &Lifecycle, finished: AdmissionBoundary, selected: Option<S
         None => facts.source_epoch.checked_add(1).map(AdmissionEpoch)
             .ok_or_else(|| failure("Resume recording", "The admission epoch overflowed."))?,
     };
-    let resume_anchor = clock::utc_anchor().map_err(controller_error)?;
+    let resume_anchor = controller_utc_anchor()?;
     let tick_anchor = clock::message_tick_anchor().map_err(controller_error)?;
     let reopened = boundary(origin, resume_anchor.qpc, epoch)?;
     drop(facts);
@@ -2198,17 +2183,17 @@ fn sample_anchors(lifecycle: &Lifecycle) -> Result<(), CaptureError> {
     let (Some(origin), Some(opened)) = (facts.status.clock, facts.status.opened) else {
         return Ok(());
     };
-    let now = clock::qpc().map_err(controller_error)?;
+    let now = controller_qpc()?;
     let ticks_per_second = i128::from(origin.qpc_frequency.0.get());
     if facts.tick_anchor.is_none_or(|anchor| {
-        i128::from(now.0) - i128::from(anchor.qpc.0) >= ticks_per_second
+        now.ticks_since(anchor.qpc) >= ticks_per_second
     }) {
         facts.tick_anchor = Some(clock::message_tick_anchor().map_err(controller_error)?);
     }
     if facts.utc_anchors.last().is_none_or(|anchor| {
-        i128::from(now.0) - i128::from(anchor.sample.qpc.0) >= ticks_per_second * i128::from(UTC_INTERVAL_SECONDS)
+        now.ticks_since(anchor.sample.qpc) >= ticks_per_second * i128::from(UTC_INTERVAL_SECONDS)
     }) {
-        facts.utc_anchors.push(ClockAnchor { admission_epoch: opened.epoch, sample: clock::utc_anchor().map_err(controller_error)? });
+        facts.utc_anchors.push(ClockAnchor { admission_epoch: opened.epoch, sample: controller_utc_anchor()? });
     }
     Ok(())
 }
@@ -2223,7 +2208,15 @@ fn timing_error(error: crate::protocol::ClockRangeError) -> CaptureError {
 
 /// Clock and lifecycle errors on the controller path belong to the controller.
 fn controller_error(error: ProbeError) -> CaptureError {
-    error.into_error(FailureComponent::Controller)
+    error.to_error(FailureComponent::Controller)
+}
+
+fn controller_qpc() -> Result<QpcTick, CaptureError> {
+    clock::qpc().map_err(controller_error)
+}
+
+fn controller_utc_anchor() -> Result<UtcAnchor, CaptureError> {
+    clock::utc_anchor().map_err(controller_error)
 }
 
 fn failure(operation: &'static str, message: &'static str) -> CaptureError {

@@ -10,7 +10,6 @@ use crate::win::{Failure, Result};
 
 pub const HEARTBEAT: Duration = Duration::from_millis(250);
 pub(crate) const LEASE: Duration = Duration::from_secs(1);
-const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 pub(crate) fn qpc() -> Result<QpcTick> {
     let mut tick = 0;
@@ -24,7 +23,7 @@ pub(crate) fn qpc() -> Result<QpcTick> {
 /// deadline. Zero is a terminal latch, including on a clock fault.
 pub(crate) struct Lifetime {
     expiry: AtomicI64,
-    ticks_per_second: i64,
+    frequency: QpcFrequency,
     pub(super) witness: OnceLock<Arc<AtomicI64>>,
     cleanup: AtomicI64,
     owner: AtomicI64,
@@ -33,13 +32,10 @@ pub(crate) struct Lifetime {
 
 impl Lifetime {
     pub(crate) fn new(frequency: QpcFrequency, startup: Instant) -> Result<Self> {
-        let ticks_per_second = i64::try_from(frequency.0.get()).map_err(|_| Failure::Supervisor)?;
         let remaining = startup.saturating_duration_since(Instant::now());
-        let ticks = (remaining.as_nanos() * ticks_per_second as u128) / NANOS_PER_SECOND;
-        let ticks = i64::try_from(ticks).map_err(|_| Failure::Supervisor)?;
-        let expiry = qpc()?.0.checked_add(ticks).ok_or(Failure::Supervisor)?;
+        let expiry = qpc()?.checked_after(frequency, remaining).ok_or(Failure::Supervisor)?;
         Ok(Self {
-            expiry: AtomicI64::new(expiry), ticks_per_second, witness: OnceLock::new(), cleanup: AtomicI64::new(0), owner: AtomicI64::new(0),
+            expiry: AtomicI64::new(expiry.0), frequency, witness: OnceLock::new(), cleanup: AtomicI64::new(0), owner: AtomicI64::new(0),
             providers: [const { AtomicI64::new(0) }; ProviderKind::COUNT],
         })
     }
@@ -99,9 +95,24 @@ impl Lifetime {
     }
 
     pub(super) fn ticks(&self, duration: Duration) -> Result<i64> {
-        let ticks = duration.as_nanos().checked_mul(self.ticks_per_second as u128)
-            .ok_or(Failure::Supervisor)? / NANOS_PER_SECOND;
-        i64::try_from(ticks).map_err(|_| Failure::Supervisor)
+        self.frequency.ticks(duration).ok_or(Failure::Supervisor)
+    }
+
+    /// `at` plus the whole ticks in `duration`.
+    pub(super) fn after(&self, at: QpcTick, duration: Duration) -> Result<QpcTick> {
+        at.checked_after(self.frequency, duration).ok_or(Failure::Supervisor)
+    }
+
+    /// The instant `ticks` from now, rounded down to a nanosecond.
+    pub(super) fn instant_of(&self, ticks: i64) -> Result<Instant> {
+        let ticks = u64::try_from(ticks).map_err(|_| Failure::Supervisor)?;
+        Instant::now().checked_add(self.frequency.duration(ticks)).ok_or(Failure::Supervisor)
+    }
+
+    /// Registers a teardown call from `now` within the cleanup bound.
+    pub(super) fn teardown(&self, now: QpcTick) -> Result<Provider<'_>> {
+        let deadline = self.after(now, crate::deadline::CLEANUP)?;
+        self.provider(ProviderKind::Teardown, deadline).ok_or(Failure::Supervisor)
     }
 
     pub(super) fn enter_cleanup(&self, now: QpcTick) -> Result<()> {
@@ -109,8 +120,8 @@ impl Lifetime {
     }
 
     pub(super) fn begin_cleanup(&self, now: QpcTick, limit: Option<QpcTick>) -> Result<()> {
-        let deadline = now.0.checked_add(self.ticks(crate::deadline::CLEANUP)?).ok_or(Failure::Supervisor)?;
-        let deadline = limit.map_or(deadline, |limit| limit.0.min(deadline));
+        let deadline = self.after(now, crate::deadline::CLEANUP)?;
+        let deadline = limit.map_or(deadline, |limit| limit.min(deadline)).0;
         self.cleanup.fetch_update(AcqRel, Acquire, |active| Some(if active == 0 { deadline } else { active.min(deadline) }))
             .map_err(|_| Failure::Supervisor)?;
         Ok(())

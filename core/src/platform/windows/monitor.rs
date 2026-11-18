@@ -23,10 +23,12 @@ use crate::{
     package::{diagnostics::{Failure, FailureComponent}, metadata::{CaptureCounters, MonitorCapture}, outcome::HealthKind},
     protocol::{AdmissionEpoch, CaptureEpoch, FrameId, FrameSequence, GeometryEpoch, GeometryId, MonitorId, SessionTimeUs},
     config::SelectedMonitor,
-    session::{AdmissionBoundary, fault::FaultReport, windows::{Admission, PauseProducer, Receipt, WorkerSession}},
+    platform::windows::controller::{Admission, PauseProducer, Receipt, WorkerSession},
+    session::{AdmissionBoundary, fault::FaultReport},
+    util::widen,
 };
 
-use super::{context::{ELEVATED_FRAME_WAIT_US, FrameApproval, FramePolicy}, Apartment, ProbeError, capture_device, clock, clock_error, display, encoder, gpu, hdr, native, pixels, readback, slots, stage, still_png, still_rows, stills, unavailable, video, wgc};
+use super::{context::{ELEVATED_FRAME_WAIT_US, FrameApproval, FramePolicy}, ProbeError, capture_device, clock, com_apartment, display, encoder, gpu, hdr, native, pixels, readback, slots, stage, still_png, still_rows, stills, unavailable, video, wgc};
 
 /// The bound on one GPU video conversion.
 pub(super) const CONVERSION_DEADLINE: Duration = Duration::from_secs(3);
@@ -211,7 +213,7 @@ fn capture(
     frame_policy: &FramePolicy, topology: &display::topology::Topology, borderless: bool, ready: SyncSender<Ready>, video: VideoTarget,
     png: still_png::Inbox, rows: still_rows::Rows, counters: &mut CaptureCounters, epochs: &mut Vec<MonitorCapture>,
 ) -> Result<Exit, ProbeError> {
-    let _apartment = Apartment::initialize()?;
+    let _apartment = com_apartment()?;
     if !stage(GraphicsCaptureSession::IsSupported(), "Check screen capture support")? {
         return Err(unavailable("Windows screen capture is unavailable"));
     }
@@ -297,7 +299,7 @@ fn capture(
                 stage(unsafe { device.GetDeviceRemovedReason() }, "Check the monitor GPU device")?;
                 next_device_check = now + DEVICE_CHECK_INTERVAL;
             }
-            let now_session = open.clock.time(open.qpc).map_err(clock_error)?;
+            let now_session = open.clock.time(open.qpc)?;
             let snapshot = topology.snapshot();
             let latest = snapshot.as_ref().and_then(|snapshot| snapshot.output(&selected.key).map(|output| output.cloned()));
             let item_closed = native_capture.as_ref().is_some_and(wgc::Capture::item_closed);
@@ -550,8 +552,8 @@ fn capture(
             };
             let wgc_time_100ns = borrowed.source_100ns()?;
             let clock = receipt.clock;
-            let source_offset = clock.wgc_offset_100ns(wgc_time_100ns).map_err(clock_error)?;
-            let geometry_offset = geometry_after.map(|at| clock.offset_100ns(at)).transpose().map_err(clock_error)?;
+            let source_offset = clock.wgc_offset_100ns(wgc_time_100ns)?;
+            let geometry_offset = geometry_after.map(|at| clock.offset_100ns(at)).transpose()?;
             let before_boundary = received < receipt.boundary.qpc;
             let negative_source = source_offset < 0;
             let before_geometry = geometry_offset.is_some_and(|offset| source_offset < offset);
@@ -577,8 +579,8 @@ fn capture(
                 borrowed.close()?;
                 continue;
             }
-            let source_time = clock.wgc_time(wgc_time_100ns).map_err(clock_error)?;
-            let dequeued_time = clock.time(received).map_err(clock_error)?;
+            let source_time = clock.wgc_time(wgc_time_100ns)?;
+            let dequeued_time = clock.time(received)?;
             // WGC stamps a frame with its DWM present (vblank) time, which can
             // lead the dequeue by up to a refresh interval. The frame's receipt is
             // therefore max(dequeue, source), so source <= receipt holds (§6.5).
@@ -596,7 +598,7 @@ fn capture(
             // latest foreground observation by less than one context poll; an
             // ordinary approval not yet observed through it is awaited briefly.
             let content_time = source_time.min(dequeued_time);
-            let mut approval_at = clock.time(receipt.qpc).map_err(clock_error)?;
+            let mut approval_at = clock.time(receipt.qpc)?;
             let approval = loop {
                 let waiting = approval_at.0 - content_time.0 < MAX_APPROVAL_CATCH_UP_US;
                 match frame_policy.try_current(receipt.boundary.epoch, approval_at) {
@@ -608,7 +610,7 @@ fn capture(
                     _ => break None,
                 }
                 thread::park_timeout(APPROVAL_POLL);
-                approval_at = clock.time(super::clock::qpc()?).map_err(clock_error)?;
+                approval_at = clock.time(super::clock::qpc()?)?;
             };
             let Some(approval) = approval else {
                 devlog!("monitor", "frame rejected by approval: content_time_us={} approval_at_us={}",
@@ -653,7 +655,7 @@ fn capture(
                 recv_t_us: recv_time,
                 source_uncertainty_us: None, color: mode.conversion, extent: images.extent,
             };
-            let publish_at = clock.time(super::clock::qpc()?).map_err(clock_error)?;
+            let publish_at = clock.time(super::clock::qpc()?)?;
             let current = frame_policy.current(receipt.boundary.epoch, publish_at);
             if !permit_m1_publication(&metadata, selected, receipt.boundary)
                 || current.is_none_or(|approval| !approval.owns(&metadata)) || !metadata.covered()
@@ -669,7 +671,7 @@ fn capture(
             }
             images.publish(owned, metadata, &painter, &video, timeline, &mut converter, &mut pending_video,
                 &mut waiting, capture.size, now, counters)?;
-            let now_session = receipt.clock.time(receipt.qpc).map_err(clock_error)?;
+            let now_session = receipt.clock.time(receipt.qpc)?;
             observations.step(&images.native, &mode, frame_policy, worker.config(), open.boundary.epoch, now_session);
         }
     })();
@@ -705,7 +707,7 @@ fn finish_stills(
         observations.finish_private_prefix(prefix, images, worker.config(), certified || expired);
         if certified && observations.drained() { break; }
         if expired {
-            observations.expire_drain(if stopping { "stop_drain_deadline" } else { "pause_drain_deadline" });
+            observations.expire_drain(stopping);
             observations.work(device, images, readbacks, png, cutoff.time, now)?;
             break;
         }
@@ -825,7 +827,7 @@ fn deliver_converted(
         }
         return Ok(false);
     }
-    let available = open.clock.time(clock::qpc()?).map_err(clock_error)?;
+    let available = open.clock.time(clock::qpc()?)?;
     let approval = frame_policy.try_current(open.boundary.epoch, available);
     if metadata.elevated_visit().is_some() && approval.is_err() && now < *deadline {
         return Ok(true);
@@ -923,7 +925,7 @@ impl TimelineWait {
         if let Some((_, old)) = self.frame.replace((owned, metadata)) {
             counters.timeline_pending = counters.timeline_pending.saturating_add(1);
             let at = old.source_t_us;
-            self.replaced = Some(self.replaced.map_or((at, at), |(first, last)| (first.min(at), last.max(at))));
+            widen(&mut self.replaced, at);
         }
     }
 

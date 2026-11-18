@@ -9,7 +9,7 @@ use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::{QpcTick, SessionTimeUs};
+use crate::protocol::{QpcTick, SessionTimeUs, ipc::GapCause};
 
 /// Closed vocabulary of reasons why items never reached a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -58,6 +58,15 @@ pub enum LossReason {
     NotificationOverflow,
     /// Elevated records past the certified prefix of an interrupted visit (E1).
     UncertifiedSource,
+}
+
+impl From<GapCause> for LossReason {
+    fn from(cause: GapCause) -> Self {
+        match cause {
+            GapCause::Overflow => Self::NativeQueueOverflow,
+            GapCause::Malformed => Self::MalformedPacket,
+        }
+    }
 }
 
 /// Typed identity of the producer whose items were lost, when it is known.

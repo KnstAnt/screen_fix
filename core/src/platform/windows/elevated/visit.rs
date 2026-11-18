@@ -10,7 +10,7 @@ use screen_fix_protocol::{AdmissionEpoch, FocusGeneration, GeometryId, QpcFreque
 
 use super::{CLEANUP, peer::{LeaseState, Peer, Progress}};
 use super::super::context::{elevated_focus_matches, identity::WindowProcess};
-use crate::session::windows::SourceDispatch;
+use crate::{platform::windows::controller::SourceDispatch, util::keep_earlier};
 
 const HELD_BUDGET: Duration = Duration::from_millis(250);
 const HELD_RETRY: Duration = Duration::from_millis(100);
@@ -27,7 +27,7 @@ pub(super) struct Host {
     witness: Option<Witness>,
     sequence: u64,
     request: u64,
-    focus_generation: u64,
+    focus_generation: FocusGeneration,
     grant: Option<Grant>,
     last_closed: Option<VisitBinding>,
     retry: Option<ReadBinding>,
@@ -87,7 +87,7 @@ impl Host {
     pub(super) fn new(peer: Peer, frequency: QpcFrequency) -> Result<Self> {
         Ok(Self {
             peer, lease: LeaseState::new(frequency)?, frequency, configured: false, witness: None,
-            sequence: 0, request: 0, focus_generation: 0, grant: None, last_closed: None, retry: None, retry_after: None, optional_reads: VecDeque::new(),
+            sequence: 0, request: 0, focus_generation: FocusGeneration(0), grant: None, last_closed: None, retry: None, retry_after: None, optional_reads: VecDeque::new(),
         })
     }
 
@@ -134,7 +134,7 @@ impl Host {
         self.retry = None;
         self.retry_after = None;
         if let Some(grant) = self.grant.as_mut() {
-            grant.closing_before = Some(grant.closing_before.map_or(before, |previous| previous.min(before)));
+            keep_earlier(&mut grant.closing_before, before);
             if matches!(grant.phase, Phase::Closing) { return; }
             grant.phase = Phase::Closing;
             grant.deadline = Instant::now() + CLEANUP;
@@ -178,10 +178,10 @@ impl Host {
         }
         if !matches_target(claim)? { return Ok(false); }
         let sequence = next(self.sequence)?;
-        let focus_generation = next(self.focus_generation)?;
+        let focus_generation = FocusGeneration(next(self.focus_generation.0)?.get());
         let binding = VisitBinding {
             epoch, source_generation: sequence, grant: sequence, witness_revision: witness.revision,
-            foreground: claim.target, focus_generation: FocusGeneration(focus_generation.get()),
+            foreground: claim.target, focus_generation,
             focus_revision: witness.focus_revision, resync_revision: NonZeroU64::MIN,
         };
         let expires_qpc = add_time(progress.now, self.frequency, PREPARE_EXPIRY)?;
@@ -191,7 +191,7 @@ impl Host {
             })))?;
         if sent {
             self.sequence = sequence.get();
-            self.focus_generation = focus_generation.get();
+            self.focus_generation = focus_generation;
             self.grant = Some(Grant { claim: claim.clone(), binding, requested: progress.now,
                 deadline, phase: Phase::Preparing, lower: progress.now, focus: None, registration: None, closing_before: None });
         }
@@ -260,15 +260,15 @@ impl Host {
             return Ok(false);
         }
         let previous = grant.binding;
-        let generation = next(self.focus_generation)?;
+        let generation = FocusGeneration(next(self.focus_generation.0)?.get());
         let next = VisitBinding {
-            focus_generation: FocusGeneration(generation.get()), focus_revision: witness.focus_revision, ..previous
+            focus_generation: generation, focus_revision: witness.focus_revision, ..previous
         };
         let sent = self.lease.renew(&self.peer, progress, Some(previous.epoch), Some(|lease: screen_fix_protocol::ipc::elevated::runtime::Lease| {
             Control::RefreshFocus { previous, next, lease: lease.sequence }
         }))?;
         if sent {
-            self.focus_generation = generation.get();
+            self.focus_generation = generation;
             grant.phase = Phase::Refreshing { next };
             grant.deadline = Instant::now() + READINESS;
         }
@@ -319,7 +319,7 @@ impl Host {
                 Status::FocusRefreshed { visit, .. } if (VisitBinding {
                     focus_generation: visit.focus_generation, focus_revision: visit.focus_revision, ..binding
                 }) == *visit && visit.focus_revision > binding.focus_revision
-                    && visit.focus_generation.0 == self.focus_generation => Some(*visit),
+                    && visit.focus_generation == self.focus_generation => Some(*visit),
                 _ => None,
             };
             if let Some(visit) = replacement {
@@ -410,7 +410,7 @@ impl Host {
                 return Ok(Change::InputClosed { binding, before: first_uncovered, loss: Some((cause, native_gap)) });
             }
             Status::Invalidated { visit, before_qpc, reason } if visit == binding && before_qpc <= now => {
-                grant.closing_before = Some(grant.closing_before.map_or(before_qpc, |previous| previous.min(before_qpc)));
+                keep_earlier(&mut grant.closing_before, before_qpc);
                 if !matches!(grant.phase, Phase::Closing) {
                     grant.deadline = Instant::now() + CLEANUP;
                 }
@@ -522,10 +522,10 @@ impl Host {
         &mut self, mut binding: ReadBinding, build: impl FnOnce(ReadBinding) -> Query,
         secondary: Option<screen_fix_protocol::ipc::elevated::runtime::IdentityClaim>,
     ) -> Result<Option<ReadBinding>> {
-        let recent = self.frequency.0.get();
+        let recent = self.frequency.ticks(REJECT_RETENTION);
         self.optional_reads.retain(|read| {
             let age = binding.requested_qpc.0.saturating_sub(read.deadline_qpc.0);
-            age <= 0 || u64::try_from(age).is_ok_and(|age| age <= recent * REJECT_RETENTION.as_secs())
+            age <= 0 || recent.is_none_or(|recent| age <= recent)
         });
         if self.optional_reads.len() == OPTIONAL_READ_CAPACITY { return Ok(None); }
         let request = next(self.request)?;
@@ -591,7 +591,6 @@ fn next(previous: u64) -> Result<NonZeroU64> {
 
 /// `at` plus `duration`, at least one tick later.
 pub(in crate::platform::windows) fn add_time(at: QpcTick, frequency: QpcFrequency, duration: Duration) -> Result<QpcTick> {
-    let delta = duration.as_nanos().checked_mul(u128::from(frequency.0.get())).ok_or(Failure::Protocol)? / 1_000_000_000;
-    let delta = i64::try_from(delta).map_err(|_| Failure::Protocol)?;
+    let delta = frequency.ticks(duration).ok_or(Failure::Protocol)?;
     at.0.checked_add(delta.max(1)).map(QpcTick).ok_or(Failure::Protocol)
 }

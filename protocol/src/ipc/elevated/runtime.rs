@@ -12,7 +12,7 @@ use crate::ipc::{
 use super::{
     ContextEvidence, GrantedInput, ImagePath, InputEvidence, Query, ReadBinding, ReadEvidence, ReadOutcome,
     ReadUnavailable, VisitBinding, WindowInstance,
-    attachment::{ConnectionId, HEADER_BYTES, MAX_FRAME_BYTES, Role, Scope},
+    attachment::{ConnectionId, FrameHeader, HEADER_BYTES, MAX_FRAME_BYTES, Role, Scope},
 };
 
 pub const MAX_APPROVED_EXECUTABLES: usize = 64;
@@ -202,6 +202,13 @@ pub struct ContextGap {
     pub last_position: NonZeroU64,
     pub first_qpc: QpcTick,
     pub last_qpc: QpcTick,
+}
+
+impl ContextGap {
+    /// The number of undelivered positions, at least one.
+    pub fn count(&self) -> u64 {
+        self.last_position.get().saturating_sub(self.first_position.get()).saturating_add(1)
+    }
 }
 
 /// Why context positions were not delivered (E3). TextEdit commits are
@@ -455,27 +462,27 @@ pub const fn capacity<T: Record>() -> usize {
 pub fn payload_len<T: Record>(
     header: &[u8], connection: ConnectionId, sequence: u64,
 ) -> Result<usize, PacketError> {
-    let header: &[u8; HEADER_BYTES] = header.try_into().map_err(|_| PacketError::HeaderTooShort)?;
-    if header[..4] != MAGIC {
+    let bytes: &[u8; HEADER_BYTES] = header.try_into().map_err(|_| PacketError::HeaderTooShort)?;
+    let header = FrameHeader::parse(bytes);
+    if header.magic != MAGIC {
         return Err(PacketError::InvalidMagic);
     }
-    let version = u16::from_le_bytes([header[4], header[5]]);
-    if version != VERSION {
-        return Err(PacketError::UnsupportedVersion(version));
+    if header.version != VERSION {
+        return Err(PacketError::UnsupportedVersion(header.version));
     }
-    if header[6] != T::ROLE as u8 || header[8] != T::DIRECTION {
+    if header.role != T::ROLE as u8 || header.direction != T::DIRECTION {
         return Err(PacketError::WrongDirection);
     }
-    if header[9..12] != [0; 3] {
+    if !FrameHeader::reserved_clear(bytes) {
         return Err(PacketError::ReservedHeaderByte);
     }
-    if !T::valid_kind(header[7]) || !header[16..24].eq(&sequence.to_le_bytes())
+    if !T::valid_kind(header.kind) || header.sequence != sequence
         || sequence < T::FIRST_SEQUENCE || sequence == u64::MAX
-        || header[24..] != connection.as_bytes()
+        || header.connection != connection.as_bytes()
     {
         return Err(PacketError::InvalidPayload);
     }
-    let length = u32::from_le_bytes(header[12..16].try_into().expect("fixed length field")) as usize;
+    let length = header.length as usize;
     if !(1..=capacity::<T>() - HEADER_BYTES).contains(&length) {
         return Err(PacketError::InvalidLength);
     }
@@ -498,25 +505,22 @@ pub fn encode<T: Record>(
         }
     })?;
     let length = end - HEADER_BYTES - payload.len();
-    let header = &mut output[..HEADER_BYTES];
-    header.fill(0);
-    header[..4].copy_from_slice(&MAGIC);
-    header[4..6].copy_from_slice(&VERSION.to_le_bytes());
-    header[6] = T::ROLE as u8;
-    header[7] = record.kind();
-    header[8] = T::DIRECTION;
-    header[12..16].copy_from_slice(&(length as u32).to_le_bytes());
-    header[16..24].copy_from_slice(&sequence.to_le_bytes());
-    header[24..].copy_from_slice(&connection.as_bytes());
-    payload_len::<T>(header, connection, sequence)?;
+    let header = FrameHeader {
+        magic: MAGIC, version: VERSION, role: T::ROLE as u8, kind: record.kind(), direction: T::DIRECTION,
+        length: length as u32, sequence, connection: connection.as_bytes(),
+    }.write();
+    output[..HEADER_BYTES].copy_from_slice(&header);
+    payload_len::<T>(&header, connection, sequence)?;
     Ok(HEADER_BYTES + length)
 }
 
 pub fn decode<T: Record>(
     frame: &[u8], scope: &Scope, connection: ConnectionId, sequence: u64,
 ) -> Result<T, PacketError> {
-    let header = frame.get(..HEADER_BYTES).ok_or(PacketError::HeaderTooShort)?;
+    let header: &[u8; HEADER_BYTES] = frame.get(..HEADER_BYTES).and_then(|header| header.try_into().ok())
+        .ok_or(PacketError::HeaderTooShort)?;
     let length = payload_len::<T>(header, connection, sequence)?;
+    let kind = FrameHeader::parse(header).kind;
     if frame.len() != HEADER_BYTES + length {
         return Err(PacketError::InvalidLength);
     }
@@ -525,7 +529,7 @@ pub fn decode<T: Record>(
     let scoped = records.next().ok_or(PacketError::InvalidPayload)?.map_err(|_| PacketError::InvalidPayload)?;
     // A foreign scope or a kind that contradicts the header is a protocol
     // violation, never a skippable record.
-    if scoped.attempt != scope.attempt || scoped.session != scope.session || scoped.record.kind() != header[7] {
+    if scoped.attempt != scope.attempt || scoped.session != scope.session || scoped.record.kind() != kind {
         return Err(PacketError::InvalidRecord("The record scope or kind contradicts its frame"));
     }
     if records.byte_offset() != payload.len() || !scoped.record.valid() {

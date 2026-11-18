@@ -26,12 +26,12 @@
   - Unavailable classification uses string keys `"focus:<status>"` for now; replace them with a typed enum in R1.
 - **A2.** `core/src/session/fault.rs`.
   - `FaultReport` with class `Attempt` (F) or `Activity(Required|Auxiliary)` (L). `FaultLog` lives in the controller `Facts`. The first report is primary; F reports are capped at 32 and deduplicated.
-  - `CaptureError::owned(component, …)`; `ProbeError::owned_by` / `into_error(owner)`.
+  - `CaptureError::owned(component, …)`; `ProbeError::owned_by` / `to_error(owner)`.
   - `FailureComponent`: `Capture`, `Receiver`, `Context`, `Stills`, …
   - `MetadataOwner::finish_recording(AttemptFaults)` applies the rule-4 order. Manifest `health.activity_losses`. The UI shows "Recording degraded".
   - G-class losses never go to `FaultReport`; they belong in the ingress ledger.
   - PNG worker exit is still F. Stage P1 converts it to L-auxiliary per §6.2 row 16 (journal failure stays F, no double report; the UI shows degraded and the disposition stays recorded).
-- **S0.** `PowerMarks` seqlock in `session/windows/environment.rs`; the only suspend store.
+- **S0.** `PowerMarks` seqlock in `platform/windows/controller/environment.rs`; the only suspend store.
   - Accessor `WorkerSession::suspend_marks() -> SuspendMarks { sequence, suspend, resume }` and `suspended_for`.
   - Power and desktop callbacks use `catch_unwind` and no Mutex.
   - **Follow-up (critic).** I5, S1 and V5 must use one S0-side query, "suspend-excluded elapsed time over [a, b]", that returns an explicit unknown (not zero) when a mark lacks a QPC. Unknown never produces a fault. Do not subtract directly from the latest suspend mark.
@@ -72,7 +72,7 @@ Follow the plan's §7 order: I1, I5, V2a, V3, V4, P1, C3, S1, S2, E2, E3, E4, X1
   - Protocol `SCHEMA_VERSION` 8: `Producer::OptionalHid`, `OptionalCollection`, `HelperToCore::OptionalUnavailable`, `ProducerGap.cause`, `PacketError::InvalidCursor`.
   - The helper skips malformed packets and counts them.
   - `SuspendMarks::awake_elapsed(...)` → `AwakeElapsed::{Known, Unknown}`.
-  - `input/blind.rs`: typed blind intervals with a `producers` field (`registration_lost`, `hook_lost`, `producer_stall`, `resync_unavailable`, `elevated_window`, `foreground_inaccessible`, `device_removed`).
+  - `capture/input/blind.rs`: typed blind intervals with a `producers` field (`registration_lost`, `hook_lost`, `producer_stall`, `resync_unavailable`, `elevated_window`, `foreground_inaccessible`, `device_removed`).
   - Stall: blind at 250 ms awake, L at 5 s. Only packets of the stalled producers are dropped (I5 fix).
   - `input_health` per second (`raw_packets_coalesced`, `motion_rows_thinned`, `suppressed`).
   - The manifest has `optional_unavailable`.

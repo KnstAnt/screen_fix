@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use screen_fix_protocol::ipc::{EnvironmentState, GapCause, HelperToCore, Producer, ProducerGap, Receipt};
 
 /// Pending gaps of one producer kept apart by cause before they merge.
@@ -8,20 +10,17 @@ const MAX_PENDING: usize = 8;
 /// ranges stay contiguous. Adjacent ranges of the same cause merge; at the
 /// bound, a different cause extends the last range instead.
 #[derive(Default)]
-pub struct Losses([Vec<ProducerGap>; Producer::ALL.len()]);
+pub struct Losses([VecDeque<ProducerGap>; Producer::ALL.len()]);
 
 impl Losses {
     /// The earliest pending gap of the producer, which is delivered first.
     fn front(&self, producer: Producer) -> Option<ProducerGap> {
-        self.0[producer.index()].first().copied()
+        self.0[producer.index()].front().copied()
     }
 
     /// Remove the front gap after it was delivered.
     fn delivered(&mut self, producer: Producer) {
-        let pending = &mut self.0[producer.index()];
-        if !pending.is_empty() {
-            pending.remove(0);
-        }
+        self.0[producer.index()].pop_front();
     }
 
     /// Deliver the producer's pending gaps in order through `send`, which
@@ -53,17 +52,11 @@ impl Losses {
     }
 
     fn lose(&mut self, record: &HelperToCore, cause: GapCause) {
-        let (producer, receipt) = match record {
-            HelperToCore::Input(input) => (input.sample.producer(), input.receipt),
-            HelperToCore::DeviceArrived { receipt, .. } | HelperToCore::DeviceRemoved { receipt, .. } =>
-                (Producer::DeviceNotifications, *receipt),
-            HelperToCore::Gap(gap) => {
-                self.absorb(*gap);
-                return;
-            }
-            _ => return,
-        };
-        self.absorb(gap(producer, cause, receipt));
+        if let HelperToCore::Gap(gap) = record {
+            self.absorb(*gap);
+        } else if let Some((producer, receipt)) = receipt(record) {
+            self.absorb(gap(producer, cause, receipt));
+        }
     }
 
     pub fn finish(self) -> impl Iterator<Item = ProducerGap> {
@@ -73,13 +66,23 @@ impl Losses {
     fn absorb(&mut self, next: ProducerGap) {
         let pending = &mut self.0[next.producer.index()];
         let full = pending.len() == MAX_PENDING;
-        match pending.last_mut() {
+        match pending.back_mut() {
             Some(previous) if previous.cause == next.cause || full => {
                 previous.last_sequence = next.last_sequence;
                 previous.last_qpc = next.last_qpc;
             }
-            _ => pending.push(next),
+            _ => pending.push_back(next),
         }
+    }
+}
+
+/// The producer and receipt of a record that consumed one producer sequence number.
+fn receipt(record: &HelperToCore) -> Option<(Producer, Receipt)> {
+    match record {
+        HelperToCore::Input(input) => Some((input.sample.producer(), input.receipt)),
+        HelperToCore::DeviceArrived { receipt, .. } | HelperToCore::DeviceRemoved { receipt, .. } =>
+            Some((Producer::DeviceNotifications, *receipt)),
+        _ => None,
     }
 }
 
@@ -98,7 +101,7 @@ fn gap(producer: Producer, cause: GapCause, receipt: Receipt) -> ProducerGap {
 #[derive(Default)]
 pub struct PendingStatus {
     environment: Option<EnvironmentState>,
-    notices: Vec<HelperToCore>,
+    notices: VecDeque<HelperToCore>,
 }
 
 impl PendingStatus {
@@ -112,7 +115,7 @@ impl PendingStatus {
                 }
                 self.environment = Some(state);
             }
-            HelperToCore::OptionalUnavailable { .. } => self.notices.push(record),
+            HelperToCore::OptionalUnavailable { .. } => self.notices.push_back(record),
             record => return Err(record),
         }
         Ok(())
@@ -133,9 +136,9 @@ impl PendingStatus {
             if !send(HelperToCore::Environment(state))? { return Ok(false); }
             self.environment = None;
         }
-        while let Some(notice) = self.notices.first() {
+        while let Some(notice) = self.notices.front() {
             if !send(notice.clone())? { return Ok(false); }
-            self.notices.remove(0);
+            self.notices.pop_front();
         }
         Ok(true)
     }
@@ -148,11 +151,8 @@ impl PendingStatus {
 
 pub fn producer(record: &HelperToCore) -> Option<Producer> {
     match record {
-        HelperToCore::Input(input) => Some(input.sample.producer()),
-        HelperToCore::DeviceArrived { .. } | HelperToCore::DeviceRemoved { .. } =>
-            Some(Producer::DeviceNotifications),
         HelperToCore::Gap(gap) => Some(gap.producer),
         HelperToCore::Progress(progress) => Some(progress.producer),
-        _ => None,
+        _ => receipt(record).map(|(producer, _)| producer),
     }
 }

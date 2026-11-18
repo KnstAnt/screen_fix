@@ -1,8 +1,13 @@
-use std::{mem::size_of, ptr::null_mut};
+use std::{
+    mem::size_of,
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    ptr::null_mut,
+};
 
 use windows_sys::Win32::{
-    Foundation::{ERROR_SUCCESS, SYSTEMTIME},
+    Foundation::{ERROR_NO_MORE_FILES, ERROR_SUCCESS, GetLastError, INVALID_HANDLE_VALUE, SYSTEMTIME},
     System::{
+        Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS},
         Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY, RegGetValueW},
         SystemInformation::GetSystemTime,
         Threading::{GetCurrentProcess, IsWow64Process2},
@@ -16,6 +21,43 @@ use super::wide;
 const VERSION_KEY: &str = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
 const PRODUCT_KEY: &str = "SYSTEM\\CurrentControlSet\\Control\\ProductOptions";
 const AMD64: u16 = 0x8664;
+
+/// The step at which a process inventory could not start.
+pub(super) enum InventoryFailure {
+    Snapshot,
+    FirstProcess,
+}
+
+/// The processes of one Toolhelp snapshot, in snapshot order.
+pub(super) struct ProcessImages {
+    /// Each process's PID and image file name, decoded lossily.
+    pub images: Vec<(u32, String)>,
+    /// The walk reached the end of the snapshot rather than another failure.
+    pub complete: bool,
+}
+
+/// The PID and image file name of each process in a new Toolhelp snapshot.
+pub(super) fn process_image_names() -> Result<ProcessImages, InventoryFailure> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(InventoryFailure::Snapshot);
+    }
+    // SAFETY: CreateToolhelp32Snapshot returned a new handle that this value alone closes.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+    let mut entry = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+    if unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) } == 0 {
+        return Err(InventoryFailure::FirstProcess);
+    }
+    let mut images = Vec::new();
+    loop {
+        let end = entry.szExeFile.iter().position(|unit| *unit == 0).unwrap_or(entry.szExeFile.len());
+        images.push((entry.th32ProcessID, String::from_utf16_lossy(&entry.szExeFile[..end])));
+        if unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) } == 0 {
+            let complete = unsafe { GetLastError() } == ERROR_NO_MORE_FILES;
+            return Ok(ProcessImages { images, complete });
+        }
+    }
+}
 
 pub(super) fn check() -> Result<WindowsEvidence, CaptureError> {
     if !cfg!(target_arch = "x86_64") {

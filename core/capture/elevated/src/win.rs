@@ -1,6 +1,8 @@
 pub(crate) mod acl;
 
-use std::{fmt, io, os::windows::ffi::OsStrExt, ffi::OsStr};
+use std::{io, os::windows::ffi::OsStrExt, ffi::OsStr};
+
+use screen_fix_protocol::SourceFailureReason;
 
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
@@ -47,46 +49,47 @@ pub enum Failure {
     NativeProducer(screen_fix_protocol::ipc::HelperFailure),
 }
 
-impl fmt::Display for Failure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::DeploymentRequired => "Install the protected Windows release to use elevated capture",
-            Self::InstalledPath => "Could not verify the protected installation paths",
-            Self::InstalledPermissions => "The installed paths have unexpected permissions",
-            Self::InstalledSignature => "Could not verify the installed publisher signature",
-            Self::RevocationUnknown => "Could not confirm that the installed publisher certificate is not revoked",
-            Self::ReleaseMismatch => "The installed Recorder and collector releases do not match",
-            Self::ProcessIdentity => "Could not verify the original process image and instance",
-            Self::TokenIdentity(_) => "Could not verify the process token or interactive access",
-            Self::Arguments => "The protected startup arguments are invalid",
-            Self::Busy => "An elevation request is already in flight",
-            Self::ConsentDenied => "Windows elevation consent was declined",
-            Self::ConsentLaunch => "Windows could not launch the protected collector",
-            Self::ConsentDeadline => "Windows elevation consent did not complete before the deadline",
-            Self::ReadinessDeadline => "Protected attachment did not complete before the deadline",
-            Self::CleanupDeadline => "The elevated capture source did not finish cleanup before the deadline",
-            Self::Cancelled => "Protected attachment was cancelled",
-            Self::PeerExited => "The original peer process exited",
-            Self::PipeSecurity => "Could not verify the local pipe permissions",
-            Self::PipeConnection => "Could not connect the protected local pipes",
-            Self::PipePeer => "A local pipe client does not match the original process",
-            Self::Transport => "Protected local pipe I/O failed",
-            Self::Protocol => "Protected attachment framing or binding failed",
-            Self::Cryptography => "Windows cryptography failed during protected attachment",
-            Self::LeaseExpired => "The elevated capture controller lease expired",
-            Self::Witness => "The elevated capture desktop witness became unavailable",
-            Self::ScopeClosed => "The elevated capture scope was revoked",
-            Self::TargetAccess => "The elevated collector could not verify access to the active desktop",
-            Self::TargetChanged => "The approved elevated target could not be verified",
-            Self::Supervisor => "Could not start the protected lifetime supervisor",
-            Self::RequiredRegistration => "The collector did not confirm the required input registrations",
-            Self::StandardHelperUnavailable => "The Recorder input helper could not resume capture",
-            Self::NativeOwnerLost | Self::NativeProducer(_) => "An elevated input producer failed",
-        })
+impl Failure {
+    /// The reported reason; it drops the detail that `SourceFailure` keeps
+    /// in its own fields.
+    pub fn reason(self) -> SourceFailureReason {
+        use SourceFailureReason as Reason;
+        match self {
+            Self::DeploymentRequired => Reason::DeploymentRequired,
+            Self::InstalledPath => Reason::InstalledPath,
+            Self::InstalledPermissions => Reason::InstalledPermissions,
+            Self::InstalledSignature => Reason::InstalledSignature,
+            Self::RevocationUnknown => Reason::RevocationUnknown,
+            Self::ReleaseMismatch => Reason::ReleaseMismatch,
+            Self::ProcessIdentity => Reason::ProcessIdentity,
+            Self::TokenIdentity(_) => Reason::TokenIdentity,
+            Self::Arguments => Reason::Arguments,
+            Self::Busy => Reason::Busy,
+            Self::ConsentDenied => Reason::ConsentDenied,
+            Self::ConsentLaunch => Reason::ConsentLaunch,
+            Self::ConsentDeadline => Reason::ConsentDeadline,
+            Self::ReadinessDeadline => Reason::ReadinessDeadline,
+            Self::CleanupDeadline => Reason::CleanupDeadline,
+            Self::Cancelled => Reason::Cancelled,
+            Self::PeerExited => Reason::PeerExited,
+            Self::PipeSecurity => Reason::PipeSecurity,
+            Self::PipeConnection => Reason::PipeConnection,
+            Self::PipePeer => Reason::PipePeer,
+            Self::Transport => Reason::Transport,
+            Self::Protocol => Reason::Protocol,
+            Self::Cryptography => Reason::Cryptography,
+            Self::Supervisor => Reason::Supervisor,
+            Self::LeaseExpired => Reason::LeaseExpired,
+            Self::Witness => Reason::Witness,
+            Self::TargetChanged => Reason::TargetChanged,
+            Self::TargetAccess => Reason::TargetAccess,
+            Self::ScopeClosed => Reason::ScopeClosed,
+            Self::RequiredRegistration => Reason::RequiredRegistration,
+            Self::StandardHelperUnavailable => Reason::StandardHelperUnavailable,
+            Self::NativeOwnerLost | Self::NativeProducer(_) => Reason::NativeProducer,
+        }
     }
 }
-
-impl std::error::Error for Failure {}
 
 pub type Result<T> = std::result::Result<T, Failure>;
 
@@ -115,6 +118,28 @@ impl Drop for Handle {
 
 pub(crate) fn wide(text: impl AsRef<OsStr>) -> Vec<u16> {
     text.as_ref().encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// The UTF-16 units of `text`, without a terminating NUL, for comparisons.
+pub(crate) fn wide_no_nul(text: impl AsRef<OsStr>) -> Vec<u16> {
+    text.as_ref().encode_wide().collect()
+}
+
+/// The longest path Windows reports, in UTF-16 units.
+const MAX_WIDE_PATH: usize = 32768;
+
+/// The UTF-16 string that `fill` writes into a buffer of `MAX_WIDE_PATH`
+/// units, given the buffer and its capacity. `fill` returns the length
+/// written, without the NUL; zero, or a length that leaves no room for the
+/// NUL, reports a failure or a truncated string.
+pub(crate) fn read_wide(fill: impl FnOnce(*mut u16, u32) -> u32) -> Option<Vec<u16>> {
+    let mut units = vec![0_u16; MAX_WIDE_PATH];
+    let length = fill(units.as_mut_ptr(), units.len() as u32) as usize;
+    if length == 0 || length >= units.len() {
+        return None;
+    }
+    units.truncate(length);
+    Some(units)
 }
 
 pub(crate) fn last_error() -> u32 {

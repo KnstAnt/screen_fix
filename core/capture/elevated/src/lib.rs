@@ -1,4 +1,5 @@
-#![cfg(target_os = "windows")]
+#[cfg(not(target_os = "windows"))]
+compile_error!("Screen Fix supports only Windows.");
 
 mod collector;
 mod deadline;

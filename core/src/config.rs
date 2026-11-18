@@ -1,8 +1,11 @@
 use std::{fmt, num::NonZeroU16, path::{Path, PathBuf}};
 
-use crate::protocol::{
-    BoundedList, BoundedText, DeviceId, Evidence, MonitorId, UnavailableReason, UncertaintyUs,
-    ipc::elevated::runtime::{MAX_APPROVAL_KEY_BYTES, MAX_APPROVED_EXECUTABLES},
+use crate::{
+    protocol::{
+        BoundedList, BoundedText, DeviceId, Evidence, MonitorId, UnavailableReason, UncertaintyUs,
+        ipc::elevated::runtime::{MAX_APPROVAL_KEY_BYTES, MAX_APPROVED_EXECUTABLES},
+    },
+    util::has_duplicate,
 };
 
 pub const MAX_SELECTED_MONITORS: usize = 32;
@@ -84,9 +87,7 @@ impl ResolvedProfile {
         capture_pace: CapturePace,
     ) -> Result<Self, ConfigError> {
         let approved = BoundedList::new(approved).map_err(|_| ConfigError::TooManyApprovedIdentities)?;
-        if approved.as_slice().iter().enumerate().any(|(index, identity)| {
-            approved.as_slice()[..index].contains(identity)
-        }) {
+        if has_duplicate(approved.as_slice(), |previous, identity| previous == identity) {
             return Err(ConfigError::DuplicateApprovedIdentity);
         }
         Ok(Self { revision, approved, clipboard, capture_pace, pen_hid: false })
@@ -182,17 +183,11 @@ impl ResolvedCaptureConfig {
             return Err(ConfigError::NoSelectedMonitors);
         }
         let monitors = BoundedList::new(monitors).map_err(|_| ConfigError::TooManySelectedMonitors)?;
-        if monitors.as_slice().iter().enumerate().any(|(index, monitor)| {
-            monitors.as_slice()[..index].iter().any(|previous| {
-                previous.id == monitor.id || previous.key == monitor.key
-            })
-        }) {
+        if has_duplicate(monitors.as_slice(), |previous, monitor| previous.id == monitor.id || previous.key == monitor.key) {
             return Err(ConfigError::DuplicateSelectedMonitor);
         }
         let calibrations = BoundedList::new(calibrations).map_err(|_| ConfigError::TooManyCalibrations)?;
-        if calibrations.as_slice().iter().enumerate().any(|(index, calibration)| {
-            calibrations.as_slice()[..index].iter().any(|previous| previous.device == calibration.device)
-        }) {
+        if has_duplicate(calibrations.as_slice(), |previous, calibration| previous.device == calibration.device) {
             return Err(ConfigError::DuplicateCalibration);
         }
         Ok(Self { output_root, monitors, profile, calibrations, capabilities })
@@ -215,8 +210,8 @@ impl ResolvedCaptureConfig {
     }
 
     pub fn calibration(&self, device: DeviceId) -> Evidence<DeviceCalibration> {
-        self.calibrations().iter().find(|entry| entry.device == device).copied()
-            .map_or(Evidence::Unavailable(UnavailableReason::MissingCalibration), Evidence::Observed)
+        Evidence::from_option(self.calibrations().iter().find(|entry| entry.device == device).copied(),
+            UnavailableReason::MissingCalibration)
     }
 
     pub fn capabilities(&self) -> EffectiveCapabilities {

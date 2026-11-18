@@ -7,7 +7,7 @@ use std::{
 };
 
 use screen_fix_protocol::{
-    QpcFrequency, QpcTick,
+    AdmissionEpoch, QpcFrequency, QpcTick,
     ipc::{
         EnvironmentChange,
         elevated::{ContextEvidence, GrantedInput, InputEvidence, Query, ReadBinding, ReadEvidence, ReadOutcome, ReadUnavailable,
@@ -64,7 +64,7 @@ struct Owner<'a> {
     current: Option<Visit>,
     lease: Option<Lease>,
     grant_sequence: u64,
-    epoch: u64,
+    epoch: AdmissionEpoch,
     source_generation: u64,
     environment: Option<NonZeroU64>,
     cleanup_limit: Option<QpcTick>,
@@ -203,8 +203,8 @@ fn run_with_witness(links: Links, lifetime: &Arc<Lifetime>, startup: Instant, wi
                 if let Some(delivery) = &item.delivery
                     && item.visit == item.grant.visit() && item.grant.read_floor(false).is_ok()
                 {
-                    let deadline = qpc()?.0.checked_add(item.grant.lifetime.ticks(GATE)?).ok_or(Failure::Supervisor)?;
-                    if let Some(_provider) = item.grant.lifetime.provider(super::lifetime::ProviderKind::Egress, QpcTick(deadline)) {
+                    let deadline = item.grant.lifetime.after(qpc()?, GATE)?;
+                    if let Some(_provider) = item.grant.lifetime.provider(super::lifetime::ProviderKind::Egress, deadline) {
                         delivery.gate(&item.grant, &mut item.evidence)?;
                     } else {
                         return Err(Failure::Supervisor);
@@ -231,7 +231,7 @@ fn run_with_witness(links: Links, lifetime: &Arc<Lifetime>, startup: Instant, wi
     let mut owner = Owner {
         witness: witness.view.clone(), lifetime, connection: &links.connection, configuration,
         frequency: links.connection.scope.qpc_frequency, current: None, lease: None,
-        grant_sequence: 0, epoch: 0, source_generation: 0, environment: None, cleanup_limit: None, revisions: (0, 0),
+        grant_sequence: 0, epoch: AdmissionEpoch(0), source_generation: 0, environment: None, cleanup_limit: None, revisions: (0, 0),
         status, observation, input, urgent,
     };
     let result = owner.run(incoming, query_owner);
@@ -299,7 +299,7 @@ impl Owner<'_> {
                 if self.urgent.stopping.load(Acquire) || self.current.is_some() || visit.grant.get() <= self.grant_sequence
                     // The same epoch may prepare again before admission (D-8 A);
                     // grant and source generation still strictly increase.
-                    || visit.epoch.0 < self.epoch || visit.source_generation.get() <= self.source_generation
+                    || visit.epoch < self.epoch || visit.source_generation.get() <= self.source_generation
                     || request.expires_qpc <= now
                 {
                     self.transition_rejected(visit, Transition::Prepare,
@@ -307,7 +307,7 @@ impl Owner<'_> {
                     return Ok(false);
                 }
                 self.grant_sequence = visit.grant.get();
-                self.epoch = visit.epoch.0;
+                self.epoch = visit.epoch;
                 self.source_generation = visit.source_generation.get();
                 let grant = match Grant::prepare(request, &self.configuration.approved,
                     self.lease.ok_or(Failure::Protocol)?, Arc::clone(&self.connection.peer),
@@ -660,13 +660,13 @@ impl Owner<'_> {
         }
         match visit.grant.finish_opening(result.completed) {
             Ok(()) => {
-                let before = result.completed.0.checked_add(self.lifetime.ticks(INPUT_HOLDBACK)?).ok_or(Failure::Supervisor)?;
+                let before = self.lifetime.after(result.completed, INPUT_HOLDBACK)?;
                 let first = visit.resync_from.take().unwrap_or(result.completed);
                 visit.resync_expires = None;
                 self.send(&Status::ResyncAccepted {
                     visit: read.visit, after_qpc: result.completed, held: result.readiness,
                     input_coverage: CoverageLoss {
-                        first_qpc: first, before_qpc: QpcTick(before),
+                        first_qpc: first, before_qpc: before,
                         reason: if result.readiness == HeldReadiness::Unknown { CoverageReason::HeldUnknown } else { CoverageReason::Opening },
                     },
                 })

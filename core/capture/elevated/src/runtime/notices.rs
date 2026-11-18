@@ -67,9 +67,7 @@ fn poll(grant: &Arc<Grant>, send: &Outbox, seen: &SeenWindows, notices: &Notific
             let foreground = notice.window == grant.target.window.window && notice.thread == grant.target.window.thread.get();
             let active_focus = notice.object == windows_sys::Win32::UI::WindowsAndMessaging::OBJID_CARET as i32
                 && grant.expected_focus(visit).is_some_and(|expected| {
-                    let target = visit.foreground;
-                    let foreground = WindowProcess { window: target.window, process: target.process, thread: target.thread };
-                    notice.thread == expected.thread.get() && FocusSnapshot::read(foreground).is_some_and(|native| {
+                    notice.thread == expected.thread.get() && FocusSnapshot::read(visit.foreground.into()).is_some_and(|native| {
                         native.focus == expected && (notice.window == expected.window || Some(notice.window) == native.caret_window)
                     })
                 });

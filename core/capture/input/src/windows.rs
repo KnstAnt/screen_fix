@@ -4,12 +4,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use screen_fix_native_observation::input::{
-    self, Collector, NativeError, Settings, last_error, loss::{self, Losses, PendingStatus},
+use screen_fix_native_observation::{
+    channel::HelperEndpoint,
+    input::{self, Collector, NativeError, Settings, last_error, loss::{self, Losses, PendingStatus}},
 };
 use screen_fix_protocol::ipc::{
     CoreToHelper, HelperFailureStage, HelperToCore,
-    InputRegistration, PacketError, Producer, shared::HelperEndpoint,
+    InputRegistration, PacketError, Producer,
 };
 use windows_sys::Win32::{
     Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation,

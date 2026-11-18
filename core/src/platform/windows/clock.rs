@@ -1,6 +1,6 @@
 //! The only Windows clock reads used by the recording lifecycle.
 
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, time::Duration};
 
 use windows::Win32::System::{
     Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
@@ -49,10 +49,10 @@ pub(super) fn message_tick_interval(
     anchor: MessageTickAnchor, frequency: QpcFrequency, coarse: CoarseTime,
 ) -> Option<(QpcTick, QpcTick)> {
     let delta = anchor.tick_delta_ms(coarse.tick_ms)?;
+    let uncertainty = frequency.ticks_ceil(Duration::from_micros(coarse.uncertainty_us.0))?;
     let frequency = i128::from(frequency.0.get());
     let center = i128::from(anchor.qpc.0) + (i128::from(delta) * frequency).div_euclid(1000);
-    let uncertainty = (i128::from(coarse.uncertainty_us.0) * frequency + 999_999) / 1_000_000;
-    let radius = uncertainty + i128::from(anchor.qpc_bracket_ticks) + 1;
+    let radius = i128::from(uncertainty) + i128::from(anchor.qpc_bracket_ticks) + 1;
     Some((QpcTick(i64::try_from(center - radius).ok()?), QpcTick(i64::try_from(center + radius).ok()?)))
 }
 
@@ -70,6 +70,11 @@ impl MessageTickEstimate {
     pub(super) fn is_late(&self, received: SessionTimeUs) -> bool {
         i128::from(received.0) - self.center_us > 2 * self.uncertainty_us + self.bracket_us
     }
+
+    /// Whether the earliest time the tick can denote is at or after `start`.
+    pub(super) fn not_before(&self, start: SessionTimeUs) -> bool {
+        self.center_us - self.uncertainty_us - self.bracket_us >= i128::from(start.0)
+    }
 }
 
 pub(super) fn message_tick_estimate(
@@ -77,7 +82,6 @@ pub(super) fn message_tick_estimate(
 ) -> Option<MessageTickEstimate> {
     let anchor = anchor?;
     let center_us = i128::from(anchor.coarse_estimate(origin, coarse.tick_ms).ok()?.0);
-    let frequency = i128::from(origin.qpc_frequency.0.get());
-    let bracket_us = (i128::from(anchor.qpc_bracket_ticks) * 1_000_000 + frequency - 1) / frequency;
+    let bracket_us = origin.qpc_frequency.ticks_to_us_ceil(anchor.qpc_bracket_ticks);
     Some(MessageTickEstimate { center_us, uncertainty_us: i128::from(coarse.uncertainty_us.0), bracket_us })
 }

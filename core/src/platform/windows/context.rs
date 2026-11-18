@@ -20,6 +20,7 @@ mod windows;
 use std::{collections::{BTreeMap, VecDeque}, time::{Duration, Instant}};
 
 use serde_json::{Value, json};
+use screen_fix_native_observation::LossSpan;
 use screen_fix_protocol::ipc::{FocusAtReceipt, elevated::{ReadBinding, VisitBinding}};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_DESTROY, EVENT_OBJECT_FOCUS, EVENT_OBJECT_HIDE, EVENT_OBJECT_IME_CHANGE,
@@ -33,6 +34,7 @@ use crate::{
     config::{ClipboardMode, ResolvedCaptureConfig},
     package::metadata::AttemptLayout,
     package::outcome::{LossEvidence, LossProducer, LossReason},
+    package::row::MessageTick,
     protocol::{BoundedList, ClockOrigin, CoarseTime, Evidence, FocusGeneration, GeometryId, PhysicalPoint, PhysicalRect, QpcTick, RequestId, SessionTimeUs, UnavailableReason, WindowId, ipc::{ForegroundAtReceipt, ProcessInstance}},
 };
 
@@ -42,7 +44,7 @@ use self::{
     queries::{Classification, PointerBackend, Queries},
     windows::{FocusSnapshot, WindowMetadata},
 };
-use crate::session::windows::Receipt;
+use crate::platform::windows::controller::Receipt;
 
 use super::{ProbeError, clipboard, clock, display, elevated::{InputCertificate, Selector}, unavailable};
 
@@ -66,7 +68,6 @@ const FUTURE_COMMIT_LIMIT: usize = 4;
 /// The receipt uncertainty of a hook-only record (remediation §6.4).
 const HOOK_UNCERTAINTY_MS: u64 = 16;
 const HOOK_UNCERTAINTY_US: i64 = HOOK_UNCERTAINTY_MS as i64 * 1_000;
-const MICROS_PER_SECOND: i128 = 1_000_000;
 
 /// File metadata is sampled by the startup coordinator before input capture.
 /// This describes the approved file at startup, not a loaded process image.
@@ -223,18 +224,14 @@ const SUPPRESSION_LIMIT: usize = 32;
 
 /// Context losses waiting for the context journal, at most one per reason (C3).
 #[derive(Default)]
-struct Losses(Vec<(LossReason, u64, QpcTick, QpcTick)>);
+struct Losses(Vec<(LossReason, LossSpan)>);
 
 impl Losses {
-    fn note(&mut self, reason: LossReason, count: u64, first: QpcTick, last: QpcTick) {
-        if count == 0 { return; }
-        match self.0.iter_mut().find(|entry| entry.0 == reason) {
-            Some(entry) => {
-                entry.1 = entry.1.saturating_add(count);
-                entry.2 = entry.2.min(first);
-                entry.3 = entry.3.max(last);
-            }
-            None => self.0.push((reason, count, first, last)),
+    fn note(&mut self, reason: LossReason, span: LossSpan) {
+        if span.count == 0 { return; }
+        match self.0.iter_mut().find(|(noted, _)| *noted == reason) {
+            Some((_, noted)) => noted.merge(span),
+            None => self.0.push((reason, span)),
         }
     }
 }
@@ -398,7 +395,7 @@ impl<'a> Context<'a> {
 
     pub fn discard_paused_notifications(&mut self) -> u64 {
         let notifications = self.notifications.drain().count() as u64;
-        let lost = self.notifications.take_loss().map_or(0, |(count, _, _)| count);
+        let lost = self.notifications.take_loss().map_or(0, |span| span.count);
         let _ = self.cursor.results();
         let clipboard = self.clipboard.as_ref().map_or(0, |worker| worker.notices().count() as u64);
         notifications.saturating_add(lost).saturating_add(clipboard)
@@ -409,8 +406,8 @@ impl<'a> Context<'a> {
     /// observes these notices; a ring loss is still counted (C3).
     pub fn discard_unbound_notifications(&mut self) {
         self.notifications.drain().for_each(|_| ());
-        if let Some((count, first, last)) = self.notifications.take_loss() {
-            self.losses.note(LossReason::NotificationOverflow, count, first, last);
+        if let Some(span) = self.notifications.take_loss() {
+            self.losses.note(LossReason::NotificationOverflow, span);
         }
     }
 
@@ -427,8 +424,7 @@ impl<'a> Context<'a> {
     pub fn activate_elevated(&mut self, binding: VisitBinding, focus: FocusAtReceipt, at: QpcTick) -> Result<Visit, ProbeError> {
         self.generation = self.generation.checked_add(1)
             .ok_or_else(|| unavailable("The focus generation counter overflowed"))?;
-        let foreground = WindowProcess { window: binding.foreground.window,
-            process: binding.foreground.process, thread: binding.foreground.thread };
+        let foreground = binding.foreground.into();
         let visit = Visit { generation: FocusGeneration(self.generation), started_at: at, foreground,
             native: None, uia_blocked: None, elevated: Some((binding, focus)) };
         self.current = Some(visit);
@@ -445,13 +441,13 @@ impl<'a> Context<'a> {
             return Err(screen_fix_elevated::Failure::Witness);
         }
         let mut invalidation: Option<(QpcTick, bool)> = None;
-        if let Some((count, first, last)) = self.notifications.take_loss() {
-            self.losses.note(LossReason::NotificationOverflow, count, first, last);
+        if let Some(span) = self.notifications.take_loss() {
+            self.losses.note(LossReason::NotificationOverflow, span);
             // A loss that ended before the visit opened hid none of its
             // notices. A later loss may have hidden a foreground change, so
             // the visit is revoked from its first possible notice (D1).
-            if last >= after {
-                invalidation = Some((first.max(after), true));
+            if span.last >= after {
+                invalidation = Some((span.first.max(after), true));
             }
         }
         for notice in self.notifications.drain() {
@@ -470,8 +466,7 @@ impl<'a> Context<'a> {
                 }
                 continue;
             }
-            let interval = receipt.tick_anchor.zip(notice.source_tick).and_then(|(anchor, tick)|
-                clock::message_tick_interval(anchor, receipt.clock.qpc_frequency, CoarseTime::windows_message(tick)));
+            let interval = notice_interval(notice, receipt);
             if interval.is_some_and(|(_, latest)| latest < after) { continue; }
             let before = interval.map_or(after, |(lower, _)| lower.min(notice.receipt));
             invalidation = Some(invalidation.map_or((before, foreground), |(old, close)| (old.min(before), close || foreground)));
@@ -522,7 +517,7 @@ impl<'a> Context<'a> {
         let interrupted = lost != 0 || notices.iter().any(|notice| matches!(notice.event,
             EVENT_SYSTEM_FOREGROUND | EVENT_SYSTEM_DESKTOPSWITCH));
         let foreground = self.read_foreground();
-        let observed_at = origin.time(clock::qpc()?).map_err(super::clock_error)?;
+        let observed_at = origin.time(clock::qpc()?)?;
         frame_policy.publish(foreground.approved, observed_at, receipt.boundary, interrupted);
         let now = Instant::now();
         let scan = self.scan_notices(&notices);
@@ -582,9 +577,9 @@ impl<'a> Context<'a> {
     fn take_notices(&mut self, start: QpcTick, at: QpcTick) -> (Vec<Notice>, u64) {
         let mut notices = Vec::new();
         let ring_loss = self.notifications.take_loss();
-        let mut lost = ring_loss.map_or(0, |(count, _, _)| count);
-        if let Some((count, first, last)) = ring_loss {
-            self.losses.note(LossReason::NotificationOverflow, count, first, last);
+        let mut lost = ring_loss.map_or(0, |span| span.count);
+        if let Some(span) = ring_loss {
+            self.losses.note(LossReason::NotificationOverflow, span);
         }
         let mut future = Vec::with_capacity(FUTURE_NOTICE_LIMIT);
         for notice in self.future_notices.drain(..).chain(self.notifications.drain()) {
@@ -718,7 +713,7 @@ impl<'a> Context<'a> {
         let open = self.suppressions.last().is_some_and(|interval| interval.end.is_none());
         match self.current {
             None if !open => {
-                let start = origin.time(ended.unwrap_or(self.swept.unwrap_or(at))).map_err(super::clock_error)?;
+                let start = origin.time(ended.unwrap_or(self.swept.unwrap_or(at)))?;
                 let reason = self.suppression_reason(observed);
                 if self.suppressions.len() == SUPPRESSION_LIMIT {
                     if let Some(last) = self.suppressions.last_mut() { last.end = None; }
@@ -727,7 +722,7 @@ impl<'a> Context<'a> {
                 }
             }
             Some(visit) if open => if let Some(last) = self.suppressions.last_mut() {
-                last.end = Some(origin.time(visit.started_at).map_err(super::clock_error)?.max(last.start));
+                last.end = Some(origin.time(visit.started_at)?.max(last.start));
             },
             _ => {}
         }
@@ -750,8 +745,8 @@ impl<'a> Context<'a> {
         &mut self, approved: Option<WindowProcess>, foreground: &ForegroundRead, notices: &[Notice], lost: u64,
         receipt: Receipt,
     ) -> Result<Value, ProbeError> {
-        let mut row = approved.and_then(|proof| self.window_row(proof, "foreground"))
-            .unwrap_or_else(|| json!({ "kind": "foreground", "approved": false }));
+        let mut row = approved.and_then(|proof| self.window_row(proof, WindowRowKind::Foreground))
+            .unwrap_or_else(|| json!({ "kind": WindowRowKind::Foreground, "approved": false }));
         if foreground.replaced.is_some() && foreground.replaced == approved {
             row["ghost_replacement"] = json!(true);
         }
@@ -838,7 +833,7 @@ impl<'a> Context<'a> {
                 continue;
             }
             let Some(kind) = window_event_kind(notice.event) else { continue };
-            if kind == WINDOW_LOCATION && self.location_limited(notice.window, now) {
+            if kind == WindowRowKind::WindowLocation && self.location_limited(notice.window, now) {
                 self.mark_location_dirty(notice.window);
                 continue;
             }
@@ -848,12 +843,12 @@ impl<'a> Context<'a> {
                 continue;
             }
             if let Some(mut row) = self.window_row(proof, kind) {
-                if kind == WINDOW_LOCATION && let Some(visit) = self.current.filter(|visit| visit.foreground == proof) {
+                if kind == WindowRowKind::WindowLocation && let Some(visit) = self.current.filter(|visit| visit.foreground == proof) {
                     self.observe_visit_geometry(visit, at)?;
                 }
                 add_win_event_timing(&mut row, notice, receipt)?;
                 row["source_event_tick_ms"] = json!(notice.source_tick);
-                if kind == WINDOW_LOCATION {
+                if kind == WindowRowKind::WindowLocation {
                     self.rate_location(notice.window, now);
                 }
                 output.push(row);
@@ -866,7 +861,7 @@ impl<'a> Context<'a> {
     fn trailing_locations(&mut self, now: Instant, at: QpcTick, output: &mut Vec<Value>) -> Result<(), ProbeError> {
         for window in self.due_locations(now) {
             let Some(proof) = read_window(window) else { continue };
-            if let Some(mut row) = self.window_row(proof, WINDOW_LOCATION) {
+            if let Some(mut row) = self.window_row(proof, WindowRowKind::WindowLocation) {
                 if let Some(visit) = self.current.filter(|visit| visit.foreground == proof) {
                     self.observe_visit_geometry(visit, at)?;
                 }
@@ -910,7 +905,7 @@ impl<'a> Context<'a> {
         if self.cursor_completions.len() < CURSOR_STAGING_LIMIT {
             self.cursor_completions.push(change);
         } else {
-            self.losses.note(LossReason::StagingPressure, 1, change.received(), change.received());
+            self.losses.note(LossReason::StagingPressure, LossSpan::at(change.received()));
         }
     }
 
@@ -931,18 +926,18 @@ impl<'a> Context<'a> {
 
     /// A context loss found outside this owner, such as elevated evidence the
     /// Recorder could not stage; it is admitted with the owner's own losses.
-    pub fn note_loss(&mut self, reason: LossReason, count: u64, first: QpcTick, last: QpcTick) {
-        self.losses.note(reason, count, first, last);
+    pub fn note_loss(&mut self, reason: LossReason, span: LossSpan) {
+        self.losses.note(reason, span);
     }
 
     /// Context losses since the last call, clipped to the admission through `at` (C3).
     pub fn take_losses(&mut self, receipt: Receipt, at: QpcTick) -> Vec<LossEvidence> {
-        std::mem::take(&mut self.losses.0).into_iter().filter_map(|(reason, count, first, last)| {
-            let last = last.min(at);
+        std::mem::take(&mut self.losses.0).into_iter().filter_map(|(reason, span)| {
+            let last = span.last.min(at);
             if last < receipt.boundary.qpc { return None; }
-            let first = receipt.clock.time(first.max(receipt.boundary.qpc).min(last)).ok()?;
+            let first = receipt.clock.time(span.first.max(receipt.boundary.qpc).min(last)).ok()?;
             let last = receipt.clock.time(last).ok()?;
-            Some(LossEvidence::ordinary(reason, None, std::num::NonZeroU64::new(count)?, first, last))
+            Some(LossEvidence::ordinary(reason, None, std::num::NonZeroU64::new(span.count)?, first, last))
         }).collect()
     }
 
@@ -1057,7 +1052,7 @@ impl<'a> Context<'a> {
                     }
                 }
                 if !worker.grant(notice, visit, self.queries.clipboard_guard()) {
-                    self.losses.note(LossReason::ClipboardQueue, 1, notice.received, notice.received);
+                    self.losses.note(LossReason::ClipboardQueue, LossSpan::at(notice.received));
                 }
             }
             self.clipboard_notices = pending;
@@ -1123,11 +1118,11 @@ impl<'a> Context<'a> {
         let visit = self.current;
         let elevated = visit.is_some_and(Visit::is_elevated).then(|| self.take_elevated_text(now));
         let mut lost: Vec<_> = std::mem::take(&mut self.text_losses.0).into_iter()
-            .filter_map(|(reason, count, first, last)| text_loss(receipt, reason, count, first, last)).collect();
+            .filter_map(|(reason, span)| text_loss(receipt, reason, span)).collect();
         if let Some(confirmed) = elevated {
             return (confirmed, lost);
         }
-        let mut lose = |reason, count, first, last| lost.extend(text_loss(receipt, reason, count, first, last));
+        let mut lose = |reason, span| lost.extend(text_loss(receipt, reason, span));
         for loss in self.queries.commit_losses() {
             let reason = match loss.reason {
                 CommitLossReason::Capacity => LossReason::CommitCapacity,
@@ -1136,28 +1131,28 @@ impl<'a> Context<'a> {
                 CommitLossReason::Rejected => LossReason::CommitRejected,
                 CommitLossReason::Stale => LossReason::LateCommit,
             };
-            lose(reason, loss.count, loss.first, loss.last);
+            lose(reason, loss.span);
         }
         let mut commits = std::mem::take(&mut self.future_text);
         commits.extend(self.queries.commits());
         let mut confirmed = Vec::new();
         for commit in commits {
             let Some(visit) = visit.filter(|visit| visit.generation == commit.generation) else {
-                lose(LossReason::LateCommit, 1, commit.receipt, commit.receipt);
+                lose(LossReason::LateCommit, LossSpan::at(commit.receipt));
                 continue;
             };
             if commit.receipt > now {
                 if self.future_text.len() < FUTURE_COMMIT_LIMIT {
                     self.future_text.push(commit);
                 } else {
-                    lose(LossReason::CommitCapacity, 1, commit.receipt, commit.receipt);
+                    lose(LossReason::CommitCapacity, LossSpan::at(commit.receipt));
                 }
                 continue;
             }
             if commit.receipt < visit.started_at || !self.queries.accepts_commit(commit.generation, commit.revision)
                 || !self.confirm_focus(visit)
             {
-                lose(LossReason::LateCommit, 1, commit.receipt, commit.receipt);
+                lose(LossReason::LateCommit, LossSpan::at(commit.receipt));
                 continue;
             }
             confirmed.push(ConfirmedText {
@@ -1295,7 +1290,7 @@ impl<'a> Context<'a> {
         if !self.routes_since.is_some_and(|since| since <= at) {
             return Evidence::Unavailable(UnavailableReason::NotObserved);
         }
-        self.point_geometry(point).map_or(Evidence::Unavailable(UnavailableReason::NotObserved), Evidence::Observed)
+        Evidence::from_option(self.point_geometry(point), UnavailableReason::NotObserved)
     }
 
     pub fn window_geometry_at(&self, proof: ForegroundAtReceipt, at: QpcTick) -> Evidence<GeometryId> {
@@ -1362,15 +1357,14 @@ impl<'a> Context<'a> {
         captures.next().is_none().then_some(geometry)
     }
 
-    fn window_row(&mut self, proof: WindowProcess, kind: &'static str) -> Option<Value> {
+    fn window_row(&mut self, proof: WindowProcess, kind: WindowRowKind) -> Option<Value> {
         if hung::is_ghost(proof.hwnd().0) { return None; }
         let identity = self.approvals.get(proof.process)?;
         if !self.ordinary_process(proof.process) { return None; }
         // An identity change during the read gets one re-read; an approved
         // window whose metadata still cannot be read stays approved (C4).
         let Some(window) = WindowMetadata::read(proof, &self.scrubber).or_else(|| WindowMetadata::read(proof, &self.scrubber)) else {
-            return Some(json!({ "kind": kind, "approved": true, "window": proof.window, "pid": proof.process.pid,
-                "metadata": "unavailable" }));
+            return Some(unreadable_window_row(kind, proof));
         };
         Some(self.window_evidence_row(proof, identity, kind, window))
     }
@@ -1379,7 +1373,7 @@ impl<'a> Context<'a> {
     /// `monitor`, `product`, `version`, `version_string`, `title` and `class`.
     fn window_evidence_row(
         &self, proof: WindowProcess, identity: &crate::config::ExecutableIdentity,
-        kind: &'static str, window: WindowMetadata,
+        kind: WindowRowKind, window: WindowMetadata,
     ) -> Value {
         let version = self.executable_versions.0.iter().find(|(executable, _)| executable == identity)
             .and_then(|(_, version)| version.as_ref());
@@ -1418,7 +1412,7 @@ impl<'a> Context<'a> {
         if let Some((_, _, access)) = self.ordinary_access.iter().find(|(process, _, _)| *process == proof) {
             return *access;
         }
-        let access = ProcessHandle::open(proof.pid).filter(|process| process.instance(proof.pid) == Some(proof))
+        let access = ProcessHandle::open_instance(proof)
             .and_then(|process| process.image_path())
             .ok_or(AccessUnknown::Unclassified)
             .and_then(|image| foreground_access(proof, &image).map_err(|failure| match failure {
@@ -1514,19 +1508,28 @@ impl<'a> Context<'a> {
 
 }
 
+/// The QPC interval in which a notice's source message tick was posted;
+/// `None` without a tick anchor or a source tick.
+fn notice_interval(notice: Notice, receipt: Receipt) -> Option<(QpcTick, QpcTick)> {
+    receipt.tick_anchor.zip(notice.source_tick).and_then(|(anchor, tick)|
+        clock::message_tick_interval(anchor, receipt.clock.qpc_frequency, CoarseTime::windows_message(tick)))
+}
+
 fn add_win_event_timing(row: &mut Value, notice: Notice, receipt: Receipt) -> Result<(), ProbeError> {
     let Some(tick) = notice.source_tick else { return Ok(()); };
-    let received = receipt.clock.time(notice.receipt).map_err(super::clock_error)?;
+    let received = receipt.clock.time(notice.receipt)?;
     let coarse = CoarseTime::windows_message(tick);
     let late = clock::message_tick_estimate(receipt.clock, receipt.tick_anchor, coarse)
         .map(|estimate| estimate.is_late(received));
     // The observation uses the poll receipt. The callback receipt remains
     // independently available, including when notifications arrive out of order.
     row["win_event_recv_t_us"] = json!(received);
-    row["tick_ms"] = json!(coarse.tick_ms);
-    row["tick_uncertainty_us"] = json!(coarse.uncertainty_us);
-    row["late"] = json!(late);
-    Ok(())
+    MessageTick::new(Some(coarse), late).write(row).map_err(|_| unavailable("Encode the WinEvent timing of a context row"))
+}
+
+/// The row of an approved window whose metadata cannot be read (C4).
+fn unreadable_window_row(kind: WindowRowKind, proof: WindowProcess) -> Value {
+    json!({ "kind": kind, "approved": true, "window": proof.window, "pid": proof.process.pid, "metadata": "unavailable" })
 }
 
 /// Keep `notice` for a later poll. One beyond `FUTURE_NOTICE_LIMIT` is a
@@ -1536,20 +1539,30 @@ fn defer_notice(future: &mut Vec<Notice>, losses: &mut Losses, notice: Notice) -
         future.push(notice);
         true
     } else {
-        losses.note(LossReason::NotificationOverflow, 1, notice.receipt, notice.receipt);
+        losses.note(LossReason::NotificationOverflow, LossSpan::at(notice.receipt));
         false
     }
 }
 
-const WINDOW_LOCATION: &str = "window_location";
+/// The `kind` of a window row: the foreground window, or a top-level window event.
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WindowRowKind {
+    Foreground,
+    WindowTitle,
+    /// Rate-limited per window (C4).
+    WindowLocation,
+    WindowShown,
+    WindowHidden,
+}
 
 /// The window row kind of a top-level window event.
-fn window_event_kind(event: u32) -> Option<&'static str> {
+fn window_event_kind(event: u32) -> Option<WindowRowKind> {
     match event {
-        EVENT_OBJECT_NAMECHANGE => Some("window_title"),
-        EVENT_OBJECT_LOCATIONCHANGE => Some(WINDOW_LOCATION),
-        EVENT_OBJECT_SHOW => Some("window_shown"),
-        EVENT_OBJECT_HIDE => Some("window_hidden"),
+        EVENT_OBJECT_NAMECHANGE => Some(WindowRowKind::WindowTitle),
+        EVENT_OBJECT_LOCATIONCHANGE => Some(WindowRowKind::WindowLocation),
+        EVENT_OBJECT_SHOW => Some(WindowRowKind::WindowShown),
+        EVENT_OBJECT_HIDE => Some(WindowRowKind::WindowHidden),
         _ => None,
     }
 }
@@ -1582,11 +1595,11 @@ pub(super) fn elevated_focus_matches(foreground: WindowProcess, focus: FocusAtRe
 
 /// A typed TextEdit input loss, clipped to the admission; `None` when it
 /// ended before the admission (I7).
-fn text_loss(receipt: Receipt, reason: LossReason, count: u64, first: QpcTick, last: QpcTick) -> Option<LossEvidence> {
-    if last < receipt.boundary.qpc { return None; }
-    let first = receipt.clock.time(first.max(receipt.boundary.qpc)).ok()?;
-    let last = receipt.clock.time(last).ok()?;
-    Some(LossEvidence::ordinary(reason, Some(LossProducer::TextEdit), std::num::NonZeroU64::new(count)?, first, last))
+fn text_loss(receipt: Receipt, reason: LossReason, span: LossSpan) -> Option<LossEvidence> {
+    if span.last < receipt.boundary.qpc { return None; }
+    let first = receipt.clock.time(span.first.max(receipt.boundary.qpc)).ok()?;
+    let last = receipt.clock.time(span.last).ok()?;
+    Some(LossEvidence::ordinary(reason, Some(LossProducer::TextEdit), std::num::NonZeroU64::new(span.count)?, first, last))
 }
 
 /// The staged and newly completed clipboard reads completed through `now`.
@@ -1605,7 +1618,7 @@ fn due_clipboard_reads(
         } else if staged.len() < CLIPBOARD_STAGING_LIMIT {
             staged.push(read);
         } else {
-            losses.note(LossReason::ClipboardQueue, 1, read.completed, read.completed);
+            losses.note(LossReason::ClipboardQueue, LossSpan::at(read.completed));
         }
     }
     due
@@ -1625,14 +1638,14 @@ fn clipboard_activity(
 /// Queue the clipboard owner's notices, at most `CLIPBOARD_STAGING_LIMIT`;
 /// every notice it or this queue could not hold is a `clipboard_queue` loss (C3).
 fn take_clipboard_notices(worker: &clipboard::Worker, notices: &mut VecDeque<clipboard::Notice>, losses: &mut Losses) {
-    if let Some((count, first, last)) = worker.take_loss() {
-        losses.note(LossReason::ClipboardQueue, count, first, last);
+    if let Some(span) = worker.take_loss() {
+        losses.note(LossReason::ClipboardQueue, span);
     }
     for notice in worker.notices() {
         if notices.len() < CLIPBOARD_STAGING_LIMIT {
             notices.push_back(notice);
         } else {
-            losses.note(LossReason::ClipboardQueue, 1, notice.received, notice.received);
+            losses.note(LossReason::ClipboardQueue, LossSpan::at(notice.received));
         }
     }
 }
@@ -1652,12 +1665,25 @@ fn clipboard_row(read: clipboard::Read, clock: ClockOrigin) -> Value {
 }
 
 fn clipboard_change_after_visit(notice: clipboard::Notice, visit: Visit, receipt: Receipt) -> bool {
-    let Some(anchor) = receipt.tick_anchor else { return false };
-    let Ok(estimate) = anchor.coarse_estimate(receipt.clock, notice.source_tick) else { return false };
     let Ok(started) = receipt.clock.time(visit.started_at) else { return false };
-    let coarse = CoarseTime::windows_message(notice.source_tick);
-    let frequency = i128::from(receipt.clock.qpc_frequency.0.get());
-    let bracket = (i128::from(anchor.qpc_bracket_ticks) * MICROS_PER_SECOND + frequency - 1) / frequency;
-    i128::from(estimate.0) - i128::from(coarse.uncertainty_us.0) - bracket >= i128::from(started.0)
+    clock::message_tick_estimate(receipt.clock, receipt.tick_anchor, CoarseTime::windows_message(notice.source_tick))
+        .is_some_and(|estimate| estimate.not_before(started))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use super::*;
+
+    /// The row of an approved window whose metadata cannot be read.
+    #[test]
+    fn unreadable_window_bytes() -> serde_json::Result<()> {
+        let pid = NonZeroU32::MIN.saturating_add(6);
+        let proof = WindowProcess { window: WindowId(42), process: ProcessInstance { pid, creation_filetime: 9 }, thread: NonZeroU32::MIN };
+        assert_eq!(serde_json::to_string(&unreadable_window_row(WindowRowKind::WindowShown, proof))?,
+            r#"{"approved":true,"kind":"window_shown","metadata":"unavailable","pid":7,"window":42}"#);
+        Ok(())
+    }
+}

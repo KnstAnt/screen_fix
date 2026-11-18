@@ -156,7 +156,7 @@ pub(super) fn verify_segments(
     adapter: IDXGIAdapter1, parts: Receiver<SegmentToVerify>, verdicts: SyncSender<Verdict>,
     deadline: impl Fn() -> Option<std::time::Instant>,
 ) {
-    let _apartment = match super::Apartment::initialize() {
+    let _apartment = match super::com_apartment() {
         Ok(apartment) => apartment,
         Err(error) => {
             // Without COM no part can be verified. The first part's verdict
@@ -272,7 +272,7 @@ fn verify_decoded_frames(
     stage(unsafe { reader.SetCurrentMediaType(0, None, &output) }, "Configure MP4 decoding")?;
     let media_type = stage(unsafe { reader.GetCurrentMediaType(0) }, "Read the decoded segment format")?;
     let actual = stage(unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE) }, "Read the decoded segment dimensions")?;
-    if actual != ((u64::from(size[0]) << 32) | u64::from(size[1])) {
+    if actual != mf::pack(size[0], size[1]) {
         return Err(unavailable("The decoded segment dimensions do not match the manifest"));
     }
     let mut decoded = 0;

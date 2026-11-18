@@ -13,7 +13,7 @@ use windows::Win32::Media::MediaFoundation::*;
 use crate::{
     devlog::devlog,
     CaptureError,
-    capture::frame::{FrameCoverage, FrameMetadata},
+    capture::frame::{ApprovalGeneration, FrameCoverage, FrameMetadata},
     config::SelectedMonitor,
     package::{
         ArtifactKind,
@@ -23,10 +23,11 @@ use crate::{
         outcome::HealthKind,
     },
     protocol::{AdmissionEpoch, ClockOrigin, MonitorId, QpcTick, SegmentId, SessionTimeUs},
-    session::{AdmissionBoundary, fault::FaultReport, windows::{Admission, AwakeElapsed, PausedVideo, WorkerSession}},
+    platform::windows::controller::{Admission, AwakeElapsed, PausedVideo, WorkerSession},
+    session::{AdmissionBoundary, fault::FaultReport},
 };
 
-use super::{context::{ApprovalReadError, ELEVATED_FRAME_WAIT_US, FramePolicy}, Apartment, ProbeError, ProbeKind, RecordingReport, capture_device, clock, clock_error, display, encode, encoder, h264, io_error, monitor, mp4, package_journal_error, slots, stage, unavailable};
+use super::{context::{ApprovalReadError, ELEVATED_FRAME_WAIT_US, FramePolicy}, ProbeError, ProbeKind, RecordingReport, capture_device, clock, display, encode, encoder, h264, io_error, monitor, mp4, slots, stage, unavailable};
 
 const ROTATION_US: i64 = 60_000_000;
 const IDR_ALLOWANCE_US: i64 = 1_000_000;
@@ -339,7 +340,7 @@ impl Merge {
             lock().retain(|last| !due(last));
             return Ok(());
         };
-        if self.ingress.request_flush(released.0).map_err(package_journal_error)? {
+        if self.ingress.request_flush(released.0)? {
             lock().retain(|last| !due(last));
         }
         Ok(())
@@ -391,7 +392,7 @@ impl Merge {
             }
             let row = self.lanes[index].queue.front().ok_or_else(|| unavailable("The frames lane head is unavailable"))?;
             let value = serde_json::to_value(row).map_err(|error| io_error("Encode the frame index row", error.into()))?;
-            if !self.ingress.try_submit_verified(receipt, value).map_err(package_journal_error)? {
+            if !self.ingress.try_submit_verified(receipt, value)? {
                 return Ok(false);
             }
             self.lanes[index].queue.pop_front();
@@ -472,7 +473,7 @@ pub(super) fn run(
 ) -> Result<Finished, ProbeError> {
     let lane = frames.lane(monitor.id)?;
     let _exit = ExitMark(&lane.mark);
-    let _apartment = Apartment::initialize()?;
+    let _apartment = super::com_apartment()?;
     let display = display::resolve(&monitor.key)?;
     let luid = stage(unsafe { display.adapter.GetDesc1() }, "Read the display adapter")?.AdapterLuid;
     let device = capture_device(&display.adapter)?;
@@ -677,7 +678,7 @@ struct Video<'a> {
     clock: ClockOrigin,
     preserve_rotation_part: bool,
     required_finalization_failure: Option<&'static str>,
-    approval_generation: Option<u64>,
+    approval_generation: Option<ApprovalGeneration>,
     approval_break: bool,
     elevated: bool,
     conversion_wait: Option<SessionTimeUs>,
@@ -1073,7 +1074,7 @@ impl Video<'_> {
         }
         let at = match self.worker.admit()? {
             Admission::Open(receipt) if receipt.boundary == self.opening => {
-                receipt.clock.time(receipt.qpc).map_err(clock_error)?
+                receipt.clock.time(receipt.qpc)?
             }
             Admission::Closed(Some(boundary)) if boundary.epoch == self.opening.epoch => {
                 self.cutoff = Some(boundary);
@@ -1200,7 +1201,7 @@ impl Video<'_> {
     fn admit_slot(&mut self, slot: slots::Slot) -> Result<ControlFlow<encode::Next, SlotDecision>, ProbeError> {
         let decision = match self.worker.admit()? {
             Admission::Open(receipt) if receipt.boundary == self.opening => {
-                let now = receipt.clock.time(receipt.qpc).map_err(clock_error)?;
+                let now = receipt.clock.time(receipt.qpc)?;
                 if now < slot.end {
                     return Ok(ControlFlow::Break(encode::Next::Wait));
                 }
@@ -1637,7 +1638,7 @@ impl Video<'_> {
             if row.repeated == Some(true) && row.admission_epoch == self.opening.epoch {
                 row.late = Some(self.evidence.late(row.slot));
             }
-            row.published_t_us = Some(self.clock.time(clock::qpc()?).map_err(clock_error)?);
+            row.published_t_us = Some(self.clock.time(clock::qpc()?)?);
             let (epoch, encoded, reason, pts) = (row.admission_epoch, row.encoded, row.reason, row.pts_us);
             let (repeated, late) = (row.repeated == Some(true), row.late == Some(true));
             match self.lane.rows.try_send(row) {
@@ -1727,7 +1728,7 @@ impl Video<'_> {
                 }
                 Admission::Open(receipt) if receipt.boundary == self.opening => {
                     if self.change_at_slot(slot) { return Ok(()); }
-                    if receipt.clock.time(receipt.qpc).map_err(clock_error)? < slot.end {
+                    if receipt.clock.time(receipt.qpc)? < slot.end {
                         let _ = self.worker.wait_for_close(Duration::from_millis(5))?;
                         continue;
                     }
@@ -1740,7 +1741,7 @@ impl Video<'_> {
     }
 
     fn publish_unavailable(&mut self, slot: slots::Slot, reason: slots::Missing) -> Result<(), ProbeError> {
-        let decided = self.clock.time(clock::qpc()?).map_err(clock_error)?;
+        let decided = self.clock.time(clock::qpc()?)?;
         let end = self.cutoff.map_or(slot.end, |cutoff| slot.end.min(cutoff.time));
         let receipt = self.receipt(end, None);
         let mut row = slots::Row::pending(self.id, self.opening.epoch, slot, decided, receipt, None, None);
@@ -1877,7 +1878,7 @@ impl Segment {
         // any wait for a verifier slot.
         let closed_qpc = clock::qpc()?;
         let suspends = worker.suspend_marks().sequence;
-        let lag = origin.time(closed_qpc).map_err(clock_error)?.0.saturating_sub(media_before.0);
+        let lag = origin.time(closed_qpc)?.0.saturating_sub(media_before.0);
         let allowance = Duration::from_micros(VERIFICATION_ALLOWANCE_US.saturating_sub(u64::try_from(lag).unwrap_or(0)));
         let pending = Verifying {
             summary: SegmentSummary {

@@ -9,14 +9,13 @@ use std::{
         atomic::{AtomicBool, AtomicI64, Ordering::{Acquire, Release}},
         mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
     },
-    thread::{self, JoinHandle},
-    time::Duration,
+    thread::JoinHandle,
 };
 
 use windows_sys::{
     Win32::{
         Foundation::{ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM},
-        System::{LibraryLoader::GetModuleHandleW, Performance::QueryPerformanceCounter, Threading::GetCurrentThreadId},
+        System::{LibraryLoader::GetModuleHandleW, Performance::QueryPerformanceCounter},
         UI::{
             Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             WindowsAndMessaging::*,
@@ -27,7 +26,7 @@ use windows_sys::{
 
 use screen_fix_protocol::{MessageTickMs, QpcTick, WindowId};
 
-use crate::LossCounter;
+use crate::{LossCounter, LossSpan, owner::{self, StartupError}};
 
 pub use screen_fix_protocol::ipc::elevated::WindowNotice as Notice;
 
@@ -54,14 +53,13 @@ const EMPTY: Notice = Notice {
 struct Pending {
     notices: [Notice; RING_LENGTH],
     used: usize,
-    lost: u64,
-    /// Receipts of the first and last notice lost to ring overflow (C3).
-    lost_receipts: [i64; 2],
+    /// Notices lost to ring overflow (C3).
+    lost: Option<LossSpan>,
 }
 
 impl Pending {
     fn new() -> Self {
-        Self { notices: [EMPTY; RING_LENGTH], used: 0, lost: 0, lost_receipts: [0; 2] }
+        Self { notices: [EMPTY; RING_LENGTH], used: 0, lost: None }
     }
 }
 
@@ -136,8 +134,8 @@ impl Notifications {
         self.notices.try_iter().take(QUEUE_LENGTH)
     }
 
-    /// Lost notices since the last drain: count and first and last receipt.
-    pub fn take_loss(&self) -> Option<(u64, QpcTick, QpcTick)> {
+    /// Lost notices since the last drain.
+    pub fn take_loss(&self) -> Option<LossSpan> {
         self.lost.take()
     }
 
@@ -182,10 +180,11 @@ fn wake(thread: u32) {
 fn start(
     kind: Loop, stop: Arc<AtomicBool>, lost: Arc<LossCounter>, progress: Arc<[AtomicI64; 2]>, send: SyncSender<Notice>, scoped: bool,
 ) -> Result<(JoinHandle<()>, u32), StartError> {
-    let (ready, initialized) = sync_channel(1);
     let name = match kind { Loop::Main => "context-window", Loop::Locations => "context-location" };
     let worker_stop = Arc::clone(&stop);
-    let worker = thread::Builder::new().name(name.into()).spawn(move || {
+    // A loop that has not reported ready observes the stop flag before its first wait.
+    let on_failure = || stop.store(true, Release);
+    let started = owner::spawn(name, scoped, on_failure, move |ready| {
         let storage = UnsafeCell::new(Pending::new());
         let _binding = Binding::install(&storage);
         let hooks = Hooks::open(kind);
@@ -196,14 +195,14 @@ fn start(
         let (_hooks, _window) = match hooks.and_then(|hooks| window.map(|window| (hooks, window))) {
             Ok(owners) => owners,
             Err(error) => {
-                let _ = ready.try_send(Err(error));
+                ready.fail(error);
                 return;
             }
         };
         // Ensure that a message queue exists before revealing the thread ID.
         let mut message = MSG::default();
         unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE) };
-        if ready.try_send(Ok(unsafe { GetCurrentThreadId() })).is_err() {
+        if !ready.ready(()) {
             return;
         }
         while !worker_stop.load(Acquire) {
@@ -224,12 +223,13 @@ fn start(
             }
             // No Windows dispatch is performed while reading this ring.
             let pending = unsafe { &mut *storage.get() };
-            let [first, last] = std::mem::take(&mut pending.lost_receipts);
-            lost.note(std::mem::take(&mut pending.lost), first, last);
+            if let Some(span) = pending.lost.take() {
+                lost.note(span);
+            }
             for notice in &pending.notices[..pending.used] {
                 match send.try_send(*notice) {
                     Ok(()) => {}
-                    Err(TrySendError::Full(_)) => lost.note(1, notice.receipt.0, notice.receipt.0),
+                    Err(TrySendError::Full(_)) => lost.note(LossSpan::at(notice.receipt)),
                     Err(TrySendError::Disconnected(_)) => return,
                 }
             }
@@ -242,19 +242,12 @@ fn start(
                 unsafe { MsgWaitForMultipleObjectsEx(0, null(), IDLE_WAIT_MS, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
             }
         }
-    }).map_err(StartError::Spawn)?;
-    match initialized.recv_timeout(Duration::from_secs(2)) {
-        Ok(Ok(thread)) => Ok((worker, thread)),
-        result => {
-            // A loop that has not reported ready observes the stop flag
-            // before its first wait.
-            stop.store(true, Release);
-            if scoped { let _ = worker.join(); }
-            match result {
-                Ok(Err(error)) => Err(error),
-                _ => Err(StartError::StartupTimeout),
-            }
-        }
+    });
+    match started {
+        Ok((worker, ())) => Ok((worker.handle, worker.thread_id)),
+        Err(StartupError::Spawn(error)) => Err(StartError::Spawn(error)),
+        Err(StartupError::Failed(error)) => Err(error),
+        Err(StartupError::Timeout) => Err(StartError::StartupTimeout),
     }
 }
 
@@ -330,9 +323,10 @@ fn enqueue(event: u32, window: HWND, object: i32, thread: u32, source_tick: Opti
         // called while the callback touches it and no reference is retained.
         let Some(pending) = (unsafe { active.get().as_mut() }) else { return };
         if !have_stamp || pending.used >= RING_LENGTH {
-            if pending.lost == 0 { pending.lost_receipts[0] = qpc; }
-            pending.lost_receipts[1] = qpc;
-            pending.lost = pending.lost.saturating_add(1);
+            match &mut pending.lost {
+                Some(span) => span.note(QpcTick(qpc)),
+                None => pending.lost = Some(LossSpan::at(QpcTick(qpc))),
+            }
             return;
         }
         pending.notices[pending.used] = Notice {

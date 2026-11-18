@@ -2,6 +2,8 @@
 
 use std::{mem::size_of, num::NonZeroU32};
 
+use screen_fix_protocol::{WindowId, ipc::FocusAtReceipt};
+
 use windows_sys::Win32::{
     Foundation::{GetLastError, HWND, SetLastError},
     UI::{
@@ -12,6 +14,24 @@ use windows_sys::Win32::{
         },
     },
 };
+
+/// The thread and process that own a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowOwner {
+    pub thread: NonZeroU32,
+    pub pid: NonZeroU32,
+}
+
+/// The owner of `hwnd`; `None` for a null or destroyed window. A caller that
+/// relies on the owner reads it again after its other reads and compares.
+pub fn window_owner(hwnd: HWND) -> Option<WindowOwner> {
+    if hwnd.is_null() {
+        return None;
+    }
+    let mut pid = 0;
+    let thread = NonZeroU32::new(unsafe { GetWindowThreadProcessId(hwnd, &mut pid) })?;
+    Some(WindowOwner { thread, pid: NonZeroU32::new(pid)? })
+}
 
 /// ES_PASSWORD on an Edit or RichEdit window. The style bit means nothing on
 /// other classes, which give no native password evidence (`Some(false)`) and
@@ -67,11 +87,26 @@ pub fn focus_at(thread: NonZeroU32, pid: NonZeroU32) -> Option<FocusAt> {
         return None;
     }
     let window = focus_window(&gui)?;
-    let mut owner = 0;
-    let thread = NonZeroU32::new(unsafe { GetWindowThreadProcessId(window.hwnd, &mut owner) })?;
-    if owner != pid.get() {
+    let owner = window_owner(window.hwnd)?;
+    if owner.pid != pid {
         return None;
     }
+    let thread = owner.thread;
     let keyboard_layout = unsafe { GetKeyboardLayout(thread.get()) };
     (!keyboard_layout.is_null()).then_some(FocusAt { gui, window, thread, keyboard_layout })
+}
+
+impl FocusAt {
+    /// The receipt of this focus. The active window used when no window has
+    /// focus identifies the focus state and layout only, so it carries no
+    /// `password_style` (INP-2, C4). Reads the password style now.
+    pub fn receipt(&self) -> FocusAtReceipt {
+        let hwnd = self.window.hwnd;
+        FocusAtReceipt {
+            window: WindowId(hwnd as usize as u64),
+            thread: self.thread,
+            keyboard_layout: self.keyboard_layout as usize as u64,
+            password_style: if self.window.active_fallback { None } else { password_style(hwnd) },
+        }
+    }
 }

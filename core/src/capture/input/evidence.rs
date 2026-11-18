@@ -51,7 +51,7 @@ impl NormalizedInput {
         pointer_hook_lost: bool,
         layout_name: impl Fn(Key, Option<u64>) -> Option<String>,
     ) -> Self {
-        let all = || std::iter::once(&correlated.first).chain(&correlated.partners);
+        let all = || correlated.slots();
         let raw = all().find(|slot| matches!(slot.packet.sample,
             InputSample::RawKey(_) | InputSample::RawPointer(_) | InputSample::Hid(_)));
         let hook = all().find(|slot| matches!(slot.packet.sample,
@@ -121,24 +121,20 @@ impl NormalizedInput {
                     points: PointerEvidence {
                         origin: origin.origin,
                         device: origin.device,
-                        monitor: match geometry {
-                            Evidence::Observed(id) => Evidence::Observed(id.monitor),
-                            Evidence::Uncertain { value, reason } => Evidence::Uncertain { value: value.monitor, reason },
-                            Evidence::Unavailable(reason) => Evidence::Unavailable(reason),
-                        },
+                        monitor: geometry.map(|id| id.monitor),
                         geometry,
-                        event_position: event.map_or(Evidence::Unavailable(reason), Evidence::Observed),
-                        receipt_position: received.map_or(Evidence::Unavailable(UnavailableReason::NotObserved), Evidence::Observed),
+                        event_position: Evidence::from_option(event, reason),
+                        receipt_position: Evidence::from_option(received, UnavailableReason::NotObserved),
                         event_position_receipt_t_us: event.and(hook).map(|slot| slot.time.recv_t_us),
                         receipt_position_t_us: received.and(raw).map(|slot| slot.time.recv_t_us),
                     },
-                    raw_relative: delta.map_or(Evidence::Unavailable(reason), Evidence::Observed),
+                    raw_relative: Evidence::from_option(delta, reason),
                     raw_absolute,
                     raw_absolute_packet,
                     raw_packets: raw_count,
-                    raw_wheel: raw.and_then(wheel).map_or(Evidence::Unavailable(reason), Evidence::Observed),
-                    hook_wheel: hook.and_then(wheel).map_or(Evidence::Unavailable(reason), Evidence::Observed),
-                    physical_button: physical.map_or(Evidence::Unavailable(reason), Evidence::Observed),
+                    raw_wheel: Evidence::from_option(raw.and_then(wheel), reason),
+                    hook_wheel: Evidence::from_option(hook.and_then(wheel), reason),
+                    physical_button: Evidence::from_option(physical, reason),
                     warp,
                 }
             });
@@ -152,7 +148,7 @@ fn origin(
 ) -> OriginEvidence {
     let mut signature = None;
     let mut conflicting = false;
-    for slot in std::iter::once(&correlated.first).chain(&correlated.partners) {
+    for slot in correlated.slots() {
         let extra = match slot.packet.sample {
             InputSample::RawPointer(pointer) => u64::from(pointer.extra_information),
             InputSample::HookPointer(pointer) => pointer.extra_information,

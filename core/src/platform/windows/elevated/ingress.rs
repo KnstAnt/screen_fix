@@ -5,6 +5,8 @@ use screen_fix_protocol::{QpcTick, ipc::{FocusAtReceipt, GapCause, Producer, Pro
     elevated::{ContextEvidence, GrantedInput, InputEvidence, VisitBinding, runtime::{ContextProducer, Observation}},
 }};
 
+use crate::util::keep_earlier;
+
 const CAPACITY: usize = 256;
 const PRODUCERS: usize = Producer::ALL.len();
 
@@ -68,7 +70,7 @@ impl Ingress {
     pub(super) fn media_open(&self) -> bool { self.uncovered_before.is_none() }
 
     fn restrict(&mut self, before: QpcTick, notify: &impl Fn(VisitBinding, QpcTick)) {
-        self.uncovered_before = Some(self.uncovered_before.map_or(before, |old| old.min(before)));
+        keep_earlier(&mut self.uncovered_before, before);
         notify(self.visit, before);
     }
 
@@ -87,7 +89,7 @@ impl Ingress {
             *source = Some(progress.before_qpc);
             return Ok(());
         }
-        let at = last_receipt(&item.evidence);
+        let at = item.evidence.last_qpc();
         if at > now { return Err(Failure::Protocol); }
         match &item.evidence {
             InputEvidence::Input(input) => {
@@ -106,8 +108,8 @@ impl Ingress {
             _ if at <= self.sample => return Ok(()),
             _ => {}
         }
-        let first = first_receipt(&item.evidence);
-        if first < self.delivered_before || producer(&item.evidence).is_some_and(|producer| {
+        let first = item.evidence.first_qpc();
+        if first < self.delivered_before || item.evidence.producer().is_some_and(|producer| {
             self.sources[producer.index()].is_some_and(|before| first < before)
         }) {
             self.restrict(first, &restrict);
@@ -191,7 +193,7 @@ impl Ingress {
                 if gap.producer == ContextProducer::Notices {
                     self.restrict(gap.first_qpc, &restrict);
                     if gap.first_qpc < self.delivered_before { return Err(Failure::Witness); }
-                    self.lost_notice_before = Some(self.lost_notice_before.map_or(gap.first_qpc, |old| old.min(gap.first_qpc)));
+                    keep_earlier(&mut self.lost_notice_before, gap.first_qpc);
                 }
             }
             _ => return Ok(false),
@@ -242,7 +244,7 @@ impl Ingress {
         if certificate.visit != self.visit || certificate.before <= self.delivered_before { return; }
         for _ in 0..self.pending.len() {
             let Some(item) = self.pending.pop_front() else { break; };
-            if last_receipt(&item) < certificate.before {
+            if item.last_qpc() < certificate.before {
                 accept(item);
             } else {
                 self.pending.push_back(item);
@@ -263,16 +265,6 @@ fn merge_gap(slot: &mut Option<ProducerGap>, gap: ProducerGap) {
     }
 }
 
-fn producer(item: &InputEvidence) -> Option<Producer> {
-    match item {
-        InputEvidence::Input(sample) => Some(sample.sample.producer()),
-        InputEvidence::DeviceArrived { .. } | InputEvidence::DeviceRemoved { .. } => Some(Producer::DeviceNotifications),
-        InputEvidence::Progress(progress) => Some(progress.producer),
-        InputEvidence::Gap(gap) => Some(gap.producer),
-        InputEvidence::Environment(_) | InputEvidence::OptionalUnavailable { .. } => None,
-    }
-}
-
 fn input_range(item: &InputEvidence) -> Option<ProducerGap> {
     let receipt = match item {
         InputEvidence::Input(sample) => sample.receipt,
@@ -280,24 +272,6 @@ fn input_range(item: &InputEvidence) -> Option<ProducerGap> {
         InputEvidence::Gap(gap) => return Some(*gap),
         _ => return None,
     };
-    Some(ProducerGap { producer: producer(item)?, cause: GapCause::Overflow, first_sequence: receipt.sequence, last_sequence: receipt.sequence,
+    Some(ProducerGap { producer: item.producer()?, cause: GapCause::Overflow, first_sequence: receipt.sequence, last_sequence: receipt.sequence,
         first_qpc: receipt.qpc, last_qpc: receipt.qpc })
-}
-
-fn first_receipt(item: &InputEvidence) -> QpcTick {
-    match item {
-        InputEvidence::Gap(gap) => gap.first_qpc,
-        _ => last_receipt(item),
-    }
-}
-
-fn last_receipt(item: &InputEvidence) -> QpcTick {
-    match item {
-        InputEvidence::Input(input) => input.receipt.qpc,
-        InputEvidence::DeviceArrived { receipt, .. } | InputEvidence::DeviceRemoved { receipt, .. } => receipt.qpc,
-        InputEvidence::Environment(state) => state.observed_qpc,
-        InputEvidence::OptionalUnavailable { observed_qpc, .. } => *observed_qpc,
-        InputEvidence::Progress(progress) => progress.before_qpc,
-        InputEvidence::Gap(gap) => gap.last_qpc,
-    }
 }

@@ -17,17 +17,18 @@ use std::{
 use crate::{
     capture::frame::CaptureColor,
     package::{
-        ArtifactKind, ArtifactRef, ImageDigest,
+        ArtifactKind, ArtifactRef, ImageDigest, raw_relative,
         diagnostics::{Failure, FailureComponent},
         journal::{Flush, JournalIngress},
         metadata::{AttemptLayout, ImageFile, LostActivity, PngCounters},
         outcome::HealthKind,
     },
     protocol::MonitorId,
-    session::{fault::FaultReport, windows::{PauseProducer, WorkerSession}},
+    platform::windows::controller::{PauseProducer, WorkerSession},
+    session::fault::FaultReport,
 };
 
-use super::{ProbeError, clock, package_journal_error, readback::Pixels, still_rows::{Awake, Merge, Rows, StillCoverage}};
+use super::{ProbeError, clock, readback::Pixels, still_rows::{Awake, Merge, Rows, StillCoverage}};
 
 const JOBS: usize = 12;
 const MAX_NEW_IMAGES: usize = 6;
@@ -204,13 +205,13 @@ impl Worker {
             if let Some(pause) = session.paused_cutoff().filter(|pause| flushed != Some(*pause))
                 && self.rows.includes(pause.time)
             {
-                journal.flush_wait(Flush::Os, pause.time).map_err(package_journal_error)?;
+                journal.flush_wait(Flush::Os, pause.time)?;
                 flushed = Some(pause);
                 session.finish_pause(pause, PauseProducer::Stills);
             }
             let latest = session.journal_flush_revision();
             if latest != revision {
-                journal.flush_wait(Flush::Os, self.rows.latest_receipt()).map_err(package_journal_error)?;
+                journal.flush_wait(Flush::Os, self.rows.latest_receipt())?;
                 revision = latest;
             }
             if let Some(mut job) = self.take_job() {
@@ -252,7 +253,7 @@ impl Worker {
     /// images whose removal still fails. The files are kept.
     fn unreferenced_images(&self, layout: &AttemptLayout) -> u64 {
         let published = self.images.iter()
-            .filter(|image| image.file.strip_prefix("raw/").is_none_or(|file| !self.rows.references(file)))
+            .filter(|image| raw_relative(&image.file).is_none_or(|file| !self.rows.references(file)))
             .count();
         let revoked = self.revoked.iter()
             .filter(|digest| fs::remove_file(layout.path(ArtifactKind::StillImage(**digest)))

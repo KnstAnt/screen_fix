@@ -305,8 +305,7 @@ fn self_check(encoder: &Encoder, input: encode::Input) -> Result<(), ProbeError>
             let media_type = stage(unsafe { transform.GetOutputCurrentType(0) }, "Read the startup H.264 media type")?;
             let video_size = stage(unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE) }, "Read the qualified H.264 dimensions")?;
             let rate = stage(unsafe { media_type.GetUINT64(&MF_MT_FRAME_RATE) }, "Read the qualified H.264 frame rate")?;
-            if video_size != ((u64::from(format.encoded[0]) << 32) | u64::from(format.encoded[1]))
-                || rate != ((u64::from(format.fps) << 32) | 1)
+            if video_size != mf::pack(format.encoded[0], format.encoded[1]) || rate != mf::pack(format.fps, 1)
             {
                 return Err(unavailable("The H.264 probe returned a different size or frame rate"));
             }
@@ -331,13 +330,12 @@ fn self_check(encoder: &Encoder, input: encode::Input) -> Result<(), ProbeError>
 
 fn video_type(subtype: &core::GUID, format: gpu::VideoFormat) -> Result<IMFMediaType, ProbeError> {
     let media_type = mf::media_type()?;
-    // Media Foundation packs the first UINT32 into the high half.
     stage((|| unsafe {
         media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         media_type.SetGUID(&MF_MT_SUBTYPE, subtype)?;
-        media_type.SetUINT64(&MF_MT_FRAME_SIZE, (u64::from(format.encoded[0]) << 32) | u64::from(format.encoded[1]))?;
-        media_type.SetUINT64(&MF_MT_FRAME_RATE, (u64::from(format.fps) << 32) | 1)?;
-        media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1_u64 << 32) | 1)?;
+        media_type.SetUINT64(&MF_MT_FRAME_SIZE, mf::pack(format.encoded[0], format.encoded[1]))?;
+        media_type.SetUINT64(&MF_MT_FRAME_RATE, mf::pack(format.fps, 1))?;
+        media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, mf::pack(1, 1))?;
         media_type.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
         media_type.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_22.0 as u32)?;
         media_type.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;

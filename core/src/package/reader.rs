@@ -14,15 +14,16 @@ use crate::protocol::{
 
 use super::{
     ArtifactKind, ArtifactRef,
-    journal::{MAX_ROW_BYTES, Unavailable, health_kind, suppressed_us},
+    journal::MAX_ROW_BYTES,
     metadata::{MissingVideoSlot, PackageError, PackageOperation, PackageReader, PackageResult, PackageState,
         SelectedSourceKind, SourceEvidence},
-    outcome::{GapRecord, HealthKind, LossReason, UiaOutcome, UiaRead},
+    outcome::{GapRecord, HealthKind},
+    row::{RowCounts, RowKind},
 };
 
 /// Context is read first: its pause and discontinuity rows bound the gate 3
 /// and gate 4 checks of the later journals (M1-10).
-const STREAMS: [StreamId; 4] = [StreamId::Context, StreamId::Input, StreamId::Frames, StreamId::Stills];
+pub(super) const STREAMS: [StreamId; 4] = [StreamId::Context, StreamId::Input, StreamId::Frames, StreamId::Stills];
 
 #[derive(Deserialize)]
 struct Envelope {
@@ -48,35 +49,6 @@ struct FrameRow {
     reason: Option<MissingVideoSlot>,
 }
 
-/// Row counts of one journal scan that the stream summary must reproduce.
-#[derive(Default)]
-struct RowTallies {
-    /// Per reason: the sum of known gap counts and the number of unknown-count gap rows.
-    dropped: BTreeMap<LossReason, (u64, u64)>,
-    unavailable: BTreeMap<String, u64>,
-    uia: BTreeMap<UiaRead, BTreeMap<UiaOutcome, u64>>,
-    health: u64,
-    pauses: u64,
-    blind: u64,
-    /// `suppressed_interval` rows and their summed duration.
-    suppressed: (u64, u64),
-}
-
-impl RowTallies {
-    fn reconciles(&self, summary: &super::StreamSummary) -> bool {
-        let summarized: BTreeMap<_, _> = summary.dropped_by_reason.iter()
-            .filter(|(_, total)| total.gap_items != 0 || total.unknown_gaps != 0)
-            .map(|(reason, total)| (*reason, (total.gap_items, total.unknown_gaps)))
-            .collect();
-        // An unknown loss count is excluded from the identity and is visible in the totals.
-        summarized == self.dropped && self.unavailable == summary.unavailable_by_reason
-            && self.uia == summary.uia_unavailable && self.health == summary.health_rows && self.pauses == summary.pause_rows
-            && self.blind == summary.blind_rows
-            && self.suppressed == (summary.suppressed_interval_rows, summary.suppressed_interval_us)
-            && summary.outcome_total().is_none_or(|total| total == summary.offered)
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct SourceSummary {
     pub standard_intervals: usize,
@@ -85,8 +57,8 @@ pub struct SourceSummary {
     pub enhanced_coverage_us: u64,
     pub blind_intervals: usize,
     pub uncertified_tails: usize,
-    pub failure: Option<crate::session::SourceFailure>,
-    pub cleanup_failure: Option<crate::session::SourceFailure>,
+    pub failure: Option<super::source::SourceFailure>,
+    pub cleanup_failure: Option<super::source::SourceFailure>,
     pub truncated: bool,
 }
 
@@ -199,7 +171,7 @@ impl PackageReader {
             let mut receipt = None;
             let mut gap_rows = 0_u64;
             let mut dropped = 0_u64;
-            let mut tallies = RowTallies::default();
+            let mut counts = RowCounts::default();
             let mut line = Vec::new();
             loop {
                 let error = || PackageError::InvalidJournal { stream, row: count.saturating_add(1) };
@@ -213,33 +185,30 @@ impl PackageReader {
                 if envelope.seq != count.saturating_add(1) || receipt.is_some_and(|previous| envelope.recv_t_us < previous) {
                     return Err(error());
                 }
-                if let Some(unavailable) = Unavailable::of(&value) {
-                    unavailable.count(&mut tallies.unavailable, &mut tallies.uia);
+                let kind = envelope.kind.as_deref().map(RowKind::parse);
+                if let Some(kind) = kind {
+                    counts.count_row(&kind.tally(&value));
                 }
-                match (stream, envelope.kind.as_deref()) {
+                match (stream, kind) {
                     // The frames stream has no gap or health rows.
                     (StreamId::Frames, Some(_)) if strict => return Err(error()),
-                    (_, Some("gap")) => {
+                    (_, Some(RowKind::Gap)) => {
                         let gap = GapRecord::deserialize(&value).map_err(|_| error())?;
                         if !gap.is_valid(envelope.recv_t_us) {
                             return Err(error());
                         }
                         gap_rows += 1;
-                        let total = tallies.dropped.entry(gap.reason).or_default();
-                        match gap.count {
-                            Some(count) => {
-                                dropped = dropped.saturating_add(count);
-                                total.0 = total.0.saturating_add(count);
-                            }
-                            None => total.1 += 1,
+                        if let Some(count) = gap.count {
+                            dropped = dropped.saturating_add(count);
                         }
+                        counts.count_gap(&gap);
                     }
                     // A per-second `input_health` row carries counts, not a health condition.
-                    (_, Some(kind)) if kind == health_kind(stream) && value.get("health").is_some() => {
+                    (_, Some(kind)) if kind == RowKind::health(stream) && value.get("health").is_some() => {
                         if HealthKind::deserialize(&value["health"]).is_err() {
                             return Err(error());
                         }
-                        tallies.health += 1;
+                        counts.count_health();
                     }
                     (StreamId::Frames, None) => {
                         let row = FrameRow::deserialize(&value).map_err(|_| error())?;
@@ -286,7 +255,7 @@ impl PackageReader {
                         }
                     }
                     (_, None) => return Err(error()),
-                    (StreamId::Stills, Some("still" | "still_dropped")) => {
+                    (StreamId::Stills, Some(kind @ (RowKind::Still | RowKind::StillDropped))) => {
                         if let Some(event) = value.get("event_ref").filter(|value| !value.is_null()) {
                             let event = EventRef::deserialize(event).map_err(|_| error())?;
                             let input = manifest.streams.get(&StreamId::Input);
@@ -302,13 +271,15 @@ impl PackageReader {
                         }
                         // Still files are relative to `raw/`, where the journal lives (D-1).
                         let file = value["file"].as_str();
-                        if envelope.kind.as_deref() == Some("still") {
+                        let journal_image = |file: &str| ArtifactKind::from_journal_file(file)
+                            .map(|kind| ArtifactRef { attempt: manifest.attempt_id.clone(), kind });
+                        if kind == RowKind::Still {
                             let geometry = GeometryId::deserialize(&value["geometry"]).map_err(|_| error())?;
                             let frame = FrameId::deserialize(&value["frame"]["id"]).map_err(|_| error())?;
                             if frame.monitor != geometry.monitor || !manifest.selected_displays.contains(&frame.monitor) {
                                 return Err(error());
                             }
-                            let size = self.validate_image(&format!("raw/{}", file.ok_or_else(error)?), true, error)?;
+                            let size = self.validate_image(journal_image(file.ok_or_else(error)?), true, error)?;
                             if value["width"].as_u64() != Some(u64::from(size[0]))
                                 || value["height"].as_u64() != Some(u64::from(size[1]))
                             {
@@ -318,16 +289,16 @@ impl PackageReader {
                         // IMG-2: a seen image is named only when it differs from the row's image.
                         if let Some(seen) = value.get("seen_file") {
                             let seen = seen.as_str().filter(|seen| Some(*seen) != file).ok_or_else(error)?;
-                            self.validate_image(&format!("raw/{seen}"), true, error)?;
+                            self.validate_image(journal_image(seen), true, error)?;
                         }
                     }
-                    (StreamId::Context, Some("cursor_asset")) => {
+                    (StreamId::Context, Some(RowKind::CursorAsset)) => {
                         let image = &value["image"];
                         match (value["available"].as_bool(), image["png"].as_str()) {
                             (Some(true), Some(png)) => {
-                                let size = self.validate_image(png, false, error)?;
+                                let size = self.validate_image(self.artifact_for_uri(png), false, error)?;
                                 if let Some(mask) = image["xor_mask"].as_str() {
-                                    if self.validate_image(mask, false, error)? != size {
+                                    if self.validate_image(self.artifact_for_uri(mask), false, error)? != size {
                                         return Err(error());
                                     }
                                 } else if !image["xor_mask"].is_null() {
@@ -338,21 +309,15 @@ impl PackageReader {
                             _ => return Err(error()),
                         }
                     }
-                    (_, Some("pause")) => tallies.pauses += 1,
-                    (_, Some("blind")) => tallies.blind += 1,
-                    (_, Some("suppressed_interval")) => {
-                        tallies.suppressed.0 += 1;
-                        tallies.suppressed.1 = tallies.suppressed.1.saturating_add(suppressed_us(&value));
-                    }
                     _ => {}
                 }
-                gates.row(stream, envelope.seq, envelope.recv_t_us, envelope.kind.as_deref(), &value)?;
+                gates.row(stream, envelope.seq, envelope.recv_t_us, kind, &value)?;
                 count = envelope.seq;
                 receipt = Some(envelope.recv_t_us);
             }
             if count != summary.rows || receipt != summary.last_receipt
                 || dropped != summary.dropped || (manifest.profile.is_some() && gap_rows != summary.gap_rows)
-                || (manifest.health.is_some() && !tallies.reconciles(summary))
+                || (manifest.health.is_some() && !counts.reconciles(summary))
             {
                 return Err(PackageError::InvalidJournal { stream, row: count });
             }
@@ -368,8 +333,10 @@ impl PackageReader {
 
     /// Check one image a journal row names. A name that is not an inventoried
     /// image of the expected kind is an error of the naming row (`row_error`).
-    fn validate_image(&self, uri: &str, still: bool, row_error: impl Fn() -> PackageError) -> PackageResult<[u32; 2]> {
-        let artifact = self.artifact_for_uri(uri).ok_or_else(&row_error)?;
+    fn validate_image(
+        &self, artifact: Option<ArtifactRef>, still: bool, row_error: impl Fn() -> PackageError,
+    ) -> PackageResult<[u32; 2]> {
+        let artifact = artifact.ok_or_else(&row_error)?;
         if !matches!((artifact.kind, still), (ArtifactKind::StillImage(_), true) | (ArtifactKind::CursorImage(_), false)) {
             return Err(row_error());
         }
@@ -397,17 +364,6 @@ impl PackageReader {
         Ok([width, height])
     }
 }
-
-/// Kinds of input rows that are user actions a still can reference (gate 2).
-const ACTIONS: [&str; 7] = ["key_down", "key_up", "pointer_down", "pointer_up", "pointer_move", "scroll", "pen"];
-
-/// The v6 boundary, loss and health kinds a context journal may hold inside a
-/// pause interval (gate 4), besides `pause`, `resume` and unapproved `foreground`.
-const PAUSE_CONTEXT: [&str; 6] = ["discontinuity", "gap", "health", "recorder_control", "recorder_control_gap", "input_source_loss"];
-
-/// The v6 loss, blind, health and suppression kinds an input journal may hold
-/// inside a pause interval (gate 4).
-const PAUSE_INPUT: [&str; 4] = ["gap", "blind", "input_health", "suppressed_interval"];
 
 /// Evidence of gates 2–4 gathered in the single journal pass (M1-10).
 #[derive(Default)]
@@ -439,55 +395,59 @@ impl Gates {
         self.pauses.iter().any(|(cutoff, resume)| at > *cutoff && resume.is_none_or(|resume| at < resume))
     }
 
-    fn row(&mut self, stream: StreamId, seq: u64, at: SessionTimeUs, kind: Option<&str>, value: &Value) -> PackageResult<()> {
+    fn row(&mut self, stream: StreamId, seq: u64, at: SessionTimeUs, kind: Option<RowKind>, value: &Value) -> PackageResult<()> {
         let violation = |gate, reason| Err(PackageError::GateViolation { gate, stream, row: seq, reason });
         let time = |field: &str| value[field].as_i64().map(SessionTimeUs);
         match kind {
-            Some("gap") => self.excluded.extend(time("first_recv_t_us").zip(time("last_recv_t_us"))),
-            Some("blind") => self.excluded.extend(time("start_us").zip(time("end_us"))),
-            Some("discontinuity" | "suppressed_interval") => self.excluded.extend(time("start_t_us").zip(time("end_t_us"))),
+            Some(RowKind::Gap) => self.excluded.extend(time("first_recv_t_us").zip(time("last_recv_t_us"))),
+            Some(RowKind::Blind) => self.excluded.extend(time("start_us").zip(time("end_us"))),
+            Some(RowKind::Discontinuity | RowKind::SuppressedInterval) => {
+                self.excluded.extend(time("start_t_us").zip(time("end_t_us")));
+            }
             _ => {}
         }
         // Gate 4: only boundary, loss and approval-free rows inside a pause interval.
         match stream {
             StreamId::Context => match kind {
-                Some("pause") => {
+                Some(RowKind::Pause) => {
                     self.pauses.push((time("cutoff_t_us").unwrap_or(at), None));
                     self.paused = true;
                 }
-                Some("resume") => {
+                Some(RowKind::Resume) => {
                     if let Some(pause) = self.pauses.last_mut() { pause.1 = Some(at); }
                     self.paused = false;
                 }
-                Some(kind) if PAUSE_CONTEXT.contains(&kind) => {}
-                Some("foreground") if value["approved"] == false => {}
+                Some(kind) if kind.allowed_in_pause(stream) => {}
+                Some(RowKind::Foreground) if value["approved"] == false => {}
                 _ if self.paused => return violation(4, "a context row other than a boundary or loss row while paused"),
                 _ => {}
             },
-            StreamId::Input if self.paused_at(at) && !kind.is_some_and(|kind| PAUSE_INPUT.contains(&kind)) =>
+            StreamId::Input if self.paused_at(at) && !kind.is_some_and(|kind| kind.allowed_in_pause(stream)) =>
                 return violation(4, "an input row inside a pause interval"),
             StreamId::Frames if kind.is_none() && time("pts_us").is_some_and(|slot| self.paused_at(slot)) =>
                 return violation(4, "a frames row for a paused slot"),
-            StreamId::Stills if matches!(kind, Some("still" | "still_dropped")) && time("trigger_t_us").is_some_and(|trigger| self.paused_at(trigger)) =>
+            StreamId::Stills if matches!(kind, Some(RowKind::Still | RowKind::StillDropped)) && time("trigger_t_us").is_some_and(|trigger| self.paused_at(trigger)) =>
                 return violation(4, "a still triggered inside a pause interval"),
             _ => {}
         }
         if stream != StreamId::Input { return Ok(()) }
-        if kind.is_some_and(|kind| ACTIONS.contains(&kind)) && value["synthetic"] != true {
+        if kind.is_some_and(RowKind::is_action) && value["synthetic"] != true {
             let index = usize::try_from(seq / 64).unwrap_or(usize::MAX);
             if self.actions.len() <= index { self.actions.resize(index.saturating_add(1), 0); }
             self.actions[index] |= 1 << (seq % 64);
         }
         self.pass_pauses(Some(at));
-        let Some(kind @ ("key_down" | "key_up" | "pointer_down" | "pointer_up")) = kind else { return Ok(()) };
+        let Some(kind @ (RowKind::KeyDown | RowKind::KeyUp | RowKind::PointerDown | RowKind::PointerUp)) = kind else {
+            return Ok(())
+        };
         let synthetic = value["synthetic"] == true;
-        let key = kind.starts_with("key");
+        let key = matches!(kind, RowKind::KeyDown | RowKind::KeyUp);
         // Synthetic and ordinary rows carry the same key, button and device
         // fields; a touchpad-attributed row keeps its reporting device apart.
         let device = if value["source_device"].is_null() { &value["device"] } else { &value["source_device"] };
         let device = (device["status"] == "observed").then(|| device["detail"].as_u64()).flatten();
         let identity = if key { ("key", value["vk"].to_string(), device) } else { ("button", value["button"].to_string(), device) };
-        if kind.ends_with("_down") {
+        if matches!(kind, RowKind::KeyDown | RowKind::PointerDown) {
             // An autorepeat or an unknown repeat state (I4) does not open a press.
             let opens = synthetic || value.get("repeat").is_none_or(|repeat| *repeat == false);
             if opens && let Some((row, opened)) = self.presses.insert(identity, (seq, at)) {

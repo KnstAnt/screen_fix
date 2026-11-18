@@ -54,9 +54,25 @@ pub(crate) enum Modifier {
     RightWin = 7,
 }
 
+/// The side-specific virtual key of each modifier, in discriminant order.
+const MODIFIER_VKS: [(Modifier, u16); 8] = [
+    (Modifier::LeftShift, 0xa0), (Modifier::RightShift, 0xa1), (Modifier::LeftCtrl, 0xa2), (Modifier::RightCtrl, 0xa3),
+    (Modifier::LeftAlt, 0xa4), (Modifier::RightAlt, 0xa5), (Modifier::LeftWin, 0x5b), (Modifier::RightWin, 0x5c),
+];
+
 impl Modifier {
     pub const ALL: [Self; 8] = [Self::LeftShift, Self::RightShift, Self::LeftCtrl, Self::RightCtrl,
         Self::LeftAlt, Self::RightAlt, Self::LeftWin, Self::RightWin];
+
+    /// The side-specific virtual key.
+    pub fn vk(self) -> u16 {
+        MODIFIER_VKS[self as usize].1
+    }
+
+    /// The modifier of a side-specific virtual key.
+    pub fn from_vk(vk: u16) -> Option<Self> {
+        MODIFIER_VKS.iter().find(|(_, key)| *key == vk).map(|(modifier, _)| *modifier)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -279,18 +295,7 @@ fn normalize_key(mut vk: u16, mut scan: Option<ScanCode>, down: bool) -> Option<
         0x12 if scan.is_some() => 0xa4,
         _ => vk,
     };
-    let modifier = match vk {
-        0xa0 => Some(Modifier::LeftShift),
-        0xa1 => Some(Modifier::RightShift),
-        0xa2 => Some(Modifier::LeftCtrl),
-        0xa3 => Some(Modifier::RightCtrl),
-        0xa4 => Some(Modifier::LeftAlt),
-        0xa5 => Some(Modifier::RightAlt),
-        0x5b => Some(Modifier::LeftWin),
-        0x5c => Some(Modifier::RightWin),
-        _ => None,
-    };
-    Some(Key { scan, virtual_key: vk, down, modifier })
+    Some(Key { scan, virtual_key: vk, down, modifier: Modifier::from_vk(vk) })
 }
 
 fn hook_pointer(pointer: HookPointer) -> Option<Action> {

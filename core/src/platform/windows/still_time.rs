@@ -1,7 +1,7 @@
 //! Capture-owner selectors. Every comparison uses an actual capture's source time.
 
 use crate::{
-    capture::frame::FrameMetadata,
+    capture::frame::{ApprovalGeneration, FrameMetadata},
     config::DeviceCalibration,
     protocol::{AdmissionEpoch, CaptureEpoch, GeometryId, SessionTimeUs},
 };
@@ -13,7 +13,7 @@ pub(super) struct Interval {
     pub geometry: GeometryId,
     pub capture: CaptureEpoch,
     pub admission: AdmissionEpoch,
-    pub approval: u64,
+    pub approval: ApprovalGeneration,
     pub elevated_visit: Option<screen_fix_protocol::ipc::elevated::VisitBinding>,
 }
 

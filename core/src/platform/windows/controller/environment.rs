@@ -48,9 +48,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLo
 
 use crate::{
     CaptureError,
-    platform::windows::{clock, on_input_desktop},
     protocol::{QpcTick, ipc::EnvironmentChange},
 };
+
+use crate::platform::windows::{clock, on_input_desktop};
 
 const CLASS_NAME: *const u16 = w!("ScreenFixControllerNotifications");
 const DESKTOP_POLL: Duration = Duration::from_millis(100);
@@ -98,7 +99,7 @@ impl SuspendMarks {
     pub(crate) fn awake_elapsed(
         &self, from: QpcTick, to: QpcTick, since: u64, frequency: crate::protocol::QpcFrequency,
     ) -> AwakeElapsed {
-        let ticks = |from: QpcTick, to: QpcTick| u128::try_from(to.0.saturating_sub(from.0).max(0)).unwrap_or(0);
+        let ticks = |from: QpcTick, to: QpcTick| u64::try_from(to.0.saturating_sub(from.0)).unwrap_or(0);
         let total = ticks(from, to);
         let excluded = if self.sequence == 0 {
             0
@@ -115,8 +116,7 @@ impl SuspendMarks {
                 _ => return AwakeElapsed::Unknown,
             }
         };
-        let nanos = total.saturating_sub(excluded).saturating_mul(1_000_000_000) / u128::from(frequency.0.get());
-        AwakeElapsed::Known(Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)))
+        AwakeElapsed::Known(frequency.duration(total.saturating_sub(excluded)))
     }
 }
 

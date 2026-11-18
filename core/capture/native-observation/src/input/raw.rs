@@ -27,7 +27,7 @@ use windows_sys::{
             Input::KeyboardAndMouse::GetKeyboardLayout,
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow,
-                GetGUIThreadInfo, GetPhysicalCursorPos, GetSystemMetrics, GetWindowThreadProcessId,
+                GetGUIThreadInfo, GetPhysicalCursorPos, GetSystemMetrics,
                 HWND_MESSAGE, MSG, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
                 SM_CYVIRTUALSCREEN, SM_SWAPBUTTON, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
             },
@@ -406,9 +406,8 @@ impl RawWindow {
         if foreground.is_null() {
             return None;
         }
-        let mut pid = 0;
-        let thread = NonZeroU32::new(unsafe { GetWindowThreadProcessId(foreground, &mut pid) })?;
-        let pid = NonZeroU32::new(pid)?;
+        let owner = crate::focus::window_owner(foreground)?;
+        let (thread, pid) = (owner.thread, owner.pid);
         if self.foreground.as_ref().is_none_or(|cached| cached.pid != pid.get()) {
             self.foreground = None;
             let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid.get()) };
@@ -422,12 +421,8 @@ impl RawWindow {
         }
         let creation_filetime = self.foreground.as_ref()?.creation_filetime;
         let focus = sample_focus(thread, pid);
-        let mut checked_pid = 0;
-        let stable = unsafe {
-            GetForegroundWindow() == foreground
-                && GetWindowThreadProcessId(foreground, &mut checked_pid) == thread.get()
-                && checked_pid == pid.get()
-        };
+        let stable = unsafe { GetForegroundWindow() } == foreground
+            && crate::focus::window_owner(foreground) == Some(owner);
         if !stable {
             return None;
         }
@@ -440,22 +435,16 @@ impl RawWindow {
 }
 
 fn sample_focus(thread: NonZeroU32, pid: NonZeroU32) -> Option<FocusAtReceipt> {
-    let crate::focus::FocusAt {
-        mut gui, window: crate::focus::FocusWindow { hwnd: focus, active_fallback }, thread: focus_thread,
-        keyboard_layout: layout,
-    } = crate::focus::focus_at(thread, pid)?;
-    // The active window used when nothing has focus is layout evidence only.
-    let password_style = (!active_fallback).then(|| crate::focus::password_style(focus)).flatten();
+    let at = crate::focus::focus_at(thread, pid)?;
+    let receipt = at.receipt();
+    let mut gui = at.gui;
     if unsafe { GetGUIThreadInfo(thread.get(), &mut gui) } == 0
-        || crate::focus::focus_window(&gui).map(|current| current.hwnd) != Some(focus)
-        || unsafe { GetKeyboardLayout(focus_thread.get()) } != layout
+        || crate::focus::focus_window(&gui).map(|current| current.hwnd) != Some(at.window.hwnd)
+        || unsafe { GetKeyboardLayout(at.thread.get()) } != at.keyboard_layout
     {
         return None;
     }
-    Some(FocusAtReceipt {
-        window: WindowId(focus as usize as u64), thread: focus_thread,
-        keyboard_layout: layout as usize as u64, password_style,
-    })
+    Some(receipt)
 }
 
 fn absolute_desktop(flags: u16) -> Option<PhysicalRect> {

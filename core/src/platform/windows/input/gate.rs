@@ -11,7 +11,7 @@ use crate::{
         observation::ProvisionalInputKind,
         input::{
             Action, ClassifiedControlInput, ControlDisposition, CorrelatedInput, Correlation, HeldBoundary, HeldIdentity,
-            SyntheticHeldEdge, HeldInput, Holding, InputOrigin, Key, Modifier, Motion, PendingInput, PublishedHeld, ScanCode,
+            SyntheticHeldEdge, HeldInput, Holding, InputOrigin, PendingInput, PublishedHeld, ScanCode,
             VK_PACKET, buttons_in, has_promotion, injected_hook, modifier_bit, modifier_of, modifiers_in,
         },
     },
@@ -19,13 +19,19 @@ use crate::{
         diagnostics::Failure,
         journal::{HealthRecord, JournalIngress, Submit},
         outcome::{HealthKind, LossCount, LossEvidence, LossProducer, LossReason, LossScope, SuppressionClass},
+        row::RowEnvelope,
     },
-    protocol::{AdmissionEpoch, DeviceId, EventRef, Evidence, FocusGeneration, GeometryId, ObservationId, SessionTimeUs, UnavailableReason, ipc::{DeviceDescriptor, ForegroundAtReceipt, InputSample, MAX_INPUT_DEVICES, OptionalCollection, Producer, elevated::VisitBinding}},
-    session::windows::Receipt,
+    protocol::{AdmissionEpoch, DeviceId, EventRef, Evidence, FocusGeneration, GeometryId, ObservationId, RecordTime, SessionTimeUs, UnavailableReason, ipc::{DeviceDescriptor, ForegroundAtReceipt, InputSample, MAX_INPUT_DEVICES, OptionalCollection, Producer, elevated::VisitBinding}},
+    platform::windows::controller::Receipt,
+    util::keep_earlier,
 };
 
-use super::super::{ProbeError, clock, context::{ConfirmedText, Context, HookReceipt, ImeState, ReceiptFocus, Visit}, package_journal_error};
-use super::{ReceiptPrefix, blind::Blinds, hid::{self, HidPublication}, receiver::ProvisionalRequests, text::{KeyboardText, TextCommit, TextOrigin, TextStatus, Typing, text_key}};
+use super::super::{ProbeError, clock, unavailable, context::{ConfirmedText, Context, HookReceipt, ImeState, ReceiptFocus, Visit}};
+use crate::capture::input::{
+    blind::Blinds, hid::{self, HidPublication}, loss::{is_key, record_loss},
+    publication::{ModifierKnowledge, MotionCounts, Outcomes, modifier_bits, per_second},
+};
+use super::{ReceiptPrefix, receiver::ProvisionalRequests, text::{KeyboardText, TextCommit, TextOrigin, TextStatus, Typing, text_key}};
 
 const MAX_SLOTS: usize = 1024;
 const MAX_CONFIRMATIONS: usize = 256;
@@ -61,42 +67,8 @@ pub(super) struct Gate {
     injector_hints: Vec<ControllerHint>,
 }
 
-/// Input terminal outcomes that are not rows: losses and policy suppressions.
-/// The publication owner admits them to the input journal in receipt order.
-#[derive(Default)]
-struct Outcomes {
-    /// Ordinary losses, at most one per (reason, producer). Each is admitted
-    /// only once every record at or before its last receipt has been
-    /// published, so its range never exceeds its admission receipt.
-    ordinary: Vec<LossEvidence>,
-    /// Count-only losses (§6.1 rule 5); they carry no time.
-    sensitive: Vec<LossEvidence>,
-    suppressed: std::collections::BTreeMap<SuppressionClass, u64>,
-    health: Vec<HealthRecord>,
-}
-
 /// Pending runtime health conditions; each kind is rare.
 const MAX_PENDING_HEALTH: usize = 32;
-
-impl Outcomes {
-    fn loss(&mut self, evidence: LossEvidence) {
-        let pending = match evidence.scope {
-            LossScope::Ordinary(_) => &mut self.ordinary,
-            LossScope::Sensitive => &mut self.sensitive,
-        };
-        let mut evidence = evidence;
-        for entry in pending.iter_mut() {
-            match entry.merge(evidence) {
-                Ok(merged) => {
-                    *entry = merged;
-                    return;
-                }
-                Err(unmerged) => evidence = unmerged,
-            }
-        }
-        pending.push(evidence);
-    }
-}
 
 enum Slot {
     Input(ClassifiedControlInput),
@@ -104,61 +76,6 @@ enum Slot {
         at: SessionTimeUs, visit: Visit, held_modifiers: u8, released_modifiers: u8, edges: Vec<SyntheticHeldEdge>,
     },
     Boundary { at: SessionTimeUs, kind: HeldBoundary, selection: Selection },
-}
-
-#[derive(Clone, Copy)]
-struct ModifierKnowledge {
-    known: u8,
-    // A second device may still hold a side after an approved device releases it.
-    possibly_hidden: u8,
-    awaiting_confirmation: u8,
-}
-
-impl ModifierKnowledge {
-    fn from_released(released: u8) -> Self {
-        Self { known: released, possibly_hidden: !released, awaiting_confirmation: 0 }
-    }
-
-    fn conceal(&mut self, bits: u8) {
-        self.known &= !bits;
-        self.possibly_hidden |= bits;
-        self.awaiting_confirmation &= !bits;
-    }
-
-    fn after(mut self, input: &HeldInput, key: Key) -> Self {
-        self.known &= input.held.modifiers_known;
-        self.awaiting_confirmation &= input.held.modifiers;
-        if let Some(modifier) = key.modifier {
-            let bit = modifier_bit(modifier);
-            self.awaiting_confirmation &= !bit;
-            let held = input.held.modifiers & bit != 0;
-            if input.held.modifiers_known & bit == 0
-                || matches!(input.repeat, Evidence::Unavailable(UnavailableReason::Ambiguous | UnavailableReason::Blind))
-            {
-                self.conceal(bit);
-            } else if key.down && held {
-                self.known |= bit;
-            } else if !key.down && !held {
-                self.known |= bit;
-                self.possibly_hidden &= !bit;
-            } else if !key.down && self.possibly_hidden & bit != 0 {
-                self.known &= !bit;
-            }
-        } else {
-            self.conceal(modifier_bits(key));
-        }
-        self
-    }
-}
-
-fn modifier_bits(key: Key) -> u8 {
-    match (key.modifier, key.virtual_key) {
-        (Some(modifier), _) => modifier_bit(modifier),
-        (None, 0x10) => modifier_bit(Modifier::LeftShift) | modifier_bit(Modifier::RightShift),
-        (None, 0x11) => modifier_bit(Modifier::LeftCtrl) | modifier_bit(Modifier::RightCtrl),
-        (None, 0x12) => modifier_bit(Modifier::LeftAlt) | modifier_bit(Modifier::RightAlt),
-        _ => 0,
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -202,45 +119,6 @@ struct RedactedVisit {
     start: Option<SessionTimeUs>,
     end: Option<SessionTimeUs>,
     count: u64,
-}
-
-/// One session second of `input_health` counts (INP-6): coalesced raw
-/// packets, thinned motion rows, policy suppressions that carry no
-/// privacy-sensitive timing, and raw-motion evidence that no cursor sample
-/// carries: per device, the packet count and summed relative delta (stage I2).
-#[derive(Default)]
-struct MotionCounts {
-    second: i64,
-    coalesced: u64,
-    thinned: u64,
-    suppressed: std::collections::BTreeMap<SuppressionClass, u64>,
-    raw_motion: std::collections::BTreeMap<Option<DeviceId>, (u64, i64, i64)>,
-}
-
-impl MotionCounts {
-    /// The bucket of the second of `at`, opened if none is pending.
-    fn at(motion: &mut Option<Self>, at: SessionTimeUs) -> &mut Self {
-        motion.get_or_insert(Self { second: at.0.div_euclid(1_000_000), ..Self::default() })
-    }
-
-    fn raw_motion(&mut self, record: &PendingInput) {
-        let InputSample::RawPointer(pointer) = record.packet.sample else { return };
-        let Action::Motion(motion) = record.action else { return };
-        let (packets, x, y) = self.raw_motion.entry(pointer.device).or_default();
-        *packets = packets.saturating_add(1);
-        if let Motion::Relative { x: dx, y: dy } = motion {
-            *x = x.saturating_add(i64::from(dx));
-            *y = y.saturating_add(i64::from(dy));
-        }
-    }
-}
-
-/// Suppression classes whose per-second counts can be written. Approval,
-/// focus and cluster classes can belong to an unapproved or sensitive visit
-/// and are counted only in the stream totals (§6.1).
-fn per_second(class: SuppressionClass) -> bool {
-    matches!(class, SuppressionClass::RecorderControl | SuppressionClass::UnconfirmedSynchronization
-        | SuppressionClass::NotPublishable)
 }
 
 impl Gate {
@@ -335,19 +213,20 @@ impl Gate {
         // Blind intervals join the input stream (INP-13) at their end, raised to the published prefix.
         for blind in blinds.take_ready(ready, closing) {
             let at = prefix.raised(blind.end);
-            prefix.submit_boundary(output, at, vec![blind.row()])?;
+            let row = blind.row().map_err(|_| unavailable("Encode an input blind row"))?;
+            prefix.submit_boundary(output, at, vec![row])?;
         }
         let health: Vec<_> = self.outcomes.health
             .extract_if(.., |record| closing.is_some() || ready.is_some_and(|ready| record.detected <= ready)).collect();
         for mut record in health {
             if let Some(cutoff) = closing { record.detected = record.detected.min(cutoff); }
             let admitted = prefix.raised(record.detected);
-            output.submit_health(record).map_err(package_journal_error)?;
+            output.submit_health(record)?;
             prefix.admit(admitted)?;
         }
         let admitted = prefix.last_time.unwrap_or(receipt.boundary.time);
         for evidence in std::mem::take(&mut self.outcomes.sensitive) {
-            output.record_loss(evidence, admitted).map_err(package_journal_error)?;
+            output.record_loss(evidence, admitted)?;
         }
         // `ordinary` holds ordinary-scope losses only.
         let mut due: Vec<_> = self.outcomes.ordinary.extract_if(.., |evidence| matches!(evidence.scope,
@@ -368,7 +247,7 @@ impl Gate {
                 }
             }
             let admitted = prefix.raised(range.last_t_us);
-            output.record_loss(evidence, admitted).map_err(package_journal_error)?;
+            output.record_loss(evidence, admitted)?;
             prefix.admit(admitted)?;
         }
         Ok(())
@@ -377,9 +256,9 @@ impl Gate {
     pub fn push(&mut self, input: ClassifiedControlInput, requests: &mut ProvisionalRequests) {
         if self.slots.len() >= MAX_SLOTS || self.overflow_at.is_some() {
             self.overflow = true;
-            self.overflow_at.get_or_insert(input.input.normalized.correlated.first.time.recv_t_us);
+            self.overflow_at.get_or_insert(input.input.receipt());
             // A row is one item; its partner and absorbed evidence belongs to it.
-            self.note_records_lost(LossReason::StagingPressure, [&input.input.normalized.correlated.first], None);
+            self.note_records_lost(LossReason::StagingPressure, [input.input.first()], None);
             requests.retire_input(input.input);
         } else {
             self.slots.push_back(Slot::Input(input));
@@ -389,7 +268,7 @@ impl Gate {
     pub fn boundary(&mut self, at: SessionTimeUs, kind: HeldBoundary, selection: Selection) {
         if !is_closing(kind) && (self.slots.len() >= MAX_SLOTS || self.overflow_at.is_some()) {
             self.overflow = true;
-            self.overflow_at = Some(self.overflow_at.map_or(at, |first| first.min(at)));
+            keep_earlier(&mut self.overflow_at, at);
         } else {
             self.slots.push_back(Slot::Boundary { at, kind, selection });
         }
@@ -484,7 +363,7 @@ impl Gate {
 
     fn first_slot(&self) -> Option<SessionTimeUs> {
         self.slots.front().map(|slot| match slot {
-            Slot::Input(input) => input.input.normalized.correlated.first.time.recv_t_us,
+            Slot::Input(input) => input.input.receipt(),
             Slot::Boundary { at, .. } | Slot::Synchronization { at, .. } => *at,
         })
     }
@@ -516,7 +395,7 @@ impl Gate {
     ) -> Result<(), ProbeError> {
         self.resolve_confirmed(requests);
         let observed = if context.visit().is_some_and(Visit::is_elevated) {
-            receipt.clock.time(receipt.qpc).map_err(super::clock_error)?.max(through)
+            receipt.clock.time(receipt.qpc)?.max(through)
         } else {
             through
         };
@@ -531,7 +410,7 @@ impl Gate {
                     && let Some(last) = prefix.last_time.filter(|last| *last > *at)
                 {
                     let (at, _) = self.confirmed_text.pop_front().expect("confirmed text was present");
-                    output.record_loss(text_loss(LossReason::LateCommit, at), last).map_err(package_journal_error)?;
+                    output.record_loss(text_loss(LossReason::LateCommit, at), last)?;
                     continue;
                 }
                 let elapsed = observed.0.saturating_sub(at.0);
@@ -668,11 +547,11 @@ impl Gate {
                         if matches!(class, SuppressionClass::NotApproved | SuppressionClass::ApprovalUnknown) {
                             context.count_suppressed(at);
                         }
-                        if matches!(classified.input.normalized.correlated.first.action, Action::Key(_)) {
+                        if matches!(classified.input.first().action, Action::Key(_)) {
                             // Without an approved classification, even the affected side is private.
                             self.modifier_knowledge.conceal(u8::MAX);
                         }
-                        if let InputSample::Hid(sample) = &classified.input.normalized.correlated.first.packet.sample {
+                        if let InputSample::Hid(sample) = &classified.input.first().packet.sample {
                             self.hid.reset(Some(sample.device));
                         }
                         requests.retire_input(classified.input);
@@ -714,7 +593,7 @@ impl Gate {
             let row = json!({ "kind": "suppressed_interval", "reason": interval.reason,
                 "start_t_us": interval.start, "end_t_us": end, "input_suppressed": interval.input,
                 "admission_epoch": receipt.boundary.epoch });
-            prefix.advance_time(at, output.try_submit(at, row).map_err(package_journal_error)?)?;
+            prefix.advance_time(at, output.try_submit(at, row)?)?;
         }
         self.resolve_confirmed(requests);
         context.note_held_buttons(self.held.buttons_down());
@@ -975,9 +854,6 @@ impl Gate {
             row["cluster_raw"] = json!(cluster.raw);
             row["cluster_hooks"] = json!(cluster.hooks);
         }
-        row["admission_epoch"] = json!(first.admission);
-        row["source_t_us"] = json!(source_time);
-        row["source_uncertainty_us"] = json!(first.time.source_uncertainty_us);
         // A correlated group has at most one hook. Prefer its tick without
         // replacing the earlier logical receipt that orders the group.
         let tick_witness = if matches!(first.packet.sample, InputSample::RawKey(_) | InputSample::RawPointer(_)) {
@@ -990,9 +866,8 @@ impl Gate {
         let late = coarse.filter(|_| !injected_hook(&tick_witness.packet.sample))
             .and_then(|tick| clock::message_tick_estimate(receipt.clock, tick_witness.tick_anchor, tick))
             .map(|estimate| estimate.is_late(at));
-        row["tick_ms"] = json!(coarse.map(|time| time.tick_ms));
-        row["tick_uncertainty_us"] = json!(coarse.map(|time| time.uncertainty_us));
-        row["late"] = json!(late);
+        RowEnvelope::new(RecordTime { source_t_us: source_time, coarse, ..first.time }, late, first.admission)
+            .write(&mut row).map_err(|_| unavailable("Encode the input row envelope"))?;
         if let Some(pointer) = pointer {
             // `held` and `mods` are the published state after this row (INP-5).
             let (modifiers, buttons) = match input.edge {
@@ -1034,13 +909,11 @@ impl Gate {
             && !lacks_confirmation_capacity
         {
             let observation = requests.choose(&input, geometry, proof, kind);
-            let device = match pointer.map_or(normal.origin.device, |pointer| pointer.points.device) {
-                Evidence::Observed(device) => Some(device), _ => None,
-            };
-            let (disposition, event) = output.try_submit_confirmed(at, row).map_err(package_journal_error)?;
+            let device = pointer.map_or(normal.origin.device, |pointer| pointer.points.device).observed();
+            let (disposition, event) = output.try_submit_confirmed(at, row)?;
             (disposition, Some(Confirmation { observation, geometry, kind, admission: first.admission, proof, device, at, event }))
         } else {
-            (output.try_submit(at, row).map_err(package_journal_error)?, None)
+            (output.try_submit(at, row)?, None)
         };
         prefix.advance_time(at, disposition)?;
         if let Some(knowledge) = modifier_knowledge {
@@ -1098,7 +971,7 @@ impl Gate {
     }
 
     fn conceal_modifier(&mut self, input: &HeldInput) {
-        if let Action::Key(key) = input.normalized.correlated.first.action {
+        if let Action::Key(key) = input.first().action {
             self.modifier_knowledge.conceal(modifier_bits(key));
         }
     }
@@ -1136,7 +1009,7 @@ impl Gate {
             "focus_generation": generation, "admission_epoch": receipt.boundary.epoch,
             "text_edit_receipt_t_us": provider_receipt,
         });
-        prefix.advance_time(at, output.try_submit(at, row).map_err(package_journal_error)?)
+        prefix.advance_time(at, output.try_submit(at, row)?)
     }
 
     pub fn resolve_confirmed(&mut self, requests: &mut ProvisionalRequests) {
@@ -1179,7 +1052,7 @@ impl Gate {
         for visit in self.completed_redactions.drain(..) {
             let row = json!({ "kind": "redacted", "field_start_t_us": visit.start, "field_end_t_us": visit.end,
                 "key_count": visit.count, "admission_epoch": receipt.boundary.epoch });
-            prefix.advance_time(at, output.try_submit(at, row).map_err(package_journal_error)?)?;
+            prefix.advance_time(at, output.try_submit(at, row)?)?;
         }
         Ok(())
     }
@@ -1205,7 +1078,7 @@ impl Gate {
                 json!({ "device": device, "packets": packets, "delta": [x, y] })
             }).collect::<Vec<_>>(),
             "admission_epoch": receipt.boundary.epoch });
-        prefix.advance_time(at, output.try_submit(at, row).map_err(package_journal_error)?)
+        prefix.advance_time(at, output.try_submit(at, row)?)
     }
 
     fn close(
@@ -1267,7 +1140,7 @@ impl Gate {
             prefix.submit_boundary(output, at, edges.into_iter().map(|edge| held_row(edge, receipt)).collect())?;
         } else {
             for edge in edges {
-                let submitted = output.try_submit(at, held_row(edge, receipt)).map_err(package_journal_error)?;
+                let submitted = output.try_submit(at, held_row(edge, receipt))?;
                 prefix.advance_time(at, submitted)?;
             }
         }
@@ -1283,7 +1156,7 @@ fn clean_null_pointer(input: &crate::capture::input::NormalizedInput) -> bool {
     }
     let mut raw = false;
     let mut hook = false;
-    for slot in std::iter::once(&input.correlated.first).chain(&input.correlated.partners) {
+    for slot in input.correlated.slots() {
         match &slot.packet.sample {
             InputSample::RawPointer(pointer) if pointer.device.is_none()
                 && !has_promotion(u64::from(pointer.extra_information)) => raw = true,
@@ -1317,7 +1190,7 @@ fn approved_receipt(input: &HeldInput, context: &mut Context<'_>)
 {
     let unknown = SuppressionClass::ApprovalUnknown;
     let input = &input.normalized.correlated;
-    let slots = || std::iter::once(&input.first).chain(&input.partners);
+    let slots = || input.slots();
     let producer = Producer::RawInput;
     let first_raw = slots().find(|slot| slot.packet.sample.producer() == producer);
     let promotion_pen = input.promotion.as_ref().map(|link| link.pen.as_ref());
@@ -1361,25 +1234,6 @@ fn reference_key() -> Option<[u8; 32]> {
     (status == 0).then_some(key)
 }
 
-/// A keyboard record, raw or hook.
-pub(super) fn is_key(sample: &InputSample) -> bool {
-    matches!(sample, InputSample::RawKey(_) | InputSample::HookKey(_))
-}
-
-/// The loss evidence of one record of `producer` by its privacy class (§6.1
-/// rule 5): a key record is count-only, since its visit may be sensitive;
-/// any other keeps its receipt range from `first` to `at`.
-pub(super) fn record_loss(
-    reason: LossReason, producer: Producer, key: bool, first: SessionTimeUs, at: SessionTimeUs,
-) -> LossEvidence {
-    let producer = Some(LossProducer::from(producer));
-    if key {
-        LossEvidence::sensitive(reason, producer, std::num::NonZeroU64::MIN)
-    } else {
-        LossEvidence::ordinary(reason, producer, std::num::NonZeroU64::MIN, first, at)
-    }
-}
-
 /// One text-edit commit lost at `at`.
 fn text_loss(reason: LossReason, at: SessionTimeUs) -> LossEvidence {
     LossEvidence::ordinary(reason, Some(LossProducer::TextEdit), std::num::NonZeroU64::MIN, at, at)
@@ -1394,7 +1248,7 @@ fn is_closing(reason: HeldBoundary) -> bool {
 fn held_row(edge: SyntheticHeldEdge, receipt: Receipt) -> serde_json::Value {
     let down = edge.edge.down;
     let identity = edge.edge.identity;
-    let device = identity.device.map_or(Evidence::Unavailable(UnavailableReason::NotObserved), Evidence::Observed);
+    let device = Evidence::from_option(identity.device, UnavailableReason::NotObserved);
     let mut row = json!({
         "synthetic": true, "boundary": edge.reason, "device": device, "admission_epoch": receipt.boundary.epoch,
     });
@@ -1413,7 +1267,7 @@ fn held_row(edge: SyntheticHeldEdge, receipt: Receipt) -> serde_json::Value {
         Holding::Button { logical, physical } => {
             row["kind"] = json!(pointer);
             row["button"] = json!(logical);
-            row["button_physical"] = json!(physical.map_or(Evidence::Unavailable(UnavailableReason::NotObserved), Evidence::Observed));
+            row["button_physical"] = json!(Evidence::from_option(physical, UnavailableReason::NotObserved));
         }
         Holding::PromotedPenPointer { logical, cursor_id } => {
             row["kind"] = json!(pointer);

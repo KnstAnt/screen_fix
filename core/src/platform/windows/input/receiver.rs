@@ -6,7 +6,7 @@ use crate::{
     capture::{
         context::ControllerHint,
         input::{
-            ControlChords, Discarded, HeldBoundary, HeldInput, InputGap,
+            ControlChords, ControlNotice, Discarded, HeldBoundary, HeldInput, InputGap,
             InputMatcher, InputStep, Key, MotionSampler,
             NormalizedInput, PendingInput, PhysicalHeld, ProvisionalInputChange, Sampled, ScanCode, ScanPrefix,
             modifier_bit, modifier_of, startup_modifier,
@@ -20,12 +20,17 @@ use crate::{
     },
     protocol::{
         AdmissionEpoch, BoundedList, DeviceId, Evidence, EventRef, FocusGeneration, GeometryId, MonitorId, ObservationId, PhysicalPoint, QpcTick, SessionTimeUs, UnavailableReason,
-        ipc::{DeviceDescriptor, ForegroundAtReceipt, GapCause, HelperToCore, InputSample, MAX_INPUT_DEVICES, OptionalCollection, Producer, ProducerGap, elevated::{InputEvidence, VisitBinding}},
+        ipc::{DeviceDescriptor, ForegroundAtReceipt, HelperToCore, InputSample, MAX_INPUT_DEVICES, OptionalCollection, Producer, ProducerGap, elevated::{InputEvidence, VisitBinding}},
     },
-    session::{AdmissionBoundary, hotkey::ControlOutcome, windows::{AwakeElapsed, ControlPrefix, InputFailure, Receipt, SuspendMarks}},
+    platform::windows::controller::{AwakeElapsed, ControlPrefix, InputFailure, Receipt, SuspendMarks},
+    session::{AdmissionBoundary, hotkey::ControlOutcome},
+    util::raise,
 };
 
-use super::{ProbeError, ReceiptPrefix, blind::Blinds, clock, clock_error, devices::Devices, gate::{Gate, Selection, is_key, record_loss}, hook_health::HookHealth, input_timing, resync, unavailable};
+use crate::capture::input::{
+    blind::Blinds, devices::Devices, hook_health::HookHealth, loss::{ProducerLoss, SampleLoss, is_key, record_loss},
+};
+use super::{ProbeError, ReceiptPrefix, clock, gate::{Gate, Selection}, input_timing, resync, unavailable};
 use super::super::{context::{ConfirmedText, Context, Visit}, elevated::InputCertificate, still_rows, stills};
 
 /// A producer without progress for this long, suspend excluded, opens a
@@ -124,7 +129,7 @@ impl Receiver {
     /// first missing receipt is [`Self::earliest_missing`]. An unknown suspend
     /// interval is not evaluated.
     pub fn check_stall(&mut self, receipt: Receipt, power: SuspendMarks) -> Result<Option<Producer>, ProbeError> {
-        let now = receipt.clock.time(receipt.qpc).map_err(clock_error)?;
+        let now = receipt.clock.time(receipt.qpc)?;
         // Liveness is measured from this (re)opening of ordinary input, which
         // can follow its admission boundary after an elevated visit.
         let opening = *self.opening_mark.get_or_insert(ProgressMark {
@@ -254,20 +259,11 @@ impl Receiver {
     ) -> Result<(), ProbeError> {
         let Some(certificate) = self.source_certificate else { return Ok(()); };
         if self.source != Some(certificate.visit) { return Ok(()); }
-        let record = match record {
-            InputEvidence::Input(value) if value.receipt.qpc < certificate.before => HelperToCore::Input(value),
-            InputEvidence::DeviceArrived { receipt, descriptor } if receipt.qpc < certificate.before =>
-                HelperToCore::DeviceArrived { receipt, descriptor },
-            InputEvidence::DeviceRemoved { receipt, id } if receipt.qpc < certificate.before =>
-                HelperToCore::DeviceRemoved { receipt, id },
-            InputEvidence::Environment(state) if state.observed_qpc < certificate.before =>
-                HelperToCore::Environment(state),
-            InputEvidence::Gap(gap) if gap.last_qpc < certificate.before => HelperToCore::Gap(gap),
-            InputEvidence::OptionalUnavailable { collection, observed_qpc } if observed_qpc < certificate.before =>
-                HelperToCore::OptionalUnavailable { collection, observed_qpc },
-            _ => return Ok(()),
-        };
-        self.accept(record, receipt, closing, context)
+        // Producer progress counts only through the certificate's bounds.
+        if matches!(record, InputEvidence::Progress(_)) || record.last_qpc() >= certificate.before {
+            return Ok(());
+        }
+        self.accept(record.into(), receipt, closing, context)
     }
 
     pub fn finish_elevated_delivery(&mut self, receipt: Receipt) -> Result<(), ProbeError> {
@@ -276,7 +272,7 @@ impl Receiver {
             // The matcher may consume only the part of each original
             // producer bound materialized inside this certified delivery.
             let eligible = progress.before_qpc.min(certificate.before).min(certificate.context_before);
-            let before = receipt.clock.time(eligible).map_err(clock_error)?;
+            let before = receipt.clock.time(eligible)?;
             self.matcher.progress(progress.producer, before);
         }
         Ok(())
@@ -378,7 +374,7 @@ impl Receiver {
                 ).map_err(|_| unavailable("The input request ID counter overflowed"))?;
             }
             HelperToCore::Progress(progress) => {
-                let before = receipt.clock.time(progress.before_qpc).map_err(clock_error)?;
+                let before = receipt.clock.time(progress.before_qpc)?;
                 self.matcher.progress(progress.producer, before);
                 let mark = &mut self.marks[progress.producer.index()];
                 if mark.is_none_or(|mark| progress.before_qpc > mark.qpc) {
@@ -388,7 +384,7 @@ impl Receiver {
                     let resumed = stall.stalled.iter().any(|(producer, stalled)| *producer == progress.producer && progress.before_qpc > *stalled);
                     if resumed {
                         stall.stalled.retain(|(producer, _)| *producer != progress.producer);
-                        let end = receipt.clock.time(receipt.qpc).map_err(clock_error)?.max(before);
+                        let end = receipt.clock.time(receipt.qpc)?.max(before);
                         // This producer's own interval ends here; the shared
                         // blind interval ends when the last one resumes.
                         self.hook_health.end_stall(progress.producer, end);
@@ -399,7 +395,7 @@ impl Receiver {
                 }
             }
             HelperToCore::OptionalUnavailable { collection, observed_qpc } => {
-                let at = receipt.clock.time(observed_qpc.max(receipt.boundary.qpc)).map_err(clock_error)?;
+                let at = receipt.clock.time(observed_qpc.max(receipt.boundary.qpc))?;
                 self.note_optional_lost(collection, Some(at));
             }
             HelperToCore::Gap(gap) => {
@@ -409,14 +405,11 @@ impl Receiver {
                 }
                 let first_qpc = gap.first_qpc.max(receipt.boundary.qpc);
                 let last_qpc = closing.map_or(gap.last_qpc, |end| gap.last_qpc.min(end.qpc));
-                let first = receipt.clock.time(first_qpc).map_err(clock_error)?;
-                let last = receipt.clock.time(last_qpc).map_err(clock_error)?;
+                let first = receipt.clock.time(first_qpc)?;
+                let last = receipt.clock.time(last_qpc)?;
                 let clipped = gap.first_qpc < receipt.boundary.qpc || closing.is_some_and(|end| gap.last_qpc > end.qpc);
                 let count = native_count(gap, clipped);
-                let reason = match gap.cause {
-                    GapCause::Overflow => LossReason::NativeQueueOverflow,
-                    GapCause::Malformed => LossReason::MalformedPacket,
-                };
+                let reason = gap.cause.into();
                 self.matcher.gap(InputGap {
                     producer: gap.producer, reason, first, last, count,
                     source_seq: Some([gap.first_sequence.0, gap.last_sequence.0]), qpc: Some([first_qpc, last_qpc]),
@@ -424,7 +417,7 @@ impl Receiver {
             }
             HelperToCore::DeviceRemoved { receipt: removal, id } => {
                 if removal.qpc >= receipt.boundary.qpc && closing.is_none_or(|end| removal.qpc < end.qpc) {
-                    let time = receipt.clock.time(removal.qpc).map_err(clock_error)?;
+                    let time = receipt.clock.time(removal.qpc)?;
                     self.matcher.remove_device(id, removal, time);
                 } else if removal.qpc < receipt.boundary.qpc {
                     self.gate.forget_input_device(id);
@@ -454,7 +447,7 @@ impl Receiver {
     /// An elevated record past the certified prefix of an interrupted visit (E1).
     pub fn note_uncertified(&mut self, record: InputEvidence, receipt: Receipt) -> Result<(), ProbeError> {
         if let InputEvidence::Input(packet) = record && packet.receipt.qpc >= receipt.boundary.qpc {
-            let at = receipt.clock.time(packet.receipt.qpc).map_err(clock_error)?;
+            let at = receipt.clock.time(packet.receipt.qpc)?;
             self.note_packet_lost(LossReason::UncertifiedSource, &packet.sample, at);
         }
         Ok(())
@@ -524,19 +517,20 @@ impl Receiver {
             {
                 self.controls.start_chord();
             } else {
-                let at = receipt.clock.time(notice.activation.at).map_err(clock_error)?;
-                self.controls.confirm(notice.activation, at);
+                let at = receipt.clock.time(notice.activation.at)?;
+                let control = ControlNotice { virtual_key: notice.activation.virtual_key, message_tick: notice.activation.message_tick };
+                self.controls.confirm(control, at);
             }
         }
         if let Some(loss) = prefix.loss {
             self.overflow = true;
-            self.controls.note_loss(receipt.clock.time(loss.last).map_err(clock_error)?);
+            self.controls.note_loss(receipt.clock.time(loss.last)?);
         }
         if let Some(before) = prefix.before {
-            self.controls.progress(receipt.clock.time(before).map_err(clock_error)?);
+            self.controls.progress(receipt.clock.time(before)?);
         }
         if prefix.failed {
-            let unavailable_at = receipt.clock.time(receipt.qpc).map_err(clock_error)?;
+            let unavailable_at = receipt.clock.time(receipt.qpc)?;
             self.controls.note_loss(unavailable_at);
             self.controls.progress(unavailable_at);
         }
@@ -633,7 +627,7 @@ impl Receiver {
         let visit = context.visit().filter(|&visit| context.confirm_focus(visit));
         if let Some(state) = resync::read() {
             let qpc = clock::qpc()?;
-            let at = receipt.clock.time(qpc).map_err(clock_error)?;
+            let at = receipt.clock.time(qpc)?;
             self.install_synchronization(qpc, at, state, visit.filter(|&visit| context.confirm_focus(visit)));
         }
         Ok(())
@@ -643,7 +637,7 @@ impl Receiver {
         &mut self, receipt: Receipt, completed: QpcTick, snapshot: Option<screen_fix_protocol::ipc::elevated::HeldSnapshot>,
         visit: Visit,
     ) -> Result<(), ProbeError> {
-        let at = receipt.clock.time(completed).map_err(clock_error)?;
+        let at = receipt.clock.time(completed)?;
         if let Some(snapshot) = snapshot {
             self.install_synchronization(completed, at, resync::from_snapshot(snapshot), Some(visit));
         } else {
@@ -659,7 +653,7 @@ impl Receiver {
         &mut self, receipt: Receipt, completed: QpcTick, snapshot: screen_fix_protocol::ipc::elevated::HeldSnapshot,
         visit: Visit,
     ) -> Result<(), ProbeError> {
-        let at = receipt.clock.time(completed).map_err(clock_error)?;
+        let at = receipt.clock.time(completed)?;
         self.sync_visit = Some(visit);
         self.matcher.stage_synchronization(completed, at, resync::from_snapshot(snapshot));
         Ok(())
@@ -681,8 +675,8 @@ impl Receiver {
         self.gate.note_loss(LossEvidence {
             reason, producer: gap.map(|gap| LossProducer::from(gap.producer)), count,
             scope: LossScope::Ordinary(LossRange {
-                first_t_us: receipt.clock.time(first_qpc).map_err(clock_error)?,
-                last_t_us: receipt.clock.time(last_qpc).map_err(clock_error)?,
+                first_t_us: receipt.clock.time(first_qpc)?,
+                last_t_us: receipt.clock.time(last_qpc)?,
                 source_seq: gap.map(|gap| [gap.first_sequence.0, gap.last_sequence.0]),
                 qpc: Some([first_qpc, last_qpc]),
             }),
@@ -706,8 +700,11 @@ impl Receiver {
     /// its evidence from the per-producer split, so its keys stay count-only.
     fn note_gap_loss(&mut self, gap: InputGap) {
         if gap.reason == LossReason::ForegroundInaccessible {
-            std::mem::take(&mut self.foreground_losses[gap.producer.index()])
-                .note(&mut self.gate, gap.reason, gap.producer);
+            for evidence in std::mem::take(&mut self.foreground_losses[gap.producer.index()])
+                .evidence(gap.reason, gap.producer)
+            {
+                self.gate.note_loss(evidence);
+            }
         } else {
             self.gate.note_loss(gap.evidence());
         }
@@ -754,7 +751,7 @@ impl Receiver {
     ) -> Result<(), ProbeError> {
         let certified = self.matched_and_sampled_before();
         let certified = if let Some(before) = self.elevated_hook_loss() {
-            let at = receipt.clock.time(before).map_err(clock_error)?;
+            let at = receipt.clock.time(before)?;
             certified.map(|bound| bound.min(at))
         } else { certified };
         self.gate.drain(context, output, prefix, &mut self.provisional, &mut self.blinds, receipt, through, certified, final_boundary)
@@ -898,7 +895,7 @@ impl Receiver {
                         return;
                     }
                 }
-                if let InputSample::Hid(report) = &input.first.packet.sample && report.pen_continuity_uncertain() {
+                if let InputSample::Hid(report) = &input.first.packet.sample && crate::capture::input::pen::continuity_uncertain(report) {
                     self.flush_motion();
                     let at = input.first.time.recv_t_us;
                     self.release_controls(Some(at), at, true);
@@ -973,7 +970,7 @@ impl Receiver {
         self.matcher.discard_stale_synchronization(through);
         self.requires_opening_sync = true;
         self.sync_visit = None;
-        self.sync_after = Some(self.sync_after.map_or(through, |previous| previous.max(through)));
+        raise(&mut self.sync_after, through);
     }
 
     fn invalidate(&mut self, at: SessionTimeUs, through: SessionTimeUs, reason: HeldBoundary) {
@@ -1016,17 +1013,17 @@ impl Receiver {
             match sample {
                 Sampled::Retained(input) if losses.interval.is_none() => {
                     if let Err(input) = controls.stage(input) {
-                        losses.record(input, requests);
+                        retire_lost(&mut losses, input, requests);
                     }
                 }
                 Sampled::Thinned(mut input) if losses.interval.is_none() => {
                     input.motion_thinned = true;
                     if let Err(input) = controls.stage(input) {
-                        losses.record(input, requests);
+                        retire_lost(&mut losses, input, requests);
                     }
                 }
                 Sampled::Retained(input) | Sampled::Dropped(input) | Sampled::Thinned(input) => {
-                    losses.record(input, requests);
+                    retire_lost(&mut losses, input, requests);
                 }
 
             }
@@ -1035,32 +1032,34 @@ impl Receiver {
             return false;
         }
         for input in self.sampler.discard_pending() {
-            let at = input.normalized.correlated.first.time.recv_t_us;
+            let at = input.receipt();
             if losses.interval.is_some_and(|(first, _)| at < first) {
                 if let Err(input) = self.controls.stage(input) {
-                    losses.record(input, &mut self.provisional);
+                    retire_lost(&mut losses, input, &mut self.provisional);
                 }
             } else {
-                losses.record(input, &mut self.provisional);
+                retire_lost(&mut losses, input, &mut self.provisional);
             }
         }
         let Some((first, _)) = losses.interval else { return false };
         for input in self.controls.discard_from(first) {
-            losses.record(input, &mut self.provisional);
+            retire_lost(&mut losses, input, &mut self.provisional);
         }
         let Some((first, last)) = losses.interval else { return false };
         self.overflow = true;
         self.hook_health.reset_streaks();
         self.matcher.invalidate_through(last);
         self.apply_gap(first, last, HeldBoundary::InputGap, losses.by_producer);
-        losses.note(&mut self.gate);
+        for evidence in losses.evidence() {
+            self.gate.note_loss(evidence);
+        }
         true
     }
 
     fn release_controls(&mut self, before: Option<SessionTimeUs>, at: SessionTimeUs, closing: bool) {
         for classified in self.controls.release(before, at, closing) {
             if let Some(boundary) = classified.boundary && (!closing || boundary.at <= at) {
-                self.gate.boundary(classified.input.normalized.correlated.first.time.recv_t_us,
+                self.gate.boundary(classified.input.receipt(),
                     HeldBoundary::RecorderControl, Selection::Modifiers(boundary.modifiers));
             }
             self.gate.push(classified, &mut self.provisional);
@@ -1075,62 +1074,10 @@ fn native_count(gap: ProducerGap, clipped: bool) -> LossCount {
         .filter(|_| !clipped).map_or(LossCount::Unknown, LossCount::Known)
 }
 
-/// The lost records of one producer split by privacy class (§6.1 rule 5):
-/// key records keep only their count, since their visit may be sensitive;
-/// the others keep their merged receipt range.
-#[derive(Clone, Copy, Default)]
-struct ProducerLoss {
-    keys: u64,
-    others: Option<InputGap>,
-}
-
-impl ProducerLoss {
-    /// One lost record, as its logical gap.
-    fn record(&mut self, gap: InputGap, key: bool) {
-        if key {
-            self.keys = self.keys.saturating_add(1);
-        } else {
-            self.others = Some(self.others.map_or(gap, |old| old.merge(gap)));
-        }
-    }
-
-    fn note(self, gate: &mut Gate, reason: LossReason, producer: Producer) {
-        if let Some(count) = std::num::NonZeroU64::new(self.keys) {
-            gate.note_loss(LossEvidence::sensitive(reason, Some(LossProducer::from(producer)), count));
-        }
-        if let Some(gap) = self.others {
-            gate.note_loss(gap.evidence());
-        }
-    }
-}
-
-#[derive(Default)]
-struct SampleLoss {
-    interval: Option<(SessionTimeUs, SessionTimeUs)>,
-    /// Every lost record of each producer, for the held invalidation.
-    by_producer: [Option<InputGap>; Producer::ALL.len()],
-    /// The same records split by privacy class, for their loss evidence.
-    evidence: [ProducerLoss; Producer::ALL.len()],
-}
-
-impl SampleLoss {
-    fn record(&mut self, input: HeldInput, requests: &mut ProvisionalRequests) {
-        let slot = &input.normalized.correlated.first;
-        let at = slot.time.recv_t_us;
-        let producer = slot.packet.sample.producer();
-        let gap = InputGap::logical(producer, LossReason::StagingPressure, at);
-        let pending = &mut self.by_producer[producer.index()];
-        *pending = Some(pending.map_or(gap, |old| old.merge(gap)));
-        self.evidence[producer.index()].record(gap, is_key(&slot.packet.sample));
-        self.interval = Some(self.interval.map_or((at, at), |(first, last)| (first.min(at), last.max(at))));
-        requests.retire_input(input);
-    }
-
-    fn note(&self, gate: &mut Gate) {
-        for producer in Producer::ALL {
-            self.evidence[producer.index()].note(gate, LossReason::StagingPressure, producer);
-        }
-    }
+/// Record one input lost to staging pressure and retire its provisional requests.
+fn retire_lost(losses: &mut SampleLoss, input: HeldInput, requests: &mut ProvisionalRequests) {
+    losses.record(&input);
+    requests.retire_input(input);
 }
 
 fn scan_from_layout(vk: u16, layout: Option<u64>) -> Option<ScanCode> {
@@ -1289,7 +1236,7 @@ impl ProvisionalRequests {
     fn poll_pointer_rest(&mut self, context: &mut Context<'_>, receipt: Receipt, observed: QpcTick, source: Option<VisitBinding>)
         -> Result<(), ProbeError>
     {
-        let now = receipt.clock.time(observed).map_err(clock_error)?;
+        let now = receipt.clock.time(observed)?;
         let Some(motion) = self.motion.take_if(|motion| now.0.saturating_sub(motion.last.0) >= POINTER_REST_US) else {
             return Ok(());
         };
@@ -1299,7 +1246,8 @@ impl ProvisionalRequests {
         let Some(endpoint) = self.endpoints.get(&motion.geometry.monitor) else { return Ok(()) };
         let Some(rows) = &self.rows else { return Ok(()) };
         let fallback = stills::fallback_row(stills::Trigger::PointerRest, stills::Role::Image, now,
-            crate::protocol::Evidence::Observed(motion.geometry), motion.admission, None, "pointer_rest_handoff_unavailable");
+            crate::protocol::Evidence::Observed(motion.geometry), motion.admission, None,
+            stills::DropReason::PointerRestHandoffUnavailable);
         let reservation = match rows.reserve(now, Some(fallback)) {
             Ok(reservation) => reservation,
             Err(reason) => {
@@ -1316,7 +1264,7 @@ impl ProvisionalRequests {
         -> Option<ObservationId>
     {
         let correlated = &input.normalized.correlated;
-        std::iter::once(&correlated.first).chain(&correlated.partners)
+        correlated.slots()
             .filter_map(|slot| slot.observation)
             .filter_map(|id| self.pending.get(&id).map(|entry| (id, entry)))
             .filter(|(_, entry)| entry.envelope.kind == kind)
@@ -1346,7 +1294,11 @@ impl ProvisionalRequests {
             }
             _ => None,
         };
-        let reason = if routable.is_some() { "provisional_retention_unavailable" } else { "monitor_routing_unknown" };
+        let reason = if routable.is_some() {
+            stills::DropReason::ProvisionalRetentionUnavailable
+        } else {
+            stills::DropReason::MonitorRoutingUnknown
+        };
         rows.approve(kind, event, geometry, admission, at, reason);
         if let Some((decision, geometry)) = entry.decision.zip(routable) {
             // A send failure drops the transferred reservations. Approved
@@ -1363,7 +1315,8 @@ impl ProvisionalRequests {
                 // envelope or still rows, so its publication reserves nothing.
                 let at = request.time.recv_t_us;
                 let opens = request.kind != ProvisionalInputKind::PreMotion || {
-                    let previous = self.last_motion.replace(self.last_motion.map_or(at, |last| last.max(at)));
+                    let previous = self.last_motion;
+                    raise(&mut self.last_motion, at);
                     previous.is_none_or(|last| at.0.saturating_sub(last.0) >= MOTION_IDLE_US)
                 };
                 let source = source.filter(|_| opens);
@@ -1413,7 +1366,7 @@ impl ProvisionalRequests {
 
     pub fn retire_except(&mut self, input: &HeldInput, permit: Option<ObservationId>) {
         let input = &input.normalized.correlated;
-        for slot in std::iter::once(&input.first).chain(&input.partners) {
+        for slot in input.slots() {
             if let Some(id) = slot.observation.filter(|id| Some(*id) != permit) {
                 self.resolve(id);
             }
@@ -1422,6 +1375,6 @@ impl ProvisionalRequests {
 
     pub fn retire_input(&mut self, input: HeldInput) {
         let input = &input.normalized.correlated;
-        self.resolve_records(std::iter::once(&input.first).chain(&input.partners));
+        self.resolve_records(input.slots());
     }
 }

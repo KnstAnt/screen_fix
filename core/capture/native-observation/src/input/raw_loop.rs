@@ -8,7 +8,6 @@ use std::{
         mpsc::{self, Receiver, SyncSender},
     },
     thread,
-    time::Duration,
 };
 
 use screen_fix_protocol::{
@@ -21,9 +20,11 @@ use windows_sys::Win32::{
     UI::WindowsAndMessaging::{
         DispatchMessageW, GIDC_ARRIVAL, GIDC_REMOVAL, GetMessageW, GetSystemMetrics, KillTimer,
         MSG, PostThreadMessageW, SM_SWAPBUTTON, SetTimer, WM_APP, WM_INPUT, WM_INPUT_DEVICE_CHANGE,
-        WM_QUIT, WM_TIMER,
+        WM_TIMER,
     },
 };
+
+use crate::owner::{self, OwnerThread, Startup, StartupError};
 
 use super::{
     CaptureScope, NativeError, device, last_error,
@@ -31,8 +32,8 @@ use super::{
     raw::{RawRecord, RawWindow, qpc},
 };
 
-/// The Raw Input thread's identity and the optional collections it registered.
-type RawReady = (u32, [bool; screen_fix_protocol::ipc::OptionalCollection::ALL.len()]);
+/// The optional collections the Raw Input thread registered.
+type RawReady = [bool; screen_fix_protocol::ipc::OptionalCollection::ALL.len()];
 
 const CHECK_TIMER: usize = 1;
 const PROGRESS_TIMER: usize = 2;
@@ -43,11 +44,9 @@ const RAW_THREAD: [Producer; 3] = [Producer::DeviceNotifications, Producer::RawI
 const DEVICE_REQUESTS: usize = 64;
 
 pub(super) struct RawOwner {
-    thread_id: u32,
     pending: Arc<AtomicU32>,
-    owner: thread::JoinHandle<RawResult>,
-    governed: bool,
-    optional: [bool; screen_fix_protocol::ipc::OptionalCollection::ALL.len()],
+    owner: OwnerThread<RawResult>,
+    optional: RawReady,
     pub(super) records: Receiver<HelperToCore>,
 }
 
@@ -67,39 +66,29 @@ struct RawResult {
 impl RawOwner {
     pub(super) fn start(data_wake: OwnedHandle, frequency: i64, pen_hid: bool, scope: Option<Arc<CaptureScope>>) -> Result<Self, NativeError> {
         let governed = scope.is_some();
-        let (ready, initialized) = mpsc::sync_channel(1);
         let (ingress, records) = mpsc::sync_channel(RAW_QUEUE_CAPACITY);
         let pending = Arc::new(AtomicU32::new(0));
         let thread_pending = Arc::clone(&pending);
-        let owner = thread::Builder::new().name("input-raw".into()).spawn(move || {
+        let started = owner::spawn("input-raw", governed, || {}, move |ready| {
             let mut output = Evidence { ingress, data_wake, losses: Losses::default(), status: PendingStatus::default() };
             let result = raw_loop(&mut output, &thread_pending, &ready, frequency / 80, pen_hid, scope.as_deref());
             if let Err(error) = result {
-                let _ = ready.try_send(Err(error));
+                ready.fail(error);
                 signal(&output.data_wake);
             }
             RawResult { result, losses: output.losses, status: output.status }
-        }).map_err(|error| NativeError {
-            stage: HelperFailureStage::Startup,
-            code: error.raw_os_error(),
-            raw_input_registration: None,
-        })?;
-        let (thread_id, optional) = match initialized.recv_timeout(Duration::from_secs(2)) {
-            Ok(Ok(ready)) => ready,
-            result => {
-                drop(initialized);
-                if governed { let _ = owner.join(); }
-                return match result {
-                    Ok(Err(error)) => Err(error),
-                    _ => Err(NativeError::without_code(HelperFailureStage::MessageLoop)),
-                };
-            }
+        });
+        let (owner, optional) = match started {
+            Ok(started) => started,
+            Err(StartupError::Spawn(error)) => return Err(NativeError::io(HelperFailureStage::Startup, &error)),
+            Err(StartupError::Failed(error)) => return Err(error),
+            Err(StartupError::Timeout) => return Err(NativeError::without_code(HelperFailureStage::MessageLoop)),
         };
-        Ok(Self { thread_id, pending, owner, records, governed, optional })
+        Ok(Self { pending, owner, records, optional })
     }
 
     /// Optional collections registered at startup, in `OptionalCollection::ALL` order.
-    pub(super) fn optional(&self) -> [bool; screen_fix_protocol::ipc::OptionalCollection::ALL.len()] {
+    pub(super) fn optional(&self) -> RawReady {
         self.optional
     }
 
@@ -113,20 +102,16 @@ impl RawOwner {
     }
 
     pub(super) fn finish(self, changes: u32) -> Result<RawExit, NativeError> {
-        if !self.owner.is_finished() {
-            self.pending.fetch_or(STOP | changes, Release);
-            if let Err(error) = self.post(WM_QUIT) {
-                if self.governed { let _ = self.owner.join(); }
-                return Err(error);
-            }
-        }
-        let RawResult { result, losses, status } = self.owner.join()
+        // An ended thread no longer reads the pending changes.
+        self.pending.fetch_or(STOP | changes, Release);
+        let RawResult { result, losses, status } = self.owner.post_quit_and_join()
+            .map_err(|error| NativeError::io(HelperFailureStage::MessageLoop, &error))?
             .map_err(|_| NativeError::without_code(HelperFailureStage::MessageLoop))?;
         Ok(RawExit { result, losses, records: self.records, status })
     }
 
     fn post(&self, message: u32) -> Result<(), NativeError> {
-        if unsafe { PostThreadMessageW(self.thread_id, message, 0, 0) } == 0 {
+        if unsafe { PostThreadMessageW(self.owner.thread_id, message, 0, 0) } == 0 {
             return Err(last_error(HelperFailureStage::MessageLoop));
         }
         Ok(())
@@ -219,11 +204,7 @@ impl DeviceWorker {
                 if reply.send(descriptor).is_err() { return; }
                 unsafe { PostThreadMessageW(raw_thread, WAKE, 0, 0) };
             }
-        }).map_err(|error| NativeError {
-            stage: HelperFailureStage::Startup,
-            code: error.raw_os_error(),
-            raw_input_registration: None,
-        })?;
+        }).map_err(|error| NativeError::io(HelperFailureStage::Startup, &error))?;
         Ok(Self { requests, replies })
     }
 
@@ -275,7 +256,7 @@ impl DeviceWorker {
 fn raw_loop(
     output: &mut Evidence,
     pending: &AtomicU32,
-    ready: &SyncSender<Result<RawReady, NativeError>>,
+    ready: &Startup<RawReady, NativeError>,
     progress_interval: i64,
     pen_hid: bool,
     scope: Option<&CaptureScope>,
@@ -287,8 +268,9 @@ fn raw_loop(
     let first_inventory = scope.is_none().then(device::inventory).transpose()?;
     let mut inventory_serial = None;
     let _timer = Timer::start(&raw)?;
-    ready.try_send(Ok((unsafe { GetCurrentThreadId() }, raw.optional())))
-        .map_err(|_| NativeError::without_code(HelperFailureStage::Startup))?;
+    if !ready.ready(raw.optional()) {
+        return Err(NativeError::without_code(HelperFailureStage::Startup));
+    }
     if let Some(inventory) = first_inventory {
         observe_inventory(&mut raw, &worker, &mut devices, &mut device_sequence, output, inventory)?;
         inventory_serial = Some(0);

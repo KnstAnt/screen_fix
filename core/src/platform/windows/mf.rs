@@ -87,6 +87,12 @@ impl Functions {
 }
 
 /// A Media Foundation system module; a load failure means the Media Feature Pack is missing.
+/// A Media Foundation `UINT64` attribute that holds two `UINT32`s, such as a
+/// frame size or rate: `high` is the high half.
+pub(super) const fn pack(high: u32, low: u32) -> u64 {
+    ((high as u64) << 32) | low as u64
+}
+
 fn load_system(name: PCWSTR) -> Result<HMODULE, LoadError> {
     unsafe { LoadLibraryExW(name, None, LOAD_LIBRARY_SEARCH_SYSTEM32) }
         .map_err(|error| LoadError { operation: MEDIA_FEATURES, code: error.code(), kind: ProbeKind::MediaFoundationMissing })
@@ -99,14 +105,10 @@ fn load_error(operation: &'static str) -> LoadError {
 fn functions() -> Result<&'static Functions, ProbeError> {
     static FUNCTIONS: OnceLock<Result<Functions, LoadError>> = OnceLock::new();
     FUNCTIONS.get_or_init(Functions::load).as_ref()
-        .map_err(|error| ProbeError {
-            stage: error.operation,
-            kind: error.kind,
-            source: Some(error.code.into()),
-            journal: None,
-            raw_input_registration: None,
-            owner: Some(crate::package::diagnostics::FailureComponent::Video),
-        })
+        .map_err(|error| ProbeError::new(error.operation)
+            .with_kind(error.kind)
+            .with_source(Some(error.code.into()))
+            .owned_by(crate::package::diagnostics::FailureComponent::Video))
 }
 
 pub(super) struct Runtime(&'static Functions);

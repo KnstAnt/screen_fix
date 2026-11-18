@@ -10,7 +10,7 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    capture::input::{Correlation, HeldInput, Key, Modifier, VK_PACKET, injected_hook, modifier_bit, modifier_vk},
+    capture::input::{Correlation, HeldInput, Key, Modifier, VK_PACKET, injected_hook, modifier_bit},
     protocol::ipc::InputSample,
 };
 
@@ -177,11 +177,8 @@ impl KeyboardText {
         }
         let Some(scan) = key.scan else { return Typing::Unknown };
         let mut state = [0_u8; 256];
-        for modifier in [
-            Modifier::LeftShift, Modifier::RightShift, Modifier::LeftCtrl, Modifier::RightCtrl,
-            Modifier::LeftAlt, Modifier::RightAlt, Modifier::LeftWin, Modifier::RightWin,
-        ] {
-            state[usize::from(modifier_vk(modifier))] = if pressed(modifier) { 0x80 } else { 0 };
+        for modifier in Modifier::ALL {
+            state[usize::from(modifier.vk())] = if pressed(modifier) { 0x80 } else { 0 };
         }
         state[0x10] = state[0xa0] | state[0xa1];
         state[0x11] = state[0xa2] | state[0xa3] | if alt_gr { 0x80 } else { 0 };
@@ -283,7 +280,7 @@ fn packet_unit(input: &HeldInput) -> Option<u16> {
     if correlated.correlation != Correlation::Matched {
         return None;
     }
-    std::iter::once(&correlated.first).chain(&correlated.partners).find_map(|slot| match slot.packet.sample {
+    correlated.slots().find_map(|slot| match slot.packet.sample {
         InputSample::HookKey(key) if injected_hook(&slot.packet.sample) && key.virtual_key == u32::from(VK_PACKET) =>
             u16::try_from(key.scan_code).ok(),
         _ => None,

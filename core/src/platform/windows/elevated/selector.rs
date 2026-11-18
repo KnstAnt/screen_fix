@@ -1,12 +1,13 @@
 use std::{
     collections::VecDeque,
     num::NonZeroU64,
-    sync::{atomic::{AtomicBool, Ordering}, mpsc::{self, Receiver, SyncSender, TryRecvError}},
+    sync::{atomic::AtomicBool, mpsc::{self, Receiver, SyncSender, TryRecvError}},
     thread,
     time::{Duration, Instant},
 };
 
 use screen_fix_elevated::{Failure, READINESS, Result};
+use screen_fix_native_observation::{LossSpan, StaticLease};
 use screen_fix_protocol::{
     AdmissionEpoch, AttemptId, GeometryId, QpcFrequency, QpcTick, SessionId,
     ipc::{EnvironmentChange, FocusAtReceipt, InputRegistration, ProducerGap, elevated::{
@@ -19,7 +20,9 @@ use screen_fix_protocol::{
 use crate::{
     config::ResolvedCaptureConfig,
     package::metadata::{SourceBlindInterval, SourceBlindReason},
-    session::{AdmissionBoundary, SourceStage, SourceStatus, windows::{SourcePreparation, WorkerSession}},
+    platform::windows::controller::{SourcePreparation, WorkerSession},
+    session::{AdmissionBoundary, SourceStage, SourceStatus},
+    util::keep_earlier,
 };
 
 use super::{CLEANUP, LaunchStatus, Ticket, ingress::{Ingress, InputCertificate, InputStagingLoss}, peer::{Peer, Progress}, visit::{Change, Host, add_time, matches_target}};
@@ -53,7 +56,7 @@ pub(in crate::platform::windows) struct Selector<'a> {
     loss: Option<(VisitBinding, QpcTick, CoverageReason, Option<ProducerGap>)>,
     recovered: Option<(VisitBinding, QpcTick, HeldSnapshot)>,
     context_pressure: Option<ContextGap>,
-    optional_dropped: Option<(QpcTick, QpcTick, u32)>,
+    optional_dropped: Option<LossSpan>,
     environment_sequence: u64,
     geometry_revision: Option<u64>,
     stopping: bool,
@@ -402,7 +405,7 @@ impl<'a> Selector<'a> {
         self.context_pressure.take()
     }
 
-    pub(in crate::platform::windows) fn take_optional_loss(&mut self) -> Option<(QpcTick, QpcTick, u32)> {
+    pub(in crate::platform::windows) fn take_optional_loss(&mut self) -> Option<LossSpan> {
         self.optional_dropped.take()
     }
 
@@ -823,25 +826,14 @@ impl<'a> Selector<'a> {
                     match observation {
                         Observation::Item { producer: ContextProducer::Notices, position, evidence: ContextEvidence::Notice(notice) } => {
                             restrict(notice.visit, notice.first_qpc);
-                            if let Some(gap) = &mut self.context_pressure {
-                                gap.last_position = position;
-                                gap.first_qpc = gap.first_qpc.min(notice.first_qpc);
-                                gap.last_qpc = gap.last_qpc.max(notice.observed_qpc);
-                            } else {
-                                self.context_pressure = Some(ContextGap { visit: notice.visit, producer: ContextProducer::Notices,
-                                    cause: ContextGapCause::Overflow, first_position: position, last_position: position, first_qpc: notice.first_qpc,
-                                    last_qpc: notice.observed_qpc });
-                            }
+                            merge_context_gap(&mut self.context_pressure, ContextGap {
+                                visit: notice.visit, producer: ContextProducer::Notices, cause: ContextGapCause::Overflow,
+                                first_position: position, last_position: position,
+                                first_qpc: notice.first_qpc, last_qpc: notice.observed_qpc,
+                            });
                         }
-                        Observation::Gap(gap) if gap.producer == ContextProducer::Notices => {
-                            if let Some(previous) = &mut self.context_pressure {
-                                previous.last_position = gap.last_position;
-                                previous.first_qpc = previous.first_qpc.min(gap.first_qpc);
-                                previous.last_qpc = previous.last_qpc.max(gap.last_qpc);
-                            } else {
-                                self.context_pressure = Some(gap);
-                            }
-                        }
+                        Observation::Gap(gap) if gap.producer == ContextProducer::Notices =>
+                            merge_context_gap(&mut self.context_pressure, gap),
                         Observation::Item { evidence, .. } => drop_optional(&mut self.optional_dropped, evidence.source().1),
                         Observation::Gap(gap) => drop_optional(&mut self.optional_dropped, gap.first_qpc),
                         _ => {}
@@ -970,13 +962,23 @@ fn drain_closed_lanes(
     Ok(context_exited && input_exited)
 }
 
-fn drop_optional(loss: &mut Option<(QpcTick, QpcTick, u32)>, at: QpcTick) {
-    if let Some((first, last, count)) = loss {
-        *first = (*first).min(at);
-        *last = (*last).max(at);
-        *count = count.saturating_add(1);
-    } else {
-        *loss = Some((at, at, 1));
+/// Extend the pending notice pressure gap with a later one, or start it. The
+/// pending gap keeps its visit, cause and first position.
+fn merge_context_gap(pending: &mut Option<ContextGap>, gap: ContextGap) {
+    match pending {
+        Some(previous) => {
+            previous.last_position = gap.last_position;
+            previous.first_qpc = previous.first_qpc.min(gap.first_qpc);
+            previous.last_qpc = previous.last_qpc.max(gap.last_qpc);
+        }
+        None => *pending = Some(gap),
+    }
+}
+
+fn drop_optional(loss: &mut Option<LossSpan>, at: QpcTick) {
+    match loss {
+        Some(span) => span.note(at),
+        None => *loss = Some(LossSpan::at(at)),
     }
 }
 
@@ -1031,10 +1033,6 @@ fn same_grant(left: VisitBinding, right: VisitBinding) -> bool {
         && left.foreground == right.foreground && left.witness_revision == right.witness_revision
 }
 
-fn keep_earlier(slot: &mut Option<QpcTick>, before: QpcTick) {
-    *slot = Some(slot.map_or(before, |old| old.min(before)));
-}
-
 fn required_registration(registration: InputRegistration, pen_hid: bool) -> bool {
     registration.required_ready() && (!pen_hid || registration.pen_hid)
 }
@@ -1058,18 +1056,9 @@ struct Classifier {
     checked_at: Option<Instant>,
 }
 
-struct ClassificationOwner;
-
-impl Drop for ClassificationOwner {
-    fn drop(&mut self) { CLASSIFIER_ACTIVE.store(false, Ordering::Release); }
-}
-
 impl Classifier {
     fn start(config: &ResolvedCaptureConfig) -> Result<Self> {
-        if CLASSIFIER_ACTIVE.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            return Err(Failure::Busy);
-        }
-        let owner = ClassificationOwner;
+        let owner = StaticLease::claim(&CLASSIFIER_ACTIVE).ok_or(Failure::Busy)?;
         let config = config.clone();
         let (request, incoming) = mpsc::sync_channel(1);
         let (done, completed) = mpsc::sync_channel(1);

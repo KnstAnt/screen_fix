@@ -8,6 +8,7 @@ use crate::{
         SessionTimeUs, SourceSequence, UnavailableReason,
         ipc::{CollectedInput, HookKey, InputSample, Producer, RawKey, Receipt},
     },
+    util::raise,
 };
 
 use super::{
@@ -71,7 +72,7 @@ impl CorrelatedInput {
     pub fn keyboard_witnesses(&self) -> (Option<RawKey>, Option<HookKey>) {
         let mut raw_input = None;
         let mut keyboard_hook = None;
-        for slot in std::iter::once(&self.first).chain(&self.partners) {
+        for slot in self.slots() {
             match slot.packet.sample {
                 InputSample::RawKey(key) => raw_input = Some(key),
                 InputSample::HookKey(key) => keyboard_hook = Some(key),
@@ -81,9 +82,14 @@ impl CorrelatedInput {
         (raw_input, keyboard_hook)
     }
 
+    /// The row's own records: the first and its partners.
+    pub fn slots(&self) -> impl Iterator<Item = &PendingInput> {
+        std::iter::once(&self.first).chain(&self.partners)
+    }
+
     /// Every record this row accounts for: its own and the absorbed hooks.
     pub fn records(&self) -> impl Iterator<Item = &PendingInput> {
-        std::iter::once(&self.first).chain(&self.partners).chain(&self.absorbed)
+        self.slots().chain(&self.absorbed)
     }
 }
 
@@ -217,7 +223,7 @@ impl InputMatcher {
     /// interval. Bounds never move backward.
     pub fn progress(&mut self, producer: Producer, before: SessionTimeUs) {
         let bound = &mut self.bounds[producer.index()];
-        *bound = Some(bound.map_or(before, |previous| previous.max(before)));
+        raise(bound, before);
     }
 
     /// Every producer has delivered its final records: the helper drained and
@@ -274,7 +280,7 @@ impl InputMatcher {
     ) -> Result<(), InputIdExhausted> {
         let producer = packet.sample.producer();
         let parts = normalize::parts(&packet, fallback_scan);
-        if let InputSample::Hid(report) = &packet.sample && report.pen_continuity_uncertain() {
+        if let InputSample::Hid(report) = &packet.sample && super::pen::continuity_uncertain(report) {
             self.pen_tips.retain(|(device, _), _| *device != report.device);
             self.pen_uncertain.retain(|_, last| time.recv_t_us.0.saturating_sub(last.0) <= 2 * MATCH_WINDOW_US);
             if self.pen_uncertain.len() < MAX_PENDING || self.pen_uncertain.contains_key(&report.device) {
@@ -284,7 +290,7 @@ impl InputMatcher {
             }
         }
         let pen_transition = if let InputSample::Hid(report) = &packet.sample
-            && let Some((link, down)) = report.pen_tip()
+            && let Some((link, down)) = super::pen::tip(report)
         {
             let key = (report.device, link);
             if self.pen_tips.len() >= MAX_PENDING && !self.pen_tips.contains_key(&key) {
@@ -386,7 +392,7 @@ impl InputMatcher {
     pub fn invalidate_through(&mut self, through: SessionTimeUs) {
         self.pen_tips.clear();
         self.pen_links.clear();
-        self.gap_barrier = Some(self.gap_barrier.map_or(through, |previous| previous.max(through)));
+        raise(&mut self.gap_barrier, through);
     }
 
     /// Every undecided record, the rows decided but not yet taken, and the
@@ -454,7 +460,7 @@ impl InputMatcher {
             if self.removals.contains_key(&order) {
                 if !due(order.time) { return None; }
                 let id = self.removals.remove(&order)?;
-                self.gap_barrier = Some(self.gap_barrier.map_or(order.time, |previous| previous.max(order.time)));
+                raise(&mut self.gap_barrier, order.time);
                 return Some(InputStep::DeviceRemoved { id, at: order.time });
             }
             // Rows decided while open may lie past a later closing limit; they

@@ -16,7 +16,7 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::{CaptureError, session::{SessionHandle, SessionOutcome, SessionPhase, SourceStatus, windows::Control}};
+use crate::{CaptureError, platform::windows::controller::Control, session::{SessionHandle, SessionOutcome, SessionPhase, SourceStatus}};
 
 const TIMER: usize = 1;
 

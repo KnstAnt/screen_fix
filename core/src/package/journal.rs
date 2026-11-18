@@ -30,8 +30,10 @@ use crate::protocol::{EventRef, MonitorId, SessionTimeUs, StreamId, StreamSequen
 
 use super::{
     diagnostics::Failure,
+    metadata::InputBlind,
     outcome::{DroppedTotal, GapRecord, HealthKind, LossCount, LossEvidence, LossProducer, LossRange, LossReason, LossScope,
         SuppressionClass, UiaOutcome, UiaRead},
+    row::{BlindRow, RowCounts, RowKind, RowTally, stamp_receipt},
 };
 
 const BUFFER_INTERVAL: Duration = Duration::from_secs(1);
@@ -187,17 +189,11 @@ pub(crate) struct HealthRecord {
     pub(crate) count: Option<u64>,
 }
 
-/// The kind of a stream's health rows: input health conditions are
-/// `input_health` rows (INP-1, INP-12), like the per-second input counts.
-pub(super) fn health_kind(stream: StreamId) -> &'static str {
-    if stream == StreamId::Input { "input_health" } else { "health" }
-}
-
 impl HealthRecord {
     fn row(&self, stream: StreamId) -> Value {
         let failure = self.failure.without_report_detail();
         serde_json::json!({
-            "kind": health_kind(stream),
+            "kind": RowKind::health(stream),
             "health": self.kind,
             "component": failure.component(),
             "failure": failure,
@@ -215,7 +211,7 @@ impl HealthRecord {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum FinalRow {
     Health(HealthRecord),
-    Blind(super::metadata::InputBlind),
+    Blind(InputBlind),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,69 +256,6 @@ type LedgerKey = (LossReason, Option<LossProducer>);
 fn add_count<K: Ord>(totals: &mut BTreeMap<K, u64>, key: K, count: u64) {
     let total = totals.entry(key).or_default();
     *total = total.saturating_add(count);
-}
-
-/// The row kinds the manifest health summary reports. The writer tallies them
-/// when appending, so the summary and the reader's scan count the same rows.
-#[derive(Debug)]
-enum RowTally {
-    Plain,
-    Pause,
-    Blind,
-    /// A suppression interval with its duration in microseconds.
-    Suppressed(u64),
-    Unavailable(Unavailable),
-}
-
-impl RowTally {
-    fn of(value: &Value) -> Self {
-        match value.get("kind").and_then(Value::as_str) {
-            Some("pause") => Self::Pause,
-            Some("blind") => Self::Blind,
-            Some("suppressed_interval") => Self::Suppressed(suppressed_us(value)),
-            _ => Unavailable::of(value).map_or(Self::Plain, Self::Unavailable),
-        }
-    }
-}
-
-/// The duration of a `suppressed_interval` row, as the summary counts it.
-pub(super) fn suppressed_us(value: &Value) -> u64 {
-    value.get("end_t_us").and_then(Value::as_i64).zip(value.get("start_t_us").and_then(Value::as_i64))
-        .map_or(0, |(end, start)| end.saturating_sub(start).max(0) as u64)
-}
-
-/// A row that records an unavailable observation, for the rows whose stream
-/// defines an explicit outcome: a dropped still by its reason, and a focus or
-/// element read whose `uia` value is an outcome instead of an element.
-/// The reader applies the same rule.
-#[derive(Debug)]
-pub(super) enum Unavailable {
-    Still(Box<str>),
-    Uia(UiaRead, UiaOutcome),
-}
-
-impl Unavailable {
-    pub(super) fn of(value: &Value) -> Option<Self> {
-        let read = match value.get("kind").and_then(Value::as_str)? {
-            "still_dropped" => return Some(Self::Still(
-                value.get("reason").and_then(Value::as_str).unwrap_or("unspecified").into())),
-            "focus" => UiaRead::Focus,
-            "element" => UiaRead::Element,
-            _ => return None,
-        };
-        UiaOutcome::deserialize(value.get("uia")?).ok().map(|outcome| Self::Uia(read, outcome))
-    }
-
-    /// Count this row in a stream's unavailable totals.
-    pub(super) fn count(
-        &self, stills: &mut BTreeMap<String, u64>, uia: &mut BTreeMap<UiaRead, BTreeMap<UiaOutcome, u64>>,
-    ) {
-        let total = match self {
-            Self::Still(reason) => stills.entry(reason.to_string()).or_default(),
-            Self::Uia(read, outcome) => uia.entry(*read).or_default().entry(*outcome).or_default(),
-        };
-        *total += 1;
-    }
 }
 
 struct QueuedRow {
@@ -580,10 +513,8 @@ impl JournalIngress {
 
     fn encode(&mut self, receipt: SessionTimeUs, mut value: Value) -> Result<Box<[u8]>, JournalError> {
         self.check_order(receipt)?;
-        let fields = value.as_object_mut().ok_or_else(|| self.error(JournalStep::Encode, None))?;
-        fields.remove("seq");
-        fields.insert("recv_t_us".into(), serde_json::json!(receipt));
-        fields.entry("source_t_us").or_insert(Value::Null);
+        value.as_object_mut().ok_or_else(|| self.error(JournalStep::Encode, None))?.remove("seq");
+        stamp_receipt(&mut value, receipt).map_err(|err| self.error(JournalStep::Encode, Some(err.into())))?;
         let mut row = RowBytes(Vec::new());
         serde_json::to_writer(&mut row, &value)
             .map_err(|err| self.error(JournalStep::Encode, Some(err.into())))?;
@@ -840,7 +771,9 @@ impl JournalOwner {
 struct JournalFile {
     stream: StreamId,
     file: BufWriter<File>,
+    /// The totals other than the row counts, which `counts` keeps.
     summary: StreamSummary,
+    counts: RowCounts,
 }
 
 fn write_stream(
@@ -849,7 +782,9 @@ fn write_stream(
 ) -> Result<StreamSummary, JournalError> {
     let file = File::create_new(path)
         .map_err(|source| JournalError { stream, step: JournalStep::Create, source: Some(source) })?;
-    let mut journal = JournalFile { stream, file: BufWriter::new(file), summary: StreamSummary::default() };
+    let mut journal = JournalFile {
+        stream, file: BufWriter::new(file), summary: StreamSummary::default(), counts: RowCounts::default(),
+    };
     let result = journal.drain(pending, tail, finals);
     // BufWriter's implicit drop must not attempt another write after failure.
     let _ = journal.file.into_parts();
@@ -893,7 +828,7 @@ impl JournalFile {
                 }
                 Ok(Entry::Health(receipt, row)) => {
                     self.append(Some(receipt), &row)?;
-                    self.summary.health_rows += 1;
+                    self.counts.count_health();
                 }
                 Ok(Entry::Flush(kind, done)) => {
                     match self.flush(kind) {
@@ -920,13 +855,20 @@ impl JournalFile {
         self.close(closed)?;
         if let Some(receiver) = finals {
             self.flush(Flush::Os)?;
-            let Ok(rows) = receiver.recv() else { return Ok(self.summary.clone()) };
+            let Ok(rows) = receiver.recv() else { return Ok(self.summary()) };
             for row in rows {
                 self.final_row(row)?;
             }
         }
         self.flush(Flush::Os)?;
-        Ok(self.summary.clone())
+        Ok(self.summary())
+    }
+
+    /// The closed totals with the row counts.
+    fn summary(&self) -> StreamSummary {
+        let mut summary = self.summary.clone();
+        self.counts.record_in(&mut summary);
+        summary
     }
 
     /// Pending ledger entries precede the stream's final health rows.
@@ -941,9 +883,9 @@ impl JournalFile {
         }
         if !unreported_paused_health.is_empty() && let Some(receipt) = admission.or(self.summary.last_receipt) {
             self.append_row(receipt, serde_json::json!({
-                "kind": health_kind(self.stream), "health": HealthKind::PausedSummary, "counts": unreported_paused_health,
+                "kind": RowKind::health(self.stream), "health": HealthKind::PausedSummary, "counts": unreported_paused_health,
             }))?;
-            self.summary.health_rows += 1;
+            self.counts.count_health();
         }
         let IngressTotals { offered, suppressed, sensitive, paused_health } = totals;
         self.summary.offered = offered;
@@ -961,18 +903,7 @@ impl JournalFile {
         self.append(Some(receipt), object)?;
         self.summary.data_rows += 1;
         self.summary.last_data_receipt = Some(receipt);
-        match tally {
-            RowTally::Plain => {}
-            RowTally::Pause => self.summary.pause_rows += 1,
-            RowTally::Blind => self.summary.blind_rows += 1,
-            RowTally::Suppressed(duration) => {
-                self.summary.suppressed_interval_rows += 1;
-                self.summary.suppressed_interval_us = self.summary.suppressed_interval_us.saturating_add(*duration);
-            }
-            RowTally::Unavailable(unavailable) => {
-                unavailable.count(&mut self.summary.unavailable_by_reason, &mut self.summary.uia_unavailable);
-            }
-        }
+        self.counts.count_row(tally);
         Ok(())
     }
 
@@ -980,13 +911,13 @@ impl JournalFile {
         match row {
             FinalRow::Health(record) => {
                 self.append_row(record.detected, record.row(self.stream))?;
-                self.summary.health_rows += 1;
+                self.counts.count_health();
             }
             FinalRow::Blind(blind) => {
-                self.append_row(blind.end_t_us, serde_json::json!({
-                    "kind": "blind", "start_us": blind.start_t_us, "end_us": blind.end_t_us, "reason": blind.reason,
-                }))?;
-                self.summary.blind_rows += 1;
+                let row = BlindRow::new(blind.reason, blind.start_t_us, blind.end_t_us, &[]).value()
+                    .map_err(|err| self.error(JournalStep::Encode, Some(err.into())))?;
+                self.append_row(blind.end_t_us, row)?;
+                self.counts.count_row(&RowTally::Blind);
             }
         }
         Ok(())
@@ -997,13 +928,9 @@ impl JournalFile {
         let mut row = serde_json::to_value(record).map_err(|err| self.error(JournalStep::Encode, Some(err.into())))?;
         row["kind"] = serde_json::json!("gap");
         self.append_row(admission, row)?;
-        let total = self.summary.dropped_by_reason.entry(loss.reason).or_default();
-        match record.count {
-            Some(count) => {
-                total.gap_items = total.gap_items.saturating_add(count);
-                self.summary.dropped = self.summary.dropped.saturating_add(count);
-            }
-            None => total.unknown_gaps = total.unknown_gaps.saturating_add(1),
+        self.counts.count_gap(&record);
+        if let Some(count) = record.count {
+            self.summary.dropped = self.summary.dropped.saturating_add(count);
         }
         self.summary.gap_rows += 1;
         Ok(())
@@ -1012,8 +939,7 @@ impl JournalFile {
     /// Append a writer-made row at `at`, raised to the last appended receipt.
     fn append_row(&mut self, at: SessionTimeUs, mut row: Value) -> Result<(), JournalError> {
         let receipt = self.summary.last_receipt.map_or(at, |last| last.max(at));
-        row["recv_t_us"] = serde_json::json!(receipt);
-        row["source_t_us"] = Value::Null;
+        stamp_receipt(&mut row, receipt).map_err(|err| self.error(JournalStep::Encode, Some(err.into())))?;
         let row = serde_json::to_vec(&row).map_err(|err| self.error(JournalStep::Encode, Some(err.into())))?;
         self.append(Some(receipt), &row)
     }

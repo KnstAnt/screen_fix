@@ -13,13 +13,14 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::{ClipboardMode, DeviceCalibration, ResolvedCaptureConfig},
     protocol::{AdmissionEpoch, AttemptId, ClockOrigin, MonitorId, SegmentId, SessionTimeUs, StreamId, UtcAnchor},
-    session::AdmissionBoundary,
 };
 
 use super::{
-    ArtifactKind, ArtifactRef,
+    ArtifactKind, ArtifactRef, RAW_CURSORS, RAW_IMAGES, RAW_VIDEO,
     journal::StreamSummary,
     outcome::{DroppedTotal, LossReason, SuppressionClass},
+    reader::STREAMS,
+    source::AdmissionBoundary,
 };
 
 /// The package format version (D-1 A-v6only): the manifest and every journal
@@ -478,7 +479,7 @@ pub enum SourceBlindReason {
     /// A source-transition pause without another pause reason.
     ElevationTransition,
     /// A pause of an elevated epoch, labelled with its actual reason.
-    Pause(crate::session::PauseReason),
+    Pause(super::source::PauseReason),
     ElevatedOpening(crate::protocol::ipc::elevated::runtime::CoverageReason),
     FocusSuspended,
     RecorderStaging,
@@ -501,9 +502,9 @@ pub struct SourceEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elevated: Option<ElevatedSourceEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failure: Option<crate::session::SourceFailure>,
+    pub failure: Option<super::source::SourceFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cleanup_failure: Option<crate::session::SourceFailure>,
+    pub cleanup_failure: Option<super::source::SourceFailure>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intervals: Vec<SelectedSourceInterval>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -801,7 +802,7 @@ pub struct AttemptManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursors: Option<Vec<ImageFile>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub disk_preflight: Option<crate::session::DiskPreflight>,
+    pub disk_preflight: Option<super::source::DiskPreflight>,
 }
 
 impl AttemptManifest {
@@ -813,7 +814,7 @@ impl AttemptManifest {
             || clock.utc_anchors.first().is_none_or(|first| first.sample.qpc != clock.origin.origin_qpc)
             || input.blind.is_some() || input.uncertified_closing_tail.is_some()
             || self.monitor_video.len() != self.selected_displays.len()
-            || self.streams.len() != 4 || self.images.is_none() || self.cursors.is_none()
+            || self.streams.len() != STREAMS.len() || self.images.is_none() || self.cursors.is_none()
         {
             return Err(inconsistent());
         }
@@ -899,7 +900,7 @@ pub(crate) struct MetadataOwner {
 
 impl MetadataOwner {
     pub(crate) fn create(
-        config: &ResolvedCaptureConfig, disk: crate::session::DiskPreflight, os: crate::platform::WindowsEvidence,
+        config: &ResolvedCaptureConfig, disk: super::source::DiskPreflight, os: crate::platform::WindowsEvidence,
     ) -> PackageResult<Self> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -945,12 +946,12 @@ impl MetadataOwner {
     }
 
     fn create_layout(&self) -> PackageResult<()> {
-        for directory in ["raw/video", "raw/images", "raw/cursors"] {
+        for directory in [RAW_VIDEO, RAW_IMAGES, RAW_CURSORS] {
             fs::create_dir_all(self.layout.root.join(directory))
                 .map_err(|e| PackageError::io(PackageOperation::CreateLayout, e))?;
         }
         for id in &self.manifest.selected_displays {
-            fs::create_dir(self.layout.root.join("raw/video").join(format!("m{}", id.0)))
+            fs::create_dir(self.layout.root.join(ArtifactKind::video_dir(*id)))
                 .map_err(|e| PackageError::io(PackageOperation::CreateLayout, e))?;
         }
         Ok(())
@@ -986,8 +987,8 @@ impl MetadataOwner {
 
     pub(crate) fn set_source_evidence(&mut self, evidence: Option<SourceEvidence>) {
         self.manifest.source_evidence = evidence.map(|mut evidence| {
-            evidence.failure = evidence.failure.map(crate::session::SourceFailure::without_report_detail);
-            evidence.cleanup_failure = evidence.cleanup_failure.map(crate::session::SourceFailure::without_report_detail);
+            evidence.failure = evidence.failure.map(super::source::SourceFailure::without_report_detail);
+            evidence.cleanup_failure = evidence.cleanup_failure.map(super::source::SourceFailure::without_report_detail);
             evidence
         });
     }
@@ -1092,7 +1093,7 @@ impl MetadataOwner {
         let pending = self.layout.root.join("manifest.pending.json");
         self.write_manifest(&pending)?;
         let manifest = self.layout.path(ArtifactKind::Manifest);
-        replace_manifest(&pending, &manifest, before_replace)
+        crate::platform::windows::replace_manifest(&pending, &manifest, before_replace)
             .map_err(|error| PackageError::io(PackageOperation::PublishManifest, error))
     }
 
@@ -1109,21 +1110,6 @@ impl MetadataOwner {
         file.sync_all().map_err(|e| PackageError::io(PackageOperation::FlushManifest, e))
     }
 
-}
-
-#[cfg(target_os = "windows")]
-fn replace_manifest(
-    pending: &Path, manifest: &Path, before_replace: impl FnOnce() -> io::Result<()>,
-) -> io::Result<()> {
-    crate::platform::windows::replace_manifest(pending, manifest, before_replace)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn replace_manifest(
-    pending: &Path, manifest: &Path, before_replace: impl FnOnce() -> io::Result<()>,
-) -> io::Result<()> {
-    before_replace()?;
-    fs::rename(pending, manifest)
 }
 
 /// Read-only view of a v6 attempt.
